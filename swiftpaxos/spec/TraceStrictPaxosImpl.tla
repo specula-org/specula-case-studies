@@ -510,6 +510,9 @@ TraceDone ==
 CanStepOrDone ==
     ENABLED TraceNext \/ TraceDone
 
+TraceRequestedInvariants ==
+    SPI!RequestedInvariants
+
 TraceMatched ==
     [](l <= Len(TraceLog) => [](TLCGet("queue") = 1 \/ l > Len(TraceLog)))
 
