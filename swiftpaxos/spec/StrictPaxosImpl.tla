@@ -840,6 +840,157 @@ Next ==
   \/ \E id \in CmdIds : ClientFastPathDecide(id)
   \/ \E id \in CmdIds : ClientSlowPathDecide(id)
 
+IsAcceptOrCommit(r, id) ==
+  cmdPhase[r][id] \in {"ACCEPT", "COMMIT"}
+
+RECURSIVE Reach(_, _, _, _)
+Reach(r, frontier, allowed, k) ==
+  IF k = 0
+  THEN frontier
+  ELSE LET prev == Reach(r, frontier, allowed, k - 1)
+       IN prev \cup {d \in allowed : \E c \in prev : d \in cmdDep[r][c]}
+
+CommittedReach(r, c) ==
+  Reach(r, cmdDep[r][c] \cap committed[r], committed[r], Cardinality(committed[r]))
+
+AllReach(r, c) ==
+  Reach(r, cmdDep[r][c] \cap knownCmds[r], knownCmds[r], Cardinality(knownCmds[r]))
+
+AcceptedOrCommittedIds(r) ==
+  {id \in knownCmds[r] : IsAcceptOrCommit(r, id)}
+
+\* Any two replicas commit a command with the same dependencies.
+InvCommittedDepsAgreement ==
+  \A r1 \in Nodes, r2 \in Nodes :
+    \A c \in committed[r1] \cap committed[r2] :
+      cmdDep[r1][c] = cmdDep[r2][c]
+
+\* Any two conflicting committed commands are dependency-ordered.
+InvCommittedConflictsOrdered ==
+  \A r \in Nodes :
+    \A c1 \in committed[r], c2 \in committed[r] :
+      c1 # c2 /\ Conflict(cmdData[r][c1], cmdData[r][c2]) =>
+        (c1 \in cmdDep[r][c2] \/ c2 \in cmdDep[r][c1])
+
+\* The committed dependency graph is acyclic.
+InvCommittedDepGraphAcyclic ==
+  \A r \in Nodes :
+    \A c \in committed[r] :
+      c \notin CommittedReach(r, c)
+
+\* If cmd[id] is populated then id is known and either waiting to propagate
+\* or already moved past START.
+InvCommandRecordAndPropagation ==
+  \A r \in Nodes :
+    \A id \in knownCmds[r] :
+      hasPropose[r][id] =>
+        /\ id \in knownCmds[r]
+        /\ cmdData[r][id] # NoCmd
+        /\ (cmdPhase[r][id] = "START" \/ cmdPhase[r][id] \in {"PRE_ACCEPT", "ACCEPT", "COMMIT"})
+
+\* START commands are not dependencies of any command.
+InvStartNotInDependencies ==
+  \A r \in Nodes :
+    \A c \in knownCmds[r] :
+      cmdPhase[r][c] = "START" =>
+        \A d \in knownCmds[r] : c \notin cmdDep[r][d]
+
+\* Ack sends carry the sender's current ballot/cballot.
+InvAckUsesCurrentBallot ==
+  /\ \A m \in fastAckToReplica :
+       m.b <= ballot[m.from]
+  /\ \A m \in lightSlowAckToReplica :
+       m.b <= ballot[m.from]
+  /\ \A r \in Nodes :
+       status[r] = "NORMAL" => cballot[r] = ballot[r]
+
+\* At ballot b, the leader emits one dependency set per command id in Ack.
+InvLeaderAckUniqueDepPerBallot ==
+  \A m1 \in fastAckToReplica, m2 \in fastAckToReplica :
+    m1.from = LeaderOf(m1.b) /\ m2.from = LeaderOf(m2.b) /\
+    m1.b = m2.b /\ m1.cmd = m2.cmd =>
+      m1.dep = m2.dep
+
+\* Leader Ack and Sync are dependency-consistent at the same ballot.
+InvLeaderAckSyncConsistent ==
+  \A m \in fastAckToReplica, s \in syncNet :
+    m.from = LeaderOf(m.b) /\ s.from = LeaderOf(s.b) /\
+    m.b = s.b /\ m.from = s.from /\ m.cmd \in s.cmds =>
+      s.deps[m.cmd] = m.dep
+
+\* At ballot b, the leader emits one Sync payload.
+InvLeaderSyncUniquePerBallot ==
+  \A s1 \in syncNet, s2 \in syncNet :
+    s1.from = LeaderOf(s1.b) /\ s2.from = LeaderOf(s2.b) /\
+    s1.b = s2.b /\ s1.from = s2.from =>
+      /\ s1.cmds = s2.cmds
+      /\ s1.phases = s2.phases
+      /\ s1.deps = s2.deps
+      /\ s1.data = s2.data
+
+\* After sending NewLeaderAck at higher ballot, a replica does not send Ack
+\* at that ballot or above.
+InvNoAckAtOrAboveNewLeaderAckBallot ==
+  \A n \in newLeaderAckNNet :
+    /\ \A m \in fastAckToReplica :
+         m.from = n.from => m.b < n.b
+    /\ \A m \in lightSlowAckToReplica :
+         m.from = n.from => m.b < n.b
+
+\* Accepted/committed dependency agrees with the leader's dependency while the
+\* leader of that cballot is NORMAL.
+InvAcceptedDepMatchesLeaderWhenNormal ==
+  \A r \in Nodes :
+    \A id \in AcceptedOrCommittedIds(r) :
+      IsAcceptOrCommit(r, id) =>
+        LET l == LeaderOf(cballot[r])
+        IN /\ cballot[l] = cballot[r]
+           /\ (status[l] = "NORMAL" /\ id \in knownCmds[l] =>
+                /\ IsAcceptOrCommit(l, id)
+                /\ cmdDep[l][id] = cmdDep[r][id])
+
+\* For a fixed ballot, accepted/committed commands are unique.
+InvAcceptedUniquePerBallot ==
+  \A r1 \in Nodes :
+    \A r2 \in Nodes :
+      \A id \in AcceptedOrCommittedIds(r1) \cap AcceptedOrCommittedIds(r2) :
+        IsAcceptOrCommit(r1, id) /\ IsAcceptOrCommit(r2, id) /\
+        cballot[r1] = cballot[r2] =>
+          /\ cmdData[r1][id] = cmdData[r2][id]
+          /\ cmdDep[r1][id] = cmdDep[r2][id]
+
+\* In ACCEPT/COMMIT, transitive dependencies are also in ACCEPT/COMMIT.
+InvAcceptCommitTransitiveDepsAccepted ==
+  \A r \in Nodes :
+    \A c \in AcceptedOrCommittedIds(r) :
+      IsAcceptOrCommit(r, c) =>
+        \A d \in AllReach(r, c) : IsAcceptOrCommit(r, d)
+
+\* Once a command is accepted/committed, higher cballots keep its dependency.
+InvHigherCBallotPreservesDep ==
+  \A r1 \in Nodes :
+    \A r2 \in Nodes :
+      \A id \in AcceptedOrCommittedIds(r1) \cap AcceptedOrCommittedIds(r2) :
+        IsAcceptOrCommit(r1, id) /\ IsAcceptOrCommit(r2, id) /\
+        cballot[r2] > cballot[r1] =>
+          cmdDep[r2][id] = cmdDep[r1][id]
+
+RequestedInvariants ==
+  /\ InvCommittedDepsAgreement
+  /\ InvCommittedConflictsOrdered
+  /\ InvCommittedDepGraphAcyclic
+  /\ InvCommandRecordAndPropagation
+  /\ InvStartNotInDependencies
+  /\ InvAckUsesCurrentBallot
+  /\ InvLeaderAckUniqueDepPerBallot
+  /\ InvLeaderAckSyncConsistent
+  /\ InvLeaderSyncUniquePerBallot
+  /\ InvNoAckAtOrAboveNewLeaderAckBallot
+  /\ InvAcceptedDepMatchesLeaderWhenNormal
+  /\ InvAcceptedUniquePerBallot
+  /\ InvAcceptCommitTransitiveDepsAccepted
+  /\ InvHigherCBallotPreservesDep
+
 Spec ==
   /\ Init
   /\ [][Next]_vars
