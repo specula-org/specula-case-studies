@@ -1,0 +1,651 @@
+From 5873fee92df3f1992390a6f56520b789458a2f3b Mon Sep 17 00:00:00 2001
+From: Emilie Ma <kewbish@gmail.com>
+Date: Sat, 14 Feb 2026 16:58:15 -0800
+Subject: [PATCH] feat: add trace instrumentation
+
+Signed-off-by: Emilie Ma <kewbish@gmail.com>
+---
+ .gitignore                 |   3 ++
+ client/client.go           |  34 ++++++++++++
+ local.conf                 |  63 ++++++++++++++++++++++
+ main.go                    |  12 +++++
+ swift/client.go            |  29 +++++++++++
+ swift/recovery.go          |  31 +++++++++++
+ swift/swift.go             |  52 +++++++++++++++++++
+ swift/trace_helpers.go     | 104 +++++++++++++++++++++++++++++++++++++
+ tlatrace/trace.go          |  11 ++++
+ tlatrace/trace_with_tla.go |  67 ++++++++++++++++++++++++
+ 10 files changed, 406 insertions(+)
+ create mode 100644 .gitignore
+ create mode 100644 local.conf
+ create mode 100644 swift/trace_helpers.go
+ create mode 100644 tlatrace/trace.go
+ create mode 100644 tlatrace/trace_with_tla.go
+
+diff --git a/.gitignore b/.gitignore
+new file mode 100644
+index 0000000..b40416e
+--- /dev/null
++++ b/.gitignore
+@@ -0,0 +1,3 @@
++swiftpaxos
++client_*
++traces/*
+diff --git a/client/client.go b/client/client.go
+index 773f8f5..925bf39 100644
+--- a/client/client.go
++++ b/client/client.go
+@@ -20,6 +20,7 @@ import (
+ 	"github.com/imdea-software/swiftpaxos/replica/defs"
+ 	fastrpc "github.com/imdea-software/swiftpaxos/rpc"
+ 	"github.com/imdea-software/swiftpaxos/state"
++	"github.com/imdea-software/swiftpaxos/tlatrace"
+ )
+ 
+ type Client struct {
+@@ -178,20 +179,53 @@ func (c *Client) SendProposal(cmd defs.Propose) {
+ 		d = c.ClosestId
+ 	}
+ 
++	event := map[string]interface{}{
++		"name":   "ClientSubmit",
++		"module": "client",
++		"cid":    strconv.FormatInt(int64(c.ClientId), 10),
++		"cmd": map[string]interface{}{
++			"client": cmd.ClientId,
++			"seq":    cmd.CommandId,
++			"op":     commandOpName(cmd.Command.Op),
++			"key":    int64(cmd.Command.K),
++		},
++		"leaderless": c.Leaderless,
++		"fast":       c.Fast,
++	}
++
+ 	if !c.Fast {
+ 		c.Println("sending command", cmd.CommandId, "to", d)
++		event["target"] = strconv.Itoa(d)
++		tlatrace.Emit(event)
+ 		c.writers[d].WriteByte(defs.PROPOSE)
+ 		cmd.Marshal(c.writers[d])
+ 		c.writers[d].Flush()
+ 	} else {
+ 		c.Println("sending command", cmd.CommandId, "to everyone")
++		targets := make([]string, 0, len(c.servers))
+ 		for rep := 0; rep < len(c.servers); rep++ {
+ 			if c.writers[rep] != nil {
++				targets = append(targets, strconv.Itoa(rep))
+ 				c.writers[rep].WriteByte(defs.PROPOSE)
+ 				cmd.Marshal(c.writers[rep])
+ 				c.writers[rep].Flush()
+ 			}
+ 		}
++		event["target"] = targets
++		tlatrace.Emit(event)
++	}
++}
++
++func commandOpName(op state.Operation) string {
++	switch op {
++	case state.PUT:
++		return "PUT"
++	case state.GET:
++		return "GET"
++	case state.SCAN:
++		return "SCAN"
++	default:
++		return "NONE"
+ 	}
+ }
+ 
+diff --git a/local.conf b/local.conf
+new file mode 100644
+index 0000000..113d838
+--- /dev/null
++++ b/local.conf
+@@ -0,0 +1,63 @@
++-- Replicas --
++
++r1 127.0.0.1
++r2 127.0.0.1
++r3 127.0.0.1
++
++-- Clients --
++
++c1     127.0.0.1 
++
++-- Master --
++
++// alias -> address
++master 127.0.0.1
++
++masterPort: 7087
++
++
++protocol: SwiftPaxos
++
++// Replicas
++noop:       false // do not execute
++thrifty:    false
++optread:    false
++leaderless: false
++fast:       true
++leader:     127.0.0.1 // if the port is not specified, port 7070 is used
++
++// Default port of any replica is 7070
++// This can be changed for all replicas:
++//     port: 7071
++// or for a specific replica:
++
++-- Apply to r1 --
++port: 7071
++-- Stop --
++-- Apply to r2 --
++port: 7072
++-- Stop --
++-- Apply to r3 --
++port: 7073
++-- Stop --
++
++// Clients
++reqs:        1000
++runTime:     1m // 5min
++writes:      10
++conflicts:   10
++commandSize: 1000
++clones:      5 
++key:         42 // conflicting key
++
++pipeline: false
++pendings: 10000
++
++-- Apply to r2 --
++waitClosest: true
++
++-- Proxy --
++server_alias r1
++server_alias r2
++server_alias r3
++---
+diff --git a/main.go b/main.go
+index b26d51c..3f13e32 100644
+--- a/main.go
++++ b/main.go
+@@ -17,6 +17,7 @@ import (
+ 	"github.com/imdea-software/swiftpaxos/master"
+ 	"github.com/imdea-software/swiftpaxos/replica/defs"
+ 	"github.com/imdea-software/swiftpaxos/swift"
++	"github.com/imdea-software/swiftpaxos/tlatrace"
+ )
+ 
+ var (
+@@ -69,6 +70,17 @@ func main() {
+ }
+ 
+ func run(c *config.Config) {
++	alias := c.Alias
++	if alias == "" {
++		alias = *machineType
++	}
++	tlatrace.SetAlias(alias)
++	if tlatrace.Enabled() {
++		log.Printf("TLA trace logging enabled: %s", tlatrace.TracePath())
++	} else {
++		log.Printf("TLA trace logging disabled (binary not built with tag 'with_tla')")
++	}
++
+ 	switch c.MachineType {
+ 	case config.MasterMachine:
+ 		runMaster(c)
+diff --git a/swift/client.go b/swift/client.go
+index ec31afd..04e25c8 100644
+--- a/swift/client.go
++++ b/swift/client.go
+@@ -197,6 +197,11 @@ func (c *Client) handleFastAck(f *MFastAck, fromLeader bool) bool {
+ 	}
+ 
+ 	c.initMsgSets(f.CmdId)
++	c.traceClientEvent("ClientFastAckReceived", f.CmdId, map[string]interface{}{
++		"from":        f.Replica,
++		"fromLeader":  fromLeader,
++		"hasChecksum": f.Checksum != nil,
++	})
+ 	c.fastPathH[f.CmdId].Add(f.Replica, fromLeader, f)
+ 	return true
+ }
+@@ -205,6 +210,9 @@ func (c *Client) handleLightSlowAck(ls *MLightSlowAck) {
+ 	if _, exists := c.delivered[ls.CmdId]; exists {
+ 		return
+ 	}
++	c.traceClientEvent("ClientLightSlowAckReceived", ls.CmdId, map[string]interface{}{
++		"from": ls.Replica,
++	})
+ 
+ 	if _, exists := c.alreadySlow[ls.CmdId]; !exists {
+ 		c.slowPaths++
+@@ -236,6 +244,21 @@ func (c *Client) handleFastAndSlowAcks(leaderMsg interface{}, msgs []interface{}
+ 	}
+ 	c.delivered[cmdId] = struct{}{}
+ 	c.RegisterReply(c.val, cmdId.SeqNum)
++	slowPath := false
++	for _, msg := range msgs {
++		fastAck := msg.(*MFastAck)
++		if fastAck.Checksum == nil {
++			slowPath = true
++			break
++		}
++	}
++	eventName := "ClientFastPathDecide"
++	if slowPath {
++		eventName = "ClientSlowPathDecide"
++	}
++	c.traceClientEvent(eventName, cmdId, map[string]interface{}{
++		"acks": len(msgs),
++	})
+ 
+ 	c.Println("Slow Paths:", c.slowPaths)
+ }
+@@ -244,6 +267,9 @@ func (c *Client) handleReply(r *MReply) {
+ 	if _, exists := c.delivered[r.CmdId]; exists {
+ 		return
+ 	}
++	c.traceClientEvent("ClientReplyReceived", r.CmdId, map[string]interface{}{
++		"from": r.Replica,
++	})
+ 	f := newFastAck()
+ 	f.Replica = r.Replica
+ 	f.Ballot = r.Ballot
+@@ -267,5 +293,8 @@ func (c *Client) handleAccept(a *MAccept) {
+ 
+ 	c.val = a.Rep
+ 	c.RegisterReply(c.val, a.CmdId.SeqNum)
++	c.traceClientEvent("ClientSlowPathDecide", a.CmdId, map[string]interface{}{
++		"from": a.Replica,
++	})
+ 	c.Println("Slow Paths:", c.slowPaths)
+ }
+diff --git a/swift/recovery.go b/swift/recovery.go
+index 232feed..4938591 100644
+--- a/swift/recovery.go
++++ b/swift/recovery.go
+@@ -17,6 +17,11 @@ func (r *Replica) handleNewLeader(msg *MNewLeader) {
+ 		return
+ 	}
+ 	log.Println("Recovering... with the ballot", msg.Ballot)
++	r.traceReplicaEvent("ReplicaRecovery", map[string]interface{}{
++		"stage":      "new_leader",
++		"from":       msg.Replica,
++		"new_ballot": msg.Ballot,
++	})
+ 
+ 	r.status = RECOVERING
+ 	r.ballot = msg.Ballot
+@@ -60,6 +65,12 @@ func (r *Replica) handleNewLeaderAckN(msg *MNewLeaderAckN) {
+ 	if r.status != RECOVERING || r.ballot != msg.Ballot {
+ 		return
+ 	}
++	r.traceReplicaEvent("ReplicaRecovery", map[string]interface{}{
++		"stage":   "new_leader_ack",
++		"from":    msg.Replica,
++		"cballot": msg.Cballot,
++		"cmds":    len(msg.CmdIds),
++	})
+ 
+ 	r.newLeaderAckNs.Add(msg.Replica, false, msg)
+ }
+@@ -78,6 +89,11 @@ func (r *Replica) handleNewLeaderAckNs(_ interface{}, msgs []interface{}) {
+ 			U[newLeaderAck] = struct{}{}
+ 		}
+ 	}
++	r.traceReplicaEvent("ReplicaRecovery", map[string]interface{}{
++		"stage":           "aggregate_new_leader_acks",
++		"ack_count":       len(msgs),
++		"selectedCballot": maxCbal,
++	})
+ 
+ 	phases := make(map[CommandId]int)
+ 	cmds := make(map[CommandId]state.Command)
+@@ -101,6 +117,10 @@ func (r *Replica) handleNewLeaderAckNs(_ interface{}, msgs []interface{}) {
+ 		Cmds:    cmds,
+ 		Deps:    deps,
+ 	}
++	r.traceReplicaEvent("ReplicaRecovery", map[string]interface{}{
++		"stage": "broadcast_sync",
++		"cmds":  len(sync.Phases),
++	})
+ 	r.sender.SendToAll(sync, r.cs.syncRPC)
+ 	r.handleSync(sync)
+ }
+@@ -149,6 +169,11 @@ func (r *Replica) handleSync(msg *MSync) {
+ 	if r.ballot > msg.Ballot || (r.ballot == msg.Ballot && r.status == NORMAL) {
+ 		return
+ 	}
++	r.traceReplicaEvent("ReplicaInstallRecoveredState", map[string]interface{}{
++		"stage":  "start",
++		"ballot": msg.Ballot,
++		"cmds":   len(msg.Phases),
++	})
+ 
+ 	if r.status == NORMAL {
+ 		r.recStart = time.Now()
+@@ -280,6 +305,12 @@ func (r *Replica) handleSync(msg *MSync) {
+ 		}
+ 		r.sender.SendToClient(propose.ClientId, acc, r.cs.acceptRPC)
+ 	}
++	r.traceReplicaEvent("ReplicaInstallRecoveredState", map[string]interface{}{
++		"stage":             "done",
++		"ballot":            r.ballot,
++		"recoveredCommands": len(msg.Phases),
++		"durationMicros":    time.Since(r.recStart).Microseconds(),
++	})
+ 
+ 	log.Println("Recovered!")
+ 	log.Println("Ballot:", r.ballot)
+diff --git a/swift/swift.go b/swift/swift.go
+index f7ae78d..fc3e218 100644
+--- a/swift/swift.go
++++ b/swift/swift.go
+@@ -264,6 +264,10 @@ func (r *Replica) run() {
+ 					}
+ 				}
+ 			}
++			r.traceReplicaEvent("ReplicaNewLeader", map[string]interface{}{
++				"requestedBallot": newBallot,
++				"newBallot":       newLeader.Ballot,
++			})
+ 			r.sender.SendToAll(newLeader, r.cs.newLeaderRPC)
+ 			r.reinitNewLeaderAckNs()
+ 			r.handleNewLeader(newLeader)
+@@ -276,6 +280,13 @@ func (r *Replica) run() {
+ 			cmdId.SeqNum = propose.CommandId
+ 			r.proposes[cmdId] = propose
+ 			dep, hs := r.getDepAndHashes(propose.Command, cmdId)
++			r.traceReplicaEvent("ReplicaClientSubmit", map[string]interface{}{
++				"cmd":      commandIDMap(cmdId),
++				"command":  commandMap(propose.Command),
++				"dep":      depToStrings(dep),
++				"hashes":   len(hs),
++				"clientId": propose.ClientId,
++			})
+ 			if upd, exists := r.pendingHashUpds[cmdId]; exists && r.leader() != r.Id {
+ 				// TODO: when pipelining this can break ordering, disabling fast paths.
+ 				delete(r.pendingHashUpds, cmdId)
+@@ -367,6 +378,11 @@ func (r *Replica) handlePropose(msg *defs.GPropose, desc *commandDesc, cmdId Com
+ 
+ 	desc.dep = desc.proposeDep
+ 	desc.phase = PRE_ACCEPT
++	r.traceReplicaEvent("ReplicaPropagate", map[string]interface{}{
++		"cmd":   commandIDMap(cmdId),
++		"phase": phaseName(desc.phase),
++		"dep":   depToStrings(desc.dep),
++	})
+ 	if (desc.afterPropagate.Recall() && desc.slowPath) ||
+ 		r.delivered.Has(cmdId.String()) {
+ 		// in this case a process already sent an MSlowAck
+@@ -387,6 +403,18 @@ func (r *Replica) handlePropose(msg *defs.GPropose, desc *commandDesc, cmdId Com
+ 	if r.Id == r.leader() {
+ 		fastAck.Seqnum = r.seqnum
+ 		r.seqnum++
++		r.traceReplicaEvent("ReplicaLeaderFastAck", map[string]interface{}{
++			"cmd":        commandIDMap(cmdId),
++			"dep":        depToStrings(desc.dep),
++			"hashes":     len(desc.hs),
++			"fastSeqnum": fastAck.Seqnum,
++		})
++	} else {
++		r.traceReplicaEvent("ReplicaFastAck", map[string]interface{}{
++			"cmd":    commandIDMap(cmdId),
++			"dep":    depToStrings(desc.dep),
++			"hashes": len(desc.hs),
++		})
+ 	}
+ 
+ 	isRead := r.fastRead && msg.Command.Op != state.PUT
+@@ -462,6 +490,11 @@ func (r *Replica) fastAckFromLeader(msg *MFastAck, desc *commandDesc) {
+ 				desc.dep = dep
+ 			}
+ 			desc.slowPath = true
++			r.traceReplicaEvent("ReplicaSlowPathDecide", map[string]interface{}{
++				"cmd":  commandIDMap(msgCmdId),
++				"dep":  depToStrings(desc.dep),
++				"from": msg.Replica,
++			})
+ 
+ 			lightSlowAck := &MLightSlowAck{
+ 				Replica: r.Id,
+@@ -506,6 +539,13 @@ func getFastAndSlowAcksHandler(r *Replica, desc *commandDesc) replica.MsgSetHand
+ 		leaderFastAck := leaderMsg.(*MFastAck)
+ 
+ 		desc.phase = COMMIT
++		r.traceReplicaEvent("ReplicaCommitOnQuorum", map[string]interface{}{
++			"cmd":      commandIDMap(leaderFastAck.CmdId),
++			"phase":    phaseName(desc.phase),
++			"acks":     len(msgs),
++			"slowPath": desc.slowPath,
++			"dep":      depToStrings(desc.dep),
++		})
+ 
+ 		for _, depCmdId := range desc.dep {
+ 			depDesc := r.getCmdDesc(depCmdId, nil, nil)
+@@ -553,7 +593,19 @@ func (r *Replica) deliver(desc *commandDesc, cmdId CommandId) {
+ 	}
+ 
+ 	r.delivered.Set(cmdId.String(), struct{}{})
++	r.traceReplicaEvent("ReplicaCommandExecuteStart", map[string]interface{}{
++		"cmd":   commandIDMap(cmdId),
++		"phase": phaseName(desc.phase),
++		"dep":   depToStrings(desc.dep),
++	})
+ 	v := desc.cmd.Execute(r.State)
++	r.traceReplicaEvent("ReplicaCommandExecute", map[string]interface{}{
++		"cmd":      commandIDMap(cmdId),
++		"phase":    phaseName(desc.phase),
++		"depCount": len(desc.dep),
++		"command":  commandMap(desc.cmd),
++		"result":   len(v),
++	})
+ 
+ 	desc.successorsL.Lock()
+ 	if desc.successors != nil {
+diff --git a/swift/trace_helpers.go b/swift/trace_helpers.go
+new file mode 100644
+index 0000000..12af618
+--- /dev/null
++++ b/swift/trace_helpers.go
+@@ -0,0 +1,104 @@
++package swift
++
++import (
++	"fmt"
++	"strconv"
++
++	"github.com/imdea-software/swiftpaxos/state"
++	"github.com/imdea-software/swiftpaxos/tlatrace"
++)
++
++func statusName(status int) string {
++	switch status {
++	case NORMAL:
++		return "NORMAL"
++	case RECOVERING:
++		return "RECOVERING"
++	default:
++		return "UNKNOWN"
++	}
++}
++
++func phaseName(phase int) string {
++	switch phase {
++	case START:
++		return "START"
++	case PRE_ACCEPT:
++		return "PRE_ACCEPT"
++	case ACCEPT:
++		return "ACCEPT"
++	case COMMIT:
++		return "COMMIT"
++	default:
++		return "UNKNOWN"
++	}
++}
++
++func commandIDString(cmdID CommandId) string {
++	return fmt.Sprintf("%d,%d", cmdID.ClientId, cmdID.SeqNum)
++}
++
++func commandIDMap(cmdID CommandId) map[string]interface{} {
++	return map[string]interface{}{
++		"client": cmdID.ClientId,
++		"seq":    cmdID.SeqNum,
++	}
++}
++
++func depToStrings(dep Dep) []string {
++	out := make([]string, 0, len(dep))
++	for _, d := range dep {
++		out = append(out, commandIDString(d))
++	}
++	return out
++}
++
++func commandMap(cmd state.Command) map[string]interface{} {
++	op := "NONE"
++	switch cmd.Op {
++	case state.PUT:
++		op = "PUT"
++	case state.GET:
++		op = "GET"
++	case state.SCAN:
++		op = "SCAN"
++	}
++	return map[string]interface{}{
++		"op":  op,
++		"key": int64(cmd.K),
++	}
++}
++
++func (r *Replica) traceReplicaEvent(name string, extra map[string]interface{}) {
++	event := map[string]interface{}{
++		"name":   name,
++		"module": "swift_replica",
++		"nid":    strconv.FormatInt(int64(r.Id), 10),
++		"state": map[string]interface{}{
++			"ballot":  r.ballot,
++			"cballot": r.cballot,
++			"status":  statusName(r.status),
++			"leader":  r.leader(),
++		},
++	}
++	for k, v := range extra {
++		event[k] = v
++	}
++	tlatrace.Emit(event)
++}
++
++func (c *Client) traceClientEvent(name string, cmdID CommandId, extra map[string]interface{}) {
++	event := map[string]interface{}{
++		"name":   name,
++		"module": "swift_client",
++		"cid":    strconv.FormatInt(int64(c.ClientId), 10),
++		"cmd":    commandIDMap(cmdID),
++		"state": map[string]interface{}{
++			"ballot": c.ballot,
++		},
++	}
++	for k, v := range extra {
++		event[k] = v
++	}
++	tlatrace.Emit(event)
++}
+diff --git a/tlatrace/trace.go b/tlatrace/trace.go
+new file mode 100644
+index 0000000..38b3dc8
+--- /dev/null
++++ b/tlatrace/trace.go
+@@ -0,0 +1,11 @@
++//go:build !with_tla
++
++package tlatrace
++
++func Enabled() bool { return false }
++
++func SetAlias(_ string) {}
++
++func TracePath() string { return "" }
++
++func Emit(_ interface{}) {}
+diff --git a/tlatrace/trace_with_tla.go b/tlatrace/trace_with_tla.go
+new file mode 100644
+index 0000000..38460ce
+--- /dev/null
++++ b/tlatrace/trace_with_tla.go
+@@ -0,0 +1,67 @@
++//go:build with_tla
++
++package tlatrace
++
++import (
++	"encoding/json"
++	"os"
++	"path/filepath"
++	"sync"
++	"time"
++)
++
++type envelope struct {
++	TS    string      `json:"ts"`
++	Event interface{} `json:"event"`
++}
++
++var (
++	once  sync.Once
++	mu    sync.Mutex
++	w     *os.File
++	alias = "participant"
++)
++
++func Enabled() bool { return true }
++
++func SetAlias(a string) {
++	if a != "" {
++		alias = a
++	}
++}
++
++func initWriter() {
++	path := os.Getenv("TLA_TRACE_FILE")
++	if path == "" {
++		path = TracePath()
++	}
++	dir := filepath.Dir(path)
++	if dir != "" && dir != "." {
++		_ = os.MkdirAll(dir, 0o755)
++	}
++	f, err := os.OpenFile(path, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o644)
++	if err == nil {
++		w = f
++		return
++	}
++	w = os.Stdout
++}
++
++func TracePath() string {
++	return filepath.Join("traces", alias+".ndjson")
++}
++
++func Emit(event interface{}) {
++	once.Do(initWriter)
++	e := envelope{
++		TS:    time.Now().UTC().Format(time.RFC3339Nano),
++		Event: event,
++	}
++	b, err := json.Marshal(e)
++	if err != nil {
++		return
++	}
++	mu.Lock()
++	defer mu.Unlock()
++	_, _ = w.Write(append(b, '\n'))
++}
+-- 
+2.52.0
+
