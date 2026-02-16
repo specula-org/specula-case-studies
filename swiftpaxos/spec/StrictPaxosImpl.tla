@@ -438,6 +438,39 @@ ReplicaRecvLeaderFastAckSlowPath(r) ==
                      selectedCmds, selectedPhases, selectedDeps, selectedData,
                      clientBallot, clientDelivered >>
 
+ReplicaRecvLeaderFastAckSlowPathExact(r, id, src) ==
+  /\ r \in Nodes
+  /\ id \in CmdIds
+  /\ src \in Nodes
+  /\ r # globalLeader
+  /\ status[r] = "NORMAL"
+  /\ src = globalLeader
+  /\ \E m \in fastAckToReplica :
+      /\ m.to = r
+      /\ m.from = src
+      /\ m.b = ballot[r]
+      /\ m.cmd = id
+      /\ m.cmd \in knownCmds[r]
+      /\ fastAckToReplica' = fastAckToReplica \ {m}
+      /\ cmdPhase' = [cmdPhase EXCEPT ![r][m.cmd] = "ACCEPT"]
+      /\ fastVotes' = [fastVotes EXCEPT ![m.cmd] = @ \cup {m.from}]
+      /\ leaderAckSeen' = [leaderAckSeen EXCEPT ![m.cmd] = TRUE]
+      /\ clientFastVotes' = [clientFastVotes EXCEPT ![m.cmd] = @ \cup {m.from}]
+      /\ slowPath' = [slowPath EXCEPT ![r][m.cmd] = TRUE]
+      /\ slowVotes' = [slowVotes EXCEPT ![m.cmd] = @ \cup {r}]
+      /\ clientSlowVotes' = [clientSlowVotes EXCEPT ![m.cmd] = @ \cup {r}]
+      /\ lightSlowAckToReplica' = lightSlowAckToReplica \cup
+           { [to |-> globalLeader, from |-> r, b |-> ballot[r], cmd |-> m.cmd] }
+      /\ lightSlowAckToClient' = lightSlowAckToClient \cup
+           { [to |-> m.cmd.client, from |-> r, b |-> ballot[r], cmd |-> m.cmd] }
+      /\ UNCHANGED << status, ballot, cballot, globalLeader, seqnum,
+                     knownCmds, hasPropose, cmdData, cmdDep, committed, delivered,
+                     executing, executed, proposeNet, fastAckToClient, replyNet,
+                     acceptNet, recoverQueue, newLeaderNet, newLeaderAckNNet,
+                     syncNet, recoveryBallot, ackCollected, selectedCBallot,
+                     selectedCmds, selectedPhases, selectedDeps, selectedData,
+                     clientBallot, clientDelivered >>
+
 ReplicaRecvLightSlowAck(r) ==
   /\ r \in Nodes
   /\ status[r] = "NORMAL"
@@ -937,17 +970,17 @@ InvNoAckAtOrAboveNewLeaderAckBallot ==
     /\ \A m \in lightSlowAckToReplica :
          m.from = n.from => m.b < n.b
 
-\* Accepted/committed dependency agrees with the leader's dependency while the
-\* leader of that cballot is NORMAL.
+\* Accepted/committed dependency agrees with the leader's dependency once both
+\* sides have reached ACCEPT/COMMIT in the same cballot. This captures
+\* convergence, not lockstep phase progression.
 InvAcceptedDepMatchesLeaderWhenNormal ==
   \A r \in Nodes :
     \A id \in AcceptedOrCommittedIds(r) :
       IsAcceptOrCommit(r, id) =>
         LET l == LeaderOf(cballot[r])
         IN /\ cballot[l] = cballot[r]
-           /\ (status[l] = "NORMAL" /\ id \in knownCmds[l] =>
-                /\ IsAcceptOrCommit(l, id)
-                /\ cmdDep[l][id] = cmdDep[r][id])
+           /\ (status[l] = "NORMAL" /\ id \in knownCmds[l] /\ IsAcceptOrCommit(l, id) =>
+                cmdDep[l][id] = cmdDep[r][id])
 
 \* For a fixed ballot, accepted/committed commands are unique.
 InvAcceptedUniquePerBallot ==

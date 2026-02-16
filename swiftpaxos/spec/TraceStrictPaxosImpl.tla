@@ -298,9 +298,13 @@ ReplicaFastAckObserved ==
 ReplicaSlowPathDecideLogged ==
     /\ LoglineIs("ReplicaSlowPathDecide")
     /\ LET r == RawNodeToNode(atoi(logline.event.nid))
+           id == CmdFromRaw(logline.event.cmd)
+           from == RawNodeToNode(logline.event.from)
        IN /\ r \in Nodes
+          /\ id \in CmdIds
+          /\ from \in Nodes
           /\ ReplicaStateMatches(r)
-          /\ SPI!ReplicaRecvLeaderFastAckSlowPath(r)
+          /\ SPI!ReplicaRecvLeaderFastAckSlowPathExact(r, id, from)
     /\ UNCHANGED csPending
 
 ReplicaCommitOnQuorumObserved ==
@@ -512,6 +516,21 @@ CanStepOrDone ==
 
 TraceRequestedInvariants ==
     SPI!RequestedInvariants
+
+TraceInvCommittedDepsAgreement == SPI!InvCommittedDepsAgreement
+TraceInvCommittedConflictsOrdered == SPI!InvCommittedConflictsOrdered
+TraceInvCommittedDepGraphAcyclic == SPI!InvCommittedDepGraphAcyclic
+TraceInvCommandRecordAndPropagation == SPI!InvCommandRecordAndPropagation
+TraceInvStartNotInDependencies == SPI!InvStartNotInDependencies
+TraceInvAckUsesCurrentBallot == SPI!InvAckUsesCurrentBallot
+TraceInvLeaderAckUniqueDepPerBallot == SPI!InvLeaderAckUniqueDepPerBallot
+TraceInvLeaderAckSyncConsistent == SPI!InvLeaderAckSyncConsistent
+TraceInvLeaderSyncUniquePerBallot == SPI!InvLeaderSyncUniquePerBallot
+TraceInvNoAckAtOrAboveNewLeaderAckBallot == SPI!InvNoAckAtOrAboveNewLeaderAckBallot
+TraceInvAcceptedDepMatchesLeaderWhenNormal == SPI!InvAcceptedDepMatchesLeaderWhenNormal
+TraceInvAcceptedUniquePerBallot == SPI!InvAcceptedUniquePerBallot
+TraceInvAcceptCommitTransitiveDepsAccepted == SPI!InvAcceptCommitTransitiveDepsAccepted
+TraceInvHigherCBallotPreservesDep == SPI!InvHigherCBallotPreservesDep
 
 TraceMatched ==
     [](l <= Len(TraceLog) => [](TLCGet("queue") = 1 \/ l > Len(TraceLog)))
