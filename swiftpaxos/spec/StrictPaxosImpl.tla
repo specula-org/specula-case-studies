@@ -165,7 +165,7 @@ DepsFor(r, c, payload) ==
 
 CanCommit(c) ==
   /\ Cardinality(fastVotes[c]) >= FastThreshold
-     \/ (leaderAckSeen[c] /\ Cardinality(slowVotes[c]) >= MajorityThreshold)
+     \/ (leaderAckSeen[c] /\ Cardinality(fastVotes[c] \cup slowVotes[c]) >= MajorityThreshold)
 
 CanExecute(r, c) ==
   /\ c \in committed[r]
@@ -271,6 +271,43 @@ ReplicaRecvProposeExact(r, c, id, payload) ==
                              syncNet, recoveryBallot, ackCollected, selectedCBallot,
                              selectedCmds, selectedPhases, selectedDeps, selectedData,
                              clientBallot, clientFastVotes, clientSlowVotes, clientDelivered >>
+
+ReplicaRecvProposeTrace(r, c, id, payload) ==
+  /\ r \in Nodes
+  /\ c \in Clients
+  /\ id \in CmdIds
+  /\ payload \in [op : {"GET", "PUT", "SCAN"}, key : Keys]
+  /\ status[r] = "NORMAL"
+  /\ LET m == [to |-> r, from |-> c, cmd |-> id, payload |-> payload]
+     IN /\ IF m \in proposeNet
+           THEN ReplicaRecvProposeExact(r, c, id, payload)
+           ELSE \/ /\ ~hasPropose[r][id]
+                   /\ knownCmds' = [knownCmds EXCEPT ![r] = @ \cup {id}]
+                   /\ hasPropose' = [hasPropose EXCEPT ![r][id] = TRUE]
+                   /\ cmdData' = [cmdData EXCEPT ![r][id] = payload]
+                   /\ cmdDep' = [cmdDep EXCEPT ![r][id] = DepsFor(r, id, payload)]
+                   /\ cmdPhase' = [cmdPhase EXCEPT ![r][id] = "START"]
+                   /\ proposeNet' = proposeNet
+                   /\ UNCHANGED << status, ballot, cballot, globalLeader, seqnum, slowPath,
+                                  fastVotes, slowVotes, leaderAckSeen, committed, delivered,
+                                  executing, executed, fastAckToReplica, fastAckToClient,
+                                  lightSlowAckToReplica, lightSlowAckToClient, replyNet,
+                                  acceptNet, recoverQueue, newLeaderNet, newLeaderAckNNet,
+                                  syncNet, recoveryBallot, ackCollected, selectedCBallot,
+                                  selectedCmds, selectedPhases, selectedDeps, selectedData,
+                                  clientBallot, clientFastVotes, clientSlowVotes, clientDelivered >>
+                \/ /\ hasPropose[r][id]
+                   /\ cmdData[r][id] = payload
+                   /\ UNCHANGED << status, ballot, cballot, globalLeader, seqnum,
+                                  knownCmds, hasPropose, cmdData, cmdDep, cmdPhase, slowPath,
+                                  fastVotes, slowVotes, leaderAckSeen, committed, delivered,
+                                  executing, executed, proposeNet,
+                                  fastAckToReplica, fastAckToClient,
+                                  lightSlowAckToReplica, lightSlowAckToClient, replyNet,
+                                  acceptNet, recoverQueue, newLeaderNet, newLeaderAckNNet,
+                                  syncNet, recoveryBallot, ackCollected, selectedCBallot,
+                                  selectedCmds, selectedPhases, selectedDeps, selectedData,
+                                  clientBallot, clientFastVotes, clientSlowVotes, clientDelivered >>
 
 ReplicaRecvPropose(r) ==
   /\ r \in Nodes
@@ -380,6 +417,23 @@ ReplicaRecvFastAckSelf(r) ==
                      ackCollected, selectedCBallot, selectedCmds, selectedPhases,
                      selectedDeps, selectedData, clientBallot,
                      clientSlowVotes, clientDelivered >>
+
+ReplicaObserveFastAckLocal(r, id) ==
+  /\ r \in Nodes
+  /\ id \in CmdIds
+  /\ status[r] = "NORMAL"
+  /\ id \in knownCmds[r]
+  /\ fastVotes' = [fastVotes EXCEPT ![id] = @ \cup {r}]
+  /\ clientFastVotes' = [clientFastVotes EXCEPT ![id] = @ \cup {r}]
+  /\ UNCHANGED << status, ballot, cballot, globalLeader, seqnum,
+                 knownCmds, hasPropose, cmdData, cmdDep, cmdPhase, slowPath,
+                 slowVotes, leaderAckSeen, committed, delivered, executing, executed,
+                 proposeNet, fastAckToReplica, fastAckToClient, lightSlowAckToReplica,
+                 lightSlowAckToClient, replyNet, acceptNet, recoverQueue,
+                 newLeaderNet, newLeaderAckNNet, syncNet, recoveryBallot,
+                 ackCollected, selectedCBallot, selectedCmds, selectedPhases,
+                 selectedDeps, selectedData, clientBallot, clientSlowVotes,
+                 clientDelivered >>
 
 ReplicaRecvFastAckConflict(r) ==
   /\ r \in Nodes
