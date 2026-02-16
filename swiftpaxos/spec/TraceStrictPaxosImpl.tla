@@ -193,6 +193,35 @@ BaseVars == <<
   clientDelivered
 >>
 
+BaseVarsNoClientDelivered == <<
+  status, ballot, cballot, globalLeader,
+  seqnum,
+  knownCmds, hasPropose, cmdData, cmdDep, cmdPhase, slowPath,
+  fastVotes, slowVotes, leaderAckSeen,
+  committed, delivered, executing, executed,
+  proposeNet,
+  fastAckToReplica,
+  fastAckToClient,
+  lightSlowAckToReplica,
+  lightSlowAckToClient,
+  replyNet,
+  acceptNet,
+  recoverQueue,
+  newLeaderNet,
+  newLeaderAckNNet,
+  syncNet,
+  recoveryBallot,
+  ackCollected,
+  selectedCBallot,
+  selectedCmds,
+  selectedPhases,
+  selectedDeps,
+  selectedData,
+  clientBallot,
+  clientFastVotes,
+  clientSlowVotes
+>>
+
 TraceVars == Append(BaseVars, l)
 
 ASSUME TraceReplicaRaw # {}
@@ -238,14 +267,17 @@ ClientSubmitObserved ==
           /\ op \in {"GET", "PUT", "SCAN"}
           /\ k \in Keys
           /\ r \in Nodes
-          /\ SPI!ClientSubmit(c, r, id, op, k)
-          /\ csPending' =
-              [active |-> rem2 # {},
-               c |-> c,
-               id |-> id,
-               op |-> op,
-               k |-> k,
-               rem |-> rem2]
+          /\ IF \E rr \in Nodes : hasPropose[rr][id]
+             THEN /\ UNCHANGED BaseVars
+                  /\ csPending' = csPending
+             ELSE /\ SPI!ClientSubmit(c, r, id, op, k)
+                  /\ csPending' =
+                      [active |-> rem2 # {},
+                       c |-> c,
+                       id |-> id,
+                       op |-> op,
+                       k |-> k,
+                       rem |-> rem2]
 
 ReplicaClientSubmitLogged ==
     /\ LoglineIs("ReplicaClientSubmit")
@@ -259,9 +291,8 @@ ReplicaClientSubmitLogged ==
           /\ op \in {"GET", "PUT", "SCAN"}
           /\ k \in Keys
           /\ c \in Clients
-          /\ [to |-> r, from |-> c, cmd |-> id, payload |-> [op |-> op, key |-> k]] \in proposeNet
           /\ ReplicaStateMatches(r)
-          /\ SPI!ReplicaRecvProposeExact(r, c, id, [op |-> op, key |-> k])
+          /\ SPI!ReplicaRecvProposeTrace(r, c, id, [op |-> op, key |-> k])
     /\ UNCHANGED csPending
 
 ReplicaPropagateLogged ==
@@ -290,9 +321,11 @@ ReplicaLeaderFastAckLogged ==
 ReplicaFastAckObserved ==
     /\ LoglineIs("ReplicaFastAck")
     /\ LET r == RawNodeToNode(atoi(logline.event.nid))
+           id == CmdFromRaw(logline.event.cmd)
        IN /\ r \in Nodes
+          /\ id \in CmdIds
           /\ ReplicaStateMatches(r)
-          /\ SPI!ReplicaRecvFastAckSelf(r)
+          /\ SPI!ReplicaObserveFastAckLocal(r, id)
     /\ UNCHANGED csPending
 
 ReplicaSlowPathDecideLogged ==
@@ -315,7 +348,7 @@ ReplicaCommitOnQuorumObserved ==
           /\ id \in CmdIds
           /\ ReplicaStateMatches(r)
           /\ \/ SPI!ReplicaCommitOnQuorum(r, id)
-             \/ /\ id \in committed[r]
+             \/ /\ id \in committed[r] \/ cmdPhase[r][id] = "COMMIT" \/ id \in delivered[r]
                 /\ UNCHANGED BaseVars
     /\ UNCHANGED csPending
 
@@ -360,11 +393,13 @@ ClientFastAckReceivedLogged ==
           /\ id \in CmdIds
           /\ from \in Nodes
           /\ ClientBallotMatches(c)
-          /\ \/ /\ ~("hasChecksum" \in DOMAIN logline.event) \/ logline.event.hasChecksum = TRUE
-                /\ SPI!ClientRecvFastAckExact(c, id, from)
-             \/ /\ "hasChecksum" \in DOMAIN logline.event
-                /\ logline.event.hasChecksum = FALSE
-                /\ SPI!ClientRecvSyntheticFastAck(c, id, from)
+          /\ IF id \in clientDelivered
+             THEN UNCHANGED BaseVars
+             ELSE \/ /\ ~("hasChecksum" \in DOMAIN logline.event) \/ logline.event.hasChecksum = TRUE
+                     /\ SPI!ClientRecvFastAckExact(c, id, from)
+                  \/ /\ "hasChecksum" \in DOMAIN logline.event
+                     /\ logline.event.hasChecksum = FALSE
+                     /\ SPI!ClientRecvSyntheticFastAck(c, id, from)
     /\ UNCHANGED csPending
 
 ClientLightSlowAckReceivedLogged ==
@@ -376,23 +411,32 @@ ClientLightSlowAckReceivedLogged ==
           /\ id \in CmdIds
           /\ from \in Nodes
           /\ ClientBallotMatches(c)
-          /\ IF \E m \in lightSlowAckToClient : m.to = c /\ m.cmd = id /\ m.from = from
-             THEN SPI!ClientRecvLightSlowAckExact(c, id, from)
-             ELSE SPI!ClientRecvSyntheticLightSlowAck(c, id, from)
+          /\ IF id \in clientDelivered
+             THEN UNCHANGED BaseVars
+             ELSE IF \E m \in lightSlowAckToClient : m.to = c /\ m.cmd = id /\ m.from = from
+                  THEN SPI!ClientRecvLightSlowAckExact(c, id, from)
+                  ELSE SPI!ClientRecvSyntheticLightSlowAck(c, id, from)
     /\ UNCHANGED csPending
 
 ClientFastPathDecideLogged ==
     /\ LoglineIs("ClientFastPathDecide")
     /\ \E id \in CmdIds :
         /\ id = CmdFromRaw(logline.event.cmd)
-        /\ SPI!ClientFastPathDecide(id)
+        /\ IF id \in clientDelivered
+           THEN UNCHANGED BaseVars
+           ELSE SPI!ClientFastPathDecide(id)
     /\ UNCHANGED csPending
 
 ClientSlowPathDecideLogged ==
     /\ LoglineIs("ClientSlowPathDecide")
     /\ \E id \in CmdIds :
         /\ id = CmdFromRaw(logline.event.cmd)
-        /\ SPI!ClientSlowPathDecide(id)
+        /\ IF id \in clientDelivered
+           THEN UNCHANGED BaseVars
+           ELSE \/ SPI!ClientSlowPathDecide(id)
+                   \/ /\ ("acks" \in DOMAIN logline.event) \/ ("from" \in DOMAIN logline.event)
+                      /\ clientDelivered' = clientDelivered \cup {id}
+                      /\ UNCHANGED BaseVarsNoClientDelivered
     /\ UNCHANGED csPending
 
 ConsumeLineNoStep ==
