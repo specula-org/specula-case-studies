@@ -1,0 +1,670 @@
+diff --git a/api.go b/api.go
+index 6aea63e..bd41607 100644
+--- a/api.go
++++ b/api.go
+@@ -145,6 +145,12 @@ type Raft struct {
+ 	// Used for our logging
+ 	logger hclog.Logger
+ 
++	// traceLogger emits structured trace events for TLA+ trace validation.
++	traceLogger TraceLogger
++
++	// traceVotedFor caches the votedFor value for trace state snapshots.
++	traceVotedFor ServerID
++
+ 	// LogStore provides durable storage for logs
+ 	logs LogStore
+ 
+@@ -555,6 +561,7 @@ func NewRaft(conf *Config, fsm FSM, logs LogStore, stable StableStore, snaps Sna
+ 		localID:               localID,
+ 		localAddr:             localAddr,
+ 		logger:                logger,
++		traceLogger:           conf.TraceLogger,
+ 		logs:                  logs,
+ 		configurationChangeCh: make(chan *configurationChangeFuture),
+ 		configurations:        configurations{},
+diff --git a/config.go b/config.go
+index 0f58697..a5200f7 100644
+--- a/config.go
++++ b/config.go
+@@ -226,6 +226,10 @@ type Config struct {
+ 	// LogOutput with LogLevel is used.
+ 	Logger hclog.Logger
+ 
++	// TraceLogger is an optional structured event logger for TLA+ trace validation.
++	// When set, Raft emits TraceEvents at key state transitions.
++	TraceLogger TraceLogger
++
+ 	// NoSnapshotRestoreOnStart controls if raft will restore a snapshot to the
+ 	// FSM on start. This is useful if your FSM recovers from other mechanisms
+ 	// than raft snapshotting. Snapshot metadata will still be used to initialize
+diff --git a/heartbeat_term_bug_test.go b/heartbeat_term_bug_test.go
+new file mode 100644
+index 0000000..73187cc
+--- /dev/null
++++ b/heartbeat_term_bug_test.go
+@@ -0,0 +1,256 @@
++// Copyright (c) HashiCorp, Inc.
++// SPDX-License-Identifier: MPL-2.0
++
++package raft
++
++import (
++	"fmt"
++	"os"
++	"sync"
++	"sync/atomic"
++	"testing"
++	"time"
++)
++
++// blockingLogStore wraps a LogStore and blocks GetLog calls on demand,
++// simulating disk IO stalls.
++type blockingLogStore struct {
++	LogStore
++	mu       sync.Mutex
++	blocked  atomic.Bool
++	unblockC chan struct{}
++}
++
++func newBlockingLogStore(inner LogStore) *blockingLogStore {
++	return &blockingLogStore{
++		LogStore: inner,
++		unblockC: make(chan struct{}),
++	}
++}
++
++func (b *blockingLogStore) block() {
++	b.mu.Lock()
++	defer b.mu.Unlock()
++	b.blocked.Store(true)
++	b.unblockC = make(chan struct{})
++}
++
++func (b *blockingLogStore) unblock() {
++	b.mu.Lock()
++	defer b.mu.Unlock()
++	if b.blocked.Load() {
++		b.blocked.Store(false)
++		close(b.unblockC)
++	}
++}
++
++func (b *blockingLogStore) GetLog(index uint64, log *Log) error {
++	if b.blocked.Load() {
++		b.mu.Lock()
++		ch := b.unblockC
++		b.mu.Unlock()
++		<-ch
++	}
++	return b.LogStore.GetLog(index, log)
++}
++
++// TestRaft_HeartbeatTermCheck verifies that heartbeat() checks resp.Term and
++// steps down when a follower responds with a higher term.
++//
++// When disk IO blocks the replicate() goroutine, only heartbeat() continues
++// sending RPCs. If heartbeat() does not check resp.Term, a stale leader can
++// maintain its lease indefinitely via "phantom contacts" — setLastContact()
++// called for followers that have rejected the heartbeat due to a higher term.
++//
++// Setup:
++//  1. 3-node cluster with stable leader L at term T
++//  2. Block L's disk IO so replicate() goroutines freeze on GetLog
++//  3. Disconnect L from F2 so L can only reach F1
++//  4. Restart F1 with a higher persisted term (T+5)
++//  5. L's heartbeat sends term T to F1 at term T+5 — F1 rejects
++//  6. Expect: L should step down (not maintain lease via phantom contact)
++func TestRaft_HeartbeatTermCheck(t *testing.T) {
++	conf := inmemConfig(t)
++
++	stores := make([]*InmemStore, 3)
++	blockStores := make([]*blockingLogStore, 3)
++	fsms := make([]FSM, 3)
++	snapStores := make([]*FileSnapshotStore, 3)
++	snapDirs := make([]string, 3)
++	transports := make([]*InmemTransport, 3)
++	addrs := make([]ServerAddress, 3)
++
++	var configuration Configuration
++	for i := 0; i < 3; i++ {
++		stores[i] = NewInmemStore()
++		blockStores[i] = newBlockingLogStore(stores[i])
++		fsms[i] = &MockFSM{}
++		dir, snap := FileSnapTest(t)
++		snapDirs[i] = dir
++		snapStores[i] = snap
++		addr, tr := NewInmemTransport("")
++		addrs[i] = addr
++		transports[i] = tr
++
++		localID := ServerID(fmt.Sprintf("server-%s", addr))
++		configuration.Servers = append(configuration.Servers, Server{
++			Suffrage: Voter,
++			ID:       localID,
++			Address:  addr,
++		})
++	}
++
++	for i := 0; i < 3; i++ {
++		for j := 0; j < 3; j++ {
++			if i != j {
++				transports[i].Connect(addrs[j], transports[j])
++			}
++		}
++	}
++
++	rafts := make([]*Raft, 3)
++	for i := 0; i < 3; i++ {
++		peerConf := *conf
++		peerConf.LocalID = configuration.Servers[i].ID
++		peerConf.Logger = newTestLoggerWithPrefix(t, string(configuration.Servers[i].ID))
++
++		err := BootstrapCluster(&peerConf, blockStores[i], stores[i], snapStores[i], transports[i], configuration)
++		if err != nil {
++			t.Fatalf("BootstrapCluster failed: %v", err)
++		}
++
++		raft, err := NewRaft(&peerConf, fsms[i], blockStores[i], stores[i], snapStores[i], transports[i])
++		if err != nil {
++			t.Fatalf("NewRaft failed: %v", err)
++		}
++		rafts[i] = raft
++	}
++
++	defer func() {
++		for _, bs := range blockStores {
++			bs.unblock()
++		}
++		for _, r := range rafts {
++			if r != nil {
++				f := r.Shutdown()
++				f.Error()
++			}
++		}
++		for _, d := range snapDirs {
++			os.RemoveAll(d)
++		}
++	}()
++
++	// Wait for leader
++	var leaderRaft *Raft
++	var leaderI int
++	deadline := time.After(10 * time.Second)
++	for leaderRaft == nil {
++		select {
++		case <-deadline:
++			t.Fatalf("timeout waiting for leader")
++		case <-time.After(10 * time.Millisecond):
++		}
++		for i, r := range rafts {
++			if r.State() == Leader {
++				leaderRaft = r
++				leaderI = i
++				break
++			}
++		}
++	}
++
++	time.Sleep(3 * conf.HeartbeatTimeout)
++	if leaderRaft.State() != Leader {
++		t.Fatalf("leader lost leadership during stabilization")
++	}
++
++	f1I := (leaderI + 1) % 3
++	f2I := (leaderI + 2) % 3
++
++	// Apply data to ensure logs are replicated
++	applyFuture := leaderRaft.Apply([]byte("test"), time.Second)
++	if err := applyFuture.Error(); err != nil {
++		t.Fatalf("failed to apply: %v", err)
++	}
++	time.Sleep(3 * conf.HeartbeatTimeout)
++
++	leaderTerm := leaderRaft.getCurrentTerm()
++
++	// Block leader's disk IO — replicate() goroutines freeze on GetLog,
++	// only heartbeat() continues.
++	blockStores[leaderI].block()
++	time.Sleep(3 * conf.CommitTimeout)
++
++	// Disconnect L↔F2. L can only reach F1 via heartbeat now.
++	transports[leaderI].Disconnect(addrs[f2I])
++	transports[f2I].Disconnect(addrs[leaderI])
++
++	time.Sleep(3 * conf.LeaderLeaseTimeout)
++	if leaderRaft.State() != Leader {
++		t.Fatalf("expected leader to remain leader with heartbeat to F1, got %v", leaderRaft.State())
++	}
++
++	// Shutdown F1, bump its persisted term to simulate F1 having participated
++	// in a higher-term election, then restart it.
++	blockStores[f1I].unblock()
++	f1Shutdown := rafts[f1I].Shutdown()
++	if err := f1Shutdown.Error(); err != nil {
++		t.Fatalf("F1 shutdown failed: %v", err)
++	}
++
++	bumpedTerm := leaderTerm + 5
++	if err := stores[f1I].SetUint64(keyCurrentTerm, bumpedTerm); err != nil {
++		t.Fatalf("failed to set bumped term: %v", err)
++	}
++
++	// Restart F1 with new transport at the same address, connected to L only.
++	// High election timeout prevents F1 from starting its own elections.
++	_, newF1Trans := NewInmemTransport(addrs[f1I])
++	newF1Trans.Connect(addrs[leaderI], transports[leaderI])
++	transports[leaderI].Connect(addrs[f1I], newF1Trans)
++
++	newF1Conf := *conf
++	newF1Conf.LocalID = configuration.Servers[f1I].ID
++	newF1Conf.Logger = newTestLoggerWithPrefix(t, string(configuration.Servers[f1I].ID))
++	newF1Conf.HeartbeatTimeout = 10 * time.Minute
++	newF1Conf.ElectionTimeout = 10 * time.Minute
++	newF1Conf.LeaderLeaseTimeout = 10 * time.Minute
++
++	newF1Snap, err := NewFileSnapshotStoreWithLogger(snapDirs[f1I], 3, newTestLogger(t))
++	if err != nil {
++		t.Fatalf("failed to create snapshot store: %v", err)
++	}
++	newF1Snap.noSync = true
++
++	newF1Raft, err := NewRaft(&newF1Conf, &MockFSM{}, stores[f1I], stores[f1I], newF1Snap, newF1Trans)
++	if err != nil {
++		t.Fatalf("NewRaft for restarted F1 failed: %v", err)
++	}
++	rafts[f1I] = newF1Raft
++
++	if f1Term := newF1Raft.getCurrentTerm(); f1Term != bumpedTerm {
++		t.Fatalf("F1 should have term %d, got %d", bumpedTerm, f1Term)
++	}
++
++	// L's heartbeat now sends term T to F1 at term T+5. F1 rejects.
++	// If heartbeat() checks resp.Term, L should step down within a few
++	// heartbeat cycles. We give it 10x LeaderLeaseTimeout.
++	steppedDown := false
++	checkDeadline := time.After(10 * conf.LeaderLeaseTimeout)
++	for !steppedDown {
++		select {
++		case <-checkDeadline:
++			goto CHECK
++		case <-time.After(10 * time.Millisecond):
++		}
++		if leaderRaft.State() != Leader {
++			steppedDown = true
++		}
++	}
++CHECK:
++	if !steppedDown {
++		t.Fatalf("leader at term %d should have stepped down after heartbeat to F1 at term %d, but remained Leader",
++			leaderRaft.getCurrentTerm(), newF1Raft.getCurrentTerm())
++	}
++}
+diff --git a/raft.go b/raft.go
+index 60c811c..c4a3aed 100644
+--- a/raft.go
++++ b/raft.go
+@@ -368,6 +368,7 @@ func (r *Raft) runCandidate() {
+ 				r.logger.Debug("newer term discovered, fallback to follower", "term", vote.Term)
+ 				r.setState(Follower)
+ 				r.setCurrentTerm(vote.Term)
++				r.traceVotedFor = ""
+ 				return
+ 			}
+ 
+@@ -376,6 +377,13 @@ func (r *Raft) runCandidate() {
+ 				grantedVotes++
+ 				r.logger.Debug("vote granted", "from", vote.voterID, "term", vote.Term, "tally", grantedVotes)
+ 			}
++			r.traceEvent("HandleRequestVoteResponse", &TraceMsg{
++				Type:        "RequestVoteResponse",
++				Term:        vote.Term,
++				From:        string(vote.voterID),
++				To:          string(r.localID),
++				VoteGranted: vote.Granted,
++			})
+ 
+ 			// Check if we've become the leader
+ 			if grantedVotes >= votesNeeded {
+@@ -494,6 +502,7 @@ func (r *Raft) runLeader() {
+ 	// setup leader state. This is only supposed to be accessed within the
+ 	// leaderloop.
+ 	r.setupLeaderState()
++	r.traceEvent("BecomeLeader", nil)
+ 
+ 	// Run a background go-routine to emit metrics on log age
+ 	stopCh := make(chan struct{})
+@@ -789,6 +798,9 @@ func (r *Raft) leaderLoop() {
+ 			oldCommitIndex := r.getCommitIndex()
+ 			commitIndex := r.leaderState.commitment.getCommitIndex()
+ 			r.setCommitIndex(commitIndex)
++			if commitIndex > oldCommitIndex {
++				r.traceEvent("AdvanceCommitIndex", nil)
++			}
+ 
+ 			// New configuration has been committed, set it as the committed
+ 			// value.
+@@ -1238,6 +1250,11 @@ func (r *Raft) appendConfigurationEntry(future *configurationChangeFuture) {
+ 	r.setLatestConfiguration(configuration, index)
+ 	r.leaderState.commitment.setConfiguration(configuration)
+ 	r.startStopReplication()
++
++	// Emit trace event for TLA+ trace validation.
++	r.traceEvent("ProposeConfigChange", &TraceMsg{
++		To: string(future.req.serverID),
++	})
+ }
+ 
+ // dispatchLog is called on the leader to push a log to disk, mark it
+@@ -1450,6 +1467,17 @@ func (r *Raft) appendEntries(rpc RPC, a *AppendEntriesRequest) {
+ 	}
+ 	var rpcErr error
+ 	defer func() {
++		r.traceEvent("HandleAppendEntriesRequest", &TraceMsg{
++			Type:         "AppendEntriesRequest",
++			Term:         a.Term,
++			From:         string(a.ID),
++			To:           string(r.localID),
++			PrevLogIndex: a.PrevLogEntry,
++			PrevLogTerm:  a.PrevLogTerm,
++			Entries:      len(a.Entries),
++			CommitIndex:  a.LeaderCommitIndex,
++			Success:      resp.Success,
++		})
+ 		rpc.Respond(resp, rpcErr)
+ 	}()
+ 
+@@ -1464,6 +1492,7 @@ func (r *Raft) appendEntries(rpc RPC, a *AppendEntriesRequest) {
+ 		// Ensure transition to follower
+ 		r.setState(Follower)
+ 		r.setCurrentTerm(a.Term)
++		r.traceVotedFor = ""
+ 		resp.Term = a.Term
+ 	}
+ 
+@@ -1612,7 +1641,17 @@ func (r *Raft) requestVote(rpc RPC, req *RequestVoteRequest) {
+ 		Granted:   false,
+ 	}
+ 	var rpcErr error
++	var candidateID string
+ 	defer func() {
++		r.traceEvent("HandleRequestVoteRequest", &TraceMsg{
++			Type:         "RequestVoteRequest",
++			Term:         req.Term,
++			From:         candidateID,
++			To:           string(r.localID),
++			VoteGranted:  resp.Granted,
++			LastLogTerm:  req.LastLogTerm,
++			LastLogIndex: req.LastLogIndex,
++		})
+ 		rpc.Respond(resp, rpcErr)
+ 	}()
+ 
+@@ -1635,6 +1674,7 @@ func (r *Raft) requestVote(rpc RPC, req *RequestVoteRequest) {
+ 		candidate = r.trans.DecodePeer(req.Candidate)
+ 		candidateBytes = req.Candidate
+ 	}
++	candidateID = string(req.ID)
+ 
+ 	// For older raft version ID is not part of the packed message
+ 	// We assume that the peer is part of the configuration and skip this check
+@@ -1667,6 +1707,7 @@ func (r *Raft) requestVote(rpc RPC, req *RequestVoteRequest) {
+ 		r.logger.Debug("lost leadership because received a requestVote with a newer term")
+ 		r.setState(Follower)
+ 		r.setCurrentTerm(req.Term)
++		r.traceVotedFor = ""
+ 
+ 		resp.Term = req.Term
+ 	}
+@@ -1729,6 +1770,7 @@ func (r *Raft) requestVote(rpc RPC, req *RequestVoteRequest) {
+ 		return
+ 	}
+ 
++	r.traceVotedFor = ServerID(req.ID)
+ 	resp.Granted = true
+ 	r.setLastContact()
+ }
+@@ -2024,6 +2066,8 @@ func (r *Raft) electSelf() <-chan *voteResult {
+ 					return nil
+ 
+ 				}
++				r.traceVotedFor = r.localID
++				r.traceEvent("BecomeCandidate", nil)
+ 				// Include our own vote
+ 				respCh <- &voteResult{
+ 					RequestVoteResponse: RequestVoteResponse{
+diff --git a/replication.go b/replication.go
+index 6ab9b68..dd34468 100644
+--- a/replication.go
++++ b/replication.go
+@@ -227,6 +227,17 @@ START:
+ 	}
+ 
+ 	// Make the RPC call
++	r.traceEvent("SendReplicateEntries", &TraceMsg{
++		Type:         "AppendEntriesRequest",
++		Subtype:      "replicate",
++		Term:         req.Term,
++		From:         string(r.localID),
++		To:           string(peer.ID),
++		PrevLogIndex: req.PrevLogEntry,
++		PrevLogTerm:  req.PrevLogTerm,
++		Entries:      len(req.Entries),
++		CommitIndex:  req.LeaderCommitIndex,
++	})
+ 	start = time.Now()
+ 	if err := r.trans.AppendEntries(peer.ID, peer.Address, &req, &resp); err != nil {
+ 		r.logger.Error("failed to appendEntries to", "peer", peer, "error", err)
+@@ -237,6 +248,14 @@ START:
+ 
+ 	// Check for a newer term, stop running
+ 	if resp.Term > req.Term {
++		r.traceEvent("HandleReplicateResponse", &TraceMsg{
++			Type:    "AppendEntriesResponse",
++			Subtype: "replicate",
++			Term:    resp.Term,
++			From:    string(peer.ID),
++			To:      string(r.localID),
++			Success: resp.Success,
++		})
+ 		r.handleStaleTerm(s)
+ 		return true
+ 	}
+@@ -261,6 +280,15 @@ START:
+ 		}
+ 		r.logger.Warn("appendEntries rejected, sending older logs", "peer", peer, "next", atomic.LoadUint64(&s.nextIndex))
+ 	}
++	r.traceEvent("HandleReplicateResponse", &TraceMsg{
++		Type:       "AppendEntriesResponse",
++		Subtype:    "replicate",
++		Term:       resp.Term,
++		From:       string(peer.ID),
++		To:         string(r.localID),
++		Success:    resp.Success,
++		MatchIndex: atomic.LoadUint64(&s.nextIndex) - 1,
++	})
+ 
+ CHECK_MORE:
+ 	// Poll the stop channel here in case we are looping and have been asked
+@@ -408,6 +436,13 @@ func (r *Raft) heartbeat(s *followerReplication, stopCh chan struct{}) {
+ 		peer := s.peer
+ 		s.peerLock.RUnlock()
+ 
++		r.traceEvent("SendHeartbeat", &TraceMsg{
++			Type:    "AppendEntriesRequest",
++			Subtype: "heartbeat",
++			Term:    req.Term,
++			From:    string(r.localID),
++			To:      string(peer.ID),
++		})
+ 		start := time.Now()
+ 		if err := r.trans.AppendEntries(peer.ID, peer.Address, &req, &resp); err != nil {
+ 			nextBackoffTime := cappedExponentialBackoff(failureWait, failures, maxFailureScale, r.config().HeartbeatTimeout/2)
+@@ -425,6 +460,14 @@ func (r *Raft) heartbeat(s *followerReplication, stopCh chan struct{}) {
+ 				r.observe(ResumedHeartbeatObservation{PeerID: peer.ID})
+ 			}
+ 			s.setLastContact()
++			r.traceEvent("HandleHeartbeatResponse", &TraceMsg{
++				Type:    "AppendEntriesResponse",
++				Subtype: "heartbeat",
++				Term:    resp.Term,
++				From:    string(peer.ID),
++				To:      string(r.localID),
++				Success: resp.Success,
++			})
+ 			failures = 0
+ 			labels := []metrics.Label{{Name: "peer_id", Value: string(peer.ID)}}
+ 			metrics.MeasureSinceWithLabels([]string{"raft", "replication", "heartbeat"}, start, labels)
+@@ -516,6 +559,22 @@ func (r *Raft) pipelineSend(s *followerReplication, p AppendPipeline, nextIdx *u
+ 		return true
+ 	}
+ 
++	// Emit trace event for the send (mirrors replicateTo instrumentation)
++	s.peerLock.RLock()
++	peer := s.peer
++	s.peerLock.RUnlock()
++	r.traceEvent("SendReplicateEntries", &TraceMsg{
++		Type:         "AppendEntriesRequest",
++		Subtype:      "replicate",
++		Term:         req.Term,
++		From:         string(r.localID),
++		To:           string(peer.ID),
++		PrevLogIndex: req.PrevLogEntry,
++		PrevLogTerm:  req.PrevLogTerm,
++		Entries:      len(req.Entries),
++		CommitIndex:  req.LeaderCommitIndex,
++	})
++
+ 	// Pipeline the append entries
+ 	if _, err := p.AppendEntries(req, new(AppendEntriesResponse)); err != nil {
+ 		r.logger.Error("failed to pipeline appendEntries", "peer", s.peer, "error", err)
+@@ -546,6 +605,14 @@ func (r *Raft) pipelineDecode(s *followerReplication, p AppendPipeline, stopCh,
+ 
+ 			// Check for a newer term, stop running
+ 			if resp.Term > req.Term {
++				r.traceEvent("HandleReplicateResponse", &TraceMsg{
++					Type:    "AppendEntriesResponse",
++					Subtype: "replicate",
++					Term:    resp.Term,
++					From:    string(peer.ID),
++					To:      string(r.localID),
++					Success: resp.Success,
++				})
+ 				r.handleStaleTerm(s)
+ 				return
+ 			}
+@@ -555,11 +622,28 @@ func (r *Raft) pipelineDecode(s *followerReplication, p AppendPipeline, stopCh,
+ 
+ 			// Abort pipeline if not successful
+ 			if !resp.Success {
++				r.traceEvent("HandleReplicateResponse", &TraceMsg{
++					Type:    "AppendEntriesResponse",
++					Subtype: "replicate",
++					Term:    resp.Term,
++					From:    string(peer.ID),
++					To:      string(r.localID),
++					Success: resp.Success,
++				})
+ 				return
+ 			}
+ 
+ 			// Update our replication state
+ 			updateLastAppended(s, req)
++			r.traceEvent("HandleReplicateResponse", &TraceMsg{
++				Type:       "AppendEntriesResponse",
++				Subtype:    "replicate",
++				Term:       resp.Term,
++				From:       string(peer.ID),
++				To:         string(r.localID),
++				Success:    resp.Success,
++				MatchIndex: atomic.LoadUint64(&s.nextIndex) - 1,
++			})
+ 		case <-stopCh:
+ 			return
+ 		}
+diff --git a/trace_logger.go b/trace_logger.go
+new file mode 100644
+index 0000000..1b5a4cf
+--- /dev/null
++++ b/trace_logger.go
+@@ -0,0 +1,80 @@
++// Copyright (c) HashiCorp, Inc.
++// SPDX-License-Identifier: MPL-2.0
++
++package raft
++
++// TraceLogger is an optional interface for emitting structured trace events
++// for TLA+ trace validation. When set on Config, the Raft node will emit
++// events at key state transitions to be captured as NDJSON traces.
++type TraceLogger interface {
++	TraceEvent(event TraceEvent)
++}
++
++// TraceEvent represents a single state transition event for trace validation.
++type TraceEvent struct {
++	Name  string      `json:"name"`
++	NID   string      `json:"nid"`
++	State *TraceState `json:"state"`
++	Msg   *TraceMsg   `json:"msg,omitempty"`
++}
++
++// TraceState captures the node's state at the time of the event.
++type TraceState struct {
++	Term         uint64 `json:"term"`
++	VotedFor     string `json:"votedFor"`
++	Role         string `json:"role"`
++	CommitIndex  uint64 `json:"commitIndex"`
++	LastLogIndex uint64 `json:"lastLogIndex"`
++	LastLogTerm  uint64 `json:"lastLogTerm"`
++}
++
++// TraceMsg captures message information for message-related events.
++type TraceMsg struct {
++	Type         string `json:"type"`
++	Subtype      string `json:"subtype,omitempty"`
++	Term         uint64 `json:"term"`
++	From         string `json:"from"`
++	To           string `json:"to"`
++	PrevLogIndex uint64 `json:"prevLogIndex,omitempty"`
++	PrevLogTerm  uint64 `json:"prevLogTerm,omitempty"`
++	Entries      int    `json:"entries"`
++	CommitIndex  uint64 `json:"commitIndex,omitempty"`
++	Success      bool   `json:"success,omitempty"`
++	MatchIndex   uint64 `json:"matchIndex,omitempty"`
++	VoteGranted  bool   `json:"voteGranted,omitempty"`
++	LastLogTerm  uint64 `json:"lastLogTerm,omitempty"`
++	LastLogIndex uint64 `json:"lastLogIndex,omitempty"`
++}
++
++// getTraceState returns a snapshot of the current node state for tracing.
++func (r *Raft) getTraceState() *TraceState {
++	lastIdx, lastTerm := r.getLastLog()
++	role := "Follower"
++	switch r.getState() {
++	case Candidate:
++		role = "Candidate"
++	case Leader:
++		role = "Leader"
++	}
++	return &TraceState{
++		Term:         r.getCurrentTerm(),
++		VotedFor:     string(r.traceVotedFor),
++		Role:         role,
++		CommitIndex:  r.getCommitIndex(),
++		LastLogIndex: lastIdx,
++		LastLogTerm:  lastTerm,
++	}
++}
++
++// traceEvent emits a trace event if TraceLogger is configured.
++func (r *Raft) traceEvent(name string, msg *TraceMsg) {
++	if r.traceLogger == nil {
++		return
++	}
++	r.traceLogger.TraceEvent(TraceEvent{
++		Name:  name,
++		NID:   string(r.localID),
++		State: r.getTraceState(),
++		Msg:   msg,
++	})
++}
