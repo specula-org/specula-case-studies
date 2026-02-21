@@ -1,79 +1,84 @@
-# hashicorp/raft 代码分析报告
+# hashicorp/raft Code Analysis Report
 
-## 1. 调查范围与方法
+## 1. Scope and Methodology
 
-### 1.1 目标
+### 1.1 Objective
 
-对 hashicorp/raft 库进行静态代码分析，寻找潜在的协议安全性问题和代码缺陷，
-为后续 TLA+ 建模和 Bug 发现提供方向。
+Static code analysis of the hashicorp/raft library to identify potential protocol safety issues
+and code defects, guiding subsequent TLA+ modeling and bug discovery.
 
-### 1.2 分析的代码
+### 1.2 Analyzed Code
 
-代码位于 `case-studies/hashicorp-raft/artifact/raft/`，主要分析文件：
+Code located at `case-studies/hashicorp-raft/artifact/raft/`, primary files analyzed:
 
-| 文件 | 大小 | 职责 |
-|------|------|------|
-| `raft.go` | ~2200 行 | 核心状态机：runFollower/runCandidate/runLeader, RPC 处理, 选举, 快照 |
-| `replication.go` | ~660 行 | 日志复制: replicate, heartbeat, pipelineReplicate |
-| `configuration.go` | ~370 行 | 集群成员配置变更逻辑 |
-| `commitment.go` | ~105 行 | Commit index 推进与 quorum 计算 |
-| `snapshot.go` | ~279 行 | 快照管理 |
-| `api.go` | 公开 API |
+| File | Size | Responsibility |
+|------|------|----------------|
+| `raft.go` | ~2200 lines | Core state machine: runFollower/runCandidate/runLeader, RPC handling, elections, snapshots |
+| `replication.go` | ~660 lines | Log replication: replicate, heartbeat, pipelineReplicate |
+| `configuration.go` | ~370 lines | Cluster membership configuration change logic |
+| `commitment.go` | ~105 lines | Commit index advancement and quorum calculation |
+| `snapshot.go` | ~279 lines | Snapshot management |
+| `api.go` | Public API |
 
-### 1.3 分析方法
+### 1.3 Methodology
 
-1. **并行静态代码分析** — 对 raft.go、replication.go、configuration.go 进行独立的逐行分析
-2. **Git 历史 Bug 模式分析** — 分析历史 commit 中的 bug fix 模式
-3. **GitHub Open Issues 分析** — 检查当前未解决的 issue 和已确认的 bug
-4. **PreVote 实现专项分析** — 分析 PreVote 扩展的实现质量
-5. **深度验证** — 对初步发现的可疑点进行逐一深入验证，区分真实 bug 与误报
+1. **Parallel static code analysis** — Independent line-by-line analysis of raft.go, replication.go, configuration.go
+2. **Git history bug pattern analysis** — Analysis of bug fix patterns in historical commits
+3. **GitHub open issues analysis** — Review of current unresolved issues and confirmed bugs
+4. **PreVote implementation audit** — Focused analysis of PreVote extension implementation quality
+5. **Deep verification** — Thorough verification of each suspicious finding, distinguishing real bugs from false positives
 
 ---
 
-## 2. 代码分析发现
+## 2. Code Analysis Findings
 
-### 2.1 raft.go 核心逻辑
+### 2.1 raft.go Core Logic
 
-#### 发现 1: heartbeat 协程不检查 resp.Term
+#### Finding 1: Heartbeat goroutine does not check resp.Term
 
-**位置**: `replication.go:412-437`
+**Location**: `replication.go:412-437`
 
-**描述**: 在 `heartbeat()` 函数中，成功收到 AppendEntries 响应后，代码完全忽略了 `resp.Term`。
-对比 `replicateTo()` (line 239-241) 和 `pipelineDecode()` (line 548-550) 都检查了 `resp.Term > req.Term`
-并调用 `handleStaleTerm(s)` 触发 leader step-down。
+**Description**: In the `heartbeat()` function, after successfully receiving an AppendEntries response,
+the code completely ignores `resp.Term`. In contrast, `replicateTo()` (line 239-241) and
+`pipelineDecode()` (line 548-550) both check `resp.Term > req.Term` and call `handleStaleTerm(s)`
+to trigger leader step-down.
 
 ```go
-// replication.go:412-437 (heartbeat - 缺失 term 检查)
+// replication.go:412-437 (heartbeat - missing term check)
 if err := r.trans.AppendEntries(peer.ID, peer.Address, &req, &resp); err != nil {
-    // ... 错误处理
+    // ... error handling
 } else {
     s.setLastContact()
     failures = 0
-    // 注意: 这里没有检查 resp.Term > req.Term
+    // NOTE: No check for resp.Term > req.Term here
     s.notifyAll(resp.Success)
 }
 
-// 对比 replication.go:238-242 (replicateTo - 有 term 检查)
+// Compare with replication.go:238-242 (replicateTo - has term check)
 if resp.Term > req.Term {
     r.handleStaleTerm(s)
     return true
 }
 ```
 
-**分析**: 这是三条代码路径中唯一缺失 term 检查的。当集群空闲（无新写入）时，只有心跳协程活跃，
-`replicateTo` 不会被调用。如果此时另一个节点当选了更高 term 的 leader，旧 leader 的心跳协程
-不会检测到更高的 term，leader step-down 需要依赖其他机制（lease 超时、收到 RequestVote 等）。
+**Analysis**: This is the only code path among three that lacks the term check. When the cluster is
+idle (no new writes), only the heartbeat goroutine is active and `replicateTo` is not called.
+If another node wins election with a higher term, the old leader's heartbeat goroutine will not
+detect the higher term; leader step-down must rely on other mechanisms (lease timeout, receiving
+RequestVote, etc.).
 
-**验证状态**: **代码不一致已确认**。但是否能导致协议违反尚需通过 TLA+ 建模或构造具体触发场景验证。
-Leader 最终会通过 lease 超时等其他机制 step down，所以这可能只是延迟 step-down 而非造成安全性违反。
+**Verification status**: **Code inconsistency confirmed**. Whether this leads to a protocol
+violation requires TLA+ modeling or constructing a specific trigger scenario.
+The leader will eventually step down via lease timeout or other mechanisms, so this may only
+delay step-down rather than cause a safety violation.
 
-**初步评估**: 代码不一致（Medium）
+**Assessment**: Code inconsistency (Medium)
 
 ---
 
-#### 发现 2: timeoutNow 无状态守卫
+#### Finding 2: timeoutNow has no state guard
 
-**位置**: `raft.go:2210-2215`
+**Location**: `raft.go:2210-2215`
 
 ```go
 func (r *Raft) timeoutNow(rpc RPC, req *TimeoutNowRequest) {
@@ -84,103 +89,111 @@ func (r *Raft) timeoutNow(rpc RPC, req *TimeoutNowRequest) {
 }
 ```
 
-**描述**: `processRPC` 在 `runFollower` (line 172), `runCandidate` (line 326), `runLeader` (line 686)
-三个状态循环中都会被调用。`timeoutNow` 不检查当前节点的状态。
+**Description**: `processRPC` is called in all three state loops: `runFollower` (line 172),
+`runCandidate` (line 326), `runLeader` (line 686). `timeoutNow` does not check the current
+node's state.
 
-**场景分析**:
+**Scenario analysis**:
 
-| 当前状态 | 收到 TimeoutNow 的后果 |
-|---------|----------------------|
-| Follower | 正常：设置 Candidate，退出 runFollower（`for r.getState() == Follower`），进入选举 |
-| Candidate | 设置 `candidateFromLeadershipTransfer=true`，赋予特权选举状态（跳过 PreVote，其他节点即使有 leader 也投票）|
-| Leader | 强制 step down：leaderLoop 退出（`for r.getState() == Leader`），停止复制，进入选举 |
+| Current State | Effect of Receiving TimeoutNow |
+|---------------|-------------------------------|
+| Follower | Normal: sets Candidate, exits runFollower (`for r.getState() == Follower`), enters election |
+| Candidate | Sets `candidateFromLeadershipTransfer=true`, granting privileged election status (skips PreVote, other nodes vote even with existing leader) |
+| Leader | Forced step-down: leaderLoop exits (`for r.getState() == Leader`), stops replication, enters election |
 
-**分析**: 正常操作中 TimeoutNow 只由 leader 发给目标 follower，不会发给 candidate 或 leader 自身。
-但协议层面没有防护。如果集群内有异常节点发送 TimeoutNow 给 leader，可以强制 leader step down。
+**Analysis**: Under normal operation, TimeoutNow is only sent by the leader to the target follower
+and would not be sent to a candidate or the leader itself. However, there is no protocol-level
+protection. If an abnormal node in the cluster sends TimeoutNow to the leader, it can force
+leader step-down.
 
-**验证状态**: **代码行为已确认**。在正常操作下不会触发，属于防御性编程缺失。
+**Verification status**: **Code behavior confirmed**. Does not trigger under normal operation;
+represents a defensive programming gap.
 
-**初步评估**: 鲁棒性问题（Low-Medium）
+**Assessment**: Robustness issue (Low-Medium)
 
 ---
 
-#### 发现 3: requestVote 中非投票者请求导致先 bump term 后拒绝
+#### Finding 3: requestVote bumps term before rejecting non-voter requests
 
-**位置**: `raft.go:1665-1684`
+**Location**: `raft.go:1665-1684`
 
 ```go
-// 先 bump term（line 1665-1672）
+// Bump term first (line 1665-1672)
 if req.Term > r.getCurrentTerm() {
     r.setState(Follower)
     r.setCurrentTerm(req.Term)
     resp.Term = req.Term
 }
 
-// 后检查是否是非投票者（line 1679-1684）
+// Then check if non-voter (line 1679-1684)
 if len(req.ID) > 0 {
     candidateID := ServerID(req.ID)
     if len(r.configurations.latest.Servers) > 0 && !hasVote(r.configurations.latest, candidateID) {
         r.logger.Warn("rejecting vote request since node is not a voter", "from", candidate)
-        return  // 拒绝投票，但 term 已经被 bump 了！
+        return  // Rejects vote, but term has already been bumped!
     }
 }
 ```
 
-**描述**: 当一个非投票者（NonVoter）发送带有更高 term 的 RequestVote 时，接收节点会先将自己的
-term 提升到请求的 term（可能导致当前 leader step down），然后才检查请求者是否有投票权。
-即使最终拒绝投票，term bump 的副作用已经发生。
+**Description**: When a non-voter (NonVoter) sends a RequestVote with a higher term, the
+receiving node first bumps its own term (potentially causing the current leader to step down),
+then checks whether the requester has voting rights. Even though the vote is ultimately
+rejected, the term bump side effect has already occurred.
 
-**分析**: 这个问题在 hashicorp/raft PR #526 中被讨论过，代码注释（line 1674-1678）说明了
-这是有意为之的设计选择：
+**Analysis**: This was discussed in hashicorp/raft PR #526, and code comments (line 1674-1678)
+explain this is an intentional design choice:
 
 > "if we get a request for vote from a nonVoter and the request term is higher,
 > step down and update term, but reject the vote request.
 > This could happen when a node, previously voter, is converted to non-voter.
 > The reason we need to step in is to permit to the cluster to make progress in such a scenario."
 
-**验证状态**: **设计决策，非 bug**。但一个被降级的节点可以通过不断发送高 term 的 RequestVote
-来反复扰乱集群（让 leader step down）。PreVote 机制可以缓解此问题。
+**Verification status**: **Design decision, not a bug**. However, a demoted node can repeatedly
+disrupt the cluster by sending high-term RequestVotes (causing leader step-down). PreVote
+can mitigate this.
 
-**初步评估**: 已知的设计权衡（Low）
+**Assessment**: Known design trade-off (Low)
 
 ---
 
-#### 发现 4: 投票/预投票使用未 committed 的 latest 配置进行成员检查
+#### Finding 4: Vote/PreVote uses uncommitted latest config for membership checks
 
-**位置**: `raft.go:1645, 1681, 1758, 1785`
+**Location**: `raft.go:1645, 1681, 1758, 1785`
 
 ```go
-// requestVote (line 1645) - 使用 latest 配置
+// requestVote (line 1645) - uses latest config
 if len(r.configurations.latest.Servers) > 0 && !inConfiguration(r.configurations.latest, candidateID) {
-    // 拒绝投票
+    // reject vote
 }
 
-// requestPreVote (line 1758) - 同样使用 latest 配置
+// requestPreVote (line 1758) - also uses latest config
 if len(r.configurations.latest.Servers) > 0 && !inConfiguration(r.configurations.latest, candidateID) {
-    // 拒绝预投票
+    // reject prevote
 }
 ```
 
-**描述**: `requestVote` 和 `requestPreVote` 都使用 `r.configurations.latest` 来判断候选人是否
-在集群中以及是否有投票权。`latest` 可能包含尚未 committed 的配置变更。
+**Description**: Both `requestVote` and `requestPreVote` use `r.configurations.latest` to
+determine whether the candidate is in the cluster and has voting rights. `latest` may include
+uncommitted configuration changes.
 
-**分析**: 这在 Raft 实现中是常见的做法。使用 committed 配置会导致新加入的 voter 在配置
-committed 之前无法参与选举。但使用 latest 配置意味着不同 follower 可能对同一个候选人的
-资格有不同判断（因为不同 follower 可能有不同的 latest 配置）。
+**Analysis**: This is common practice in Raft implementations. Using committed config would
+prevent newly added voters from participating in elections before the config is committed.
+However, using latest config means different followers may have different judgments about the
+same candidate's eligibility (because they may have different latest configs).
 
-hashicorp/raft 通过限制一次只能有一个未 committed 的配置变更（`configurationChangeChIfStable`,
-line 659）来减轻此问题的影响。
+hashicorp/raft mitigates this by restricting to one uncommitted config change at a time
+(`configurationChangeChIfStable`, line 659).
 
-**验证状态**: **代码行为已确认，是否为 bug 有争议**。大多数 Raft 实现都使用 latest 配置。
-单一未 committed 配置变更的约束限制了影响范围。
+**Verification status**: **Code behavior confirmed, debatable whether it's a bug**. Most Raft
+implementations use latest config. The single uncommitted config change constraint limits impact.
 
-**初步评估**: 已知设计权衡（Low）
+**Assessment**: Known design trade-off (Low)
 
 ---
 
-#### 发现 5: processConfigurationLogEntry 在 follower 上的 committed 语义
+#### Finding 5: processConfigurationLogEntry committed semantics on followers
 
-**位置**: `raft.go:1586-1601`
+**Location**: `raft.go:1586-1601`
 
 ```go
 func (r *Raft) processConfigurationLogEntry(entry *Log) error {
@@ -193,86 +206,92 @@ func (r *Raft) processConfigurationLogEntry(entry *Log) error {
 }
 ```
 
-**描述**: 当 follower 收到配置变更日志条目时，将当前的 `latest` 提升为 `committed`，然后
-设置新的 `latest`。但当前的 `latest` 本身可能尚未被 committed。
+**Description**: When a follower receives a config change log entry, it promotes the current
+`latest` to `committed`, then sets a new `latest`. However, the current `latest` itself may
+not yet be committed.
 
-**对比 leader 的做法** (line 795-797):
+**Compare with leader's approach** (line 795-797):
 ```go
-// Leader 只在 commit index 推进时才更新 committed
+// Leader only updates committed when commit index advances
 if r.configurations.latestIndex > oldCommitIndex &&
     r.configurations.latestIndex <= commitIndex {
     r.setCommittedConfiguration(r.configurations.latest, r.configurations.latestIndex)
 }
 ```
 
-**分析**: 由于 hashicorp/raft 限制一次只能有一个未 committed 的配置变更，在处理新的配置条目时，
-之前的 `latest` 通常已经 committed。所以在实践中这个行为大概率是正确的。
+**Analysis**: Since hashicorp/raft restricts to one uncommitted config change at a time,
+when processing a new config entry, the previous `latest` is typically already committed.
+So in practice this behavior is likely correct.
 
-此外，follower 在 `appendEntries` 中也有正确的 committed 更新逻辑 (line 1571-1572)：
+Additionally, the follower has correct committed update logic in `appendEntries` (line 1571-1572):
 ```go
 if r.configurations.latestIndex <= idx {
     r.setCommittedConfiguration(r.configurations.latest, r.configurations.latestIndex)
 }
 ```
 
-**验证状态**: **代码不一致已确认**。但由于单一未 committed 配置变更的约束，在实践中可能不会导致问题。
+**Verification status**: **Code inconsistency confirmed**. Due to the single uncommitted config
+change constraint, this likely does not cause issues in practice.
 
-**初步评估**: 代码不一致（Low）
-
----
-
-#### 发现 6: installSnapshot 不验证快照是否比当前状态更新
-
-**位置**: `raft.go:1815-1953`
-
-**描述**: `installSnapshot` 在接收并应用快照时，没有明确检查快照的 index/term 是否比当前
-状态更新。理论上可能导致状态回退。
-
-**分析**: 在正常操作中，leader 只会在 follower 落后太多时发送快照。快照的 index 应该比
-follower 当前的 lastApplied 更高。但代码没有显式检查这一点。
-
-**验证状态**: **需要进一步验证**。需要确认是否有其他机制（如 term 检查）隐式防止了此问题。
-
-**初步评估**: 需进一步验证（Low-Medium）
+**Assessment**: Code inconsistency (Low)
 
 ---
 
-#### 发现 7: dispatchLogs 失败后 inflight 列表清理问题
+#### Finding 6: installSnapshot does not verify snapshot is newer than current state
 
-**位置**: `raft.go:1256-1273`
+**Location**: `raft.go:1815-1953`
+
+**Description**: `installSnapshot` does not explicitly check whether the snapshot's index/term
+is newer than the current state when receiving and applying a snapshot. This could theoretically
+lead to state regression.
+
+**Analysis**: Under normal operation, the leader only sends snapshots when a follower is too
+far behind. The snapshot's index should be higher than the follower's current lastApplied.
+However, the code does not explicitly check this.
+
+**Verification status**: **Needs further verification**. Need to confirm whether other
+mechanisms (e.g., term check) implicitly prevent this.
+
+**Assessment**: Needs further verification (Low-Medium)
+
+---
+
+#### Finding 7: dispatchLogs inflight list cleanup issue on failure
+
+**Location**: `raft.go:1256-1273`
 
 ```go
-// 日志已加入 inflight 列表
+// Logs already added to inflight list
 for idx, applyLog := range applyLogs {
     r.leaderState.inflight.PushBack(applyLog)
 }
 
-// StoreLogs 失败
+// StoreLogs fails
 if err := r.logs.StoreLogs(logs); err != nil {
     for _, applyLog := range applyLogs {
-        applyLog.respond(err)  // 响应错误
+        applyLog.respond(err)  // respond with error
     }
-    r.setState(Follower)  // 但 inflight 列表中的条目没有移除！
+    r.setState(Follower)  // But inflight list entries not removed!
     return
 }
 ```
 
-**描述**: 当 `StoreLogs` 失败时，代码向所有 applyLog 响应错误并转换为 Follower。
-但这些 logFuture 仍然在 `inflight` 列表中。当 `runLeader` 的 defer 清理函数执行时，
-它会遍历 inflight 列表并对每个条目调用 `respond(ErrLeadershipLost)`，这意味着
-这些 future 会被 respond 两次。
+**Description**: When `StoreLogs` fails, the code responds to all applyLogs with an error
+and transitions to Follower. But these logFutures remain in the `inflight` list. When
+`runLeader`'s deferred cleanup function executes, it iterates the inflight list and calls
+`respond(ErrLeadershipLost)` on each entry, meaning these futures get responded to twice.
 
-**分析**: 需要检查 `respond()` 是否有幂等保护（只响应一次）。
+**Analysis**: Need to check whether `respond()` has idempotency protection (respond only once).
 
-**验证状态**: **需要检查 respond() 实现**
+**Verification status**: **Need to check respond() implementation**
 
-**初步评估**: 需进一步验证（Medium）
+**Assessment**: Needs further verification (Medium)
 
 ---
 
-#### 发现 8: lastLog 缓存在 truncation + StoreLogs 失败后状态错误
+#### Finding 8: lastLog cache incorrect after truncation + StoreLogs failure
 
-**位置**: `raft.go:1540-1543`
+**Location**: `raft.go:1540-1543`
 
 ```go
 if err := r.logs.StoreLogs(newEntries); err != nil {
@@ -283,84 +302,89 @@ if err := r.logs.StoreLogs(newEntries); err != nil {
 }
 ```
 
-**描述**: 这是开发者自己承认的 TODO。在 `appendEntries` 中，如果先执行了日志截断
-（`DeleteRange`, line 1526）然后 `StoreLogs` 失败，`lastLog` 缓存会处于错误状态：
-它仍然指向截断前的值，但实际日志已经被截断了。
+**Description**: This is a developer-acknowledged TODO. In `appendEntries`, if log truncation
+(`DeleteRange`, line 1526) executes first and then `StoreLogs` fails, the `lastLog` cache
+is left in an incorrect state: it still points to the pre-truncation value, but the actual
+log has already been truncated.
 
-**分析**: 这可能导致后续操作（如 `getLastEntry`）返回错误的值，影响 Log Matching 属性。
+**Analysis**: This can cause subsequent operations (e.g., `getLastEntry`) to return incorrect
+values, affecting the Log Matching property.
 
-**验证状态**: **开发者已确认的已知问题**
+**Verification status**: **Known issue acknowledged by developers**
 
-**初步评估**: 已知问题（Medium-High）
+**Assessment**: Known issue (Medium-High)
 
 ---
 
-### 2.2 replication.go 复制逻辑
+### 2.2 replication.go Replication Logic
 
-#### 发现 9: nextIndex 的非原子读写
+#### Finding 9: Non-atomic read-write of nextIndex
 
-**位置**: `replication.go:256`
+**Location**: `replication.go:256`
 
 ```go
 atomic.StoreUint64(&s.nextIndex, max(min(s.nextIndex-1, resp.LastLog+1), 1))
 ```
 
-**描述**: `atomic.StoreUint64` 内部读取 `s.nextIndex` 时没有使用 `atomic.LoadUint64`。
-`s.nextIndex` 被心跳协程和复制协程并发访问。
+**Description**: `atomic.StoreUint64` reads `s.nextIndex` internally without using
+`atomic.LoadUint64`. `s.nextIndex` is concurrently accessed by the heartbeat goroutine
+and the replication goroutine.
 
-**验证状态**: **代码问题已确认**，是一个数据竞争。
+**Verification status**: **Code issue confirmed**, this is a data race.
 
-**初步评估**: 数据竞争（Medium）
+**Assessment**: Data race (Medium)
 
 ---
 
-#### 发现 10: s.peer.ID 在无锁情况下被访问
+#### Finding 10: s.peer.ID accessed without lock
 
-**位置**: `replication.go:521, 647, 660`
+**Location**: `replication.go:521, 647, 660`
 
 ```go
-// line 660 - commitment.match 使用了无锁的 s.peer.ID
+// line 660 - commitment.match uses unlocked s.peer.ID
 s.commitment.match(s.peer.ID, last.Index)
 ```
 
-**描述**: `s.peer` 可以被 `startStopReplication` 通过 `peerLock` 修改（更新地址等），
-但某些访问点没有加锁。
+**Description**: `s.peer` can be modified by `startStopReplication` via `peerLock` (updating
+address, etc.), but some access points lack locking.
 
-**分析**: line 660 在 `updateLastAppended` 中，传递 `s.peer.ID` 给 `commitment.match`。
-如果此时 `s.peer` 被并发修改（torn read），可能传入错误的 server ID。
-不过 `peerLock` 只保护地址更新，ID 在实践中不会改变。
+**Analysis**: Line 660 in `updateLastAppended` passes `s.peer.ID` to `commitment.match`.
+If `s.peer` is concurrently modified (torn read), an incorrect server ID may be passed.
+However, `peerLock` only protects address updates; the ID does not change in practice.
 
-**验证状态**: **代码问题已确认**，但实际影响可能很小（ID 不变，只有 Address 会变）。
+**Verification status**: **Code issue confirmed**, but actual impact is likely minimal
+(ID doesn't change, only Address changes).
 
-**初步评估**: 代码问题（Low）
-
----
-
-#### 发现 11: closed stopCh 影响 best-effort 复制
-
-**位置**: `replication.go:147, 272`
-
-**描述**: `replicate` 的 `CHECK_MORE` 标签处有一个 select 检查 `stopCh`。当 `stopCh` 被关闭时，
-select 会立即选中 `stopCh` 分支，绕过 best-effort 复制逻辑。
-
-**验证状态**: **代码行为已确认**
-
-**初步评估**: 小问题（Low）
+**Assessment**: Code issue (Low)
 
 ---
 
-### 2.3 configuration.go 配置变更逻辑
+#### Finding 11: Closed stopCh affects best-effort replication
 
-#### 发现 12: AddNonvoter 的 suffrage 处理逻辑
+**Location**: `replication.go:147, 272`
 
-**位置**: `configuration.go:252-272`
+**Description**: At the `CHECK_MORE` label in `replicate`, there is a select checking `stopCh`.
+When `stopCh` is closed, select immediately picks the `stopCh` branch, bypassing the
+best-effort replication logic.
+
+**Verification status**: **Code behavior confirmed**
+
+**Assessment**: Minor issue (Low)
+
+---
+
+### 2.3 configuration.go Configuration Change Logic
+
+#### Finding 12: AddNonvoter suffrage handling logic
+
+**Location**: `configuration.go:252-272`
 
 ```go
 case AddNonvoter:
     for i, server := range configuration.Servers {
         if server.ID == change.serverID {
             if server.Suffrage != Nonvoter {
-                // 如果已经是 Voter/Staging，只更新地址，不改变 suffrage
+                // If already Voter/Staging, only update address, don't change suffrage
                 configuration.Servers[i].Address = change.serverAddress
             } else {
                 configuration.Servers[i] = newServer
@@ -369,87 +393,90 @@ case AddNonvoter:
     }
 ```
 
-**描述**: 调用 `AddNonvoter` 对一个已有的 Voter 节点不会将其降级为 Nonvoter，只会更新地址。
+**Description**: Calling `AddNonvoter` on an existing Voter node does not demote it to
+Nonvoter; it only updates the address.
 
-**分析**: 通过查看 API 文档（`api.go:959-963`），这是设计如此：
+**Analysis**: Per API documentation (`api.go:959-963`), this is by design:
 > "If the server is already in the cluster, this updates the server's address."
 
-降级需要使用 `DemoteVoter`。
+Demotion requires using `DemoteVoter`.
 
-**验证状态**: **非 bug，符合设计意图**
+**Verification status**: **Not a bug, matches design intent**
 
-**初步评估**: 符合设计（非问题）
-
----
-
-#### 发现 13: EncodeConfiguration/DecodeConfiguration 在错误时 panic
-
-**位置**: `configuration.go:352-368`
-
-**描述**: 这两个公开函数在序列化/反序列化失败时调用 `panic` 而不是返回 error。
-如果收到损坏的日志条目，会导致节点崩溃。
-
-**验证状态**: **代码行为已确认**
-
-**初步评估**: 鲁棒性问题（Low-Medium）
+**Assessment**: By design (not an issue)
 
 ---
 
-#### 发现 14: committed vs latest 配置的不一致使用
+#### Finding 13: EncodeConfiguration/DecodeConfiguration panic on error
 
-**位置**: 多处
+**Location**: `configuration.go:352-368`
 
-| 功能 | 使用的配置 | 位置 |
-|------|-----------|------|
-| Leader step-down 检查 | `committed` | raft.go:798 |
+**Description**: These two public functions call `panic` instead of returning an error
+on serialization/deserialization failure. If a corrupted log entry is received, the node crashes.
+
+**Verification status**: **Code behavior confirmed**
+
+**Assessment**: Robustness issue (Low-Medium)
+
+---
+
+#### Finding 14: Inconsistent use of committed vs latest configuration
+
+**Location**: Multiple locations
+
+| Function | Config Used | Location |
+|----------|-------------|----------|
+| Leader step-down check | `committed` | raft.go:798 |
 | `quorumSize()` | `latest` | raft.go:1089 |
 | `checkLeaderLease()` | `latest` | raft.go:1049 |
 | `setupLeaderState` commitment | `latest` | raft.go:458 |
-| Vote 资格检查 | `latest` | raft.go:1645 |
+| Vote eligibility check | `latest` | raft.go:1645 |
 
-**描述**: 不同功能使用了不同版本的配置。这在大多数情况下不是问题（因为 latest 和 committed
-通常相同），但在配置变更期间可能导致不一致的决策。
+**Description**: Different functions use different versions of configuration. This is usually
+not an issue (since latest and committed are typically identical), but during configuration
+changes it can lead to inconsistent decisions.
 
-**验证状态**: **代码不一致已确认**
+**Verification status**: **Code inconsistency confirmed**
 
-**初步评估**: 代码不一致（Low-Medium）
+**Assessment**: Code inconsistency (Low-Medium)
 
 ---
 
-### 2.4 PreVote 实现
+### 2.4 PreVote Implementation
 
-#### 发现 15: metrics 标签 copy-paste 错误
+#### Finding 15: Metrics label copy-paste error
 
-**位置**: `raft.go:1738`
+**Location**: `raft.go:1738`
 
 ```go
 func (r *Raft) requestPreVote(rpc RPC, req *RequestPreVoteRequest) {
     defer metrics.MeasureSince([]string{"raft", "rpc", "requestVote"}, time.Now())
-    //                                                    ^^^^^^^^^^^ 应该是 "requestPreVote"
+    //                                                    ^^^^^^^^^^^ should be "requestPreVote"
 ```
 
-**验证状态**: **确认为 bug**（copy-paste 错误）
+**Verification status**: **Confirmed bug** (copy-paste error)
 
-**初步评估**: 确认 bug（Low，仅影响 metrics）
-
----
-
-#### 发现 16: requestPreVote 缺少 len(req.ID) > 0 守卫
-
-**位置**: `raft.go:1758`
-
-**描述**: `requestVote` 在检查 candidateID 前有 `if len(req.ID) > 0` 的守卫（向后兼容旧协议），
-但 `requestPreVote` 没有。由于 PreVote 只存在于新版本协议中，这在实践中不是问题。
-
-**验证状态**: **代码不一致已确认，但无实际影响**
-
-**初步评估**: 代码不一致（Very Low）
+**Assessment**: Confirmed bug (Low, only affects metrics)
 
 ---
 
-#### 发现 17: 不支持 PreVote 的节点被当作 granted
+#### Finding 16: requestPreVote missing len(req.ID) > 0 guard
 
-**位置**: `raft.go:2083-2091`
+**Location**: `raft.go:1758`
+
+**Description**: `requestVote` has an `if len(req.ID) > 0` guard before checking candidateID
+(backward compatibility with old protocol), but `requestPreVote` does not. Since PreVote only
+exists in the new protocol version, this has no practical impact.
+
+**Verification status**: **Code inconsistency confirmed, no practical impact**
+
+**Assessment**: Code inconsistency (Very Low)
+
+---
+
+#### Finding 17: Nodes not supporting PreVote treated as granted
+
+**Location**: `raft.go:2083-2091`
 
 ```go
 if err != nil && strings.Contains(err.Error(), rpcUnexpectedCommandError) {
@@ -458,317 +485,327 @@ if err != nil && strings.Contains(err.Error(), rpcUnexpectedCommandError) {
 }
 ```
 
-**描述**: 使用 `strings.Contains` 做错误匹配，比较脆弱。但这是为了混合版本集群的兼容性。
+**Description**: Uses `strings.Contains` for error matching, which is fragile. However, this
+is for mixed-version cluster compatibility.
 
-**验证状态**: **设计决策**
+**Verification status**: **Design decision**
 
-**初步评估**: 鲁棒性问题（Low）
-
----
-
-## 3. Git 历史 Bug 模式分析
-
-### 3.1 Bug 热点文件
-
-| 文件 | 变更次数 | 主要 Bug 类型 |
-|------|---------|-------------|
-| `raft.go` | 36 | 状态转换、竞态条件、选举安全 |
-| `api.go` | 28 | API 接口、Leadership Transfer |
-| `replication.go` | 18 | 竞态条件、peer 状态管理 |
-| `configuration.go` | 12 | 配置变更安全 |
-
-### 3.2 历史 Bug 分类
-
-| 类别 | 数量 | 严重度 |
-|------|------|--------|
-| 竞态条件 | 5+ | High |
-| Leadership Transfer 逻辑错误 | 4 | High |
-| 选举/投票安全违反 | 3 | Critical |
-| PreVote 实现 Bug | 2 | High |
-| 未处理错误导致 Panic | 2+ | High |
-| Channel 通知失败 | 2 | Medium |
-
-### 3.3 重要历史 Bug 修复
-
-| Commit | 描述 | 教训 |
-|--------|------|------|
-| `49bd61b` | `candidateFromLeadershipTransfer` 非原子访问 | Leadership Transfer 是竞态高发区 |
-| `1a62103` | Peer 访问与心跳的竞态 | replication.go 的并发模型复杂 |
-| `d68b78b` | Leadership Transfer 标志设置时序错误 | 标志在协程启动后才设置 |
-| `38cb186` | 已移除节点仍可投票 | 配置变更与选举的交互是 bug 温床 |
-| `656e6c0` | NonVoter 可转换为 Candidate | Suffrage 概念增加了状态空间 |
-| `6b4e320` | NonVoter 高 term 导致 leader step-down | 同上 |
-| `497108f` | Leader 自己的 PreVote 被拒绝 | 地址比较在特定网络环境下可能失败 |
-| `42d3446` | 授予 PreVote 错误地更新了 leader last-contact | PreVote 与心跳超时的交互 |
+**Assessment**: Robustness issue (Low)
 
 ---
 
-## 4. GitHub Open Issues 与 PRs 分析（已逐一验证）
+## 3. Git History Bug Pattern Analysis
 
-### 4.1 已标记为 Bug 的 Issues
+### 3.1 Bug Hotspot Files
 
-| Issue | 描述 | 开放时间 | 验证结果 |
-|-------|------|---------|---------|
-| #275 | `inmemPipeline` 中 `shutdownCh` 和 `consumerCh` 的竞态 | 2018 | **确认 bug**（仅影响测试基础设施，有完整复现程序） |
-| #503 | Leader LogStore 挂起导致整个集群挂起，无法重新选举 | 2022 | **确认 bug**（严重，有生产环境复现，心跳协程独立于 leader 主循环运行导致 follower 不会超时选举） |
-| #522 | Leader 无法加载快照，集群无法恢复 | 2022 | **确认 bug**（严重，leader 无法发送快照但不 step down，有生产日志证据） |
-| #85 | 从旧快照恢复后 panic | 2016 | **确认 bug**（快照回退导致日志缺口，有 Gist 复现测试，开放近10年未修复） |
-| #86 | `TrailingLogs=0` 在快照后崩溃 | 2016 | **确认 bug**（边界条件，2024年有人确认仍可复现，开放8年未修复） |
-| #66 | Peer/configuration 变更与日志操作非原子 | 2015 | **设计问题/不确定**（极简描述，无复现，无评论，可能已被新配置模型缓解） |
+| File | Change Count | Primary Bug Types |
+|------|-------------|-------------------|
+| `raft.go` | 36 | State transitions, race conditions, election safety |
+| `api.go` | 28 | API interface, Leadership Transfer |
+| `replication.go` | 18 | Race conditions, peer state management |
+| `configuration.go` | 12 | Configuration change safety |
 
-### 4.2 未标记 Issues（已逐一验证）
+### 3.2 Historical Bug Classification
 
-| Issue | 描述 | 验证结果 |
-|-------|------|---------|
-| #614 | 存储损坏的节点持续赢得选举 | **确认 bug** — 自降级后无选举惩罚机制，节点保留 term 优势反复当选，真实生产事件（持续10分钟） |
-| #612 | 复制到 follower 静默停止（详细报告） | **确认 bug**（严重）— pipeline 复制路径可能吞掉 follower 端 StoreLogs 失败，leader 侧无错误日志，有生产日志和 metrics 截图 |
-| #611 | 复制停止（简短报告） | **不确定** — 报告过于简短，无日志/复现，可能与 #612 同根因 |
-| #498 | `Apply()` 在 quorum 丢失时永久死锁 | **确认 bug**（严重）— `deferError` future 的 `errCh` 永远不会被信号通知，多人独立确认，2025年2月仍可复现，开放3年+ |
-| #634 | LeaderLeaseTimeout 可能导致不必要的 leader step-down | **设计讨论** — 理论关注，默认配置下安全，无具体复现 |
-| #652 | LeaderLeaseTimeout 短于 HeartbeatTimeout 的影响 | **非 bug** — 用户对心跳机制的误解，HashiCorp 成员已解释心跳间隔为 HeartbeatTimeout/10 |
-| #472 | 配置分歧导致选举卡在 Candidate 状态 | **确认 bug**（严重）— 3节点集群中2个存活节点配置分歧导致永久无法选举，多个独立生产系统确认 |
-| #586 | `max(uint64)` term 导致极慢选举 | **超出设计范围** — 需要人为注入故障，非拜占庭协议不处理此场景，维护者明确表示不优先 |
-| #643 | 节点身份跨集群冲突 | **用户错误** — 两个独立集群共享同一 transport 地址，Raft 设计上不支持 |
-| #621 | 线性化读优化无法安全实现 | **确认设计缺陷** — 库不暴露 leader 初始 noop 的 commit 状态，PR #625 已提出修复 |
-| #549 | Commit index 未持久化 | **确认设计缺陷** — 重启后节点无法重放已 committed 日志，HashiCorp 贡献者提出 `CommitTrackingLogStore` 接口 |
+| Category | Count | Severity |
+|----------|-------|----------|
+| Race conditions | 5+ | High |
+| Leadership Transfer logic errors | 4 | High |
+| Election/voting safety violations | 3 | Critical |
+| PreVote implementation bugs | 2 | High |
+| Unhandled errors causing panic | 2+ | High |
+| Channel notification failures | 2 | Medium |
 
-### 4.3 Open PRs（已逐一验证）
+### 3.3 Notable Historical Bug Fixes
 
-| PR | 描述 | 验证结果 |
-|----|------|---------|
-| #665 | 修复 requestPreVote metrics 标签 | **我们提交的 bug fix** |
-| #651 | Snapshot RPC 错误修复 | **真实 bug fix**（严重）— 快照传输中大小变化导致连接协议损坏，后续 RPC 解析错误 |
-| #638 | 降低 "nothing new to snapshot" 的日志级别 | **真实 bug fix**（日志噪音）— 正常行为被记录为 error |
-| #625 | 支持 Leadership 断言检查 | **重要增强** — 实现 Raft 论文 Section 8 所需的线性化读前提条件，修复 #621 |
-| #613 | 在 LogStore 中持久化 commit index | **增强** — 修复 #549，加速重启恢复 |
-| #588 | 允许在快照传输期间 shutdown | **真实 bug fix** — 大快照传输期间 Shutdown() 永久阻塞 |
-| #579 | WIP: 异步日志写入（leader 磁盘并行复制） | **增强（WIP）** — Ongaro 论文 Section 10.2.1 优化 |
-| #571 | 升级 golang.org/x/sys (CVE) | **过时** — 已被后续依赖更新取代 |
-| #538 | gRPC transport 实现 | **增强（草案）** — 3年未活跃，极度过时 |
-| #518 | 导出 SkipStartup + 添加 Start() | **增强** — 3.5年未活跃 |
-| #427 | 使 LeaderCh() 每次返回新 channel | **增强** — 5年未活跃 |
+| Commit | Description | Lesson |
+|--------|-------------|--------|
+| `49bd61b` | `candidateFromLeadershipTransfer` non-atomic access | Leadership Transfer is a race condition hotspot |
+| `1a62103` | Peer access races with heartbeat | replication.go concurrency model is complex |
+| `d68b78b` | Leadership Transfer flag set timing error | Flag set after goroutine starts |
+| `38cb186` | Removed node can still vote | Config change and election interaction is a bug breeding ground |
+| `656e6c0` | NonVoter can transition to Candidate | Suffrage concepts expand the state space |
+| `6b4e320` | NonVoter high term causes leader step-down | Same as above |
+| `497108f` | Leader's own PreVote rejected | Address comparison may fail in certain network environments |
+| `42d3446` | Granting PreVote incorrectly updates leader last-contact | PreVote and heartbeat timeout interaction |
 
 ---
 
-## 5. 深度验证结果
+## 4. GitHub Open Issues and PRs Analysis (individually verified)
 
-对初步分析中的高优先级发现进行了深入验证：
+### 4.1 Issues Labeled as Bug
 
-### 5.1 排除的误报
+| Issue | Description | Open Since | Verification Result |
+|-------|-------------|------------|---------------------|
+| #275 | Race between `shutdownCh` and `consumerCh` in `inmemPipeline` | 2018 | **Confirmed bug** (only affects test infrastructure, has full reproduction program) |
+| #503 | Leader LogStore hang causes entire cluster hang, unable to re-elect | 2022 | **Confirmed bug** (severe, has production reproduction; heartbeat goroutine runs independently of leader main loop, preventing follower timeout elections) |
+| #522 | Leader cannot load snapshot, cluster cannot recover | 2022 | **Confirmed bug** (severe, leader cannot send snapshots but does not step down, has production log evidence) |
+| #85 | Panic after restoring from old snapshot | 2016 | **Confirmed bug** (snapshot rollback causes log gap, has Gist reproduction test, open nearly 10 years unfixed) |
+| #86 | `TrailingLogs=0` crashes after snapshot | 2016 | **Confirmed bug** (boundary condition, confirmed still reproducible in 2024, open 8 years unfixed) |
+| #66 | Peer/configuration changes not atomic with log operations | 2015 | **Design issue/uncertain** (minimal description, no reproduction, no comments, may have been mitigated by new config model) |
 
-| 原始发现 | 排除原因 |
-|---------|---------|
-| "Leadership Transfer 候选人收到同 term AppendEntries 不 step down 可能导致两个 leader" | `runFollower` 循环条件是 `for r.getState() == Follower`，timeoutNow 设置 state=Candidate 后，下一次循环迭代立即退出，进入 runCandidate。不会卡在 runFollower 中。 |
-| "AddNonvoter 反转 suffrage 逻辑" | 设计如此：AddNonvoter 仅用于添加新的 nonvoter 或更新已有节点地址。降级用 DemoteVoter。API 文档明确说明了此行为。 |
-| "checkLeaderLease 可能因 replState 缺少 voter 而 panic" | 所有配置更新和 replState 更新在主线程同步执行（`appendConfigurationEntry` 中 `setLatestConfiguration` 和 `startStopReplication` 连续调用），不会出现不一致窗口。 |
-| "dispatchLogs inflight 列表双重 respond" (raft.go:1256) | `respond()` 在 `future.go:125-126` 有 `d.responded` 幂等保护，第二次调用是 no-op。即使 StoreLogs 失败后 inflight 清理再次调用 respond，也不会产生副作用。 |
-| "processConfigurationLogEntry committed 语义" (raft.go:1586) | `configurationChangeChIfStable()` (line 659) 限制一次只有一个未 committed 的配置变更。处理新配置条目时，前一个 latest 已经 committed，所以将其提升为 committed 是正确的。 |
+### 4.2 Unlabeled Issues (individually verified)
 
-### 5.2 确认的发现（二次深度验证后，按置信度排序）
+| Issue | Description | Verification Result |
+|-------|-------------|---------------------|
+| #614 | Storage-corrupted node keeps winning elections | **Confirmed bug** — no election penalty after self-demotion, node retains term advantage and wins repeatedly, real production event (lasted 10 minutes) |
+| #612 | Replication to follower silently stops (detailed report) | **Confirmed bug** (severe) — pipeline replication path may swallow follower-side StoreLogs failure, no error log on leader side, has production logs and metrics screenshots |
+| #611 | Replication stops (brief report) | **Uncertain** — report too brief, no logs/reproduction, may share root cause with #612 |
+| #498 | `Apply()` permanently deadlocks when quorum lost | **Confirmed bug** (severe) — `deferError` future's `errCh` is never signaled, independently confirmed by multiple people, still reproducible as of Feb 2025, open 3+ years |
+| #634 | LeaderLeaseTimeout may cause unnecessary leader step-down | **Design discussion** — theoretical concern, safe under default config, no concrete reproduction |
+| #652 | Impact of LeaderLeaseTimeout shorter than HeartbeatTimeout | **Not a bug** — user misunderstanding of heartbeat mechanism, HashiCorp member explained heartbeat interval is HeartbeatTimeout/10 |
+| #472 | Config divergence causes election stuck in Candidate state | **Confirmed bug** (severe) — config divergence between 2 surviving nodes in a 3-node cluster causes permanent inability to elect, confirmed by multiple independent production systems |
+| #586 | `max(uint64)` term causes extremely slow elections | **Out of design scope** — requires manual fault injection, non-Byzantine protocol does not handle this scenario, maintainers explicitly stated not a priority |
+| #643 | Node identity conflict across clusters | **User error** — two independent clusters sharing the same transport address, Raft does not support this by design |
+| #621 | Linearizable read optimization cannot be safely implemented | **Confirmed design deficiency** — library does not expose leader's initial noop commit status, PR #625 proposes fix |
+| #549 | Commit index not persisted | **Confirmed design deficiency** — after restart, node cannot replay committed logs, HashiCorp contributor proposed `CommitTrackingLogStore` interface |
 
-| # | 发现 | 置信度 | 严重度 | 详细验证结论 |
-|---|------|--------|--------|-------------|
-| 1 | Metrics 标签 copy-paste 错误 (raft.go:1738) | **确认 bug** | Low | "requestVote" 应为 "requestPreVote"。已提交 PR #665 修复。 |
-| 2 | lastLog 缓存在 truncation+StoreLogs 失败后错误 (raft.go:1540) | **确认（开发者 TODO）** | Medium-High | `DeleteRange` 成功后 `StoreLogs` 失败，lastLog 缓存指向已截断的位置。可导致后续 PrevLog 检查错误、commit index 虚高。需要磁盘故障触发。 |
-| 3 | Heartbeat 不检查 resp.Term (replication.go:412) | **确认真实问题** | Low | `replicateTo` (line 239) 和 `pipelineDecode` (line 548) 都检查了 resp.Term，唯独 heartbeat 没有。集群空闲时仅心跳运行，leader 无法通过此路径发现更高 term。但 heartbeat 不携带日志，不会导致错误 commit，LeaderLeaseTimeout 最终兜底。 |
-| 4 | timeoutNow 无状态守卫 (raft.go:2210) | **确认真实问题** | Moderate | 任何能发送 RPC 的节点均可发送 TimeoutNow：让 leader step down，或让 candidate 获得特权选举状态（跳过 PreVote，其他节点即使有 leader 也投票）。正常操作不触发，属防御性编程缺失。 |
-| 5 | nextIndex 非原子读写 (replication.go:256) | **确认数据竞争** | Medium | `atomic.StoreUint64` 内部读 `s.nextIndex` 未用 `atomic.LoadUint64`，存在数据竞争。 |
-| 6 | EncodeConfiguration panic (configuration.go:352) | **代码行为确认** | Low-Medium | 鲁棒性问题，收到损坏日志条目会导致节点 panic。 |
+### 4.3 Open PRs (individually verified)
 
----
-
-## 6. Bug 家族分析与 TLA+ 建模策略
-
-通过分析历史 bug 修复、已确认的 open issues 和代码静态分析发现，我们识别出 **5 个 Bug 家族**。
-每个家族有共同的根因模式，并关联了历史 bug 和新发现的潜在问题。
-
-### 6.1 家族 1: 竞态条件
-
-**共同根因**: 多个 goroutine 并发访问共享状态，缺少适当的同步机制。
-
-**历史 Bug**:
-- `candidateFromLeadershipTransfer` 非原子访问 (commit `49bd61b`) — Leadership Transfer 标志在设置前可被其他 goroutine 读取
-- Peer 访问与心跳竞态 (commit `1a62103`) — peer 地址更新与心跳 goroutine 并发访问
-- `inmemPipeline` shutdownCh 竞态 (#275) — channel 操作缺少同步保护
-
-**新潜在问题**:
-- **P1-C**: `nextIndex` 非原子读写 (`replication.go:256`) — `atomic.StoreUint64` 内部读 `s.nextIndex` 未用 `atomic.LoadUint64`
-
-**TLA+ 建模启示**: 在 spec 中对共享变量的读写建模为独立的原子步骤，检查 interleaving 是否导致 nextIndex 回退或跳跃。
-
----
-
-### 6.2 家族 2: Leader 无法自检失败（最关键）
-
-**共同根因**: Leader 在自身出现异常（存储挂起、快照失败、被更高 term 取代）时，未能及时检测并 step down，
-导致集群不可用。**这是 hashicorp/raft 生产环境中最严重的 bug 根因模式。**
-
-**历史 Bug**:
-- #503: LogStore 挂起 → 心跳独立运行 → follower 不超时 → **整个集群卡死**
-- #522: Leader 无法加载快照但不 step down → **集群无法恢复**
-- #614: 存储损坏节点自降级后无选举惩罚，保留 term 优势 → **反复当选，持续10分钟**
-
-**新潜在问题**:
-| ID | 描述 | 代码位置 | 风险 |
-|----|------|----------|------|
-| P2-A | heartbeat 不检查 resp.Term | `replication.go:412` | 空闲集群中 leader step-down 延迟 |
-| P2-C | `checkLeaderLease` 使用 latest 配置 | `raft.go:1049` | 配置变更期间可能错误计算 lease |
-| P2-D | 无 stable store 健康检查 | 整体设计 | 磁盘故障后 leader 不知自己异常 |
-| P2-E | 快照错误被吞掉 | 快照相关代码 | 快照失败仅 log 不触发恢复动作 |
-
-**TLA+ 建模建议**:
-- 建模 leader 的 "liveness obligation": leader 必须在有限步内检测到自身异常并 step down
-- 将 heartbeat 建模为**独立于 log replication** 的路径（这是 #503 的根因）
-- 建模 LeaderLeaseTimeout 作为最终 step-down 机制
-- 属性: `LeaderHealthProperty == [](isLeader(s) /\ ~canReachQuorum(s) => <>~isLeader(s))`
+| PR | Description | Verification Result |
+|----|-------------|---------------------|
+| #665 | Fix requestPreVote metrics label | **Our submitted bug fix** |
+| #651 | Snapshot RPC error fix | **Real bug fix** (severe) — snapshot transfer size change corrupts connection protocol, subsequent RPC parsing fails |
+| #638 | Lower "nothing new to snapshot" log level | **Real bug fix** (log noise) — normal behavior logged as error |
+| #625 | Support leadership assertion checks | **Important enhancement** — implements linearizable read precondition per Raft paper Section 8, fixes #621 |
+| #613 | Persist commit index in LogStore | **Enhancement** — fixes #549, accelerates restart recovery |
+| #588 | Allow shutdown during snapshot transfer | **Real bug fix** — Shutdown() blocks permanently during large snapshot transfers |
+| #579 | WIP: Async log writes (leader disk parallel replication) | **Enhancement (WIP)** — Ongaro thesis Section 10.2.1 optimization |
+| #571 | Upgrade golang.org/x/sys (CVE) | **Outdated** — superseded by subsequent dependency updates |
+| #538 | gRPC transport implementation | **Enhancement (draft)** — 3 years inactive, extremely outdated |
+| #518 | Export SkipStartup + add Start() | **Enhancement** — 3.5 years inactive |
+| #427 | Make LeaderCh() return new channel each time | **Enhancement** — 5 years inactive |
 
 ---
 
-### 6.3 家族 3: 配置变更安全（最复杂）
+## 5. Deep Verification Results
 
-**共同根因**: `committed` 和 `latest` 配置在不同代码路径中不一致使用，加上配置变更与选举/复制的交互，
-创造出难以预见的状态组合。
+Thorough verification of high-priority findings from initial analysis:
 
-**历史 Bug**:
-- 已移除节点仍可投票 (commit `38cb186`)
-- NonVoter 可转换为 Candidate (commit `656e6c0`)
-- 配置分歧导致选举永久卡死 (#472) — 3节点集群中2个存活节点配置分歧，**永久无法选举**
-- Peer/configuration 变更与日志操作非原子 (#66)
+### 5.1 Eliminated False Positives
 
-**committed vs latest 使用不一致一览**:
+| Original Finding | Reason for Elimination |
+|-----------------|----------------------|
+| "Leadership Transfer candidate receiving same-term AppendEntries without stepping down could lead to two leaders" | `runFollower` loop condition is `for r.getState() == Follower`; after timeoutNow sets state=Candidate, the next loop iteration immediately exits, entering runCandidate. It does not get stuck in runFollower. |
+| "AddNonvoter reverses suffrage logic" | By design: AddNonvoter is only for adding new nonvoters or updating existing node addresses. Demotion uses DemoteVoter. API documentation explicitly describes this behavior. |
+| "checkLeaderLease may panic due to missing voter in replState" | All configuration updates and replState updates execute synchronously on the main thread (`setLatestConfiguration` and `startStopReplication` called sequentially in `appendConfigurationEntry`), so no inconsistency window exists. |
+| "dispatchLogs inflight list double respond" (raft.go:1256) | `respond()` has idempotency protection via `d.responded` at `future.go:125-126`; the second call is a no-op. Even if inflight cleanup calls respond again after StoreLogs failure, no side effects occur. |
+| "processConfigurationLogEntry committed semantics" (raft.go:1586) | `configurationChangeChIfStable()` (line 659) restricts to one uncommitted config change at a time. When processing a new config entry, the previous latest is already committed, so promoting it to committed is correct. |
 
-| 功能 | 使用的配置 | 代码位置 |
-|------|-----------|----------|
-| Leader step-down 检查 | `committed` | raft.go:798 |
+### 5.2 Confirmed Findings (after secondary deep verification, ranked by confidence)
+
+| # | Finding | Confidence | Severity | Detailed Verification Conclusion |
+|---|---------|------------|----------|--------------------------------|
+| 1 | Metrics label copy-paste error (raft.go:1738) | **Confirmed bug** | Low | "requestVote" should be "requestPreVote". Submitted PR #665 to fix. |
+| 2 | lastLog cache incorrect after truncation+StoreLogs failure (raft.go:1540) | **Confirmed (developer TODO)** | Medium-High | `DeleteRange` succeeds then `StoreLogs` fails, lastLog cache points to truncated position. Can cause subsequent PrevLog check errors, inflated commit index. Requires disk failure to trigger. |
+| 3 | Heartbeat does not check resp.Term (replication.go:412) | **Confirmed real issue** | Low | `replicateTo` (line 239) and `pipelineDecode` (line 548) both check resp.Term; only heartbeat does not. When cluster is idle, only heartbeat runs, and leader cannot detect higher term via this path. But heartbeat carries no log entries, cannot cause incorrect commit; LeaderLeaseTimeout provides eventual fallback. |
+| 4 | timeoutNow has no state guard (raft.go:2210) | **Confirmed real issue** | Moderate | Any node capable of sending RPCs can send TimeoutNow: forces leader step-down, or grants candidate privileged election status (skips PreVote, other nodes vote even with existing leader). Does not trigger under normal operation; defensive programming gap. |
+| 5 | nextIndex non-atomic read-write (replication.go:256) | **Confirmed data race** | Medium | `atomic.StoreUint64` reads `s.nextIndex` internally without `atomic.LoadUint64`; data race exists. |
+| 6 | EncodeConfiguration panic (configuration.go:352) | **Code behavior confirmed** | Low-Medium | Robustness issue; receiving a corrupted log entry causes node panic. |
+
+---
+
+## 6. Bug Family Analysis and TLA+ Modeling Strategy
+
+By analyzing historical bug fixes, confirmed open issues, and static analysis findings,
+we identified **5 bug families**. Each family shares a common root cause pattern and
+is associated with historical bugs and newly discovered potential issues.
+
+### 6.1 Family 1: Race Conditions
+
+**Common root cause**: Multiple goroutines concurrently accessing shared state without proper
+synchronization.
+
+**Historical bugs**:
+- `candidateFromLeadershipTransfer` non-atomic access (commit `49bd61b`) — Leadership Transfer flag readable by other goroutines before being set
+- Peer access races with heartbeat (commit `1a62103`) — peer address update concurrent with heartbeat goroutine
+- `inmemPipeline` shutdownCh race (#275) — channel operations lack synchronization protection
+
+**New potential issues**:
+- **P1-C**: `nextIndex` non-atomic read-write (`replication.go:256`) — `atomic.StoreUint64` reads `s.nextIndex` internally without `atomic.LoadUint64`
+
+**TLA+ modeling insight**: Model shared variable read and write as independent atomic steps in the spec, checking whether interleaving causes nextIndex to regress or skip.
+
+---
+
+### 6.2 Family 2: Leader Cannot Self-Detect Failure (Most Critical)
+
+**Common root cause**: Leader fails to timely detect its own abnormality (storage hang, snapshot
+failure, superseded by higher term) and step down, causing cluster unavailability. **This is the
+most severe bug root cause pattern in hashicorp/raft production environments.**
+
+**Historical bugs**:
+- #503: LogStore hangs -> heartbeat runs independently -> followers don't timeout -> **entire cluster stuck**
+- #522: Leader cannot load snapshot but doesn't step down -> **cluster cannot recover**
+- #614: Storage-corrupted node self-demotes but has no election penalty, retains term advantage -> **wins elections repeatedly for 10 minutes**
+
+**New potential issues**:
+| ID | Description | Code Location | Risk |
+|----|-------------|---------------|------|
+| P2-A | Heartbeat does not check resp.Term | `replication.go:412` | Delayed leader step-down in idle clusters |
+| P2-C | `checkLeaderLease` uses latest config | `raft.go:1049` | May miscalculate lease during config changes |
+| P2-D | No stable store health check | Overall design | Leader unaware of its own disk failure |
+| P2-E | Snapshot errors silently swallowed | Snapshot-related code | Snapshot failure only logged, no recovery action |
+
+**TLA+ modeling recommendations**:
+- Model leader's "liveness obligation": leader must detect its own abnormality and step down within finite steps
+- Model heartbeat as **independent from log replication** path (this is the root cause of #503)
+- Model LeaderLeaseTimeout as the ultimate step-down mechanism
+- Property: `LeaderHealthProperty == [](isLeader(s) /\ ~canReachQuorum(s) => <>~isLeader(s))`
+
+---
+
+### 6.3 Family 3: Configuration Change Safety (Most Complex)
+
+**Common root cause**: Inconsistent use of `committed` and `latest` configurations across
+different code paths, combined with interactions between config changes and elections/replication,
+creates difficult-to-predict state combinations.
+
+**Historical bugs**:
+- Removed node can still vote (commit `38cb186`)
+- NonVoter can transition to Candidate (commit `656e6c0`)
+- Config divergence causes permanent election deadlock (#472) — config divergence between 2 surviving nodes in 3-node cluster, **permanently unable to elect**
+- Peer/configuration changes not atomic with log operations (#66)
+
+**committed vs latest usage inconsistency summary**:
+
+| Function | Config Used | Code Location |
+|----------|-------------|---------------|
+| Leader step-down check | `committed` | raft.go:798 |
 | `quorumSize()` | `latest` | raft.go:1089 |
 | `checkLeaderLease()` | `latest` | raft.go:1049 |
 | `setupLeaderState` commitment | `latest` | raft.go:458 |
-| Vote 资格检查 | `latest` | raft.go:1645 |
-| `electSelf` 请求投票范围 | `latest` | raft.go:1096 |
+| Vote eligibility check | `latest` | raft.go:1645 |
+| `electSelf` vote request scope | `latest` | raft.go:1096 |
 | `startStopReplication` | `latest` | raft.go:459 |
 
-**新潜在问题**:
-| ID | 描述 | 代码位置 | 风险 |
-|----|------|----------|------|
-| P3-A | `quorumSize()` 使用 latest | `raft.go:1089` | 配置变更期间 quorum 大小不正确 |
-| P3-B | `electSelf` 使用 latest | `raft.go:1096` | 向未 committed 成员请求投票 |
-| P3-C | follower 截断后配置 commit | `raft.go:1586` | 截断可能移除配置条目但 committed 不回退 |
-| P3-E | `startStopReplication` 使用 latest | `raft.go:459` | leader 可能向未 committed 新成员复制 |
+**New potential issues**:
+| ID | Description | Code Location | Risk |
+|----|-------------|---------------|------|
+| P3-A | `quorumSize()` uses latest | `raft.go:1089` | Incorrect quorum size during config changes |
+| P3-B | `electSelf` uses latest | `raft.go:1096` | Requests votes from uncommitted members |
+| P3-C | Follower config commit after truncation | `raft.go:1586` | Truncation may remove config entry but committed config doesn't revert |
+| P3-E | `startStopReplication` uses latest | `raft.go:459` | Leader may replicate to uncommitted new members |
 
-**TLA+ 建模建议**:
-- **区分建模 `committed` 和 `latest` 配置**（这是关键差异点）
-- 允许同时存在最多一个 uncommitted 配置变更
-- 在配置变更进行中时触发 leader crash 和重新选举
-- 覆盖 Voter/NonVoter/Staging 三种 suffrage
-- 属性: `ElectionSafety == [](\A s1,s2 \in Servers: isLeader(s1) /\ isLeader(s2) /\ sameTerm(s1,s2) => s1 = s2)`
-- 属性: `ConfigSafety == [](committedConfig # latestConfig => AtMostOneUncommittedChange)`
-
----
-
-### 6.4 家族 4: Copy-paste / 不完整实现
-
-**共同根因**: PreVote 功能通过复制 RequestVote 代码实现，部分路径遗漏了必要的修改。
-
-**历史 Bug**:
-- metrics 标签 copy-paste 错误（已提交 PR #665 修复）
-- PreVote 授予错误更新 leader last-contact (commit `42d3446`)
-
-**新潜在问题**:
-| ID | 描述 | 代码位置 | 风险 |
-|----|------|----------|------|
-| P4-E | `requestPreVote` 地址解码与 `requestVote` 不同 | `raft.go:1736` | 地址解析不一致 |
-| P4-F | `requestPreVote` 缺少 `len(req.ID) > 0` 守卫 | `raft.go:1758` | 无实际影响（PreVote 仅新协议）|
-| P4-G | `preElectSelf` 日志消息写 "requestVote" | 日志代码 | 调试混淆 |
-
-**分析**: 此家族更适合代码审查而非形式化验证。可通过系统性对比 RequestVote 和 RequestPreVote 的每一行来发现剩余不一致。
+**TLA+ modeling recommendations**:
+- **Distinguish between `committed` and `latest` configurations** (this is the key differentiator)
+- Allow at most one uncommitted config change at a time
+- Trigger leader crash during in-progress config changes and re-election
+- Cover Voter/NonVoter/Staging suffrage types
+- Property: `ElectionSafety == [](\A s1,s2 \in Servers: isLeader(s1) /\ isLeader(s2) /\ sameTerm(s1,s2) => s1 = s2)`
+- Property: `ConfigSafety == [](committedConfig # latestConfig => AtMostOneUncommittedChange)`
 
 ---
 
-### 6.5 家族 5: 错误处理缺口
+### 6.4 Family 4: Copy-Paste / Incomplete Implementation
 
-**共同根因**: 磁盘写入/读取失败后的恢复路径不完整，中间状态不一致。
+**Common root cause**: PreVote functionality implemented by copying RequestVote code, with some
+paths missing necessary modifications.
 
-**历史 Bug**:
-- 从旧快照恢复后 panic (#85) — 开放近10年未修复
-- `TrailingLogs=0` 在快照后崩溃 (#86) — 开放8年未修复
+**Historical bugs**:
+- Metrics label copy-paste error (submitted PR #665 to fix)
+- Granting PreVote incorrectly updates leader last-contact (commit `42d3446`)
 
-**新潜在问题**:
-| ID | 描述 | 代码位置 | 风险 |
-|----|------|----------|------|
-| P5-B | `persistVote` 非原子 | `raft.go:1135-1141` | 先写 term 再写 candidate，中间崩溃导致不一致 |
-| P5-D | `installSnapshot` 不更新 lastLog 缓存 | `raft.go:1815+` | 安装快照后 lastLog 指向旧值 |
-| P5-E | truncation + StoreLogs 失败 | `raft.go:1540` | 已确认（开发者 TODO），lastLog 缓存 stale |
-| P5-F | 配置 decode 失败导致 panic | `configuration.go:352` | 收到损坏日志 → 节点崩溃 |
+**New potential issues**:
+| ID | Description | Code Location | Risk |
+|----|-------------|---------------|------|
+| P4-E | `requestPreVote` address decoding differs from `requestVote` | `raft.go:1736` | Address resolution inconsistency |
+| P4-F | `requestPreVote` missing `len(req.ID) > 0` guard | `raft.go:1758` | No practical impact (PreVote only in new protocol) |
+| P4-G | `preElectSelf` log message says "requestVote" | Log code | Debugging confusion |
 
-**TLA+ 建模建议**:
-- 建模崩溃-恢复场景（crash after partial write）
-- 在 `persistVote` 的两次写之间、`DeleteRange` 和 `StoreLogs` 之间插入崩溃
-- 属性: `CrashRecovery == [](crashed(s) /\ recovered(s) => consistentState(s))`
+**Analysis**: This family is better suited for code review than formal verification. Can be
+found by systematically comparing every line of RequestVote and RequestPreVote.
 
 ---
 
-## 7. TLA+ 建模优先级
+### 6.5 Family 5: Error Handling Gaps
 
-### 7.1 第一优先级: 配置变更 + 选举交互
+**Common root cause**: Incomplete recovery paths after disk write/read failures, leaving
+intermediate state inconsistent.
 
-**理由**: 历史 bug 最密集（4+ critical bugs），目前有确认的未修复问题 (#472)，
-committed vs latest 配置使用不一致是代码中最系统性的可疑模式，
-TLA+ 最擅长发现此类状态空间交互问题。
+**Historical bugs**:
+- Panic after restoring from old snapshot (#85) — open nearly 10 years unfixed
+- `TrailingLogs=0` crashes after snapshot (#86) — open 8 years unfixed
 
-**可能发现的新 bug**: P3-A, P3-B, P3-C, P3-E
+**New potential issues**:
+| ID | Description | Code Location | Risk |
+|----|-------------|---------------|------|
+| P5-B | `persistVote` non-atomic | `raft.go:1135-1141` | Writes term then candidate; crash between leaves inconsistent state |
+| P5-D | `installSnapshot` doesn't update lastLog cache | `raft.go:1815+` | lastLog points to old value after snapshot install |
+| P5-E | Truncation + StoreLogs failure | `raft.go:1540` | Confirmed (developer TODO), lastLog cache stale |
+| P5-F | Configuration decode failure causes panic | `configuration.go:352` | Corrupted log -> node crash |
 
-### 7.2 第二优先级: Leader 健康检测与 step-down
-
-**理由**: 3个已确认的严重生产环境 bug (#503, #522, #614) 共享同一根因模式。
-心跳独立于 log replication 运行是一个架构性的设计选择，其副作用可能还有未发现的问题。
-
-**可能发现的新 bug**: P2-A, P2-C, P2-D
-
-### 7.3 第三优先级: 崩溃恢复一致性
-
-**理由**: 2个长期未修复的 bug (#85, #86)，开发者确认的 lastLog 缓存问题（有 TODO 注释）。
-崩溃恢复是形式化验证的经典应用场景。
-
-**可能发现的新 bug**: P5-B, P5-D, P5-E
+**TLA+ modeling recommendations**:
+- Model crash-recovery scenarios (crash after partial write)
+- Insert crashes between the two writes of `persistVote` and between `DeleteRange` and `StoreLogs`
+- Property: `CrashRecovery == [](crashed(s) /\ recovered(s) => consistentState(s))`
 
 ---
 
-## 8. 总结
+## 7. TLA+ Modeling Priorities
 
-### 8.1 代码分析发现
+### 7.1 Top Priority: Configuration Change + Election Interaction
 
-1. **1 个确认的 bug**: metrics 标签 copy-paste 错误（已提交 PR #665）
-2. **1 个开发者已知的问题**: lastLog 缓存状态错误（有 TODO 注释）
-3. **3 个真实代码问题**: heartbeat term 检查缺失、timeoutNow 无状态守卫、nextIndex 数据竞争
-4. **5 个排除的误报**: 通过深度代码验证排除了看似可疑但实际安全的代码路径
-5. **14 个新潜在 bug 实例**: 通过 Bug 家族分析从历史 bug 模式推导出的新可疑代码路径
+**Rationale**: Highest historical bug density (4+ critical bugs), has confirmed unfixed issue (#472),
+inconsistent committed vs latest config usage is the most systematic suspicious pattern in the code,
+and TLA+ excels at finding this type of state space interaction issue.
 
-### 8.2 Issue/PR 验证结论
+**Potential new bugs to discover**: P3-A, P3-B, P3-C, P3-E
 
-已逐一验证报告中提到的所有 issues 和 open PRs：
+### 7.2 Second Priority: Leader Health Detection and Step-Down
 
-- **确认为真实 bug 的 issues**: #275, #503, #522, #85, #86, #614, #612, #498, #472（共9个）
-- **确认为设计缺陷的 issues**: #621, #549（共2个）
-- **排除为非 bug 的 issues**: #652（用户误解）, #586（超出设计范围）, #643（用户错误）
-- **不确定的 issues**: #66（过于陈旧）, #611（报告不足，可能与 #612 同根因）, #634（理论讨论）
-- **值得关注的 open PRs**: #651（快照 RPC 损坏修复）, #625（线性化读 API）, #588（shutdown 阻塞修复）
+**Rationale**: 3 confirmed severe production bugs (#503, #522, #614) share the same root cause
+pattern. Heartbeat running independently of log replication is an architectural design choice
+whose side effects may have undiscovered issues.
 
-### 8.3 Bug 家族与 TLA+ 策略
+**Potential new bugs to discover**: P2-A, P2-C, P2-D
 
-| 家族 | 历史 Bug 数 | 新潜在实例 | TLA+ 优先级 | 关键建模差异 |
-|------|------------|-----------|------------|-------------|
-| 竞态条件 | 3 | 1 | 低 | 需建模细粒度并发步骤 |
-| Leader 自检失败 | 3 | 4 | **高** | 需建模 heartbeat 独立路径 |
-| 配置变更安全 | 4 | 4 | **最高** | 需区分 committed/latest 配置 |
-| Copy-paste | 2 | 3 | 低 | 更适合代码审查 |
-| 错误处理缺口 | 2 | 4 | **高** | 需建模 crash-recovery |
+### 7.3 Third Priority: Crash-Recovery Consistency
 
-### 8.4 建议的后续方向
+**Rationale**: 2 long-standing unfixed bugs (#85, #86), developer-acknowledged lastLog cache
+issue (with TODO comment). Crash recovery is a classic application of formal verification.
 
-**TLA+ 建模**: 从"配置变更 + 选举交互"开始，区分建模 committed 和 latest 配置，
-在配置变更进行中时触发 leader 故障和重新选举，重点检查 Election Safety 和 Log Matching 属性。
+**Potential new bugs to discover**: P5-B, P5-D, P5-E
 
-**代码修复 PR 目标**:
-1. `Apply()` 死锁 (#498) — 长期未解决，多人确认，影响严重
-2. heartbeat resp.Term 检查缺失 — 代码一行修复，影响明确
-3. `preElectSelf` 日志消息 copy-paste 错误 — 与 PR #665 同类问题
+---
+
+## 8. Summary
+
+### 8.1 Code Analysis Findings
+
+1. **1 confirmed bug**: Metrics label copy-paste error (submitted PR #665)
+2. **1 developer-acknowledged issue**: lastLog cache state error (has TODO comment)
+3. **3 real code issues**: Heartbeat term check missing, timeoutNow without state guard, nextIndex data race
+4. **5 eliminated false positives**: Ruled out seemingly suspicious but actually safe code paths through deep code verification
+5. **14 new potential bug instances**: New suspicious code paths derived from historical bug patterns via bug family analysis
+
+### 8.2 Issue/PR Verification Conclusions
+
+All issues and open PRs mentioned in the report have been individually verified:
+
+- **Confirmed real bug issues**: #275, #503, #522, #85, #86, #614, #612, #498, #472 (9 total)
+- **Confirmed design deficiency issues**: #621, #549 (2 total)
+- **Ruled out as non-bug issues**: #652 (user misunderstanding), #586 (out of design scope), #643 (user error)
+- **Uncertain issues**: #66 (too old), #611 (insufficient report, may share root cause with #612), #634 (theoretical discussion)
+- **Noteworthy open PRs**: #651 (snapshot RPC corruption fix), #625 (linearizable read API), #588 (shutdown blocking fix)
+
+### 8.3 Bug Families and TLA+ Strategy
+
+| Family | Historical Bug Count | New Potential Instances | TLA+ Priority | Key Modeling Differentiator |
+|--------|---------------------|----------------------|---------------|---------------------------|
+| Race conditions | 3 | 1 | Low | Requires modeling fine-grained concurrent steps |
+| Leader self-detection failure | 3 | 4 | **High** | Requires modeling independent heartbeat path |
+| Configuration change safety | 4 | 4 | **Highest** | Requires distinguishing committed/latest config |
+| Copy-paste | 2 | 3 | Low | Better suited for code review |
+| Error handling gaps | 2 | 4 | **High** | Requires modeling crash-recovery |
+
+### 8.4 Recommended Next Steps
+
+**TLA+ modeling**: Start with "configuration change + election interaction", distinguishing
+between committed and latest configurations, triggering leader failure during in-progress config
+changes and re-election, focusing on Election Safety and Log Matching properties.
+
+**Code fix PR targets**:
+1. `Apply()` deadlock (#498) — long-standing unresolved, confirmed by multiple people, severe impact
+2. Heartbeat resp.Term check missing — one-line code fix, clear impact
+3. `preElectSelf` log message copy-paste error — same category as PR #665
