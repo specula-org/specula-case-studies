@@ -1,0 +1,425 @@
+From 4e8aa34f3648705471584459558740e07b897519 Mon Sep 17 00:00:00 2001
+From: Emilie Ma <kewbish@gmail.com>
+Date: Fri, 20 Feb 2026 11:19:42 -0800
+Subject: [PATCH] feat: add epaxos instrumentation
+
+---
+ client/client.go        | 14 ++++++
+ epaxos.conf             | 63 +++++++++++++++++++++++++++
+ epaxos/epaxos.go        | 62 +++++++++++++++++++++++++++
+ epaxos/exec.go          |  3 ++
+ epaxos/trace_helpers.go | 94 +++++++++++++++++++++++++++++++++++++++++
+ 5 files changed, 236 insertions(+)
+ create mode 100644 epaxos.conf
+ create mode 100644 epaxos/trace_helpers.go
+
+diff --git a/client/client.go b/client/client.go
+index 925bf39..5f84a75 100644
+--- a/client/client.go
++++ b/client/client.go
+@@ -196,6 +196,9 @@ func (c *Client) SendProposal(cmd defs.Propose) {
+ 	if !c.Fast {
+ 		c.Println("sending command", cmd.CommandId, "to", d)
+ 		event["target"] = strconv.Itoa(d)
++		reqEvent := cloneEvent(event)
++		reqEvent["name"] = "ClientRequest"
++		tlatrace.Emit(reqEvent)
+ 		tlatrace.Emit(event)
+ 		c.writers[d].WriteByte(defs.PROPOSE)
+ 		cmd.Marshal(c.writers[d])
+@@ -212,6 +215,9 @@ func (c *Client) SendProposal(cmd defs.Propose) {
+ 			}
+ 		}
+ 		event["target"] = targets
++		reqEvent := cloneEvent(event)
++		reqEvent["name"] = "ClientRequest"
++		tlatrace.Emit(reqEvent)
+ 		tlatrace.Emit(event)
+ 	}
+ }
+@@ -229,6 +235,14 @@ func commandOpName(op state.Operation) string {
+ 	}
+ }
+ 
++func cloneEvent(in map[string]interface{}) map[string]interface{} {
++	out := make(map[string]interface{}, len(in))
++	for k, v := range in {
++		out[k] = v
++	}
++	return out
++}
++
+ func (c *Client) SendWrite(key int64, value []byte) int32 {
+ 	c.seqnum++
+ 	p := defs.Propose{
+diff --git a/epaxos.conf b/epaxos.conf
+new file mode 100644
+index 0000000..4aaf474
+--- /dev/null
++++ b/epaxos.conf
+@@ -0,0 +1,63 @@
++-- Replicas --
++
++r1 127.0.0.1
++r2 127.0.0.1
++r3 127.0.0.1
++
++-- Clients --
++
++c1     127.0.0.1 
++
++-- Master --
++
++// alias -> address
++master 127.0.0.1
++
++masterPort: 7087
++
++
++protocol: EPaxos
++
++// Replicas
++noop:       false // do not execute
++thrifty:    false
++optread:    false
++leaderless: false
++fast:       false
++leader:     127.0.0.1 // if the port is not specified, port 7070 is used
++
++// Default port of any replica is 7070
++// This can be changed for all replicas:
++//     port: 7071
++// or for a specific replica:
++
++-- Apply to r1 --
++port: 7071
++-- Stop --
++-- Apply to r2 --
++port: 7072
++-- Stop --
++-- Apply to r3 --
++port: 7073
++-- Stop --
++
++// Clients
++reqs:        1000
++runTime:     1m // 5min
++writes:      10
++conflicts:   10
++commandSize: 1000
++clones:      5 
++key:         42 // conflicting key
++
++pipeline: false
++pendings: 10000
++
++-- Apply to r2 --
++waitClosest: true
++
++-- Proxy --
++server_alias r1
++server_alias r2
++server_alias r3
++---
+diff --git a/epaxos/epaxos.go b/epaxos/epaxos.go
+index dc257b0..f6e250d 100644
+--- a/epaxos/epaxos.go
++++ b/epaxos/epaxos.go
+@@ -474,6 +474,10 @@ func (r *Replica) bcastPrepare(replica int32, instance int32) {
+ 	}()
+ 	lb := r.InstanceSpace[replica][instance].lb
+ 	args := &Prepare{r.Id, replica, instance, lb.lastTriedBallot}
++	r.traceInstanceEvent("Prepare", replica, instance, args.Ballot, -1, NONE, nil, map[string]interface{}{
++		"leader": r.Id,
++		"phase":  "broadcast",
++	})
+ 
+ 	n := r.N - 1
+ 	q := r.Id
+@@ -506,6 +510,11 @@ func (r *Replica) bcastPreAccept(replica int32, instance int32) {
+ 	pa.Command = lb.cmds
+ 	pa.Seq = lb.seq
+ 	pa.Deps = lb.deps
++	r.traceInstanceEvent("PreAccept", replica, instance, pa.Ballot, pa.Seq, PREACCEPTED, pa.Deps, map[string]interface{}{
++		"leader":  r.Id,
++		"phase":   "broadcast",
++		"command": commandsMap(pa.Command),
++	})
+ 
+ 	n := r.N - 1
+ 	if r.Thrifty {
+@@ -567,6 +576,10 @@ func (r *Replica) bcastAccept(replica int32, instance int32) {
+ 	ea.Ballot = lb.lastTriedBallot
+ 	ea.Seq = lb.seq
+ 	ea.Deps = lb.deps
++	r.traceInstanceEvent("Accept", replica, instance, ea.Ballot, ea.Seq, ACCEPTED, ea.Deps, map[string]interface{}{
++		"leader": r.Id,
++		"phase":  "broadcast",
++	})
+ 
+ 	n := r.N - 1
+ 	if r.Thrifty {
+@@ -601,6 +614,11 @@ func (r *Replica) bcastCommit(replica int32, instance int32) {
+ 	ec.Seq = lb.seq
+ 	ec.Deps = lb.deps
+ 	ec.Ballot = lb.ballot
++	r.traceInstanceEvent("Commit", replica, instance, ec.Ballot, ec.Seq, COMMITTED, ec.Deps, map[string]interface{}{
++		"leader":  r.Id,
++		"phase":   "broadcast",
++		"command": commandsMap(ec.Command),
++	})
+ 
+ 	for q := 0; q < r.N-1; q++ {
+ 		if !r.Alive[r.PreferredPeerOrder[q]] {
+@@ -731,6 +749,10 @@ func (r *Replica) handlePropose(propose *defs.GPropose) {
+ 	r.M.Unlock()
+ 
+ 	r.crtInstance[r.Id]++
++	r.traceInstanceEvent("ClientRequest", r.Id, r.crtInstance[r.Id], r.Id, 0, PREACCEPTED, nil, map[string]interface{}{
++		"clientId": propose.ClientId,
++		"command":  commandMap(propose.Command),
++	})
+ 
+ 	cmds := make([]state.Command, batchSize)
+ 	proposals := make([]*defs.GPropose, batchSize)
+@@ -841,6 +863,10 @@ func (r *Replica) handlePreAccept(preAccept *PreAccept) {
+ 		inst.Deps,
+ 		r.CommittedUpTo,
+ 		inst.Status}
++	r.traceInstanceEvent("PreAccept", preAccept.Replica, preAccept.Instance, preAccept.Ballot, inst.Seq, inst.Status, inst.Deps, map[string]interface{}{
++		"leader":  preAccept.LeaderId,
++		"command": commandsMap(preAccept.Command),
++	})
+ 	r.replyPreAccept(preAccept.LeaderId, reply)
+ }
+ 
+@@ -872,6 +898,9 @@ func (r *Replica) handlePreAcceptReply(pareply *PreAcceptReply) {
+ 	}
+ 
+ 	inst.lb.preAcceptOKs++
++	r.traceInstanceEvent("PreAcceptOK", pareply.Replica, pareply.Instance, pareply.Ballot, pareply.Seq, pareply.Status, pareply.Deps, map[string]interface{}{
++		"preAcceptOKs": inst.lb.preAcceptOKs,
++	})
+ 
+ 	if pareply.VBallot > lb.ballot {
+ 		lb.ballot = pareply.VBallot
+@@ -942,6 +971,9 @@ func (r *Replica) handlePreAcceptReply(pareply *PreAcceptReply) {
+ 		}
+ 
+ 		r.bcastCommit(pareply.Replica, pareply.Instance)
++		r.traceInstanceEvent("FastPathCommit", pareply.Replica, pareply.Instance, inst.bal, inst.Seq, inst.Status, inst.Deps, map[string]interface{}{
++			"preAcceptOKs": inst.lb.preAcceptOKs,
++		})
+ 
+ 		r.M.Lock()
+ 		r.Stats.M["fast"]++
+@@ -1001,6 +1033,9 @@ func (r *Replica) handleAccept(accept *Accept) {
+ 	}
+ 
+ 	reply := &AcceptReply{accept.Replica, accept.Instance, inst.bal}
++	r.traceInstanceEvent("Accept", accept.Replica, accept.Instance, accept.Ballot, accept.Seq, inst.Status, accept.Deps, map[string]interface{}{
++		"leader": accept.LeaderId,
++	})
+ 	r.replyAccept(accept.LeaderId, reply)
+ 
+ }
+@@ -1033,6 +1068,9 @@ func (r *Replica) handleAcceptReply(areply *AcceptReply) {
+ 	}
+ 
+ 	inst.lb.acceptOKs++
++	r.traceInstanceEvent("AcceptOK", areply.Replica, areply.Instance, areply.Ballot, inst.Seq, inst.Status, inst.Deps, map[string]interface{}{
++		"acceptOKs": inst.lb.acceptOKs,
++	})
+ 
+ 	if inst.lb.acceptOKs+1 > r.N/2 {
+ 		lb.status = COMMITTED
+@@ -1104,6 +1142,10 @@ func (r *Replica) handleCommit(commit *Commit) {
+ 	inst.Seq = commit.Seq
+ 	inst.Deps = commit.Deps
+ 	inst.Status = COMMITTED
++	r.traceInstanceEvent("Commit", commit.Replica, commit.Instance, commit.Ballot, commit.Seq, inst.Status, commit.Deps, map[string]interface{}{
++		"leader":  commit.LeaderId,
++		"command": commandsMap(commit.Command),
++	})
+ 
+ 	r.updateConflicts(commit.Command, commit.Replica, commit.Instance, commit.Seq)
+ 	r.updateCommitted(commit.Replica)
+@@ -1166,6 +1208,9 @@ func (r *Replica) startRecoveryForInstance(replica int32, instance int32) {
+ 	lb.leaderResponded = r.Id == replica
+ 
+ 	r.bcastPrepare(replica, instance)
++	r.traceInstanceEvent("Prepare", replica, instance, lb.lastTriedBallot, lb.seq, lb.status, lb.deps, map[string]interface{}{
++		"recovery": true,
++	})
+ }
+ 
+ func (r *Replica) handlePrepare(prepare *Prepare) {
+@@ -1185,6 +1230,9 @@ func (r *Replica) handlePrepare(prepare *Prepare) {
+ 		r.Printf("Joined higher ballot %d < %d", prepare.Ballot, inst.bal)
+ 	} else if inst.bal < prepare.Ballot {
+ 		r.Printf("Joining ballot %d ", prepare.Ballot)
++		r.traceInstanceEvent("Join", prepare.Replica, prepare.Instance, prepare.Ballot, inst.Seq, inst.Status, inst.Deps, map[string]interface{}{
++			"oldBallot": inst.bal,
++		})
+ 		inst.bal = prepare.Ballot
+ 	}
+ 
+@@ -1198,6 +1246,9 @@ func (r *Replica) handlePrepare(prepare *Prepare) {
+ 		inst.Cmds,
+ 		inst.Seq,
+ 		inst.Deps}
++	r.traceInstanceEvent("Prepare", prepare.Replica, prepare.Instance, prepare.Ballot, inst.Seq, inst.Status, inst.Deps, map[string]interface{}{
++		"from": prepare.LeaderId,
++	})
+ 	r.replyPrepare(prepare.LeaderId, preply)
+ }
+ 
+@@ -1219,6 +1270,11 @@ func (r *Replica) handlePrepareReply(preply *PrepareReply) {
+ 	}
+ 
+ 	lb.prepareReplies = append(lb.prepareReplies, preply)
++	r.traceInstanceEvent("PrepareOK", preply.Replica, preply.Instance, preply.Ballot, preply.Seq, preply.Status, preply.Deps, map[string]interface{}{
++		"from":         preply.AcceptorId,
++		"prepareAcks":  len(lb.prepareReplies),
++		"targetBallot": lb.lastTriedBallot,
++	})
+ 	if len(lb.prepareReplies) < r.Replica.SlowQuorumSize() {
+ 		return
+ 	}
+@@ -1300,6 +1356,9 @@ func (r *Replica) handlePrepareReply(preply *PrepareReply) {
+ 	} else if subCase == 2 || subCase == 3 {
+ 		inst.Status = ACCEPTED
+ 		lb.status = ACCEPTED
++		r.traceInstanceEvent("RecoveryAccept", preply.Replica, preply.Instance, lb.lastTriedBallot, inst.Seq, inst.Status, inst.Deps, map[string]interface{}{
++			"subCase": subCase,
++		})
+ 		r.bcastAccept(preply.Replica, preply.Instance)
+ 	} else if subCase == 4 {
+ 		lb.tryingToPreAccept = true
+@@ -1438,6 +1497,9 @@ func (r *Replica) handleTryPreAcceptReply(tpar *TryPreAcceptReply) {
+ 			inst.bal = lb.lastTriedBallot
+ 
+ 			r.bcastAccept(tpar.Replica, tpar.Instance)
++			r.traceInstanceEvent("RecoveryAccept", tpar.Replica, tpar.Instance, lb.lastTriedBallot, inst.Seq, inst.Status, inst.Deps, map[string]interface{}{
++				"subCase": "try_preaccept_quorum",
++			})
+ 			return
+ 		}
+ 	} else {
+diff --git a/epaxos/exec.go b/epaxos/exec.go
+index 5e1b845..c78c610 100644
+--- a/epaxos/exec.go
++++ b/epaxos/exec.go
+@@ -141,6 +141,9 @@ func (e *Exec) strongconnect(v *Instance, index *int) bool {
+ 				}
+ 			}
+ 			w.Status = EXECUTED
++			e.r.traceInstanceEvent("Execute", w.id.replica, w.id.instance, w.bal, w.Seq, w.Status, w.Deps, map[string]interface{}{
++				"commands": commandsMap(w.Cmds),
++			})
+ 		}
+ 		stack = stack[0:l]
+ 	}
+diff --git a/epaxos/trace_helpers.go b/epaxos/trace_helpers.go
+new file mode 100644
+index 0000000..ba63871
+--- /dev/null
++++ b/epaxos/trace_helpers.go
+@@ -0,0 +1,94 @@
++package epaxos
++
++import (
++	"strconv"
++
++	"github.com/imdea-software/swiftpaxos/state"
++	"github.com/imdea-software/swiftpaxos/tlatrace"
++)
++
++func statusName(status int8) string {
++	switch status {
++	case NONE:
++		return "NONE"
++	case PREACCEPTED:
++		return "PREACCEPTED"
++	case PREACCEPTED_EQ:
++		return "PREACCEPTED_EQ"
++	case ACCEPTED:
++		return "ACCEPTED"
++	case COMMITTED:
++		return "COMMITTED"
++	case EXECUTED:
++		return "EXECUTED"
++	default:
++		return "UNKNOWN"
++	}
++}
++
++func commandMap(cmd state.Command) map[string]interface{} {
++	op := "NONE"
++	switch cmd.Op {
++	case state.PUT:
++		op = "PUT"
++	case state.GET:
++		op = "GET"
++	case state.SCAN:
++		op = "SCAN"
++	}
++	return map[string]interface{}{
++		"op":  op,
++		"key": int64(cmd.K),
++	}
++}
++
++func commandsMap(cmds []state.Command) []map[string]interface{} {
++	out := make([]map[string]interface{}, 0, len(cmds))
++	for _, cmd := range cmds {
++		out = append(out, commandMap(cmd))
++	}
++	return out
++}
++
++func depsMap(deps []int32) []int32 {
++	if deps == nil {
++		return nil
++	}
++	out := make([]int32, len(deps))
++	copy(out, deps)
++	return out
++}
++
++func (r *Replica) traceEvent(name string, extra map[string]interface{}) {
++	event := map[string]interface{}{
++		"name":   name,
++		"module": "epaxos_replica",
++		"nid":    strconv.FormatInt(int64(r.Id), 10),
++	}
++	for k, v := range extra {
++		event[k] = v
++	}
++	tlatrace.Emit(event)
++}
++
++func (r *Replica) traceInstanceEvent(name string, replica, instance, ballot, seq int32, status int8, deps []int32, extra map[string]interface{}) {
++	event := map[string]interface{}{
++		"name":   name,
++		"module": "epaxos_replica",
++		"nid":    strconv.FormatInt(int64(r.Id), 10),
++		"iid": map[string]interface{}{
++			"replica":  replica,
++			"instance": instance,
++		},
++		"state": map[string]interface{}{
++			"ballot": ballot,
++			"status": statusName(status),
++			"seq":    seq,
++			"deps":   depsMap(deps),
++		},
++	}
++	for k, v := range extra {
++		event[k] = v
++	}
++	tlatrace.Emit(event)
++}
+-- 
+2.52.0
+
