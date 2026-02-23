@@ -1,0 +1,296 @@
+From eb7fab06ba4bcf0a088fca1e8cb2ff67c67703a0 Mon Sep 17 00:00:00 2001
+From: Emilie Ma <kewbish@gmail.com>
+Date: Sun, 22 Feb 2026 21:00:28 -0800
+Subject: [PATCH] feat: add n2paxos instrumentation
+
+---
+ client/buffer.go         |  9 ++++
+ n2paxos.conf             | 66 +++++++++++++++++++++++++++++
+ n2paxos/n2paxos.go       | 33 +++++++++++++--
+ n2paxos/trace_helpers.go | 90 ++++++++++++++++++++++++++++++++++++++++
+ 4 files changed, 194 insertions(+), 4 deletions(-)
+ create mode 100644 n2paxos.conf
+ create mode 100644 n2paxos/trace_helpers.go
+
+diff --git a/client/buffer.go b/client/buffer.go
+index 6b9ffd4..c0f2767 100644
+--- a/client/buffer.go
++++ b/client/buffer.go
+@@ -10,6 +10,7 @@ import (
+ 	"github.com/google/uuid"
+ 	"github.com/imdea-software/swiftpaxos/replica/defs"
+ 	"github.com/imdea-software/swiftpaxos/state"
++	"github.com/imdea-software/swiftpaxos/tlatrace"
+ )
+ 
+ type ReqReply struct {
+@@ -67,6 +68,14 @@ func (c *BufferClient) Pipeline(syncFreq int, window int32) {
+ 
+ func (c *BufferClient) RegisterReply(val state.Value, seqnum int32) {
+ 	t := time.Now()
++	tlatrace.Emit(map[string]interface{}{
++		"name":   "ReceiveSuccess",
++		"module": "client",
++		"cid":    c.ClientId,
++		"cmd": map[string]interface{}{
++			"seq": seqnum,
++		},
++	})
+ 	c.Reply <- &ReqReply{
+ 		Val:    val,
+ 		Seqnum: int(seqnum),
+diff --git a/n2paxos.conf b/n2paxos.conf
+new file mode 100644
+index 0000000..7b093e2
+--- /dev/null
++++ b/n2paxos.conf
+@@ -0,0 +1,66 @@
++-- Replicas --
++
++r1 127.0.0.1
++r2 127.0.0.1
++r3 127.0.0.1
++
++-- Clients --
++
++c1     127.0.0.1 
++
++-- Master --
++
++// alias -> address
++master 127.0.0.1
++
++masterPort: 7087
++
++
++protocol: n2paxos
++
++// Replicas
++noop:       false // do not execute
++thrifty:    false
++optread:    false
++leaderless: false
++fast:       false
++leader:     127.0.0.1 // if the port is not specified, port 7070 is used
++
++// Default port of any replica is 7070
++// This can be changed for all replicas:
++//     port: 7071
++// or for a specific replica:
++
++-- Apply to r1 --
++port: 7071
++-- Stop --
++-- Apply to r2 --
++port: 7072
++-- Stop --
++-- Apply to r3 --
++port: 7073
++-- Stop --
++
++// Clients
++reqs:        1000
++runTime:     1m // 5min
++writes:      100
++conflicts:   0 
++commandSize: 1000
++clones:      5 
++key:         42 // conflicting key
++
++pipeline: false
++pendings: 10000
++
++-- Apply to r2 --
++waitClosest: true
++
++-- Proxy --
++server_alias r1
++c1 (local)
++server_alias r2
++c1
++server_alias r3
++c1
++---
+diff --git a/n2paxos/n2paxos.go b/n2paxos/n2paxos.go
+index 766361e..5cbcb77 100644
+--- a/n2paxos/n2paxos.go
++++ b/n2paxos/n2paxos.go
+@@ -200,15 +200,22 @@ func (r *Replica) handlePropose(msg *defs.GPropose, desc *commandDesc, slot int)
+ 	}
+ 
+ 	desc.propose = msg
++	cmdID := CommandId{
++		ClientId: msg.ClientId,
++		SeqNum:   msg.CommandId,
++	}
++	r.traceSlotEvent("Propose", slot, cmdID, desc.phase, map[string]interface{}{
++		"command": commandMap(msg.Command),
++	})
++	r.traceSlotEvent("SendBeginBallot", slot, cmdID, desc.phase, map[string]interface{}{
++		"to": "all",
++	})
+ 
+ 	twoA := &M2A{
+ 		Replica: r.Id,
+ 		Ballot:  r.ballot,
+ 		Cmd:     msg.Command,
+-		CmdId: CommandId{
+-			ClientId: msg.ClientId,
+-			SeqNum:   msg.CommandId,
+-		},
++		CmdId:   cmdID,
+ 		CmdSlot: slot,
+ 	}
+ 
+@@ -220,6 +227,9 @@ func (r *Replica) handle2A(msg *M2A, desc *commandDesc) {
+ 	if r.status != NORMAL || r.ballot != msg.Ballot {
+ 		return
+ 	}
++	r.traceSlotEvent("ReceiveBeginBallot", msg.CmdSlot, msg.CmdId, desc.phase, map[string]interface{}{
++		"from": msg.Replica,
++	})
+ 
+ 	desc.cmd = msg.Cmd
+ 	desc.cmdId = msg.CmdId
+@@ -237,6 +247,9 @@ func (r *Replica) handle2A(msg *M2A, desc *commandDesc) {
+ 		Ballot:  msg.Ballot,
+ 		CmdSlot: msg.CmdSlot,
+ 	}
++	r.traceSlotEvent("SendVoted", msg.CmdSlot, msg.CmdId, desc.phase, map[string]interface{}{
++		"to": "all",
++	})
+ 
+ 	r.batcher.Send2B(twoB)
+ 	r.handle2B(twoB, desc)
+@@ -246,6 +259,9 @@ func (r *Replica) handle2B(msg *M2B, desc *commandDesc) {
+ 	if r.status != NORMAL || r.ballot != msg.Ballot {
+ 		return
+ 	}
++	r.traceSlotEvent("ReceiveVoted", msg.CmdSlot, desc.cmdId, desc.phase, map[string]interface{}{
++		"from": msg.Replica,
++	})
+ 
+ 	desc.twoBs.Add(msg.Replica, false, msg)
+ }
+@@ -253,6 +269,12 @@ func (r *Replica) handle2B(msg *M2B, desc *commandDesc) {
+ func get2BsHandler(r *Replica, desc *commandDesc) replica.MsgSetHandler {
+ 	return func(leaderMsg interface{}, msgs []interface{}) {
+ 		desc.phase = COMMIT
++		r.traceSlotEvent("Succeed", desc.cmdSlot, desc.cmdId, desc.phase, map[string]interface{}{
++			"votes": len(msgs),
++		})
++		r.traceSlotEvent("SendSuccess", desc.cmdSlot, desc.cmdId, desc.phase, map[string]interface{}{
++			"to": "local_deliver",
++		})
+ 		r.deliver(desc, desc.cmdSlot)
+ 	}
+ }
+@@ -296,6 +318,9 @@ func (r *Replica) deliver(desc *commandDesc, slot int) {
+ 				Timestamp: desc.propose.Timestamp,
+ 			}
+ 			r.ReplyProposeTS(rep, desc.propose.Reply, desc.propose.Mutex)
++			r.traceSlotEvent("ReceiveSuccess", slot, desc.cmdId, desc.phase, map[string]interface{}{
++				"client": desc.propose.ClientId,
++			})
+ 		}
+ 
+ 		if desc.seq {
+diff --git a/n2paxos/trace_helpers.go b/n2paxos/trace_helpers.go
+new file mode 100644
+index 0000000..121cf9a
+--- /dev/null
++++ b/n2paxos/trace_helpers.go
+@@ -0,0 +1,90 @@
++package n2paxos
++
++import (
++	"strconv"
++
++	"github.com/imdea-software/swiftpaxos/state"
++	"github.com/imdea-software/swiftpaxos/tlatrace"
++)
++
++func phaseName(phase int) string {
++	switch phase {
++	case START:
++		return "START"
++	case COMMIT:
++		return "COMMIT"
++	default:
++		return "UNKNOWN"
++	}
++}
++
++func statusName(status int) string {
++	switch status {
++	case NORMAL:
++		return "NORMAL"
++	case RECOVERING:
++		return "RECOVERING"
++	default:
++		return "UNKNOWN"
++	}
++}
++
++func cmdIDMap(cmdID CommandId) map[string]interface{} {
++	return map[string]interface{}{
++		"client": cmdID.ClientId,
++		"seq":    cmdID.SeqNum,
++	}
++}
++
++func commandMap(cmd state.Command) map[string]interface{} {
++	op := "NONE"
++	switch cmd.Op {
++	case state.PUT:
++		op = "PUT"
++	case state.GET:
++		op = "GET"
++	case state.SCAN:
++		op = "SCAN"
++	}
++	return map[string]interface{}{
++		"op":  op,
++		"key": int64(cmd.K),
++	}
++}
++
++func (r *Replica) traceEvent(name string, extra map[string]interface{}) {
++	event := map[string]interface{}{
++		"name":   name,
++		"module": "n2paxos_replica",
++		"nid":    strconv.FormatInt(int64(r.Id), 10),
++		"state": map[string]interface{}{
++			"ballot":  r.ballot,
++			"cballot": r.cballot,
++			"status":  statusName(r.status),
++		},
++	}
++	for k, v := range extra {
++		event[k] = v
++	}
++	tlatrace.Emit(event)
++}
++
++func (r *Replica) traceSlotEvent(name string, slot int, cmdID CommandId, phase int, extra map[string]interface{}) {
++	event := map[string]interface{}{
++		"name":   name,
++		"module": "n2paxos_replica",
++		"nid":    strconv.FormatInt(int64(r.Id), 10),
++		"slot":   slot,
++		"cmd":    cmdIDMap(cmdID),
++		"state": map[string]interface{}{
++			"ballot":  r.ballot,
++			"cballot": r.cballot,
++			"status":  statusName(r.status),
++			"phase":   phaseName(phase),
++		},
++	}
++	for k, v := range extra {
++		event[k] = v
++	}
++	tlatrace.Emit(event)
++}
+-- 
+2.52.0
+
