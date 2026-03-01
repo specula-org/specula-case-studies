@@ -1,35 +1,42 @@
 # Specula Case Studies
 
-Case studies for [Specula](https://github.com/specula-org/Specula): TLA+ specifications synthesized from real-world systems.
+Case studies with [Specula](https://github.com/specula-org/Specula): TLA+ specifications synthesized from real-world systems.
 
-## Cases
+## Case Studies
 
-### etcd-raft
+| Case study                                                                  | Spec folder                                                                    | Language | Family |
+| --------------------------------------------------------------------------- | ------------------------------------------------------------------------------ | -------- | ------ |
+| [Etcd Raft](https://github.com/etcd-io/raft)                                | [`etcd-raft/scenarios/`](./etcd-raft/scenarios/)                               | Go       | Raft   |
+| [Hashicorp Raft](https://github.com/hashicorp/raft)                         | [`hashicorp-raft/scenarios/base/spec/`](./hashicorp-raft/scenarios/base/spec/) | Go       | Raft   |
+| [SwiftPaxos](https://github.com/imdea-software/swiftpaxos)                  | [`swiftpaxos/spec/`](./swiftpaxos/spec/)                                       | Go       | Paxos  |
+| [EPaxos](https://github.com/imdea-software/swiftpaxos/tree/master/epaxos)   | [`epaxos/spec/`](./epaxos/spec/)                                               | Go       | Paxos  |
+| [N2Paxos](https://github.com/imdea-software/swiftpaxos/tree/master/n2paxos) | [`n2paxos/spec/`](./n2paxos/spec/)                                             | Go       | Paxos  |
 
-TLA+ specifications for [etcd/raft](https://github.com/etcd-io/raft), synthesized and validated using Specula.
+## Structure
 
-**Scenarios:**
+The case studies follow this structure:
 
-| Scenario | Description |
-|---|---|
-| `snapshot` | Core Raft protocol with snapshot and configuration change |
-| `progress_inflights` | Progress tracking and in-flight message management |
-| `leaseRead` | Lease-based read optimization |
+- `artifact/` - a Git submodule of the system implementation.
+- `harness/` - if not already included in base repo, trace extraction or replay driver code used for trace validation.
+- `spec/` - TLA+ specs and configs.
+- `patches/` - instrumentation and other local modifications (usually LLM-generated).
+- `invariants/` - a copy of the original paper, or plain-text natural-language invariants to guide spec generation.
 
-Each scenario contains:
-- `spec/` - TLA+ specifications (main spec, model checking config, trace validation config)
-- `harness/` - Go instrumentation harness for trace extraction
-- `harness/traces/` - Extracted execution traces (.ndjson)
-- `patches/` - Source code instrumentation patches (if applicable)
+Traces are usually found in `harness/traces/` or as untracked files inside the `artifact` folder itself.
 
-**Artifact:**
-- `artifact/raft/` - Instrumented etcd/raft source (submodule from [specula-org/raft](https://github.com/specula-org/raft))
+<details>
+<summary>Etcd Raft Scenarios</summary>
 
+We have specified multiple scenarios for Etcd Raft, focusing on different submodules. Each is available in its own `scenarios` folder within the `etcd-raft` case study.
 
-### swiftpaxos
+| Scenario             | Description                                               |
+| -------------------- | --------------------------------------------------------- |
+| `snapshot`           | Core Raft protocol with snapshot and configuration change |
+| `progress_inflights` | Progress tracking and in-flight message management        |
+| `leaseRead`          | Lease-based read optimization                             |
 
-TLA+ specifications for [SwiftPaxos](https://github.com/imdea-software/swiftpaxos), created by Specula.
+Each scenario contains its own `harness/traces/` for the extracted execution traces and its own `patches/` for source code instrumentation.
 
-- `spec/` - TLA+ specifications (model checking and trace validation specs, configs).
-- `patches/` - Instrumentation patch.
-- `artifact/swiftpaxos` - A submodule of the upstream repo. Trace files are collected locally in `artifact/swiftpaxos/traces`; these are not tracked in Git. These traces are the result of `./swiftpaxos` runs with variations of `local.conf` from the instrumentation patch.
+We've added some modifications to Raft, so we use the submodule at [specula-org/raft](https://github.com/specula-org/raft) instead of the Etcd base repo.
+
+</details>
