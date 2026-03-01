@@ -24,3 +24,12 @@ Each scenario contains:
 
 **Artifact:**
 - `artifact/raft/` - Instrumented etcd/raft source (submodule from [specula-org/raft](https://github.com/specula-org/raft))
+
+
+### swiftpaxos
+
+TLA+ specifications for [SwiftPaxos](https://github.com/imdea-software/swiftpaxos), created by Specula.
+
+- `spec/` - TLA+ specifications (model checking and trace validation specs, configs).
+- `patches/` - Instrumentation patch.
+- `artifact/swiftpaxos` - A submodule of the upstream repo. Trace files are collected locally in `artifact/swiftpaxos/traces`; these are not tracked in Git. These traces are the result of `./swiftpaxos` runs with variations of `local.conf` from the instrumentation patch.
