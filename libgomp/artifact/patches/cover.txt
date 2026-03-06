@@ -1,0 +1,124 @@
+From: Matthew Malcomson mmalcomson@nvidia.com>
+
+I'd previously split these patches up into logically independent
+changes, but since patches have been written on top of the others have
+just made maintainers jobs more difficult.
+- Sebastian just pointed out that I'd included the wrong link in my
+  latest email so the combination was incorrect, so I'll go the way less
+  likely to make mistakes and send everything as a single patch series.
+
+Hence sending up the patch series as a complete patchset ordered on top
+of each other.  In order to do that I rebased the "Move thread task
+re-initialisation into threads" patch on top of the others (some order
+had to be chosen since neither order cleanly applies).  This is the
+order in which I did most of my testing (and TSAN testing was done on
+the combination of all patches in the order sent here).
+
+Apologies for the noise & extra back-and-forth around attempting to
+apply patches.
+
+Including original cover letter for the patchset below here:
+------------------------------
+
+Cc'ing in maintainers of nvptx, gcn, and rtems ports for target specific
+changes (especially with request for runtime testing).
+
+After having updated the target code, looked into various TODO's and ran
+more testing I've combined my previous patches into one patchset.  This
+patchset drastically improves the performance on the micro-benchmark
+119588.
+
+This micro-benchmark represents a significant slowdown in some OMP uses
+in NVPL BLAS running GEMM routines on small matrices with a high level
+of parallelism.  (High level of parallelism due to other routines in the
+code benefiting from many threads, and there being no low-overhead way
+to change the level of parallelism between routines).
+
+This patchset has 5 commits:
+1) Is a fix for PR122314.  It ensures that GOMP tasks are executed
+   logically in the region where they are scheduled.
+2) Is a fix for PR122356.  It ensures there is a memory synchronisation
+   point between tasks being run in the barrier and the barrier
+   continuing.
+3) Changes the linux/ barrier implementation from the "centralized"
+   method currently used to a combination of a "linear" barrier gather
+   and "centralized" barrier release.
+   - I see this gives about a 3x improvement on time through a highly
+     contended barrier on a 144 core machine.
+4) Follows the LLVM example and "wait" between parallel regions *inside*
+   the barrier rather than between two barriers.  This halves the
+   overhead from barriers on many consecutive parallel regions.
+5) Reduces the data structure initialisation overhead when starting a
+   new parallel region.  Rather than have the primary thread initialise
+   each threads data while each secondary thread is waiting the primary
+   thread stores common data and lets each secondary thread initialise
+   its thread-specific data from that shared information.
+
+Patches (1), (2), and (5) could all be made independent (with some
+adjustment for patch context).  Patch (4) requires patch (3) and patch
+(3) introduces some less-pleasant code structure that the changes in
+patch (4) help fix.
+
+In order to use the feature introduced in patch (3) we have to change
+the barrier API to pass an ID.  For patch (3) alone we also need to
+introduce some relatively awkward interfaces for adjusting the size of
+the barrier.
+
+Patch (4) removes that need for the new awkward interface (the only
+barrier that needs size adjustment is now no longer in the fast path).
+
+Since I hope to have both patches in I have only made changes for other
+targets to build on top of patch (4).  This in order to avoid writing
+the implementation for this awkward interface that I intend to never be
+actually used.
+
+N.b. when I did bootstrap & regtest on the posix/ target I saw flaky
+tests before and after.  Believe the same flaky tests.
+
+Matthew Malcomson (5):
+  libgomp: Enforce tasks executed lexically after scheduled
+  libgomp: Ensure memory sync after performing tasks
+  libgomp: Implement "flat" barrier for linux/ target
+  libgomp: Removing one barrier in non-nested thread loop
+  libgomp: Move thread task re-initialisation into threads
+
+ libgomp/barrier.c                             |   4 +-
+ libgomp/config/gcn/bar.c                      |  53 +-
+ libgomp/config/gcn/bar.h                      |  98 ++-
+ libgomp/config/gcn/team.c                     |   2 +-
+ libgomp/config/linux/bar.c                    | 798 ++++++++++++++++--
+ libgomp/config/linux/bar.h                    | 331 +++++++-
+ libgomp/config/linux/futex_waitv.h            | 129 +++
+ libgomp/config/linux/simple-bar.h             |  66 ++
+ libgomp/config/linux/wait.h                   |  15 +-
+ libgomp/config/nvptx/bar.c                    |  36 +-
+ libgomp/config/nvptx/bar.h                    |  89 +-
+ libgomp/config/nvptx/team.c                   |   2 +-
+ libgomp/config/posix/bar.c                    |  41 +-
+ libgomp/config/posix/bar.h                    |  93 +-
+ libgomp/config/posix/pool.h                   |   1 +
+ libgomp/config/posix/simple-bar.h             |  10 +-
+ libgomp/config/rtems/bar.c                    | 185 +++-
+ libgomp/config/rtems/bar.h                    |  97 ++-
+ libgomp/libgomp.h                             |  21 +-
+ libgomp/single.c                              |   4 +-
+ libgomp/task.c                                |  66 +-
+ libgomp/team.c                                | 292 ++++++-
+ .../testsuite/libgomp.c++/task-reduction-20.C | 136 +++
+ .../testsuite/libgomp.c++/task-reduction-21.C | 140 +++
+ libgomp/testsuite/libgomp.c/pr122314.c        |  36 +
+ libgomp/testsuite/libgomp.c/pr122356.c        |  33 +
+ .../libgomp.c/primary-thread-tasking.c        |  80 ++
+ libgomp/work.c                                |  26 +-
+ 28 files changed, 2614 insertions(+), 270 deletions(-)
+ create mode 100644 libgomp/config/linux/futex_waitv.h
+ create mode 100644 libgomp/config/linux/simple-bar.h
+ create mode 100644 libgomp/testsuite/libgomp.c++/task-reduction-20.C
+ create mode 100644 libgomp/testsuite/libgomp.c++/task-reduction-21.C
+ create mode 100644 libgomp/testsuite/libgomp.c/pr122314.c
+ create mode 100644 libgomp/testsuite/libgomp.c/pr122356.c
+ create mode 100644 libgomp/testsuite/libgomp.c/primary-thread-tasking.c
+
+-- 
+2.43.0
+
