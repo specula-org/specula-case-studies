@@ -1,0 +1,277 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<HTML>
+ <HEAD>
+   <TITLE> [PATCH 5/5] libgomp: Move thread task re-initialisation into threads
+   </TITLE>
+   <LINK REL="Index" HREF="index.html" >
+   <LINK REL="made" HREF="mailto:mmalcomson%40nvidia.com?Subject=Re:%20Re%3A%20%5BPATCH%205/5%5D%20libgomp%3A%20Move%20thread%20task%20re-initialisation%20into%20threads&In-Reply-To=%3C20251126131142.644866-6-mmalcomson%40nvidia.com%3E">
+   <META NAME="robots" CONTENT="index,nofollow">
+   <style type="text/css">
+       pre {
+           white-space: pre-wrap;       /* css-2.1, curent FF, Opera, Safari */
+           }
+   </style>
+   <META http-equiv="Content-Type" content="text/html; charset=us-ascii">
+   <LINK REL="Previous"  HREF="702032.html">
+   <LINK REL="Next"  HREF="700116.html">
+ </HEAD>
+ <BODY BGCOLOR="#ffffff">
+   <H1>[PATCH 5/5] libgomp: Move thread task re-initialisation into threads</H1>
+    <B>mmalcomson@nvidia.com</B> 
+    <A HREF="mailto:mmalcomson%40nvidia.com?Subject=Re:%20Re%3A%20%5BPATCH%205/5%5D%20libgomp%3A%20Move%20thread%20task%20re-initialisation%20into%20threads&In-Reply-To=%3C20251126131142.644866-6-mmalcomson%40nvidia.com%3E"
+       TITLE="[PATCH 5/5] libgomp: Move thread task re-initialisation into threads">mmalcomson@nvidia.com
+       </A><BR>
+    <I>Wed Nov 26 13:11:42 GMT 2025</I>
+    <P><UL>
+        <LI>Previous message (by thread): <A HREF="702032.html">[PATCH 4/5] libgomp: Removing one barrier in non-nested thread loop
+</A></li>
+        <LI>Next message (by thread): <A HREF="700116.html">[PATCH] libgomp: Ensure memory sync after performing tasks
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#702030">[ date ]</a>
+              <a href="thread.html#702030">[ thread ]</a>
+              <a href="subject.html#702030">[ subject ]</a>
+              <a href="author.html#702030">[ author ]</a>
+         </LI>
+       </UL>
+    <HR>  
+<!--beginarticle-->
+<PRE>From: Matthew Malcomson &lt;<A HREF="mailto:mmalcomson@nvidia.com">mmalcomson@nvidia.com</A>&gt;
+
+This patch is a separate beneficial step of the work I'm doing towards
+PR119588.  In that bug I describe how some internal workloads are
+hitting some performance problems w.r.t. the creation of many parallel
+regions one after each other.
+
+I'm attempting to reduce overhead of parallel region creation when
+using a large number of threads.  The two patches earlier in this
+patchset rework the barrier implementation to something that performs
+much better in this particular case:
+
+This is a patch built on top of those, but with appropriate rebase
+could be independent.  It addresses a different area where I've seen a
+performance impact.  It's the area that I mentioned in the below mail
+to the GCC mailing list.
+<A HREF="https://gcc.gnu.org/pipermail/gcc/2025-September/246618.html">https://gcc.gnu.org/pipermail/gcc/2025-September/246618.html</A>
+
+The fundamental point is that the cost of teardown &amp; setup of a parallel
+region for LLVM is very close to the cost of a single barrier.  For us
+there is a significant chunk of extra work in the actual teardown and
+setup.
+
+When re-using a team with no changes in the affinity ICV etc it would
+seem that the ideal case is similar to LLVM -- (parallel region creation
+being about 16% slower than a barrier for LLVM, as opposed to the 4.3x
+slower for 144 threads that I'm seeing at the moment for GNU).
+This patch gets nowhere near that ideal.  In this patch I observe that
+the majority of the performance overhead in this case comes from
+re-initialising the existing threads.  While all existing threads are
+waiting on the primary thread, that primary thread is iterating over
+each secondary threads data structures and setting it as needed for the
+next parallel region.
+
+There are a number of stores that could be relatively easily performed
+in each secondary thread after it is released by the primary thread --
+removing this work from the serialised region.  This patch proposes that
+much simpler setup.  This re-initialisation scales with number of
+threads -- which is why it has such an impact on the problematic case I
+have been looking at.
+
+Only subtlety here is that in order to ensure memory safety we need to
+avoid performing this initialisation when `thr-&gt;fn == NULL`.  If a
+secondary non-nested thread gets &quot;left to exit&quot; when a new team is
+started the primary thread could race ahead, cache the new team, and
+free the team that this secondary thread was using all before the
+secondary thread goes through the new initialisation code.  That could
+lead to a use-after-free.  Hence we have to early-exit when this thread
+is not going to perform any more work.
+- N.b. When running TSAN before and after I realised that this change
+  happens to remove a race between `gomp_finish_task` in the secondary
+  thread and `gomp_init_task` in the primary thread (when re-using a
+  team and hence `nthr-&gt;task` is in the same place as the threads local
+  `task` variable).
+
+All threads that are not going to be used in the next region do
+unnecessarily re-init their `team` data structure etc, but since
+`thr-&gt;fn` is NULL they exit the do/while loop before that makes little
+difference, and the work is spread across threads so it shouldn't block
+other useful work.
+
+I imagine there is a good chunk of performance to be gained in adding
+more logic here:
+1) Something recording whether the affinity setup has changed since the
+   last non-nested team and if not removing the calculation of places
+   and assignment to `nthr-&gt;ts.place_partition_*` variables.
+2) I could move more members that are assigned multiple times to `team`
+   for each secondary thread to take.
+   - `data` pointer.
+   - `num_teams`.
+   - `team_num`.
+   - Honestly should have looked into this in the patch -- noticed it
+     while writing this cover letter and will look into whether this is
+     feasible relatively soon.
+3) If we can identify that we're re-using a team from the last parallel
+   region (and affinity ICV has not changed) it seems that we could
+   avoid re-initialising some of its fields:
+   - ordered_release[i] should already point to `nthr`?
+   - ts.team_id should already be set.
+Overall if we can identify that we're using the same team as was
+cached and we don't need to change anything we should be able to get
+away with drastically less work in the serial part of the call to
+GOMP_parallel.
+
+I did run the micro-benchmark I'm looking at (mentioned in PR119588) on
+some hacked up versions of the above and they seemed to provide
+measurable gains.  I haven't tried to put them all in this patch due to
+lack of time and the relatively higher complexity of the bookkeeping.
+I'm hoping this is a straight-forward step in the right direction.
+
+-------
+Testing done (note -- much of the testing done on top of my other
+patches rather than by itself):
+- Bootstrap &amp; regtest on x86_64 and aarch64
+  - Testsuite ran with OMP_WAIT_POLICY=PASSIVE as well.
+  - Also done with `--enable-linux-futex=no` for posix/ target.
+  - Also done with `_LIBGOMP_CHECKING_` set for assertions.
+- Cross compiler &amp; regtest on arm (qemu).
+- TSAN done combining all my other patches upstream.
+
+libgomp/ChangeLog:
+
+	PR libgomp/119588
+	* libgomp.h (struct gomp_team): Add fields for communication
+	at team start time.
+	* team.c (gomp_thread_start): Initialise thread-local data using
+	members stored on team.
+	(gomp_team_start): Primary thread stores data on team structure
+	instead of copying that data to each secondary threads
+	gomp_thread structure.
+
+Signed-off-by: Matthew Malcomson &lt;<A HREF="mailto:mmalcomson@nvidia.com">mmalcomson@nvidia.com</A>&gt;
+---
+ libgomp/libgomp.h |  8 ++++++++
+ libgomp/team.c    | 37 ++++++++++++++++++++++++++-----------
+ 2 files changed, 34 insertions(+), 11 deletions(-)
+
+diff --git a/libgomp/libgomp.h b/libgomp/libgomp.h
+index 4269a3f4e60..b188567ca28 100644
+--- a/libgomp/libgomp.h
++++ b/libgomp/libgomp.h
+@@ -866,6 +866,14 @@ struct gomp_team
+   /* Number of tasks waiting for their completion event to be fulfilled.  */
+   unsigned int task_detach_count;
+ 
++  /* Cache to help initialise each secondary threads `task` when re-using a
++     team very many times.  This allows each secondary thread to perform the
++     re-initialisation instead of having the primary thread need to perform
++     that initialisation.  */
++  struct gomp_task_icv task_icv_init;
++  struct gomp_task *task_parent_init;
++  struct gomp_taskgroup *task_taskgroup;
++
+   /* This array contains structures for implicit tasks.  */
+   struct gomp_task implicit_task[];
+ };
+diff --git a/libgomp/team.c b/libgomp/team.c
+index 30aefcd22b6..0553b8d83a3 100644
+--- a/libgomp/team.c
++++ b/libgomp/team.c
+@@ -158,6 +158,23 @@ gomp_thread_start (void *xdata)
+ 	  if (!gomp_barrier_can_hold (&amp;team-&gt;barrier) || thr-&gt;fn == NULL)
+ 	    gomp_simple_barrier_wait (&amp;pool-&gt;threads_dock);
+ 
++	  /* Early exit because if `thr-&gt;fn == NULL` then we can't guarantee
++	     the `thr-&gt;ts.team` hasn't been freed by the primary thread racing
++	     ahead.  Hence we don't want to write to it.  */
++	  if (thr-&gt;fn == NULL)
++	    break;
++	  team = thr-&gt;ts.team;
++	  thr-&gt;ts.work_share = &amp;team-&gt;work_shares[0];
++	  thr-&gt;ts.last_work_share = NULL;
++#ifdef HAVE_SYNC_BUILTINS
++	  thr-&gt;ts.single_count = 0;
++#endif
++	  thr-&gt;ts.static_trip = 0;
++	  thr-&gt;task = &amp;team-&gt;implicit_task[thr-&gt;ts.team_id];
++	  gomp_init_task (thr-&gt;task, team-&gt;task_parent_init,
++			  &amp;team-&gt;task_icv_init);
++	  thr-&gt;task-&gt;taskgroup = team-&gt;task_taskgroup;
++
+ 	  local_fn = thr-&gt;fn;
+ 	  local_data = thr-&gt;data;
+ 	  thr-&gt;fn = NULL;
+@@ -437,6 +454,15 @@ gomp_team_start (void (*fn) (void *), void *data, unsigned nthreads,
+   thr-&gt;task-&gt;taskgroup = taskgroup;
+   team-&gt;implicit_task[0].icv.nthreads_var = nthreads_var;
+   team-&gt;implicit_task[0].icv.bind_var = bind_var;
++  /* Copy entirely rather than copy pointer so that we have an immutable copy
++     for the secondary threads to take from for the time-frame that said
++     secondary threads are executing on.  Can't copy from
++     `team-&gt;implicit_task[0].icv` because primary thread could have adjusted
++     its per-task ICV by the time the secondary thread gets around to
++     initialising things.   */
++  team-&gt;task_icv_init = team-&gt;implicit_task[0].icv;
++  team-&gt;task_parent_init = task;
++  team-&gt;task_taskgroup = taskgroup;
+ 
+   if (nthreads == 1)
+     return;
+@@ -725,26 +751,15 @@ gomp_team_start (void (*fn) (void *), void *data, unsigned nthreads,
+ 	  else
+ 	    nthr = pool-&gt;threads[i];
+ 	  __atomic_store_n (&amp;nthr-&gt;ts.team, team, MEMMODEL_RELEASE);
+-	  nthr-&gt;ts.work_share = &amp;team-&gt;work_shares[0];
+-	  nthr-&gt;ts.last_work_share = NULL;
+ 	  nthr-&gt;ts.team_id = i;
+ 	  nthr-&gt;ts.level = team-&gt;prev_ts.level + 1;
+ 	  nthr-&gt;ts.active_level = thr-&gt;ts.active_level;
+ 	  nthr-&gt;ts.place_partition_off = place_partition_off;
+ 	  nthr-&gt;ts.place_partition_len = place_partition_len;
+ 	  nthr-&gt;ts.def_allocator = thr-&gt;ts.def_allocator;
+-#ifdef HAVE_SYNC_BUILTINS
+-	  nthr-&gt;ts.single_count = 0;
+-#endif
+-	  nthr-&gt;ts.static_trip = 0;
+ 	  nthr-&gt;num_teams = thr-&gt;num_teams;
+ 	  nthr-&gt;team_num = thr-&gt;team_num;
+-	  nthr-&gt;task = &amp;team-&gt;implicit_task[i];
+ 	  nthr-&gt;place = place;
+-	  gomp_init_task (nthr-&gt;task, task, icv);
+-	  team-&gt;implicit_task[i].icv.nthreads_var = nthreads_var;
+-	  team-&gt;implicit_task[i].icv.bind_var = bind_var;
+-	  nthr-&gt;task-&gt;taskgroup = taskgroup;
+ 	  nthr-&gt;fn = fn;
+ 	  nthr-&gt;data = data;
+ 	  team-&gt;ordered_release[i] = &amp;nthr-&gt;release;
+-- 
+2.43.0
+
+</PRE>
+
+
+
+
+
+
+
+
+<!--endarticle-->
+    <HR>
+    <P><UL>
+        <!--threads-->
+	<LI>Previous message (by thread): <A HREF="702032.html">[PATCH 4/5] libgomp: Removing one barrier in non-nested thread loop
+</A></li>
+	<LI>Next message (by thread): <A HREF="700116.html">[PATCH] libgomp: Ensure memory sync after performing tasks
+</A></li>
+         <LI> <B>Messages sorted by:</B> 
+              <a href="date.html#702030">[ date ]</a>
+              <a href="thread.html#702030">[ thread ]</a>
+              <a href="subject.html#702030">[ subject ]</a>
+              <a href="author.html#702030">[ author ]</a>
+         </LI>
+       </UL>
+
+<hr>
+<a href="https://gcc.gnu.org/mailman/listinfo/gcc-patches">More information about the Gcc-patches
+mailing list</a><br>
+</body></html>
