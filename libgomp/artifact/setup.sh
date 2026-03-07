@@ -1,5 +1,5 @@
 #!/bin/bash
-# Setup script: clone GCC trunk and apply NVIDIA flat-barrier patches (1-5).
+# Setup script: clone GCC trunk and apply NVIDIA flat-barrier patch.
 #
 # Prerequisites: git, gcc build dependencies (see GCC docs)
 #
@@ -28,13 +28,9 @@ echo "=== Fetching target commit $GCC_COMMIT ==="
 git fetch --depth=1 origin "$GCC_COMMIT"
 git checkout "$GCC_COMMIT"
 
-echo "=== Applying NVIDIA flat-barrier patches 1-5 ==="
-for i in 1 2 3 4 5; do
-    echo "  Applying patch${i}.patch ..."
-    git apply "$SCRIPT_DIR/patches/patch${i}.patch"
-done
-
-echo "=== Patches applied successfully ==="
+echo "=== Applying NVIDIA flat-barrier patch ==="
+git apply "$SCRIPT_DIR/patches/nvidia_flat_barrier.patch"
+echo "=== Patch applied successfully ==="
 
 if [ "${1:-}" = "--build" ]; then
     echo "=== Building libgomp ==="
