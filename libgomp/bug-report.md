@@ -24,7 +24,7 @@
 
 ## Bug #28: BAR_CANCELLED Overwrite in gomp_barrier_handle_tasks
 
-- **Severity**: Medium (final barrier path) / High (cancel barrier path)
+- **Severity**: Medium (code defect; checking builds: assertion failure at bar.c:521; production builds: no observable impact due to `team_cancelled` fallback)
 - **Status**: Not yet reported upstream
 - **Root cause**: `gomp_increment_gen` unconditionally strips all flag bits including BAR_CANCELLED
 
@@ -131,9 +131,9 @@ The bug was discovered through TLA+ model checking of the flat barrier protocol.
 - Cancel semantics: BAR_CANCELLED flag set via atomic fetch_or
 - Task scheduling: dequeue, execute, cancel interactions
 
-Key invariant violated: `BarrierSafety` — asserts that BAR_CANCELLED, once set, is never lost until explicitly cleared by `gomp_team_barrier_done_final`.
+Key invariant violated: `BarrierSafety` — asserts that no secondary thread proceeds past the barrier before all secondaries have arrived (`threadGen` ordering). The violation is indirect: `PrimaryHandleTaskLast` completes the barrier (increments generation) without checking BAR_CANCELLED, causing a split-brain where one secondary sees the cancel (undoes its arrival) while another sees the generation increment (passes normally). This creates inconsistent `threadGen` values among secondaries at "done".
 
-The counterexample shows the primary thread entering `PrimaryHandleTaskLast`, completing the barrier via `gomp_team_barrier_done` without checking BAR_CANCELLED, overwriting the flag.
+Note: The model found this violation on the cancel barrier path (`BAR_CANCEL_INCR`). Investigation of the real code shows this path is blocked in practice by an early return at bar.c:860-861. However, the same root cause (`gomp_increment_gen` stripping BAR_CANCELLED) is reachable via the final barrier path (`BAR_HOLDING_SECONDARIES`), where it triggers the checking assertion at bar.c:521-534.
 
 ---
 

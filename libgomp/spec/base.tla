@@ -521,25 +521,33 @@ SecondaryPassBarrier(t) ==
                    scanIndex, barrierRound, barrierType, holdingVars, teamVars>>
 
 (*
- * Secondary in cancel wait loop — either barrier completes or cancelled.
+ * Secondary in cancel wait loop — either cancelled or barrier completes.
  * Models: bar.c:756-850 gomp_team_barrier_wait_cancel_end
+ *
+ * Implementation: secondary atomically reads bar->generation which contains
+ * both the generation counter and BAR_CANCELLED bit. It checks BAR_CANCELLED
+ * first (bar.c:760), but also verifies the cancel is from the CURRENT
+ * generation (bar.c:762-764). If generation has advanced (barrier completed),
+ * the cancel belongs to an old generation and is ignored.
+ *
+ * In the model: cancelled is separate from generation, so we guard the cancel
+ * path with ~completed to match the implementation's generation check.
  *)
 SecondaryPassCancelBarrier(t) ==
     /\ t \in Secondaries
     /\ pc[t] = "cancel_waiting"
-    \* bar.c:746-850: the wait loop checks barrier completion FIRST (line 756),
-    \* then checks BAR_CANCELLED (line 778). Completion takes priority.
-    /\ IF generation >= threadGen[t] /\ ~holding
-       THEN \* Barrier completed normally — pass regardless of cancel flag
-            /\ pc' = [pc EXCEPT ![t] = "done"]
-            /\ UNCHANGED <<threadCGen, threadGen>>
-       ELSE IF cancelled
-       THEN \* bar.c:828-830: cancel detected (barrier not yet completed)
-            \* Undo both cgen and threadGen entry markers
+    /\ LET completed == generation >= threadGen[t] /\ ~holding
+       IN
+       IF cancelled /\ ~completed
+       THEN \* bar.c:828-830: cancel detected, barrier not yet completed — undo
             /\ threadCGen' = [threadCGen EXCEPT ![t] = threadCGen[t] - 1]
             /\ threadGen' = [threadGen EXCEPT ![t] = threadGen[t] - 1]
             /\ pc' = [pc EXCEPT ![t] = "done"]
-       ELSE FALSE  \* Neither completed nor cancelled — keep waiting (no action)
+       ELSE IF completed
+       THEN \* Barrier completed — pass (cancel if any is from old generation)
+            /\ pc' = [pc EXCEPT ![t] = "done"]
+            /\ UNCHANGED <<threadCGen, threadGen>>
+       ELSE FALSE  \* Neither cancelled nor completed — keep waiting
     /\ UNCHANGED <<globalBarVars, primaryWaiting,
                    cancelArrived, primaryWaitingC,
                    scanIndex, barrierRound, barrierType, holdingVars, teamVars>>

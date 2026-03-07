@@ -1,0 +1,3281 @@
+diff --git a/libgomp/barrier.c b/libgomp/barrier.c
+index 3a6037e..8919302 100644
+--- a/libgomp/barrier.c
++++ b/libgomp/barrier.c
+@@ -38,7 +38,7 @@ GOMP_barrier (void)
+   if (team == NULL)
+     return;
+ 
+-  gomp_team_barrier_wait (&team->barrier);
++  gomp_team_barrier_wait (&team->barrier, thr->ts.team_id);
+ }
+ 
+ bool
+@@ -50,5 +50,5 @@ GOMP_barrier_cancel (void)
+   /* The compiler transforms to barrier_cancel when it sees that the
+      barrier is within a construct that can cancel.  Thus we should
+      never have an orphaned cancellable barrier.  */
+-  return gomp_team_barrier_wait_cancel (&team->barrier);
++  return gomp_team_barrier_wait_cancel (&team->barrier, thr->ts.team_id);
+ }
+diff --git a/libgomp/config/gcn/bar.c b/libgomp/config/gcn/bar.c
+index 3045587..3fa9830 100644
+--- a/libgomp/config/gcn/bar.c
++++ b/libgomp/config/gcn/bar.c
+@@ -34,7 +34,8 @@
+ 
+ 
+ void
+-gomp_barrier_wait_end (gomp_barrier_t *bar, gomp_barrier_state_t state)
++gomp_barrier_wait_end (gomp_barrier_t *bar, gomp_barrier_state_t state,
++		       unsigned id __attribute__ ((unused)))
+ {
+   if (__builtin_expect (state & BAR_WAS_LAST, 0))
+     {
+@@ -48,9 +49,9 @@ gomp_barrier_wait_end (gomp_barrier_t *bar, gomp_barrier_state_t state)
+ }
+ 
+ void
+-gomp_barrier_wait (gomp_barrier_t *bar)
++gomp_barrier_wait (gomp_barrier_t *bar, unsigned id)
+ {
+-  gomp_barrier_wait_end (bar, gomp_barrier_wait_start (bar));
++  gomp_barrier_wait_end (bar, gomp_barrier_wait_start (bar, id), id);
+ }
+ 
+ /* Like gomp_barrier_wait, except that if the encountering thread
+@@ -61,12 +62,12 @@ gomp_barrier_wait (gomp_barrier_t *bar)
+    the barrier can be safely destroyed.  */
+ 
+ void
+-gomp_barrier_wait_last (gomp_barrier_t *bar)
++gomp_barrier_wait_last (gomp_barrier_t *bar, unsigned id)
+ {
+   /* Deferring to gomp_barrier_wait does not use the optimization opportunity
+      allowed by the interface contract for all-but-last participants.  The
+      original implementation in config/linux/bar.c handles this better.  */
+-  gomp_barrier_wait (bar);
++  gomp_barrier_wait (bar, id);
+ }
+ 
+ void
+@@ -77,7 +78,8 @@ gomp_team_barrier_wake (gomp_barrier_t *bar, int count)
+ }
+ 
+ void
+-gomp_team_barrier_wait_end (gomp_barrier_t *bar, gomp_barrier_state_t state)
++gomp_team_barrier_wait_end (gomp_barrier_t *bar, gomp_barrier_state_t state,
++			    unsigned id __attribute__ ((unused)))
+ {
+   unsigned int gen;
+ 
+@@ -93,7 +95,7 @@ gomp_team_barrier_wait_end (gomp_barrier_t *bar, gomp_barrier_state_t state)
+ 	= __atomic_load_n (&team->task_count, MEMMODEL_ACQUIRE);
+       if (__builtin_expect (task_count, 0))
+ 	{
+-	  gomp_barrier_handle_tasks (state);
++	  gomp_barrier_handle_tasks (state, bar, 0);
+ 	  state &= ~BAR_WAS_LAST;
+ 	}
+       else
+@@ -126,31 +128,32 @@ gomp_team_barrier_wait_end (gomp_barrier_t *bar, gomp_barrier_state_t state)
+       gen = __atomic_load_n (&bar->generation, MEMMODEL_ACQUIRE);
+       if (__builtin_expect (gen & BAR_TASK_PENDING, 0))
+ 	{
+-	  gomp_barrier_handle_tasks (state);
++	  gomp_barrier_handle_tasks (state, bar, 0);
+ 	  gen = __atomic_load_n (&bar->generation, MEMMODEL_ACQUIRE);
+ 	}
+     }
+-  while (!gomp_barrier_state_is_incremented (gen, state));
++  while (!gomp_barrier_state_is_incremented (gen, state, 0));
+ }
+ 
+ void
+-gomp_team_barrier_wait (gomp_barrier_t *bar)
++gomp_team_barrier_wait (gomp_barrier_t *bar, unsigned id)
+ {
+-  gomp_team_barrier_wait_end (bar, gomp_barrier_wait_start (bar));
++  gomp_team_barrier_wait_end (bar, gomp_barrier_wait_start (bar, id), id);
+ }
+ 
+ void
+-gomp_team_barrier_wait_final (gomp_barrier_t *bar)
++gomp_team_barrier_wait_final (gomp_barrier_t *bar, unsigned id)
+ {
+-  gomp_barrier_state_t state = gomp_barrier_wait_final_start (bar);
++  gomp_barrier_state_t state = gomp_barrier_wait_final_start (bar, id);
+   if (__builtin_expect (state & BAR_WAS_LAST, 0))
+     bar->awaited_final = bar->total;
+-  gomp_team_barrier_wait_end (bar, state);
++  gomp_team_barrier_wait_end (bar, state, id);
+ }
+ 
+ bool
+ gomp_team_barrier_wait_cancel_end (gomp_barrier_t *bar,
+-				   gomp_barrier_state_t state)
++				   gomp_barrier_state_t state,
++				   unsigned id __attribute__ ((unused)))
+ {
+   unsigned int gen;
+ 
+@@ -170,7 +173,7 @@ gomp_team_barrier_wait_cancel_end (gomp_barrier_t *bar,
+ 	= __atomic_load_n (&team->task_count, MEMMODEL_ACQUIRE);
+       if (__builtin_expect (task_count, 0))
+ 	{
+-	  gomp_barrier_handle_tasks (state);
++	  gomp_barrier_handle_tasks (state, bar, 0);
+ 	  state &= ~BAR_WAS_LAST;
+ 	}
+       else
+@@ -207,19 +210,21 @@ gomp_team_barrier_wait_cancel_end (gomp_barrier_t *bar,
+ 	return true;
+       if (__builtin_expect (gen & BAR_TASK_PENDING, 0))
+ 	{
+-	  gomp_barrier_handle_tasks (state);
++	  gomp_barrier_handle_tasks (state, bar, 0);
+ 	  gen = __atomic_load_n (&bar->generation, MEMMODEL_RELAXED);
+ 	}
+     }
+-  while (!gomp_barrier_state_is_incremented (gen, state));
++  while (!gomp_barrier_state_is_incremented (gen, state, 0));
+ 
+   return false;
+ }
+ 
+ bool
+-gomp_team_barrier_wait_cancel (gomp_barrier_t *bar)
++gomp_team_barrier_wait_cancel (gomp_barrier_t *bar, unsigned id)
+ {
+-  return gomp_team_barrier_wait_cancel_end (bar, gomp_barrier_wait_start (bar));
++  return gomp_team_barrier_wait_cancel_end (bar,
++					    gomp_barrier_wait_start (bar, id),
++					    id);
+ }
+ 
+ void
+diff --git a/libgomp/config/gcn/bar.h b/libgomp/config/gcn/bar.h
+index 6e838ff..eff7c51 100644
+--- a/libgomp/config/gcn/bar.h
++++ b/libgomp/config/gcn/bar.h
+@@ -71,22 +71,26 @@ static inline void gomp_barrier_destroy (gomp_barrier_t *bar)
+ {
+ }
+ 
+-extern void gomp_barrier_wait (gomp_barrier_t *);
+-extern void gomp_barrier_wait_last (gomp_barrier_t *);
+-extern void gomp_barrier_wait_end (gomp_barrier_t *, gomp_barrier_state_t);
+-extern void gomp_team_barrier_wait (gomp_barrier_t *);
+-extern void gomp_team_barrier_wait_final (gomp_barrier_t *);
+-extern void gomp_team_barrier_wait_end (gomp_barrier_t *,
+-					gomp_barrier_state_t);
+-extern bool gomp_team_barrier_wait_cancel (gomp_barrier_t *);
++extern void gomp_barrier_wait (gomp_barrier_t *, unsigned);
++extern void gomp_barrier_wait_last (gomp_barrier_t *, unsigned);
++extern void gomp_barrier_wait_end (gomp_barrier_t *, gomp_barrier_state_t,
++				   unsigned);
++
++extern void gomp_team_barrier_wait (gomp_barrier_t *, unsigned);
++extern void gomp_team_barrier_wait_final (gomp_barrier_t *, unsigned);
++extern void gomp_team_barrier_wait_end (gomp_barrier_t *, gomp_barrier_state_t,
++					unsigned);
++
++extern bool gomp_team_barrier_wait_cancel (gomp_barrier_t *, unsigned);
+ extern bool gomp_team_barrier_wait_cancel_end (gomp_barrier_t *,
+-					       gomp_barrier_state_t);
++					       gomp_barrier_state_t, unsigned);
+ extern void gomp_team_barrier_wake (gomp_barrier_t *, int);
+ struct gomp_team;
+ extern void gomp_team_barrier_cancel (struct gomp_team *);
+ 
+ static inline gomp_barrier_state_t
+-gomp_barrier_wait_start (gomp_barrier_t *bar)
++gomp_barrier_wait_start (gomp_barrier_t *bar,
++			 unsigned id __attribute__ ((unused)))
+ {
+   unsigned int ret = __atomic_load_n (&bar->generation, MEMMODEL_RELAXED);
+   ret &= -BAR_INCR | BAR_CANCELLED;
+@@ -101,16 +105,17 @@ gomp_barrier_wait_start (gomp_barrier_t *bar)
+ }
+ 
+ static inline gomp_barrier_state_t
+-gomp_barrier_wait_cancel_start (gomp_barrier_t *bar)
++gomp_barrier_wait_cancel_start (gomp_barrier_t *bar, unsigned id)
+ {
+-  return gomp_barrier_wait_start (bar);
++  return gomp_barrier_wait_start (bar, id);
+ }
+ 
+ /* This is like gomp_barrier_wait_start, except it decrements
+    bar->awaited_final rather than bar->awaited and should be used
+    for the gomp_team_end barrier only.  */
+ static inline gomp_barrier_state_t
+-gomp_barrier_wait_final_start (gomp_barrier_t *bar)
++gomp_barrier_wait_final_start (gomp_barrier_t *bar,
++			       unsigned id __attribute__ ((unused)))
+ {
+   unsigned int ret = __atomic_load_n (&bar->generation, MEMMODEL_RELAXED);
+   ret &= -BAR_INCR | BAR_CANCELLED;
+@@ -160,7 +165,8 @@ gomp_team_barrier_cancelled (gomp_barrier_t *bar)
+ }
+ 
+ static inline void
+-gomp_team_barrier_done (gomp_barrier_t *bar, gomp_barrier_state_t state)
++gomp_team_barrier_done (gomp_barrier_t *bar, gomp_barrier_state_t state,
++			unsigned increment __attribute__ ((unused)))
+ {
+   /* Need the atomic store for acquire-release synchronisation with the
+      load in `gomp_team_barrier_wait_{cancel_,}end`.  See PR112356  */
+@@ -170,18 +176,61 @@ gomp_team_barrier_done (gomp_barrier_t *bar, gomp_barrier_state_t state)
+ 
+ static inline bool
+ gomp_barrier_state_is_incremented (gomp_barrier_state_t gen,
+-				   gomp_barrier_state_t state)
++				   gomp_barrier_state_t state,
++				   unsigned increment __attribute__ ((unused)))
+ {
+   unsigned next_state = (state & -BAR_INCR) + BAR_INCR;
+   return next_state > state ? gen >= next_state : gen < state;
+ }
+ 
+ static inline bool
+-gomp_barrier_has_completed (gomp_barrier_state_t state, gomp_barrier_t *bar)
++gomp_barrier_has_completed (gomp_barrier_state_t state, gomp_barrier_t *bar,
++			    unsigned increment)
+ {
+   /* Handling overflow in the generation.  The "next" state could be less than
+      or greater than the current one.  */
+-  return gomp_barrier_state_is_incremented (bar->generation, state);
++  return gomp_barrier_state_is_incremented (bar->generation, state, increment);
++}
++
++static inline bool
++gomp_barrier_can_hold (gomp_barrier_t *bar)
++{
++  return false;
+ }
+ 
++/* Functions dummied out for this implementation.  */
++static inline void
++gomp_team_barrier_ensure_last (gomp_barrier_t *bar __attribute__ ((unused)),
++			       unsigned id __attribute__ ((unused)),
++			       gomp_barrier_state_t state
++			       __attribute__ ((unused)))
++{}
++
++static inline bool
++gomp_team_barrier_ensure_cancel_last (gomp_barrier_t *bar
++				      __attribute__ ((unused)),
++				      unsigned id __attribute__ ((unused)),
++				      gomp_barrier_state_t state
++				      __attribute__ ((unused)))
++{
++  /* After returning BAR_WAS_LAST, actually ensure that this thread is last.
++     Return `true` if this thread is known last into the barrier return `false`
++     if the barrier got cancelled such that not all threads entered the barrier.
++
++     Since BAR_WAS_LAST is only set for a thread when that thread decremented
++     the `awaited` counter to zero we know that all threads must have entered
++     the barrier.  Hence always return `true`.  */
++  return true;
++}
++
++static inline void
++gomp_reset_cancellable_primary_threadgen (gomp_barrier_t *bar,
++					  unsigned id __attribute__ ((unused)))
++{}
++
++static inline void
++gomp_team_barrier_done_final (gomp_barrier_t *bar,
++			      unsigned id __attribute__ ((unused)))
++{}
++
+ #endif /* GOMP_BARRIER_H */
+diff --git a/libgomp/config/gcn/team.c b/libgomp/config/gcn/team.c
+index c9c2f3c..97fa567 100644
+--- a/libgomp/config/gcn/team.c
++++ b/libgomp/config/gcn/team.c
+@@ -166,7 +166,7 @@ gomp_thread_start (struct gomp_thread_pool *pool)
+       thr->fn = NULL;
+ 
+       struct gomp_task *task = thr->task;
+-      gomp_team_barrier_wait_final (&thr->ts.team->barrier);
++      gomp_team_barrier_wait_final (&thr->ts.team->barrier, thr->ts.team_id);
+       gomp_finish_task (task);
+     }
+   while (1);
+diff --git a/libgomp/config/linux/bar.c b/libgomp/config/linux/bar.c
+index bbdfc89..a945f00 100644
+--- a/libgomp/config/linux/bar.c
++++ b/libgomp/config/linux/bar.c
+@@ -29,10 +29,11 @@
+ 
+ #include <limits.h>
+ #include "wait.h"
+-
++#include "futex_waitv.h"
+ 
+ void
+-gomp_barrier_wait_end (gomp_barrier_t *bar, gomp_barrier_state_t state)
++gomp_centralized_barrier_wait_end (gomp_barrier_t *bar,
++				   gomp_barrier_state_t state)
+ {
+   if (__builtin_expect (state & BAR_WAS_LAST, 0))
+     {
+@@ -51,9 +52,114 @@ gomp_barrier_wait_end (gomp_barrier_t *bar, gomp_barrier_state_t state)
+ }
+ 
+ void
+-gomp_barrier_wait (gomp_barrier_t *bar)
++gomp_centralized_barrier_wait (gomp_barrier_t *bar)
++{
++  gomp_barrier_state_t state = gomp_centralized_barrier_wait_start (bar);
++  gomp_centralized_barrier_wait_end (bar, state);
++}
++
++/* Like gomp_centralized_barrier_wait, except that if the encountering thread
++   is not the last one to hit the barrier, it returns immediately.  The
++   intended usage is that a thread which intends to gomp_barrier_destroy this
++   barrier calls gomp_centralized_barrier_wait, while all other threads call
++   gomp_centralized_barrier_wait_last.  When gomp_centralized_barrier_wait
++   returns, the barrier can be safely destroyed.  */
++
++void
++gomp_centralized_barrier_wait_last (gomp_barrier_t *bar)
++{
++  gomp_barrier_state_t state = gomp_centralized_barrier_wait_start (bar);
++  if (state & BAR_WAS_LAST)
++    gomp_centralized_barrier_wait_end (bar, state);
++}
++
++void
++gomp_barrier_ensure_last (gomp_barrier_t *bar, unsigned id,
++			  gomp_barrier_state_t state)
++{
++  gomp_assert (id == 0, "Calling ensure_last in thread %u", id);
++  gomp_assert (!(state & BAR_CANCELLED),
++	       "BAR_CANCELLED set when using plain barrier: %u", state);
++  unsigned tstate = state & BAR_GEN_MASK;
++  struct thread_lock_data *arr = bar->threadgens;
++  for (unsigned i = 1; i < bar->total; i++)
++    {
++      unsigned tmp;
++      do
++	{
++	  do_wait ((int *) &arr[i].gen, tstate);
++	  tmp = __atomic_load_n (&arr[i].gen, MEMMODEL_ACQUIRE);
++	  gomp_assert (tmp == tstate || tmp == (tstate + BAR_INCR),
++		       "Thread-local state seen to be %u"
++		       " when global gens are %u",
++		       tmp, tstate);
++	}
++      while (tmp != (tstate + BAR_INCR));
++    }
++  gomp_assert_seenflags (bar, false);
++}
++
++void
++gomp_assert_and_increment_flag (gomp_barrier_t *bar, unsigned id, unsigned gens)
++{
++  /* Our own personal flag, so don't need to atomically read it except in the
++     case of the fallback code for when running on an older Linux kernel
++     (without futex_waitv).  Do need to atomically update it for the primary
++     thread to read and form an acquire-release synchronisation from our thread
++     to the primary thread.  */
++  struct thread_lock_data *arr = bar->threadgens;
++  unsigned orig = __atomic_fetch_add (&arr[id].gen, BAR_INCR, MEMMODEL_RELEASE);
++  futex_wake ((int *) &arr[id].gen, INT_MAX);
++  /* This clause is only to handle the fallback when `futex_waitv` is not
++     available on the kernel we're running on.  For the logic of this
++     particular synchronisation see the comment in
++     `gomp_team_barrier_ensure_last`.  */
++  unsigned gen = gens & BAR_GEN_MASK;
++  if (__builtin_expect (orig == (gen | PRIMARY_WAITING_TG), 0))
++    {
++      __atomic_fetch_or (&bar->generation, BAR_SECONDARY_ARRIVED,
++			 MEMMODEL_RELEASE);
++      futex_wake ((int *) &bar->generation, INT_MAX);
++    }
++  else
++    {
++      gomp_assert (orig == gen, "Original flag %u != generation of %u\n", orig,
++		   gen);
++    }
++}
++
++void
++gomp_barrier_wait_end (gomp_barrier_t *bar, gomp_barrier_state_t state,
++		       unsigned id)
++{
++  gomp_assert (!(state & BAR_CANCELLED),
++	       "BAR_CANCELLED set when using plain barrier: %u", state);
++  if (__builtin_expect (state & BAR_WAS_LAST, 0))
++    {
++      gomp_assert (id == 0, "Id %u believes it is last\n", id);
++      /* Shouldn't have anything modifying bar->generation at this point.  */
++      gomp_assert ((bar->generation & ~BAR_BOTH_GENS_MASK) == 0,
++		   "flags set in gomp_barrier_wait_end: %u",
++		   bar->generation & ~BAR_BOTH_GENS_MASK);
++      __atomic_store_n (&bar->generation, bar->generation + BAR_INCR,
++			MEMMODEL_RELEASE);
++      futex_wake ((int *) &bar->generation, INT_MAX);
++    }
++  else
++    {
++      do
++	do_wait ((int *) &bar->generation, state);
++      while (__atomic_load_n (&bar->generation, MEMMODEL_ACQUIRE) == state);
++    }
++}
++
++void
++gomp_barrier_wait (gomp_barrier_t *bar, unsigned id)
+ {
+-  gomp_barrier_wait_end (bar, gomp_barrier_wait_start (bar));
++  gomp_barrier_state_t state = gomp_barrier_wait_start (bar, id);
++  if (__builtin_expect (state & BAR_WAS_LAST, 0))
++    gomp_barrier_ensure_last (bar, id, state);
++  gomp_barrier_wait_end (bar, state, id);
+ }
+ 
+ /* Like gomp_barrier_wait, except that if the encountering thread
+@@ -64,11 +170,29 @@ gomp_barrier_wait (gomp_barrier_t *bar)
+    the barrier can be safely destroyed.  */
+ 
+ void
+-gomp_barrier_wait_last (gomp_barrier_t *bar)
++gomp_barrier_wait_last (gomp_barrier_t *bar, unsigned id)
+ {
+-  gomp_barrier_state_t state = gomp_barrier_wait_start (bar);
++  gomp_assert (id != 0, "Thread with id %u called gomp_barrier_wait_last", id);
++  gomp_barrier_wait_start (bar, id);
++  /* N.b. For the intended use of this function we don't actually need to do
++     the below.  `state & BAR_WAS_LAST` should never be non-zero.  The
++     assertion above checks that `id != 0` and that's the only case when this
++     could be true.  However we write down what the code should be if/when
++     `gomp_barrier_wait_last` gets used in a different way.
++
++     If we do want to provide the possibility for non-primary threads to know
++     that this barrier can be destroyed we would need that non-primary thread
++     to wait on the barrier (as it would having called gomp_barrier_wait`, and
++     the primary thread to signal to it that all other threads have arrived.
++     That would be done with the below (having gotten `state` from the return
++     value of `gomp_barrier_wait_start` call above):
++
+   if (state & BAR_WAS_LAST)
+-    gomp_barrier_wait_end (bar, state);
++    {
++      gomp_barrier_ensure_last (bar, id, state);
++      gomp_barrier_wait_end (bar, state, id);
++    }
++     */
+ }
+ 
+ void
+@@ -77,29 +201,239 @@ gomp_team_barrier_wake (gomp_barrier_t *bar, int count)
+   futex_wake ((int *) &bar->generation, count == 0 ? INT_MAX : count);
+ }
+ 
++/* We need to have some "ensure we're last, but perform useful work
++   in the meantime" function.  This allows the primary thread to perform useful
++   work while it is waiting on all secondary threads.
++   - Again related to the fundamental difference between this barrier and the
++     "centralized" barrier where the thread doing the bookkeeping is
++     pre-determined as some "primary" thread and that is not necessarily the
++     last thread to enter the barrier.
++
++   To do that we loop through checking each of the other threads flags.  If any
++   are not set then we take that opportunity to check the the global generation
++   number, if there's some task to handle then do so before going back to
++   checking the remaining thread-local flags.
++
++   This approach means that the cancellable barriers work reasonably naturally.
++   If we're checking the global generation flag then we can see when it is
++   cancelled.  Hence `gomp_team_barrier_ensure_cancel_last` below does
++   something very similar to this function here.
++
++   The "wait for wakeup" is a little tricky.  When there is nothing for a
++   thread to do we usually call `futex_wait` on an address.  In this case we
++   want to wait on one of two addresses being changed.  In Linux kernels >=
++   5.16 there is the `futex_waitv` syscall which provides us exactly that
++   functionality, but in older kernels we have to implement some mechanism to
++   emulate the functionality.
++
++   On these older kernels (as a fallback implementation) we do the following:
++   - Primary fetch_add's the PRIMARY_WAITING_TG bit to the thread-local
++     generation number of the secondary it's waiting on.
++     - If primary sees that the BAR_INCR was added then secondary reached
++       barrier as we decided to go to sleep waiting for it.
++       Clear the flag and continue.
++     - Otherwise primary futex_wait's on the generation number.
++       - Past this point the only state that this primary thread will use
++	 to indicate that this particular thread has arrived will be
++	 BAR_SECONDARY_ARRIVED set on the barrier-global generation number.
++	 (the increment of the thread-local generation number no longer means
++	 anything to the primary thread, though we do assert that it's done
++	 in a checking build since that is still an invariant that must hold
++	 for later uses of this barrier).
++       - Can get woken up by a new task being added (BAR_TASK_PENDING).
++       - Can get woken up by BAR_SECONDARY_ARRIVED bit flag in the global
++	 generation number saying "secondary you were waiting on has
++	 arrived".
++	 - In this case it clears that bit and returns to looking to see if
++	   all secondary threads have arrived.
++   Meanwhile secondary thread:
++   - Checks the value it gets in `gomp_assert_and_increment_flag`.
++     - If it has the PRIMARY_WAITING_TG flag then set
++       BAR_SECONDARY_ARRIVED on global generation number and futex_wake
++       it.
++   Each secondary thread has to ignore BAR_SECONDARY_ARRIVED in their loop
++   (will still get woken up by it, just continue around the loop until it's
++   cleared).
++
++   N.b. using this fallback mechanism is the only place where any thread
++   modifies a thread-local generation number that is not its own.  This is also
++   the only place where a secondary thread would modify bar->generation without
++   a lock held.  Hence these modifications need a reasonable amount of care
++   w.r.t.  atomicity.  */
+ void
+-gomp_team_barrier_wait_end (gomp_barrier_t *bar, gomp_barrier_state_t state)
++gomp_team_barrier_ensure_last (gomp_barrier_t *bar, unsigned id,
++			       gomp_barrier_state_t state)
++{
++  /* Thought process here:
++     - Until we are the last thread, we are "some thread waiting on the
++       barrier".  Hence we should doing only a variant of what is done in
++       `gomp_team_barrier_wait_end` for the other threads.
++     - The loop done in that function is:
++       1) Wait on `generation` having some flag.
++       2) When it changes, enforce the acquire-release semantics and
++	  re-load.
++       3) If added `BAR_TASK_PENDING`, then handle some tasks.
++       4) Ignore `BAR_WAITING_FOR_TASK` flag.
++     - Hence the loop done in this function is:
++       1) Look through each thread-local generation number.
++	  - When this is not incremented, then:
++	    1. wait on `generation` having some flag.
++	    2. When it does have such a flag, enforce the acquire-release
++	       semantics and load.
++	    3. If added `BAR_TASK_PENDING` then handle some tasks.
++	    4. Ignore `BAR_WAITING_FOR_TASK` not necessary because it's us that
++	       would set that flag.
++       Differences otherwise are that we put pausing in different positions.  */
++  gomp_assert (id == 0, "Calling ensure_last in thread %u\n", id);
++  unsigned gstate = state & (BAR_BOTH_GENS_MASK | BAR_CANCELLED);
++  unsigned tstate = state & BAR_GEN_MASK;
++  struct thread_lock_data *arr = bar->threadgens;
++  for (unsigned i = 1; i < bar->total; i++)
++    {
++      unsigned long long j, count = spin_count ();
++
++    wait_on_this_thread:
++      /* Use `j <= count` here just in case `gomp_spin_count_var == 0` (which
++	 can happen with OMP_WAIT_POLICY=passive).  We need to go around this
++	 loop at least once to check and handle any changes.  */
++      for (j = 0; j <= count; j++)
++	{
++	  /* Thought about using MEMMODEL_ACQUIRE or MEMMODEL_RELAXED until we
++	     see a difference and *then* MEMMODEL_ACQUIRE for the
++	     acquire-release semantics.  Idea was that the more relaxed memory
++	     model might provide a performance boost.  Did not see any
++	     improvement on a micro-benchmark and decided not to do that.
++
++	     TODO Question whether to run one loop checking both variables, or
++		  two loops each checking one variable multiple times. Suspect
++		  that one loop checking both variables is going to be more
++		  responsive and more understandable in terms of performance
++		  characteristics when specifying GOMP_SPINCOUNT.
++		  However there's the chance that checking each variable
++		  something like 10000 times and going around this loop
++		  count/10000 times could give better throughput?  */
++	  unsigned int threadgen
++	    = __atomic_load_n (&arr[i].gen, MEMMODEL_ACQUIRE);
++	  /* If this thread local generation number has PRIMARY_WAITING_TG set,
++	     then we must have set it (primary thread is the only one that sets
++	     this flag).  The mechanism by which that would be set is:
++	     1) We dropped into `futex_waitv` while waiting on this thread
++	     2) Some secondary thread woke us (either by setting
++		`BAR_TASK_PENDING` or the thread we were waiting on setting
++		`BAR_SECONDARY_ARRIVED`).
++	     3) We came out of `futex_wake` and started waiting on this thread
++		again.
++	     Go into the `bar->generation` clause below to reset state around
++	     here and we'll go back to this thing later.  N.b. having
++	     `PRIMARY_WAITING_TG` set on a given thread local generation flag
++	     means that the "continue" flag for this thread is now seeing
++	     `BAR_SECONDARY_ARRIVED` set on the global generation flag.  */
++	  if (__builtin_expect (threadgen != tstate, 0)
++	      && __builtin_expect (!(threadgen & PRIMARY_WAITING_TG), 1))
++	    {
++	      gomp_assert (threadgen == (tstate + BAR_INCR),
++			   "Thread-local state seen to be %u"
++			   " when global state was %u.\n",
++			   threadgen, tstate);
++	      goto wait_on_next_thread;
++	    }
++	  /* Only need for MEMMODEL_ACQUIRE below is when using the futex_waitv
++	     fallback for older kernels.  When this happens we use the
++	     BAR_SECONDARY_ARRIVED flag for synchronisation need to ensure the
++	     acquire-release synchronisation is formed from secondary thread to
++	     primary thread as per OpenMP flush requirements on a barrier.  */
++	  unsigned int gen
++	    = __atomic_load_n (&bar->generation, MEMMODEL_ACQUIRE);
++	  if (__builtin_expect (gen != gstate, 0))
++	    {
++	      /* If there are some tasks to perform then perform them.  */
++	      if (gen & BAR_TASK_PENDING)
++		gomp_barrier_handle_tasks (gstate, bar, false);
++	      if (gen & BAR_SECONDARY_ARRIVED)
++		{
++		  /* Secondary thread has arrived, clear the flag on the
++		     thread local generation and the global generation.
++		     Invariants are:
++		     - BAR_SECONDARY_ARRIVED is only ever set by the secondary
++		       threads and only when their own thread-local generation
++		       has the flag PRIMARY_WAITING_TG.
++		     - PRIMARY_WAITING_TG flag is only ever set by the primary
++		       thread.
++		     - Release-Acquire ordering on the generation number means
++		       that as far as this thread is concerned the relevant
++		       secondary thread must have incremented its generation.
++		     - When using the fallback the required "flush" release
++		       semantics are provided by the Release-Acquire
++		       syncronisation on the generation number (with
++		       BAR_SECONDARY_ARRIVED). Otherwise it's provided by the
++		       Release-Acquire ordering on the thread-local generation.
++		  */
++		  __atomic_fetch_and (&bar->generation, ~BAR_SECONDARY_ARRIVED,
++				      MEMMODEL_RELAXED);
++		  gomp_assert (
++		    (threadgen == ((tstate + BAR_INCR) | PRIMARY_WAITING_TG))
++		      || (threadgen == (tstate | PRIMARY_WAITING_TG)),
++		    "Thread %d local generation is %d but expected"
++		    " PRIMARY_WAITING_TG set because bar->generation"
++		    " marked with SECONDARY (%d)",
++		    i, threadgen, gen);
++		  __atomic_fetch_and (&arr[i].gen, ~PRIMARY_WAITING_TG,
++				      MEMMODEL_RELAXED);
++		}
++	      /* There should be no other way in which this can be different. */
++	      gomp_assert (
++		(gen & BAR_CANCELLED) == (gstate & BAR_CANCELLED),
++		"Unnecessary looping due to mismatching BAR_CANCELLED"
++		" bar->generation: %u   state: %u",
++		gen, gstate);
++	      gomp_assert (
++		!(gen & BAR_WAITING_FOR_TASK),
++		"BAR_WAITING_FOR_TASK set by non-primary thread gen=%d", gen);
++	      gomp_assert (
++		!gomp_barrier_state_is_incremented (gen, gstate, BAR_INCR),
++		"Global state incremented by non-primary thread gen=%d", gen);
++	      goto wait_on_this_thread;
++	    }
++	}
++      /* Neither thread-local generation number nor global generation seem to
++	 be changing.  Wait for one of them to change.  */
++      futex_waitv ((int *) &arr[i].gen, tstate, (int *) &bar->generation,
++		   gstate);
++      /* One of the above values has changed, go back to the start of this loop
++       * and we can find out what it was and deal with it accordingly.  */
++      goto wait_on_this_thread;
++
++    wait_on_next_thread:
++      continue;
++    }
++  gomp_assert_seenflags (bar, false);
++}
++
++void
++gomp_team_barrier_wait_end (gomp_barrier_t *bar, gomp_barrier_state_t state,
++			    unsigned id)
+ {
+   unsigned int generation, gen;
++  gomp_assert (!(state & BAR_CANCELLED),
++	       "Generation number includes BAR_CANCELLED in "
++	       "gomp_team_barrier_wait_end: %u , id: %u",
++	       state, id);
+ 
+   if (__builtin_expect (state & BAR_WAS_LAST, 0))
+     {
+-      /* Next time we'll be awaiting TOTAL threads again.  */
++      gomp_assert (id == 0, "Id %u believes it is last\n", id);
+       struct gomp_thread *thr = gomp_thread ();
+       struct gomp_team *team = thr->ts.team;
+-
+-      bar->awaited = bar->total;
+       team->work_share_cancelled = 0;
+       unsigned task_count
+ 	= __atomic_load_n (&team->task_count, MEMMODEL_ACQUIRE);
+       if (__builtin_expect (task_count, 0))
+ 	{
+-	  gomp_barrier_handle_tasks (state);
++	  gomp_barrier_handle_tasks (state, bar, BAR_INCR);
+ 	  state &= ~BAR_WAS_LAST;
+ 	}
+       else
+ 	{
+-	  state &= ~BAR_CANCELLED;
+ 	  state += BAR_INCR - BAR_WAS_LAST;
+ 	  __atomic_store_n (&bar->generation, state, MEMMODEL_RELEASE);
+ 	  futex_wake ((int *) &bar->generation, INT_MAX);
+@@ -108,108 +442,466 @@ gomp_team_barrier_wait_end (gomp_barrier_t *bar, gomp_barrier_state_t state)
+     }
+ 
+   generation = state;
+-  state &= ~BAR_CANCELLED;
+   do
+     {
+       do_wait ((int *) &bar->generation, generation);
+       gen = __atomic_load_n (&bar->generation, MEMMODEL_ACQUIRE);
++      gomp_assert (!(gen & BAR_CANCELLED),
++		   "BAR_CANCELLED set on generation in team barrier"
++		   " gen: %u  generation: %u  id: %u",
++		   gen, generation, id);
+       if (__builtin_expect (gen & BAR_TASK_PENDING, 0))
+ 	{
+-	  gomp_barrier_handle_tasks (state);
++	  gomp_barrier_handle_tasks (state, bar, BAR_INCR);
+ 	  gen = __atomic_load_n (&bar->generation, MEMMODEL_ACQUIRE);
+ 	}
++      /* These flags will not change until this barrier is completed.
++	 Going forward we don't want to be continually waking up checking for
++	 whether this barrier has completed yet.  */
+       generation |= gen & BAR_WAITING_FOR_TASK;
++      /* Other flags that may be set in `bar->generation` are:
++	 1) BAR_SECONDARY_ARRIVED
++	 2) BAR_SECONDARY_CANCELLABLE_ARRIVED
++	 While we want to ignore these, they should be transient and quickly
++	 removed, hence we don't adjust our expected `generation` accordingly.
++	 TODO Would be good to benchmark both approaches.  */
+     }
+-  while (!gomp_barrier_state_is_incremented (gen, state));
++  while (!gomp_barrier_state_is_incremented (gen, state, BAR_INCR));
+ }
+ 
+ void
+-gomp_team_barrier_wait (gomp_barrier_t *bar)
++gomp_team_barrier_wait (gomp_barrier_t *bar, unsigned id)
+ {
+-  gomp_team_barrier_wait_end (bar, gomp_barrier_wait_start (bar));
++  gomp_barrier_state_t state = gomp_barrier_wait_start (bar, id);
++  if (__builtin_expect (state & BAR_WAS_LAST, 0))
++    gomp_team_barrier_ensure_last (bar, id, state);
++  gomp_team_barrier_wait_end (bar, state, id);
+ }
+ 
+ void
+-gomp_team_barrier_wait_final (gomp_barrier_t *bar)
++gomp_team_barrier_wait_for_tasks (gomp_barrier_t *bar,
++				  gomp_barrier_state_t state, unsigned id)
+ {
+-  gomp_barrier_state_t state = gomp_barrier_wait_final_start (bar);
++  unsigned int generation, gen;
++
+   if (__builtin_expect (state & BAR_WAS_LAST, 0))
+-    bar->awaited_final = bar->total;
+-  gomp_team_barrier_wait_end (bar, state);
++    {
++      gomp_assert (id == 0, "Id %u believes it is last\n", id);
++      struct gomp_thread *thr = gomp_thread ();
++      struct gomp_team *team = thr->ts.team;
++      team->work_share_cancelled = 0;
++      unsigned task_count
++	= __atomic_load_n (&team->task_count, MEMMODEL_ACQUIRE);
++      if (__builtin_expect (task_count, 0))
++	{
++	  gomp_barrier_handle_tasks (state, bar, BAR_HOLDING_SECONDARIES);
++	  state &= ~BAR_WAS_LAST;
++	}
++      else
++	{
++	  unsigned gens = state & ~BAR_WAS_LAST;
++	  gens |= BAR_HOLDING_SECONDARIES;
++	  /* Acquire-release ordering from primary thread to secondary threads
++	     is formed in `gomp_team_barrier_done_final` rather than this
++	     function.  That is where all secondary threads are allowed to run.
++	     However, we do still need to perform an atomic store as-per C
++	     "data race" requirements because there are other threads waiting
++	     in `do_spin` that are repeatedly watching this variable.  */
++	  __atomic_store_n (&bar->generation, gens, MEMMODEL_RELAXED);
++	  return;
++	}
++    }
++
++  generation = state;
++  state &= ~BAR_CANCELLED;
++  do
++    {
++      do_wait ((int *) &bar->generation, generation);
++      gen = __atomic_load_n (&bar->generation, MEMMODEL_ACQUIRE);
++      gomp_assert ((gen & BAR_CANCELLED) == (generation & BAR_CANCELLED)
++		     /* Cancellation of *next* barrier is fine -- we will
++			exit.  */
++		     || gomp_barrier_state_is_incremented (
++		       gen, generation, BAR_HOLDING_SECONDARIES)
++		     /* Can cancel a barrier when already gotten into final
++			implicit barrier at the end of a parallel loop.
++			This happens in `cancel-parallel-3.c`.
++			In this case the above assertion does not hold because
++			We are waiting on the implicit barrier at the end of a
++			parallel region while some other thread is performing
++			work in that parallel region, hits a
++			`#pragma omp cancel parallel`, and sets said flag.  */
++		     || !(generation & BAR_CANCELLED),
++		   "Unnecessary looping due to BAR_CANCELLED diff"
++		   " gen: %u  state: %u  generation: %u  id: %u",
++		   gen, state, generation, id);
++      gomp_assert (!gomp_barrier_state_is_incremented (gen, state,
++						       BAR_HOLDING_SECONDARIES)
++		     || !gomp_barrier_state_is_incremented (
++		       gen, gomp_increment_gen (state, BAR_INCR),
++		       BAR_HOLDING_SECONDARIES),
++		   "Generation has gone ahead of us two times!"
++		   " gen = %u, state = %u, generation = %u",
++		   gen, state, generation);
++      if (__builtin_expect (gen & BAR_TASK_PENDING, 0))
++	{
++	  gomp_barrier_handle_tasks (state, bar, BAR_HOLDING_SECONDARIES);
++	  gen = __atomic_load_n (&bar->generation, MEMMODEL_ACQUIRE);
++	}
++      generation |= gen & BAR_WAITING_FOR_TASK;
++      generation |= gen & BAR_CANCELLED;
++      /* Situation where we know all tasks are finished, and we were called
++	 with instructions to wait for all tasks to finish before letting the
++	 primary thread exit and holding secondary threads ready to be woken
++	 up.  */
++      if (id == 0 && gen & BAR_HOLDING_SECONDARIES)
++	return;
++      generation |= gen & BAR_HOLDING_SECONDARIES;
++    }
++  while (
++    !gomp_barrier_state_is_incremented (gen, state, BAR_HOLDING_SECONDARIES));
++}
++
++void
++gomp_team_barrier_wait_final (gomp_barrier_t *bar, unsigned id)
++{
++  gomp_barrier_state_t state = gomp_barrier_wait_start (bar, id);
++  if (__builtin_expect (state & BAR_WAS_LAST, 0))
++    gomp_team_barrier_ensure_last (bar, id, state);
++  gomp_team_barrier_wait_for_tasks (bar, state, id);
++}
++
++void
++gomp_team_barrier_done_final (gomp_barrier_t *bar, unsigned id)
++{
++  gomp_assert (id == 0, "called with ID = %u", id);
++  unsigned gen = bar->generation;
++  gomp_assert ((gen & BAR_FLAGS_MASK & ~BAR_CANCELLED)
++		 == BAR_HOLDING_SECONDARIES,
++	       "gomp_team_barrier_done_final called with generation: %u", gen);
++  gen &= ~(BAR_HOLDING_SECONDARIES | BAR_CANCELLED);
++  gen += BAR_INCR;
++  __atomic_store_n (&bar->generation, gen, MEMMODEL_RELEASE);
++  futex_wake ((int *) &bar->generation, INT_MAX);
++}
++
++void
++gomp_assert_and_increment_cancel_flag (gomp_barrier_t *bar, unsigned id,
++				       unsigned gens)
++{
++  struct thread_lock_data *arr = bar->threadgens;
++  /* Because we have separate thread local generation numbers for cancellable
++     barriers and non-cancellable barriers, we can use fetch_add in the
++     cancellable thread-local generation number and just let the bits roll over
++     into the BAR_INCR area.  This means we don't have to have a CAS loop to
++     handle the futex_waitv_fallback possibility that the primary thread
++     updates our thread-local variable at the same time as we do.  */
++  unsigned orig
++    = __atomic_fetch_add (&arr[id].cgen, BAR_CANCEL_INCR, MEMMODEL_RELEASE);
++  futex_wake ((int *) &arr[id].cgen, INT_MAX);
++
++  /* However, using that fetch_add means that we need to mask out the values
++     we're comparing against.  Since this masking is not a memory operation we
++     believe that trade-off is good.  */
++  unsigned orig_cgen = orig & (BAR_CANCEL_GEN_MASK | BAR_FLAGS_MASK);
++  unsigned global_cgen = gens & BAR_CANCEL_GEN_MASK;
++  if (__builtin_expect (orig_cgen == (global_cgen | PRIMARY_WAITING_TG), 0))
++    {
++      unsigned prev = __atomic_fetch_or (&bar->generation,
++					 BAR_SECONDARY_CANCELLABLE_ARRIVED,
++					 MEMMODEL_RELAXED);
++      /* Wait! The barrier got cancelled, this flag is nothing but annoying
++	 state to ignore in the non-cancellable barrier that will be coming up
++	 soon and is state that needs to be reset before any following
++	 cancellable barrier is called.  */
++      if (prev & BAR_CANCELLED)
++	__atomic_fetch_and (&bar->generation,
++			    ~BAR_SECONDARY_CANCELLABLE_ARRIVED,
++			    MEMMODEL_RELAXED);
++      futex_wake ((int *) &bar->generation, INT_MAX);
++    }
++  else
++    {
++      gomp_assert (orig_cgen == global_cgen,
++		   "Id %u:  Original flag %u != generation of %u\n", id,
++		   orig_cgen, global_cgen);
++    }
++}
++
++bool
++gomp_team_barrier_ensure_cancel_last (gomp_barrier_t *bar, unsigned id,
++				      gomp_barrier_state_t state)
++{
++  gomp_assert (id == 0, "Calling ensure_cancel_last in thread %u\n", id);
++  unsigned gstate = state & BAR_BOTH_GENS_MASK;
++  unsigned tstate = state & BAR_CANCEL_GEN_MASK;
++  struct thread_lock_data *arr = bar->threadgens;
++  for (unsigned i = 1; i < bar->total; i++)
++    {
++      unsigned long long j, count = spin_count ();
++
++    wait_on_this_thread:
++      for (j = 0; j <= count; j++)
++	{
++	  unsigned int threadgen
++	    = __atomic_load_n (&arr[i].cgen, MEMMODEL_ACQUIRE);
++	  /* Clear "overrun" bits -- spillover into the non-cancellable
++	     generation numbers that we are leaving around in order to avoid
++	     having to perform extra memory operations in this barrier.   */
++	  threadgen &= (BAR_CANCEL_GEN_MASK | BAR_FLAGS_MASK);
++
++	  if (__builtin_expect (threadgen != tstate, 0)
++	      && __builtin_expect (!(threadgen & PRIMARY_WAITING_TG), 1))
++	    {
++	      gomp_assert (threadgen == BAR_INCREMENT_CANCEL (tstate),
++			   "Thread-local state seen to be %u"
++			   " when global state was %u.\n",
++			   threadgen, tstate);
++	      goto wait_on_next_thread;
++	    }
++	  unsigned int gen
++	    = __atomic_load_n (&bar->generation, MEMMODEL_ACQUIRE);
++	  if (__builtin_expect (gen != gstate, 0))
++	    {
++	      gomp_assert (
++		!(gen & BAR_WAITING_FOR_TASK),
++		"BAR_WAITING_FOR_TASK set in non-primary thread gen=%d", gen);
++	      gomp_assert (!gomp_barrier_state_is_incremented (gen, gstate,
++							       BAR_CANCEL_INCR),
++			   "Global state incremented by non-primary thread "
++			   "gstate=%d gen=%d",
++			   gstate, gen);
++	      if (gen & BAR_CANCELLED)
++		{
++		  if (__builtin_expect (threadgen & PRIMARY_WAITING_TG, 0))
++		    __atomic_fetch_and (&arr[i].cgen, ~PRIMARY_WAITING_TG,
++					MEMMODEL_RELAXED);
++		  /* Don't check for BAR_SECONDARY_CANCELLABLE_ARRIVED here.
++		     There are too many windows for race conditions if
++		     resetting here (essentially can't guarantee that we'll
++		     catch it so appearing like we might is just confusing).
++		     Instead the primary thread has to ignore that flag in the
++		     next barrier (which will be a non-cancellable barrier),
++		     and we'll eventually reset it either in the thread that
++		     set `BAR_CANCELLED` or in the thread that set
++		     `BAR_SECONDARY_CANCELLABLE_ARRIVED`.  */
++		  return false;
++		}
++	      if (gen & BAR_SECONDARY_CANCELLABLE_ARRIVED)
++		{
++		  __atomic_fetch_and (&bar->generation,
++				      ~BAR_SECONDARY_CANCELLABLE_ARRIVED,
++				      MEMMODEL_RELAXED);
++		  gomp_assert (
++		    (threadgen
++		     == (BAR_INCREMENT_CANCEL (tstate) | PRIMARY_WAITING_TG))
++		      || (threadgen == (tstate | PRIMARY_WAITING_TG)),
++		    "Thread %d local generation is %d but expected"
++		    " PRIMARY_WAITING_TG set because bar->generation"
++		    " marked with SECONDARY (%d)",
++		    i, threadgen, gen);
++		  __atomic_fetch_and (&arr[i].cgen, ~PRIMARY_WAITING_TG,
++				      MEMMODEL_RELAXED);
++		}
++
++	      if (gen & BAR_TASK_PENDING)
++		gomp_barrier_handle_tasks (gstate, bar, false);
++	      goto wait_on_this_thread;
++	    }
++	}
++      futex_waitv ((int *) &arr[i].cgen, tstate, (int *) &bar->generation,
++		   gstate);
++      goto wait_on_this_thread;
++
++    wait_on_next_thread:
++      continue;
++    }
++  gomp_assert_seenflags (bar, true);
++  return true;
+ }
+ 
+ bool
+ gomp_team_barrier_wait_cancel_end (gomp_barrier_t *bar,
+-				   gomp_barrier_state_t state)
++				   gomp_barrier_state_t state, unsigned id)
+ {
+   unsigned int generation, gen;
++  gomp_assert (
++    !(state & BAR_CANCELLED),
++    "gomp_team_barrier_wait_cancel_end called when barrier cancelled state: %u",
++    state);
+ 
+   if (__builtin_expect (state & BAR_WAS_LAST, 0))
+     {
+-      /* Next time we'll be awaiting TOTAL threads again.  */
+-      /* BAR_CANCELLED should never be set in state here, because
+-	 cancellation means that at least one of the threads has been
+-	 cancelled, thus on a cancellable barrier we should never see
+-	 all threads to arrive.  */
+       struct gomp_thread *thr = gomp_thread ();
+       struct gomp_team *team = thr->ts.team;
+-
+-      bar->awaited = bar->total;
+       team->work_share_cancelled = 0;
+       unsigned task_count
+ 	= __atomic_load_n (&team->task_count, MEMMODEL_ACQUIRE);
+       if (__builtin_expect (task_count, 0))
+ 	{
+-	  gomp_barrier_handle_tasks (state);
++	  gomp_barrier_handle_tasks (state, bar, BAR_CANCEL_INCR);
+ 	  state &= ~BAR_WAS_LAST;
+ 	}
+       else
+ 	{
+-	  state += BAR_INCR - BAR_WAS_LAST;
++	  state &= ~BAR_WAS_LAST;
++	  state = BAR_INCREMENT_CANCEL (state);
+ 	  __atomic_store_n (&bar->generation, state, MEMMODEL_RELEASE);
+ 	  futex_wake ((int *) &bar->generation, INT_MAX);
+ 	  return false;
+ 	}
+     }
+ 
+-  if (__builtin_expect (state & BAR_CANCELLED, 0))
+-    return true;
+-
+   generation = state;
+   do
+     {
+       do_wait ((int *) &bar->generation, generation);
+       gen = __atomic_load_n (&bar->generation, MEMMODEL_ACQUIRE);
+       if (__builtin_expect (gen & BAR_CANCELLED, 0))
+-	return true;
++	{
++	  if (__builtin_expect ((gen & BAR_CANCEL_GEN_MASK)
++				  != (state & BAR_CANCEL_GEN_MASK),
++				0))
++	    {
++	      /* Have cancelled a barrier just after completing the current
++		 one.  We must not reset our local state.  */
++	      gomp_assert (
++		(gen & BAR_CANCEL_GEN_MASK)
++		  == (BAR_INCREMENT_CANCEL (state) & BAR_CANCEL_GEN_MASK),
++		"Incremented global generation (cancellable) more than one"
++		" gen: %u  original state: %u",
++		gen, state);
++	      /* Other threads could have continued on in between the time that
++		 the primary thread signalled all other threads should wake up
++		 and the time that we actually read `bar->generation` above.
++		 Any one of them could be performing tasks, also they could be
++		 waiting on the next barrier and could have set
++		 BAR_SECONDARY{_CANCELLABLE,}_ARRIVED.
++
++		 W.r.t. the task handling that could have been set (primary
++		 thread increments generation telling us to go, then it
++		 continues itself and finds an `omp task` directive and
++		 schedules a task) we need to move on with it (PR122314).  */
++	      gomp_assert (!(gen & BAR_WAITING_FOR_TASK),
++			   "Generation incremented while "
++			   " main thread is still waiting for tasks: gen: %u  "
++			   "original state: %u",
++			   gen, state);
++	      /* *This* barrier wasn't cancelled -- the next barrier is
++		 cancelled.  Returning `false` gives that information back up
++		 to calling functions.  */
++	      return false;
++	    }
++	  /* Need to reset our thread-local generation.  Don't want state to be
++	     messed up the next time we hit a cancellable barrier.
++	     Must do this atomically because the cancellation signal could
++	     happen from "somewhere else" while the primary thread has decided
++	     that it wants to wait on us -- if we're using the fallback for
++	     pre-5.16 Linux kernels.
++
++	     We are helped by the invariant that when this barrier is
++	     cancelled, the next barrier that will be entered is a
++	     non-cancellable barrier.  That means we don't have to worry about
++	     the primary thread getting confused by this generation being
++	     incremented to say it's reached a cancellable barrier.
++
++	     We do not reset the PRIMARY_WAITING_TG bit.  That is left to the
++	     primary thread.  We only subtract the BAR_CANCEL_INCR that we
++	     added before getting here.
++
++	     N.b. Another approach to avoid problems with multiple threads
++	     modifying this thread-local generation could be for the primary
++	     thread to reset the thread-local generations once it's "gathered"
++	     all threads during the next non-cancellable barrier.  Such a reset
++	     would not need to be atomic because we would know that all threads
++	     have already acted on their thread-local generation number.
++
++	     That approach mirrors the previous approach where the primary
++	     thread would reset `awaited`.  The problem with this is that now
++	     we have *many* generations to reset, the primary thread can be the
++	     bottleneck in a barrier (it performs the most work) and putting
++	     more work into the primary thread while all secondary threads are
++	     waiting on it seems problematic.  Moreover outside of the
++	     futex_waitv_fallback the primary thread does not adjust the
++	     thread-local generations.  Maintaining that property where
++	     possible seems very worthwhile.  */
++	  unsigned orig __attribute__ ((unused))
++	  = __atomic_fetch_sub (&bar->threadgens[id].cgen, BAR_CANCEL_INCR,
++				MEMMODEL_RELAXED);
++#if _LIBGOMP_CHECKING_
++	  unsigned orig_gen = (orig & BAR_CANCEL_GEN_MASK);
++	  unsigned global_gen_plus1
++	    = ((gen + BAR_CANCEL_INCR) & BAR_CANCEL_GEN_MASK);
++	  gomp_assert (orig_gen == global_gen_plus1
++			 || orig_gen == (global_gen_plus1 | PRIMARY_WAITING_TG),
++		       "Thread-local generation %u unknown modification:"
++		       " expected %u (with possible PRIMARY* flags) seen %u",
++		       id, (gen + BAR_CANCEL_INCR) & BAR_CANCEL_GEN_MASK, orig);
++#endif
++	  return true;
++	}
+       if (__builtin_expect (gen & BAR_TASK_PENDING, 0))
+ 	{
+-	  gomp_barrier_handle_tasks (state);
++	  gomp_barrier_handle_tasks (state, bar, BAR_CANCEL_INCR);
+ 	  gen = __atomic_load_n (&bar->generation, MEMMODEL_ACQUIRE);
+ 	}
+       generation |= gen & BAR_WAITING_FOR_TASK;
+     }
+-  while (!gomp_barrier_state_is_incremented (gen, state));
++  while (!gomp_barrier_state_is_incremented (gen, state, BAR_CANCEL_INCR));
+ 
+   return false;
+ }
+ 
+ bool
+-gomp_team_barrier_wait_cancel (gomp_barrier_t *bar)
++gomp_team_barrier_wait_cancel (gomp_barrier_t *bar, unsigned id)
+ {
+-  return gomp_team_barrier_wait_cancel_end (bar, gomp_barrier_wait_start (bar));
++  gomp_barrier_state_t state = gomp_barrier_wait_cancel_start (bar, id);
++
++  if (__builtin_expect (state & BAR_CANCELLED, 0))
++    return true;
++
++  if (__builtin_expect (state & BAR_WAS_LAST, 0)
++      && !gomp_team_barrier_ensure_cancel_last (bar, id, state))
++    {
++      gomp_reset_cancellable_primary_threadgen (bar, id);
++      return true;
++    }
++  return gomp_team_barrier_wait_cancel_end (bar, state, id);
+ }
+ 
+ void
+ gomp_team_barrier_cancel (struct gomp_team *team)
+ {
+-  gomp_mutex_lock (&team->task_lock);
+-  if (team->barrier.generation & BAR_CANCELLED)
+-    {
+-      gomp_mutex_unlock (&team->task_lock);
+-      return;
+-    }
+-  team->barrier.generation |= BAR_CANCELLED;
+-  gomp_mutex_unlock (&team->task_lock);
+-  futex_wake ((int *) &team->barrier.generation, INT_MAX);
++  /* Always set CANCEL on the barrier.  Means we have one simple atomic
++     operation.  Need an atomic operation because the barrier now uses the
++     `generation` to communicate.
++
++     Don't need to add any memory-ordering here.  The only thing that
++     BAR_CANCELLED signifies is that the barrier is cancelled and the only
++     thing that BAR_SECONDARY_CANCELLABLE_ARRIVED signifies is that the
++     secondary thread has arrived at the barrier.  No thread infers anything
++     about any other data having been set based on these flags.  */
++  unsigned orig = __atomic_fetch_or (&team->barrier.generation, BAR_CANCELLED,
++				     MEMMODEL_RELAXED);
++  /* We're cancelling a barrier and it's currently using the fallback mechanism
++     instead of the futex_waitv syscall.  We need to ensure that state gets
++     reset before the next cancellable barrier.
++
++     Any cancelled barrier is followed by a non-cancellable barrier so just
++     ensuring this reset happens in one thread allows us to ensure that it
++     happens before any thread reaches the next cancellable barrier.
++
++     This and the check in `gomp_assert_and_increment_cancel_flag` are the two
++     ways in which we ensure `BAR_SECONDARY_CANCELLABLE_ARRIVED` is reset by
++     the time that any thread arrives at the next cancellable barrier.
++
++     We need both since that `BAR_SECONDARY_CANCELLABLE_ARRIVED` flag could be
++     set *just* after this `BAR_CANCELLED` bit gets set (in which case the
++     other case handles resetting) or before (in which case this clause handles
++     resetting).  */
++  if (orig & BAR_SECONDARY_CANCELLABLE_ARRIVED)
++    __atomic_fetch_and (&team->barrier.generation,
++			~BAR_SECONDARY_CANCELLABLE_ARRIVED, MEMMODEL_RELAXED);
++  if (!(orig & BAR_CANCELLED))
++    futex_wake ((int *) &team->barrier.generation, INT_MAX);
+ }
+diff --git a/libgomp/config/linux/bar.h b/libgomp/config/linux/bar.h
+index 4dc0d3c..9fb5909 100644
+--- a/libgomp/config/linux/bar.h
++++ b/libgomp/config/linux/bar.h
+@@ -32,14 +32,33 @@
+ 
+ #include "mutex.h"
+ 
++/* Handy to have `cgen` and `gen` separate, since then we can use
++   `__atomic_fetch_add` directly on the `cgen` instead of having to use a CAS
++   loop to increment the cancel generation bits.  If it weren't for the
++   fallback for when `futex_waitv` is not available it wouldn't matter but with
++   that fallback more than one thread can adjust these thread-local generation
++   numbers and hence we have to be concerned about synchronisation issues.  */
++struct __attribute__ ((aligned (64))) thread_lock_data
++{
++  unsigned gen;
++  unsigned cgen;
++};
++
+ typedef struct
+ {
+-  /* Make sure total/generation is in a mostly read cacheline, while
+-     awaited in a separate cacheline.  */
++  /* Make sure total/allocated and generation are in mostly read cachelines
++     while awaited in a separate cacheline.  Each generation structure is in a
++     separate cache line too.  Put both cancellable and non-cancellable
++     generation numbers in the same cache line because they should both be
++     only ever modified by their corresponding thread (except in the case of
++     the primary thread wanting to wait on a given thread arriving at the
++     barrier and we're on an old Linux kernel).  */
+   unsigned total __attribute__((aligned (64)));
++  unsigned allocated;
+   unsigned generation;
+-  unsigned awaited __attribute__((aligned (64)));
+-  unsigned awaited_final;
++  /* `awaited` only used for "simple" barrier.  */
++  unsigned awaited __attribute__ ((aligned (64)));
++  struct thread_lock_data *threadgens;
+ } gomp_barrier_t;
+ 
+ typedef unsigned int gomp_barrier_state_t;
+@@ -48,45 +67,158 @@ typedef unsigned int gomp_barrier_state_t;
+    low bits dedicated to flags.  Note that TASK_PENDING and WAS_LAST can
+    share space because WAS_LAST is never stored back to generation.  */
+ #define BAR_TASK_PENDING	1
++/* In this particular target BAR_WAS_LAST indicates something more like
++   "chosen by design to be last", but I like having the macro the same name as
++   it is given in other targets.  */
+ #define BAR_WAS_LAST		1
+ #define BAR_WAITING_FOR_TASK	2
+ #define BAR_CANCELLED		4
+-#define BAR_INCR		8
++/* BAR_SECONDARY_ARRIVED and PRIMARY_WAITING_TG flags are only used for the
++   fallback approach when `futex_waitv` is not available.  That syscall should
++   be available on all kernels newer than Linux 5.16.  */
++#define BAR_SECONDARY_ARRIVED 8
++#define BAR_SECONDARY_CANCELLABLE_ARRIVED 16
++/* Flag to indicate that primary should be released while others should be
++   left.  */
++#define BAR_HOLDING_SECONDARIES 32
++/* Using bits 6 -> 11 for the generation number of cancellable barriers and
++   remaining bits for the generation number of non-cancellable barriers.  */
++#define BAR_CANCEL_INCR 64
++#define BAR_INCR 4096
++#define BAR_FLAGS_MASK (~(-BAR_CANCEL_INCR))
++#define BAR_GEN_MASK (-BAR_INCR)
++#define BAR_BOTH_GENS_MASK (-BAR_CANCEL_INCR)
++#define BAR_CANCEL_GEN_MASK (-BAR_CANCEL_INCR & (~(-BAR_INCR)))
++/* Increment BAR_CANCEL_INCR, with wrapping arithmetic within the bits assigned
++   to this generation number.  I.e. Increment, then set bits above BAR_INCR to
++   what they were before.  */
++#define BAR_INCREMENT_CANCEL(X)                                                \
++  ({                                                                           \
++    __typeof__ (X) _X = (X);                                                   \
++    (((_X + BAR_CANCEL_INCR) & BAR_CANCEL_GEN_MASK)                            \
++     | (_X & ~BAR_CANCEL_GEN_MASK));                                           \
++  })
++/* The thread-local generation field similarly contains a counter in the high
++   bits and has a few low bits dedicated to flags.  None of the flags above are
++   used in the thread-local generation field.  Hence we can have a different
++   set of bits for a protocol between the primary thread and the secondary
++   threads.  */
++#define PRIMARY_WAITING_TG 1
++
++static inline void
++gomp_assert_seenflags (gomp_barrier_t *bar, bool cancellable)
++{
++#if _LIBGOMP_CHECKING_
++  unsigned gen = __atomic_load_n (&bar->generation, MEMMODEL_RELAXED);
++  struct thread_lock_data *arr = bar->threadgens;
++  unsigned cancel_incr = cancellable ? BAR_CANCEL_INCR : 0;
++  unsigned incr = cancellable ? 0 : BAR_INCR;
++  /* Assert that all threads have been seen.  */
++  for (unsigned i = 0; i < bar->total; i++)
++    {
++      unsigned g = arr[i].gen;
++      unsigned cg = arr[i].cgen;
++      gomp_assert (g == (gen & BAR_GEN_MASK) + incr,
++		   "Index %u generation is %u (global is %u)\n", i, g, gen);
++      gomp_assert ((cg & BAR_CANCEL_GEN_MASK)
++		     == ((gen + cancel_incr) & BAR_CANCEL_GEN_MASK),
++		   "Index %u cancel generation is %u (global is %u)\n", i, cg,
++		   gen);
++    }
+ 
+-static inline void gomp_barrier_init (gomp_barrier_t *bar, unsigned count)
++  /* Assert that generation numbers not corresponding to any thread are
++     cleared.  This helps us test code-paths.  */
++  for (unsigned i = bar->total; i < bar->allocated; i++)
++    {
++      unsigned g = arr[i].gen;
++      unsigned cg = arr[i].cgen;
++      gomp_assert (g == 0,
++		   "Index %u gen should be 0.  Is %u (global gen is %u)\n", i,
++		   g, gen);
++      gomp_assert (cg == 0,
++		   "Index %u gen should be 0.  Is %u (global gen is %u)\n", i,
++		   cg, gen);
++    }
++#endif
++}
++
++static inline void
++gomp_centralized_barrier_init (gomp_barrier_t *bar, unsigned count)
+ {
++  bar->threadgens = NULL;
+   bar->total = count;
++  bar->allocated = 0;
+   bar->awaited = count;
+-  bar->awaited_final = count;
+   bar->generation = 0;
+ }
+ 
+-static inline void gomp_barrier_reinit (gomp_barrier_t *bar, unsigned count)
++static inline void
++gomp_barrier_init (gomp_barrier_t *bar, unsigned count)
+ {
+-  __atomic_add_fetch (&bar->awaited, count - bar->total, MEMMODEL_ACQ_REL);
++  bar->threadgens
++    = gomp_aligned_alloc (64, sizeof (bar->threadgens[0]) * count);
++  for (unsigned i = 0; i < count; ++i)
++    {
++      bar->threadgens[i].gen = 0;
++      bar->threadgens[i].cgen = 0;
++    }
+   bar->total = count;
++  bar->allocated = count;
++  bar->awaited = count;
++  bar->generation = 0;
++}
++
++/* When re-initialising a barrier we know that all threads are serialised on
++   something else (because `gomp_barrier_can_hold` returns true.  However we
++   still want to have memory synchronisation between each thread so still use
++   atomic operations.  */
++static inline void
++gomp_centralized_barrier_reinit (gomp_barrier_t *bar, unsigned nthreads)
++{
++  __atomic_add_fetch (&bar->awaited, nthreads - bar->total, MEMMODEL_ACQ_REL);
++  bar->total = nthreads;
+ }
+ 
+ static inline void gomp_barrier_destroy (gomp_barrier_t *bar)
+ {
++  gomp_aligned_free (bar->threadgens);
+ }
+ 
+-extern void gomp_barrier_wait (gomp_barrier_t *);
+-extern void gomp_barrier_wait_last (gomp_barrier_t *);
+-extern void gomp_barrier_wait_end (gomp_barrier_t *, gomp_barrier_state_t);
+-extern void gomp_team_barrier_wait (gomp_barrier_t *);
+-extern void gomp_team_barrier_wait_final (gomp_barrier_t *);
+-extern void gomp_team_barrier_wait_end (gomp_barrier_t *,
+-					gomp_barrier_state_t);
+-extern bool gomp_team_barrier_wait_cancel (gomp_barrier_t *);
+-extern bool gomp_team_barrier_wait_cancel_end (gomp_barrier_t *,
++extern void gomp_barrier_wait (gomp_barrier_t *, unsigned);
++extern void gomp_barrier_wait_last (gomp_barrier_t *, unsigned);
++extern void gomp_barrier_wait_end (gomp_barrier_t *, gomp_barrier_state_t,
++				   unsigned);
++
++extern void gomp_centralized_barrier_wait (gomp_barrier_t *);
++extern void gomp_centralized_barrier_wait_last (gomp_barrier_t *);
++extern void gomp_centralized_barrier_wait_end (gomp_barrier_t *,
+ 					       gomp_barrier_state_t);
++
++extern void gomp_team_barrier_wait (gomp_barrier_t *, unsigned);
++extern void gomp_team_barrier_wait_final (gomp_barrier_t *, unsigned);
++extern void gomp_team_barrier_wait_end (gomp_barrier_t *, gomp_barrier_state_t,
++					unsigned);
++
++extern bool gomp_team_barrier_wait_cancel (gomp_barrier_t *, unsigned);
++extern bool gomp_team_barrier_wait_cancel_end (gomp_barrier_t *,
++					       gomp_barrier_state_t, unsigned);
++
+ extern void gomp_team_barrier_wake (gomp_barrier_t *, int);
+ struct gomp_team;
+ extern void gomp_team_barrier_cancel (struct gomp_team *);
++extern void gomp_team_barrier_ensure_last (gomp_barrier_t *, unsigned,
++					   gomp_barrier_state_t);
++extern void gomp_barrier_ensure_last (gomp_barrier_t *, unsigned,
++				      gomp_barrier_state_t);
++extern bool gomp_team_barrier_ensure_cancel_last (gomp_barrier_t *, unsigned,
++						  gomp_barrier_state_t);
++extern void gomp_assert_and_increment_flag (gomp_barrier_t *, unsigned,
++					    unsigned);
++extern void gomp_assert_and_increment_cancel_flag (gomp_barrier_t *, unsigned,
++						   unsigned);
+ 
+ static inline gomp_barrier_state_t
+-gomp_barrier_wait_start (gomp_barrier_t *bar)
++gomp_centralized_barrier_wait_start (gomp_barrier_t *bar)
+ {
+   unsigned int ret = __atomic_load_n (&bar->generation, MEMMODEL_ACQUIRE);
+   ret &= -BAR_INCR | BAR_CANCELLED;
+@@ -101,87 +233,193 @@ gomp_barrier_wait_start (gomp_barrier_t *bar)
+ }
+ 
+ static inline gomp_barrier_state_t
+-gomp_barrier_wait_cancel_start (gomp_barrier_t *bar)
++gomp_barrier_wait_start (gomp_barrier_t *bar, unsigned id)
+ {
+-  return gomp_barrier_wait_start (bar);
++  /* TODO I don't believe this MEMMODEL_ACQUIRE is needed.
++     Look into it later.  Point being that this should only ever read a value
++     from last barrier or from tasks/cancellation/etc.  There was already an
++     acquire-release ordering at exit of the last barrier, all setting of
++     tasks/cancellation etc are done with RELAXED memory model => using ACQUIRE
++     doesn't help.
++
++     See corresponding comment in `gomp_team_barrier_cancel` when thinking
++     about this.  */
++  unsigned int ret = __atomic_load_n (&bar->generation, MEMMODEL_ACQUIRE);
++  ret &= (BAR_BOTH_GENS_MASK | BAR_CANCELLED);
++#if !_LIBGOMP_CHECKING_
++  if (id != 0)
++#endif
++    /* Increment local flag.  For thread id 0 this doesn't communicate
++       anything to *other* threads, but it is useful for debugging purposes.  */
++    gomp_assert_and_increment_flag (bar, id, ret);
++
++  if (id == 0)
++    ret |= BAR_WAS_LAST;
++  return ret;
+ }
+ 
+-/* This is like gomp_barrier_wait_start, except it decrements
+-   bar->awaited_final rather than bar->awaited and should be used
+-   for the gomp_team_end barrier only.  */
+ static inline gomp_barrier_state_t
+-gomp_barrier_wait_final_start (gomp_barrier_t *bar)
++gomp_barrier_wait_cancel_start (gomp_barrier_t *bar, unsigned id)
+ {
+   unsigned int ret = __atomic_load_n (&bar->generation, MEMMODEL_ACQUIRE);
+-  ret &= -BAR_INCR | BAR_CANCELLED;
+-  /* See above gomp_barrier_wait_start comment.  */
+-  if (__atomic_add_fetch (&bar->awaited_final, -1, MEMMODEL_ACQ_REL) == 0)
++  ret &= BAR_BOTH_GENS_MASK | BAR_CANCELLED;
++  if (!(ret & BAR_CANCELLED)
++#if !_LIBGOMP_CHECKING_
++      && id != 0
++#endif
++  )
++    gomp_assert_and_increment_cancel_flag (bar, id, ret);
++  if (id == 0)
+     ret |= BAR_WAS_LAST;
+   return ret;
+ }
+ 
++static inline void
++gomp_reset_cancellable_primary_threadgen (gomp_barrier_t *bar, unsigned id)
++{
++#if _LIBGOMP_CHECKING_
++  gomp_assert (id == 0,
++	       "gomp_reset_cancellable_primary_threadgen called with "
++	       "non-primary thread id: %u",
++	       id);
++  unsigned orig = __atomic_fetch_sub (&bar->threadgens[id].cgen,
++				      BAR_CANCEL_INCR, MEMMODEL_RELAXED);
++  unsigned orig_gen = (orig & BAR_CANCEL_GEN_MASK);
++  unsigned gen = __atomic_load_n (&bar->generation, MEMMODEL_RELAXED);
++  unsigned global_gen_plus1 = ((gen + BAR_CANCEL_INCR) & BAR_CANCEL_GEN_MASK);
++  gomp_assert (orig_gen == global_gen_plus1,
++	       "Thread-local generation %u unknown modification:"
++	       " expected %u seen %u",
++	       id, (gen + BAR_CANCEL_GEN_MASK) & BAR_CANCEL_GEN_MASK, orig);
++#endif
++}
++
+ static inline bool
+ gomp_barrier_last_thread (gomp_barrier_state_t state)
+ {
+   return state & BAR_WAS_LAST;
+ }
+ 
+-/* All the inlines below must be called with team->task_lock
+-   held.  */
++extern void gomp_team_barrier_done_final (gomp_barrier_t *bar, unsigned id);
++
++static inline bool
++gomp_barrier_can_hold (gomp_barrier_t *bar)
++{
++  return true;
++}
++
++/* All the inlines below must be called with team->task_lock held.  However
++   with the `futex_waitv` fallback there can still be contention on
++   `bar->generation`.  For the RMW operations it is obvious that we need to
++   perform these atomically.  For the load in `gomp_barrier_has_completed` and
++   `gomp_team_barrier_cancelled` the need is tied to the C specification.
++
++   On the architectures I have some grips on (x86_64 and AArch64) there would
++   be no real downside to setting a bit in thread while reading in another.
++   However the C definition of data race doesn't have any such leeway and to
++   avoid UB we need to load atomically.  */
+ 
+ static inline void
+ gomp_team_barrier_set_task_pending (gomp_barrier_t *bar)
+ {
+-  bar->generation |= BAR_TASK_PENDING;
++  __atomic_fetch_or (&bar->generation, BAR_TASK_PENDING, MEMMODEL_RELAXED);
+ }
+ 
+ static inline void
+ gomp_team_barrier_clear_task_pending (gomp_barrier_t *bar)
+ {
+-  bar->generation &= ~BAR_TASK_PENDING;
++  __atomic_fetch_and (&bar->generation, ~BAR_TASK_PENDING, MEMMODEL_RELAXED);
+ }
+ 
+ static inline void
+ gomp_team_barrier_set_waiting_for_tasks (gomp_barrier_t *bar)
+ {
+-  bar->generation |= BAR_WAITING_FOR_TASK;
++  __atomic_fetch_or (&bar->generation, BAR_WAITING_FOR_TASK, MEMMODEL_RELAXED);
+ }
+ 
+ static inline bool
+ gomp_team_barrier_waiting_for_tasks (gomp_barrier_t *bar)
+ {
+-  return (bar->generation & BAR_WAITING_FOR_TASK) != 0;
++  unsigned gen = __atomic_load_n (&bar->generation, MEMMODEL_RELAXED);
++  return (gen & BAR_WAITING_FOR_TASK) != 0;
+ }
+ 
+ static inline bool
+ gomp_team_barrier_cancelled (gomp_barrier_t *bar)
+ {
+-  return __builtin_expect ((bar->generation & BAR_CANCELLED) != 0, 0);
++  unsigned gen = __atomic_load_n (&bar->generation, MEMMODEL_RELAXED);
++  return __builtin_expect ((gen & BAR_CANCELLED) != 0, 0);
++}
++
++static inline unsigned
++gomp_increment_gen (gomp_barrier_state_t gen, unsigned increment)
++{
++  unsigned gens = (gen & BAR_BOTH_GENS_MASK);
++  switch (increment)
++    {
++    case BAR_CANCEL_INCR:
++      return BAR_INCREMENT_CANCEL (gens);
++    /* Increment of `false` used when increment of barrier not possible.
++       Used when the primary thread is waiting for all other threads to arrive.
++       Using `false` just as something to make it clear in the code that this
++       function can't increment.  This function still has to handle such an
++       argument.  */
++    case false:
++    case BAR_INCR:
++      return gens + BAR_INCR;
++    case BAR_HOLDING_SECONDARIES:
++      return gens | BAR_HOLDING_SECONDARIES;
++    default:
++      gomp_fatal ("Unknown increment in gomp_increment_gen: %u\n", increment);
++    }
+ }
+ 
+ static inline void
+-gomp_team_barrier_done (gomp_barrier_t *bar, gomp_barrier_state_t state)
++gomp_team_barrier_done (gomp_barrier_t *bar, gomp_barrier_state_t state,
++			unsigned increment)
+ {
+-  /* Need the atomic store for acquire-release synchronisation with the
+-     load in `gomp_team_barrier_wait_{cancel_,}end`.  See PR112356  */
+-  __atomic_store_n (&bar->generation, (state & -BAR_INCR) + BAR_INCR,
++  /* Using MEMMODEL_RELEASE because this will "publish" the user data written
++     in tasks to other threads.  */
++#if _LIBGOMP_CHECKING_
++  if (increment == BAR_HOLDING_SECONDARIES)
++    {
++      unsigned cur = __atomic_load_n (&bar->generation, MEMMODEL_RELAXED);
++      gomp_assert (!(cur & BAR_HOLDING_SECONDARIES),
++		   "Setting BAR_HOLDING_SECONDARIES on generation of %u", cur);
++    }
++#endif
++  __atomic_store_n (&bar->generation, gomp_increment_gen (state, increment),
+ 		    MEMMODEL_RELEASE);
+ }
+ 
+ static inline bool
+ gomp_barrier_state_is_incremented (gomp_barrier_state_t gen,
+-				   gomp_barrier_state_t state)
++				   gomp_barrier_state_t state,
++				   unsigned increment)
+ {
+-  unsigned next_state = (state & -BAR_INCR) + BAR_INCR;
+-  return next_state > state ? gen >= next_state : gen < state;
++  /* In the case of BAR_HOLDING_SECONDARIES the actual point at which all
++     threads are released is an increment of BAR_INCR after the primary thread
++     has continued past that temporary hold.  */
++  if (increment == BAR_HOLDING_SECONDARIES)
++    increment = BAR_INCR;
++  unsigned next = gomp_increment_gen (state, increment);
++  return next > state ? gen >= next : gen < state;
+ }
+ 
+ static inline bool
+-gomp_barrier_has_completed (gomp_barrier_state_t state, gomp_barrier_t *bar)
++gomp_barrier_has_completed (gomp_barrier_state_t state, gomp_barrier_t *bar,
++			    unsigned increment)
+ {
+-  /* Handling overflow in the generation.  The "next" state could be less than
+-     or greater than the current one.  */
+-  return gomp_barrier_state_is_incremented (bar->generation, state);
++  unsigned curgen = __atomic_load_n (&bar->generation, MEMMODEL_RELAXED);
++  if (curgen & BAR_HOLDING_SECONDARIES)
++    {
++      gomp_assert (increment == BAR_HOLDING_SECONDARIES,
++		   "Barrier generation %u which claims holding secondaries"
++		   " but increment was %u",
++		   curgen, increment);
++      return true;
++    }
++  return gomp_barrier_state_is_incremented (curgen, state, increment);
+ }
+ 
+ #endif /* GOMP_BARRIER_H */
+diff --git a/libgomp/config/linux/wait.h b/libgomp/config/linux/wait.h
+index f914140..38a387f 100644
+--- a/libgomp/config/linux/wait.h
++++ b/libgomp/config/linux/wait.h
+@@ -35,6 +35,8 @@
+ 
+ #define FUTEX_WAIT	0
+ #define FUTEX_WAKE	1
++
++#define FUTEX_32 2
+ #define FUTEX_PRIVATE_FLAG	128
+ 
+ #ifdef HAVE_ATTRIBUTE_VISIBILITY
+@@ -45,14 +47,21 @@ extern int gomp_futex_wait, gomp_futex_wake;
+ 
+ #include <futex.h>
+ 
+-static inline int do_spin (int *addr, int val)
++static inline unsigned long long
++spin_count ()
+ {
+-  unsigned long long i, count = gomp_spin_count_var;
+-
++  unsigned long long count = gomp_spin_count_var;
+   if (__builtin_expect (__atomic_load_n (&gomp_managed_threads,
+                                          MEMMODEL_RELAXED)
+                         > gomp_available_cpus, 0))
+     count = gomp_throttled_spin_count_var;
++  return count;
++}
++
++static inline int
++do_spin (int *addr, int val)
++{
++  unsigned long long i, count = spin_count ();
+   for (i = 0; i < count; i++)
+     if (__builtin_expect (__atomic_load_n (addr, MEMMODEL_RELAXED) != val, 0))
+       return 0;
+diff --git a/libgomp/config/nvptx/bar.c b/libgomp/config/nvptx/bar.c
+index aabc44a..dbe59b0 100644
+--- a/libgomp/config/nvptx/bar.c
++++ b/libgomp/config/nvptx/bar.c
+@@ -31,7 +31,8 @@
+ #include "libgomp.h"
+ 
+ void
+-gomp_barrier_wait_end (gomp_barrier_t *bar, gomp_barrier_state_t state)
++gomp_barrier_wait_end (gomp_barrier_t *bar, gomp_barrier_state_t state,
++		       unsigned id __attribute__ ((unused)))
+ {
+   if (__builtin_expect (state & BAR_WAS_LAST, 0))
+     {
+@@ -45,9 +46,9 @@ gomp_barrier_wait_end (gomp_barrier_t *bar, gomp_barrier_state_t state)
+ }
+ 
+ void
+-gomp_barrier_wait (gomp_barrier_t *bar)
++gomp_barrier_wait (gomp_barrier_t *bar, unsigned id)
+ {
+-  gomp_barrier_wait_end (bar, gomp_barrier_wait_start (bar));
++  gomp_barrier_wait_end (bar, gomp_barrier_wait_start (bar, id), id);
+ }
+ 
+ /* Like gomp_barrier_wait, except that if the encountering thread
+@@ -58,7 +59,8 @@ gomp_barrier_wait (gomp_barrier_t *bar)
+    the barrier can be safely destroyed.  */
+ 
+ void
+-gomp_barrier_wait_last (gomp_barrier_t *bar)
++gomp_barrier_wait_last (gomp_barrier_t *bar,
++			unsigned id __attribute__ ((unused)))
+ {
+   /* The above described behavior matches 'bar.arrive' perfectly.  */
+   if (bar->total > 1)
+@@ -77,7 +79,8 @@ gomp_barrier_wait_last (gomp_barrier_t *bar)
+    on GPUs).  */
+ 
+ void
+-gomp_team_barrier_wait_end (gomp_barrier_t *bar, gomp_barrier_state_t state)
++gomp_team_barrier_wait_end (gomp_barrier_t *bar, gomp_barrier_state_t state,
++			    unsigned id __attribute__ ((unused)))
+ {
+   struct gomp_thread *thr = gomp_thread ();
+   struct gomp_team *team = thr->ts.team;
+@@ -98,7 +101,7 @@ gomp_team_barrier_wait_end (gomp_barrier_t *bar, gomp_barrier_state_t state)
+     {
+       while (__atomic_load_n (&bar->generation, MEMMODEL_ACQUIRE)
+ 	     & BAR_TASK_PENDING)
+-	gomp_barrier_handle_tasks (state);
++	gomp_barrier_handle_tasks (state, bar, 0);
+ 
+       if (bar->total > 1)
+ 	asm volatile ("bar.sync 1, %0;" : : "r" (32 * bar->total));
+@@ -106,25 +109,26 @@ gomp_team_barrier_wait_end (gomp_barrier_t *bar, gomp_barrier_state_t state)
+ }
+ 
+ void
+-gomp_team_barrier_wait (gomp_barrier_t *bar)
++gomp_team_barrier_wait (gomp_barrier_t *bar, unsigned id)
+ {
+-  gomp_team_barrier_wait_end (bar, gomp_barrier_wait_start (bar));
++  gomp_team_barrier_wait_end (bar, gomp_barrier_wait_start (bar, id), id);
+ }
+ 
+ void
+-gomp_team_barrier_wait_final (gomp_barrier_t *bar)
++gomp_team_barrier_wait_final (gomp_barrier_t *bar, unsigned id)
+ {
+-  gomp_barrier_state_t state = gomp_barrier_wait_final_start (bar);
++  gomp_barrier_state_t state = gomp_barrier_wait_final_start (bar, id);
+   if (__builtin_expect (state & BAR_WAS_LAST, 0))
+     bar->awaited_final = bar->total;
+-  gomp_team_barrier_wait_end (bar, state);
++  gomp_team_barrier_wait_end (bar, state, id);
+ }
+ 
+ /* See also comments for gomp_team_barrier_wait_end.  */
+ 
+ bool
+ gomp_team_barrier_wait_cancel_end (gomp_barrier_t *bar,
+-				   gomp_barrier_state_t state)
++				   gomp_barrier_state_t state,
++				   unsigned id __attribute__ ((unused)))
+ {
+   struct gomp_thread *thr = gomp_thread ();
+   struct gomp_team *team = thr->ts.team;
+@@ -152,7 +156,7 @@ gomp_team_barrier_wait_cancel_end (gomp_barrier_t *bar,
+     {
+       while (__atomic_load_n (&bar->generation, MEMMODEL_ACQUIRE)
+ 	     & BAR_TASK_PENDING)
+-	gomp_barrier_handle_tasks (state);
++	gomp_barrier_handle_tasks (state, bar, 0);
+ 
+       if (bar->total > 1)
+ 	asm volatile ("bar.sync 1, %0;" : : "r" (32 * bar->total));
+@@ -162,9 +166,11 @@ gomp_team_barrier_wait_cancel_end (gomp_barrier_t *bar,
+ }
+ 
+ bool
+-gomp_team_barrier_wait_cancel (gomp_barrier_t *bar)
++gomp_team_barrier_wait_cancel (gomp_barrier_t *bar, unsigned id)
+ {
+-  return gomp_team_barrier_wait_cancel_end (bar, gomp_barrier_wait_start (bar));
++  return gomp_team_barrier_wait_cancel_end (bar,
++					    gomp_barrier_wait_start (bar, id),
++					    id);
+ }
+ 
+ void
+diff --git a/libgomp/config/nvptx/bar.h b/libgomp/config/nvptx/bar.h
+index aa2592b..dd7e3a7 100644
+--- a/libgomp/config/nvptx/bar.h
++++ b/libgomp/config/nvptx/bar.h
+@@ -69,16 +69,17 @@ static inline void gomp_barrier_destroy (gomp_barrier_t *bar)
+ {
+ }
+ 
+-extern void gomp_barrier_wait (gomp_barrier_t *);
+-extern void gomp_barrier_wait_last (gomp_barrier_t *);
+-extern void gomp_barrier_wait_end (gomp_barrier_t *, gomp_barrier_state_t);
+-extern void gomp_team_barrier_wait (gomp_barrier_t *);
+-extern void gomp_team_barrier_wait_final (gomp_barrier_t *);
+-extern void gomp_team_barrier_wait_end (gomp_barrier_t *,
+-					gomp_barrier_state_t);
+-extern bool gomp_team_barrier_wait_cancel (gomp_barrier_t *);
++extern void gomp_barrier_wait (gomp_barrier_t *, unsigned);
++extern void gomp_barrier_wait_last (gomp_barrier_t *, unsigned);
++extern void gomp_barrier_wait_end (gomp_barrier_t *, gomp_barrier_state_t,
++				   unsigned);
++extern void gomp_team_barrier_wait (gomp_barrier_t *, unsigned);
++extern void gomp_team_barrier_wait_final (gomp_barrier_t *, unsigned);
++extern void gomp_team_barrier_wait_end (gomp_barrier_t *, gomp_barrier_state_t,
++					unsigned);
++extern bool gomp_team_barrier_wait_cancel (gomp_barrier_t *, unsigned);
+ extern bool gomp_team_barrier_wait_cancel_end (gomp_barrier_t *,
+-					       gomp_barrier_state_t);
++					       gomp_barrier_state_t, unsigned);
+ struct gomp_team;
+ extern void gomp_team_barrier_cancel (struct gomp_team *);
+ 
+@@ -90,7 +91,8 @@ gomp_team_barrier_wake (gomp_barrier_t *bar, int count)
+ }
+ 
+ static inline gomp_barrier_state_t
+-gomp_barrier_wait_start (gomp_barrier_t *bar)
++gomp_barrier_wait_start (gomp_barrier_t *bar,
++			 unsigned id __attribute__ ((unused)))
+ {
+   unsigned int ret = __atomic_load_n (&bar->generation, MEMMODEL_ACQUIRE);
+   ret &= -BAR_INCR | BAR_CANCELLED;
+@@ -105,16 +107,17 @@ gomp_barrier_wait_start (gomp_barrier_t *bar)
+ }
+ 
+ static inline gomp_barrier_state_t
+-gomp_barrier_wait_cancel_start (gomp_barrier_t *bar)
++gomp_barrier_wait_cancel_start (gomp_barrier_t *bar, unsigned id)
+ {
+-  return gomp_barrier_wait_start (bar);
++  return gomp_barrier_wait_start (bar, id);
+ }
+ 
+ /* This is like gomp_barrier_wait_start, except it decrements
+    bar->awaited_final rather than bar->awaited and should be used
+    for the gomp_team_end barrier only.  */
+ static inline gomp_barrier_state_t
+-gomp_barrier_wait_final_start (gomp_barrier_t *bar)
++gomp_barrier_wait_final_start (gomp_barrier_t *bar,
++			       unsigned id __attribute__ ((unused)))
+ {
+   unsigned int ret = __atomic_load_n (&bar->generation, MEMMODEL_ACQUIRE);
+   ret &= -BAR_INCR | BAR_CANCELLED;
+@@ -164,25 +167,67 @@ gomp_team_barrier_cancelled (gomp_barrier_t *bar)
+ }
+ 
+ static inline void
+-gomp_team_barrier_done (gomp_barrier_t *bar, gomp_barrier_state_t state)
++gomp_team_barrier_done (gomp_barrier_t *bar, gomp_barrier_state_t state,
++			unsigned increment __attribute__ ((unused)))
+ {
+   bar->generation = (state & -BAR_INCR) + BAR_INCR;
+ }
+ 
+ static inline bool
+ gomp_barrier_state_is_incremented (gomp_barrier_state_t gen,
+-				   gomp_barrier_state_t state)
++				   gomp_barrier_state_t state,
++				   unsigned increment __attribute__ ((unused)))
+ {
+   unsigned next_state = (state & -BAR_INCR) + BAR_INCR;
+   return next_state > state ? gen >= next_state : gen < state;
+ }
+ 
+ static inline bool
+-gomp_barrier_has_completed (gomp_barrier_state_t state, gomp_barrier_t *bar)
++gomp_barrier_has_completed (gomp_barrier_state_t state, gomp_barrier_t *bar,
++			    unsigned increment)
+ {
+   /* Handling overflow in the generation.  The "next" state could be less than
+      or greater than the current one.  */
+-  return gomp_barrier_state_is_incremented (bar->generation, state);
++  return gomp_barrier_state_is_incremented (bar->generation, state, increment);
+ }
+ 
++static inline bool
++gomp_barrier_can_hold (gomp_barrier_t *bar)
++{
++  return false;
++}
++
++/* Functions dummied out for this implementation.  */
++static inline void
++gomp_team_barrier_ensure_last (gomp_barrier_t *bar __attribute__ ((unused)),
++			       unsigned id __attribute__ ((unused)),
++			       gomp_barrier_state_t state
++			       __attribute__ ((unused)))
++{}
++
++static inline bool
++gomp_team_barrier_ensure_cancel_last (gomp_barrier_t *bar
++				      __attribute__ ((unused)),
++				      unsigned id __attribute__ ((unused)),
++				      gomp_barrier_state_t state
++				      __attribute__ ((unused)))
++{
++  /* After returning BAR_WAS_LAST, actually ensure that this thread is last.
++     Return `true` if this thread is known last into the barrier return `false`
++     if the barrier got cancelled such that not all threads entered the barrier.
++
++     Since BAR_WAS_LAST is only set for a thread when that thread decremented
++     the `awaited` counter to zero we know that all threads must have entered
++     the barrier.  Hence always return `true`.  */
++  return true;
++}
++
++static inline void
++gomp_reset_cancellable_primary_threadgen (gomp_barrier_t *bar, unsigned id)
++{}
++
++static inline void
++gomp_team_barrier_done_final (gomp_barrier_t *bar, unsigned id)
++{}
++
+ #endif /* GOMP_BARRIER_H */
+diff --git a/libgomp/config/nvptx/team.c b/libgomp/config/nvptx/team.c
+index 39c8e85..8cc35d7 100644
+--- a/libgomp/config/nvptx/team.c
++++ b/libgomp/config/nvptx/team.c
+@@ -136,7 +136,7 @@ gomp_thread_start (struct gomp_thread_pool *pool)
+       thr->fn = NULL;
+ 
+       struct gomp_task *task = thr->task;
+-      gomp_team_barrier_wait_final (&thr->ts.team->barrier);
++      gomp_team_barrier_wait_final (&thr->ts.team->barrier, thr->ts.team_id);
+       gomp_finish_task (task);
+     }
+   /* Work around an NVIDIA driver bug: when generating sm_50 machine code,
+diff --git a/libgomp/config/posix/bar.c b/libgomp/config/posix/bar.c
+index c46659b..39199ca 100644
+--- a/libgomp/config/posix/bar.c
++++ b/libgomp/config/posix/bar.c
+@@ -105,13 +105,14 @@ gomp_barrier_wait_end (gomp_barrier_t *bar, gomp_barrier_state_t state)
+ }
+ 
+ void
+-gomp_barrier_wait (gomp_barrier_t *barrier)
++gomp_barrier_wait (gomp_barrier_t *barrier, unsigned id)
+ {
+-  gomp_barrier_wait_end (barrier, gomp_barrier_wait_start (barrier));
++  gomp_barrier_wait_end (barrier, gomp_barrier_wait_start (barrier, id));
+ }
+ 
+ void
+-gomp_team_barrier_wait_end (gomp_barrier_t *bar, gomp_barrier_state_t state)
++gomp_team_barrier_wait_end (gomp_barrier_t *bar, gomp_barrier_state_t state,
++			    unsigned id __attribute__ ((unused)))
+ {
+   unsigned int n;
+ 
+@@ -127,7 +128,7 @@ gomp_team_barrier_wait_end (gomp_barrier_t *bar, gomp_barrier_state_t state)
+ 	= __atomic_load_n (&team->task_count, MEMMODEL_ACQUIRE);
+       if (task_count)
+ 	{
+-	  gomp_barrier_handle_tasks (state);
++	  gomp_barrier_handle_tasks (state, bar, BAR_INCR);
+ 	  if (n > 0)
+ 	    gomp_sem_wait (&bar->sem2);
+ 	  gomp_mutex_unlock (&bar->mutex1);
+@@ -154,7 +155,7 @@ gomp_team_barrier_wait_end (gomp_barrier_t *bar, gomp_barrier_state_t state)
+ 	  gen = __atomic_load_n (&bar->generation, MEMMODEL_ACQUIRE);
+ 	  if (gen & BAR_TASK_PENDING)
+ 	    {
+-	      gomp_barrier_handle_tasks (state);
++	      gomp_barrier_handle_tasks (state, bar, BAR_INCR);
+ 	      gen = __atomic_load_n (&bar->generation, MEMMODEL_ACQUIRE);
+ 	    }
+ 	}
+@@ -175,7 +176,8 @@ gomp_team_barrier_wait_end (gomp_barrier_t *bar, gomp_barrier_state_t state)
+ 
+ bool
+ gomp_team_barrier_wait_cancel_end (gomp_barrier_t *bar,
+-				   gomp_barrier_state_t state)
++				   gomp_barrier_state_t state,
++				   unsigned id __attribute__ ((unused)))
+ {
+   unsigned int n;
+ 
+@@ -191,7 +193,7 @@ gomp_team_barrier_wait_cancel_end (gomp_barrier_t *bar,
+ 	= __atomic_load_n (&team->task_count, MEMMODEL_ACQUIRE);
+       if (task_count)
+ 	{
+-	  gomp_barrier_handle_tasks (state);
++	  gomp_barrier_handle_tasks (state, bar, BAR_INCR);
+ 	  if (n > 0)
+ 	    gomp_sem_wait (&bar->sem2);
+ 	  gomp_mutex_unlock (&bar->mutex1);
+@@ -226,7 +228,7 @@ gomp_team_barrier_wait_cancel_end (gomp_barrier_t *bar,
+ 	    break;
+ 	  if (gen & BAR_TASK_PENDING)
+ 	    {
+-	      gomp_barrier_handle_tasks (state);
++	      gomp_barrier_handle_tasks (state, bar, BAR_INCR);
+ 	      gen = __atomic_load_n (&bar->generation, MEMMODEL_ACQUIRE);
+ 	      if (gen & BAR_CANCELLED)
+ 		break;
+@@ -251,9 +253,10 @@ gomp_team_barrier_wait_cancel_end (gomp_barrier_t *bar,
+ }
+ 
+ void
+-gomp_team_barrier_wait (gomp_barrier_t *barrier)
++gomp_team_barrier_wait (gomp_barrier_t *barrier, unsigned id)
+ {
+-  gomp_team_barrier_wait_end (barrier, gomp_barrier_wait_start (barrier));
++  gomp_team_barrier_wait_end (barrier, gomp_barrier_wait_start (barrier, id),
++			      id);
+ }
+ 
+ void
+@@ -266,10 +269,10 @@ gomp_team_barrier_wake (gomp_barrier_t *bar, int count)
+ }
+ 
+ bool
+-gomp_team_barrier_wait_cancel (gomp_barrier_t *bar)
++gomp_team_barrier_wait_cancel (gomp_barrier_t *bar, unsigned id)
+ {
+-  gomp_barrier_state_t state = gomp_barrier_wait_cancel_start (bar);
+-  return gomp_team_barrier_wait_cancel_end (bar, state);
++  gomp_barrier_state_t state = gomp_barrier_wait_cancel_start (bar, id);
++  return gomp_team_barrier_wait_cancel_end (bar, state, id);
+ }
+ 
+ void
+diff --git a/libgomp/config/posix/bar.h b/libgomp/config/posix/bar.h
+index 026daca..e87f748 100644
+--- a/libgomp/config/posix/bar.h
++++ b/libgomp/config/posix/bar.h
+@@ -62,20 +62,21 @@ extern void gomp_barrier_init (gomp_barrier_t *, unsigned);
+ extern void gomp_barrier_reinit (gomp_barrier_t *, unsigned);
+ extern void gomp_barrier_destroy (gomp_barrier_t *);
+ 
+-extern void gomp_barrier_wait (gomp_barrier_t *);
++extern void gomp_barrier_wait (gomp_barrier_t *, unsigned);
+ extern void gomp_barrier_wait_end (gomp_barrier_t *, gomp_barrier_state_t);
+-extern void gomp_team_barrier_wait (gomp_barrier_t *);
+-extern void gomp_team_barrier_wait_end (gomp_barrier_t *,
+-					gomp_barrier_state_t);
+-extern bool gomp_team_barrier_wait_cancel (gomp_barrier_t *);
++extern void gomp_team_barrier_wait (gomp_barrier_t *, unsigned);
++extern void gomp_team_barrier_wait_end (gomp_barrier_t *, gomp_barrier_state_t,
++					unsigned);
++extern bool gomp_team_barrier_wait_cancel (gomp_barrier_t *, unsigned);
+ extern bool gomp_team_barrier_wait_cancel_end (gomp_barrier_t *,
+-					       gomp_barrier_state_t);
++					       gomp_barrier_state_t, unsigned);
+ extern void gomp_team_barrier_wake (gomp_barrier_t *, int);
+ struct gomp_team;
+ extern void gomp_team_barrier_cancel (struct gomp_team *);
+ 
+ static inline gomp_barrier_state_t
+-gomp_barrier_wait_start (gomp_barrier_t *bar)
++gomp_barrier_wait_start (gomp_barrier_t *bar,
++			 unsigned id __attribute__ ((unused)))
+ {
+   unsigned int ret;
+   gomp_mutex_lock (&bar->mutex1);
+@@ -86,7 +87,8 @@ gomp_barrier_wait_start (gomp_barrier_t *bar)
+ }
+ 
+ static inline gomp_barrier_state_t
+-gomp_barrier_wait_cancel_start (gomp_barrier_t *bar)
++gomp_barrier_wait_cancel_start (gomp_barrier_t *bar,
++				unsigned id __attribute__ ((unused)))
+ {
+   unsigned int ret;
+   gomp_mutex_lock (&bar->mutex1);
+@@ -99,9 +101,9 @@ gomp_barrier_wait_cancel_start (gomp_barrier_t *bar)
+ }
+ 
+ static inline void
+-gomp_team_barrier_wait_final (gomp_barrier_t *bar)
++gomp_team_barrier_wait_final (gomp_barrier_t *bar, unsigned id)
+ {
+-  gomp_team_barrier_wait (bar);
++  gomp_team_barrier_wait (bar, id);
+ }
+ 
+ static inline bool
+@@ -111,9 +113,9 @@ gomp_barrier_last_thread (gomp_barrier_state_t state)
+ }
+ 
+ static inline void
+-gomp_barrier_wait_last (gomp_barrier_t *bar)
++gomp_barrier_wait_last (gomp_barrier_t *bar, unsigned id)
+ {
+-  gomp_barrier_wait (bar);
++  gomp_barrier_wait (bar, id);
+ }
+ 
+ /* All the inlines below must be called with team->task_lock
+@@ -150,7 +152,8 @@ gomp_team_barrier_cancelled (gomp_barrier_t *bar)
+ }
+ 
+ static inline void
+-gomp_team_barrier_done (gomp_barrier_t *bar, gomp_barrier_state_t state)
++gomp_team_barrier_done (gomp_barrier_t *bar, gomp_barrier_state_t state,
++			unsigned increment __attribute__ ((unused)))
+ {
+   /* Need the atomic store for acquire-release synchronisation with the
+      load in `gomp_team_barrier_wait_{cancel_,}end`.  See PR112356  */
+@@ -167,11 +170,54 @@ gomp_barrier_state_is_incremented (gomp_barrier_state_t gen,
+ }
+ 
+ static inline bool
+-gomp_barrier_has_completed (gomp_barrier_state_t state, gomp_barrier_t *bar)
++gomp_barrier_has_completed (gomp_barrier_state_t state, gomp_barrier_t *bar,
++			    unsigned increment __attribute__ ((unused)))
+ {
+   /* Handling overflow in the generation.  The "next" state could be less than
+      or greater than the current one.  */
+   return gomp_barrier_state_is_incremented (bar->generation, state);
+ }
+ 
++static inline bool
++gomp_barrier_can_hold (gomp_barrier_t *bar)
++{
++  return false;
++}
++
++/* Functions dummied out for this implementation.  */
++static inline void
++gomp_team_barrier_ensure_last (gomp_barrier_t *bar __attribute__ ((unused)),
++			       unsigned id __attribute__ ((unused)),
++			       gomp_barrier_state_t state
++			       __attribute__ ((unused)))
++{}
++
++static inline bool
++gomp_team_barrier_ensure_cancel_last (gomp_barrier_t *bar
++				      __attribute__ ((unused)),
++				      unsigned id __attribute__ ((unused)),
++				      gomp_barrier_state_t state
++				      __attribute__ ((unused)))
++{
++  /* After returning BAR_WAS_LAST, actually ensure that this thread is last.
++     Return `true` if this thread is known last into the barrier return `false`
++     if the barrier got cancelled such that not all threads entered the barrier.
++
++     Since BAR_WAS_LAST is only set for a thread when that thread decremented
++     the `awaited` counter to zero we know that all threads must have entered
++     the barrier.  Hence always return `true`.  */
++  return true;
++}
++
++static inline void
++gomp_reset_cancellable_primary_threadgen (gomp_barrier_t *bar,
++					  unsigned id __attribute__ ((unused)))
++{}
++
++static inline void
++gomp_team_barrier_done_final (gomp_barrier_t *bar,
++			      unsigned id __attribute__ ((unused)))
++{}
++
++/* TODO Introduce `gomp_barrier_completed`.  */
+ #endif /* GOMP_BARRIER_H */
+diff --git a/libgomp/config/posix/pool.h b/libgomp/config/posix/pool.h
+index 1149354..385f339 100644
+--- a/libgomp/config/posix/pool.h
++++ b/libgomp/config/posix/pool.h
+@@ -44,6 +44,7 @@ gomp_get_thread_pool (struct gomp_thread *thr, unsigned nthreads)
+       pool->threads_size = 0;
+       pool->threads_used = 0;
+       pool->last_team = NULL;
++      pool->prev_barrier = NULL;
+       pool->threads_busy = nthreads;
+       thr->thread_pool = pool;
+       pthread_setspecific (gomp_thread_destructor, thr);
+diff --git a/libgomp/config/posix/simple-bar.h b/libgomp/config/posix/simple-bar.h
+index 9452a2d..327e844 100644
+--- a/libgomp/config/posix/simple-bar.h
++++ b/libgomp/config/posix/simple-bar.h
+@@ -43,9 +43,9 @@ gomp_simple_barrier_init (gomp_simple_barrier_t *bar, unsigned count)
+ }
+ 
+ static inline void
+-gomp_simple_barrier_reinit (gomp_simple_barrier_t *bar, unsigned count)
++gomp_simple_barrier_reinit (gomp_simple_barrier_t *sbar, unsigned nthreads)
+ {
+-  gomp_barrier_reinit (&bar->bar, count);
++  gomp_barrier_reinit (&sbar->bar, nthreads);
+ }
+ 
+ static inline void
+@@ -57,13 +57,15 @@ gomp_simple_barrier_destroy (gomp_simple_barrier_t *bar)
+ static inline void
+ gomp_simple_barrier_wait (gomp_simple_barrier_t *bar)
+ {
+-  gomp_barrier_wait (&bar->bar);
++  /* In default implementation the barrier ID argument is unused.  */
++  gomp_barrier_wait (&bar->bar, 0);
+ }
+ 
+ static inline void
+ gomp_simple_barrier_wait_last (gomp_simple_barrier_t *bar)
+ {
+-  gomp_barrier_wait_last (&bar->bar);
++  /* In default implementation the barrier ID argument is unused.  */
++  gomp_barrier_wait_last (&bar->bar, 0);
+ }
+ 
+ #endif /* GOMP_SIMPLE_BARRIER_H */
+diff --git a/libgomp/config/rtems/bar.c b/libgomp/config/rtems/bar.c
+index 73d3058..1ab9995 100644
+--- a/libgomp/config/rtems/bar.c
++++ b/libgomp/config/rtems/bar.c
+@@ -72,5 +72,186 @@ do_wait (int *addr, int val)
+     futex_wait (addr, val);
+ }
+ 
+-#define GOMP_WAIT_H 1
+-#include "../linux/bar.c"
++void
++gomp_barrier_wait_end (gomp_barrier_t *bar, gomp_barrier_state_t state,
++		       unsigned id __attribute__ ((unused)))
++{
++  if (__builtin_expect (state & BAR_WAS_LAST, 0))
++    {
++      /* Next time we'll be awaiting TOTAL threads again.  */
++      bar->awaited = bar->total;
++      __atomic_store_n (&bar->generation, bar->generation + BAR_INCR,
++			MEMMODEL_RELEASE);
++      futex_wake ((int *) &bar->generation, INT_MAX);
++    }
++  else
++    {
++      do
++	do_wait ((int *) &bar->generation, state);
++      while (__atomic_load_n (&bar->generation, MEMMODEL_ACQUIRE) == state);
++    }
++}
++
++void
++gomp_barrier_wait (gomp_barrier_t *bar, unsigned id)
++{
++  gomp_barrier_wait_end (bar, gomp_barrier_wait_start (bar, id), id);
++}
++
++/* Like gomp_barrier_wait, except that if the encountering thread
++   is not the last one to hit the barrier, it returns immediately.
++   The intended usage is that a thread which intends to gomp_barrier_destroy
++   this barrier calls gomp_barrier_wait, while all other threads
++   call gomp_barrier_wait_last.  When gomp_barrier_wait returns,
++   the barrier can be safely destroyed.  */
++
++void
++gomp_barrier_wait_last (gomp_barrier_t *bar, unsigned id)
++{
++  gomp_barrier_state_t state = gomp_barrier_wait_start (bar, id);
++  if (state & BAR_WAS_LAST)
++    gomp_barrier_wait_end (bar, state, id);
++}
++
++void
++gomp_team_barrier_wake (gomp_barrier_t *bar, int count)
++{
++  futex_wake ((int *) &bar->generation, count == 0 ? INT_MAX : count);
++}
++
++void
++gomp_team_barrier_wait_end (gomp_barrier_t *bar, gomp_barrier_state_t state,
++			    unsigned id __attribute__ ((unused)))
++{
++  unsigned int generation, gen;
++
++  if (__builtin_expect (state & BAR_WAS_LAST, 0))
++    {
++      /* Next time we'll be awaiting TOTAL threads again.  */
++      struct gomp_thread *thr = gomp_thread ();
++      struct gomp_team *team = thr->ts.team;
++
++      bar->awaited = bar->total;
++      team->work_share_cancelled = 0;
++      if (__builtin_expect (team->task_count, 0))
++	{
++	  gomp_barrier_handle_tasks (state, bar, 0);
++	  state &= ~BAR_WAS_LAST;
++	}
++      else
++	{
++	  state &= ~BAR_CANCELLED;
++	  state += BAR_INCR - BAR_WAS_LAST;
++	  __atomic_store_n (&bar->generation, state, MEMMODEL_RELEASE);
++	  futex_wake ((int *) &bar->generation, INT_MAX);
++	  return;
++	}
++    }
++
++  generation = state;
++  state &= ~BAR_CANCELLED;
++  do
++    {
++      do_wait ((int *) &bar->generation, generation);
++      gen = __atomic_load_n (&bar->generation, MEMMODEL_ACQUIRE);
++      if (__builtin_expect (gen & BAR_TASK_PENDING, 0))
++	{
++	  gomp_barrier_handle_tasks (state, bar, 0);
++	  gen = __atomic_load_n (&bar->generation, MEMMODEL_ACQUIRE);
++	}
++      generation |= gen & BAR_WAITING_FOR_TASK;
++    }
++  while (!gomp_barrier_state_is_incremented (gen, state, BAR_INCR));
++}
++
++void
++gomp_team_barrier_wait (gomp_barrier_t *bar, unsigned id)
++{
++  gomp_team_barrier_wait_end (bar, gomp_barrier_wait_start (bar, id), id);
++}
++
++void
++gomp_team_barrier_wait_final (gomp_barrier_t *bar, unsigned id)
++{
++  gomp_barrier_state_t state = gomp_barrier_wait_final_start (bar, id);
++  if (__builtin_expect (state & BAR_WAS_LAST, 0))
++    bar->awaited_final = bar->total;
++  gomp_team_barrier_wait_end (bar, state, id);
++}
++
++bool
++gomp_team_barrier_wait_cancel_end (gomp_barrier_t *bar,
++				   gomp_barrier_state_t state,
++				   unsigned id __attribute__ ((unused)))
++{
++  unsigned int generation, gen;
++
++  if (__builtin_expect (state & BAR_WAS_LAST, 0))
++    {
++      /* Next time we'll be awaiting TOTAL threads again.  */
++      /* BAR_CANCELLED should never be set in state here, because
++	 cancellation means that at least one of the threads has been
++	 cancelled, thus on a cancellable barrier we should never see
++	 all threads to arrive.  */
++      struct gomp_thread *thr = gomp_thread ();
++      struct gomp_team *team = thr->ts.team;
++
++      bar->awaited = bar->total;
++      team->work_share_cancelled = 0;
++      if (__builtin_expect (team->task_count, 0))
++	{
++	  gomp_barrier_handle_tasks (state, bar, 0);
++	  state &= ~BAR_WAS_LAST;
++	}
++      else
++	{
++	  state += BAR_INCR - BAR_WAS_LAST;
++	  __atomic_store_n (&bar->generation, state, MEMMODEL_RELEASE);
++	  futex_wake ((int *) &bar->generation, INT_MAX);
++	  return false;
++	}
++    }
++
++  if (__builtin_expect (state & BAR_CANCELLED, 0))
++    return true;
++
++  generation = state;
++  do
++    {
++      do_wait ((int *) &bar->generation, generation);
++      gen = __atomic_load_n (&bar->generation, MEMMODEL_ACQUIRE);
++      if (__builtin_expect (gen & BAR_CANCELLED, 0))
++	return true;
++      if (__builtin_expect (gen & BAR_TASK_PENDING, 0))
++	{
++	  gomp_barrier_handle_tasks (state, bar, 0);
++	  gen = __atomic_load_n (&bar->generation, MEMMODEL_ACQUIRE);
++	}
++      generation |= gen & BAR_WAITING_FOR_TASK;
++    }
++  while (!gomp_barrier_state_is_incremented (gen, state, BAR_INCR));
++
++  return false;
++}
++
++bool
++gomp_team_barrier_wait_cancel (gomp_barrier_t *bar, unsigned id)
++{
++  return gomp_team_barrier_wait_cancel_end (bar,
++					    gomp_barrier_wait_start (bar, id),
++					    id);
++}
++
++void
++gomp_team_barrier_cancel (struct gomp_team *team)
++{
++  gomp_mutex_lock (&team->task_lock);
++  if (team->barrier.generation & BAR_CANCELLED)
++    {
++      gomp_mutex_unlock (&team->task_lock);
++      return;
++    }
++  team->barrier.generation |= BAR_CANCELLED;
++  gomp_mutex_unlock (&team->task_lock);
++  futex_wake ((int *) &team->barrier.generation, INT_MAX);
++}
+diff --git a/libgomp/config/rtems/bar.h b/libgomp/config/rtems/bar.h
+index 80fb1cd..a77b040 100644
+--- a/libgomp/config/rtems/bar.h
++++ b/libgomp/config/rtems/bar.h
+@@ -73,22 +73,25 @@ static inline void gomp_barrier_destroy (gomp_barrier_t *bar)
+ {
+ }
+ 
+-extern void gomp_barrier_wait (gomp_barrier_t *);
+-extern void gomp_barrier_wait_last (gomp_barrier_t *);
+-extern void gomp_barrier_wait_end (gomp_barrier_t *, gomp_barrier_state_t);
+-extern void gomp_team_barrier_wait (gomp_barrier_t *);
+-extern void gomp_team_barrier_wait_final (gomp_barrier_t *);
+-extern void gomp_team_barrier_wait_end (gomp_barrier_t *,
+-					gomp_barrier_state_t);
+-extern bool gomp_team_barrier_wait_cancel (gomp_barrier_t *);
++extern void gomp_barrier_wait (gomp_barrier_t *, unsigned);
++extern void gomp_barrier_wait_last (gomp_barrier_t *, unsigned);
++extern void gomp_barrier_wait_end (gomp_barrier_t *, gomp_barrier_state_t,
++				   unsigned);
++
++extern void gomp_team_barrier_wait (gomp_barrier_t *, unsigned);
++extern void gomp_team_barrier_wait_final (gomp_barrier_t *, unsigned);
++extern void gomp_team_barrier_wait_end (gomp_barrier_t *, gomp_barrier_state_t,
++					unsigned);
++extern bool gomp_team_barrier_wait_cancel (gomp_barrier_t *, unsigned);
+ extern bool gomp_team_barrier_wait_cancel_end (gomp_barrier_t *,
+-					       gomp_barrier_state_t);
++					       gomp_barrier_state_t, unsigned);
+ extern void gomp_team_barrier_wake (gomp_barrier_t *, int);
+ struct gomp_team;
+ extern void gomp_team_barrier_cancel (struct gomp_team *);
+ 
+ static inline gomp_barrier_state_t
+-gomp_barrier_wait_start (gomp_barrier_t *bar)
++gomp_barrier_wait_start (gomp_barrier_t *bar,
++			 unsigned id __attribute__ ((unused)))
+ {
+   unsigned int ret = __atomic_load_n (&bar->generation, MEMMODEL_ACQUIRE);
+   ret &= -BAR_INCR | BAR_CANCELLED;
+@@ -103,16 +106,17 @@ gomp_barrier_wait_start (gomp_barrier_t *bar)
+ }
+ 
+ static inline gomp_barrier_state_t
+-gomp_barrier_wait_cancel_start (gomp_barrier_t *bar)
++gomp_barrier_wait_cancel_start (gomp_barrier_t *bar, unsigned id)
+ {
+-  return gomp_barrier_wait_start (bar);
++  return gomp_barrier_wait_start (bar, id);
+ }
+ 
+ /* This is like gomp_barrier_wait_start, except it decrements
+    bar->awaited_final rather than bar->awaited and should be used
+    for the gomp_team_end barrier only.  */
+ static inline gomp_barrier_state_t
+-gomp_barrier_wait_final_start (gomp_barrier_t *bar)
++gomp_barrier_wait_final_start (gomp_barrier_t *bar,
++			       unsigned id __attribute__ ((unused)))
+ {
+   unsigned int ret = __atomic_load_n (&bar->generation, MEMMODEL_ACQUIRE);
+   ret &= -BAR_INCR | BAR_CANCELLED;
+@@ -162,7 +166,8 @@ gomp_team_barrier_cancelled (gomp_barrier_t *bar)
+ }
+ 
+ static inline void
+-gomp_team_barrier_done (gomp_barrier_t *bar, gomp_barrier_state_t state)
++gomp_team_barrier_done (gomp_barrier_t *bar, gomp_barrier_state_t state,
++			unsigned increment __attribute__ ((unused)))
+ {
+   /* Need the atomic store for acquire-release synchronisation with the
+      load in `gomp_team_barrier_wait_{cancel_,}end`.  See PR112356  */
+@@ -172,18 +177,61 @@ gomp_team_barrier_done (gomp_barrier_t *bar, gomp_barrier_state_t state)
+ 
+ static inline bool
+ gomp_barrier_state_is_incremented (gomp_barrier_state_t gen,
+-				   gomp_barrier_state_t state)
++				   gomp_barrier_state_t state,
++				   unsigned increment __attribute__ ((unused)))
+ {
+   unsigned next_state = (state & -BAR_INCR) + BAR_INCR;
+   return next_state > state ? gen >= next_state : gen < state;
+ }
+ 
+ static inline bool
+-gomp_barrier_has_completed (gomp_barrier_state_t state, gomp_barrier_t *bar)
++gomp_barrier_has_completed (gomp_barrier_state_t state, gomp_barrier_t *bar,
++			    unsigned increment)
+ {
+   /* Handling overflow in the generation.  The "next" state could be less than
+      or greater than the current one.  */
+-  return gomp_barrier_state_is_incremented (bar->generation, state);
++  return gomp_barrier_state_is_incremented (bar->generation, state, increment);
+ }
+ 
++static inline bool
++gomp_barrier_can_hold (gomp_barrier_t *bar)
++{
++  return false;
++}
++
++/* Functions dummied out for this implementation.  */
++static inline void
++gomp_team_barrier_ensure_last (gomp_barrier_t *bar __attribute__ ((unused)),
++			       unsigned id __attribute__ ((unused)),
++			       gomp_barrier_state_t state
++			       __attribute__ ((unused)))
++{}
++
++static inline bool
++gomp_team_barrier_ensure_cancel_last (gomp_barrier_t *bar
++				      __attribute__ ((unused)),
++				      unsigned id __attribute__ ((unused)),
++				      gomp_barrier_state_t state
++				      __attribute__ ((unused)))
++{
++  /* After returning BAR_WAS_LAST, actually ensure that this thread is last.
++     Return `true` if this thread is known last into the barrier return `false`
++     if the barrier got cancelled such that not all threads entered the barrier.
++
++     Since BAR_WAS_LAST is only set for a thread when that thread decremented
++     the `awaited` counter to zero we know that all threads must have entered
++     the barrier.  Hence always return `true`.  */
++  return true;
++}
++
++static inline void
++gomp_reset_cancellable_primary_threadgen (gomp_barrier_t *bar,
++					  unsigned id __attribute__ ((unused)))
++{}
++
++static inline void
++gomp_team_barrier_done_final (gomp_barrier_t *bar,
++			      unsigned id __attribute__ ((unused)))
++{}
++
+ #endif /* GOMP_BARRIER_H */
+diff --git a/libgomp/libgomp.h b/libgomp/libgomp.h
+index 42f3243..c854743 100644
+--- a/libgomp/libgomp.h
++++ b/libgomp/libgomp.h
+@@ -59,6 +59,7 @@
+ #include <stdbool.h>
+ #include <stdlib.h>
+ #include <stdarg.h>
++#include <limits.h>
+ 
+ /* Needed for memset in priority_queue.c.  */
+ #if _LIBGOMP_CHECKING_
+@@ -200,6 +201,14 @@ extern void gomp_vfatal (const char *, va_list)
+ extern void gomp_fatal (const char *, ...)
+ 	__attribute__ ((noreturn, format (printf, 1, 2)));
+ 
++#if _LIBGOMP_CHECKING_
++#define gomp_assert(EXPR, MSG, ...)                                            \
++  if (!(EXPR))                                                                 \
++  gomp_fatal ("%s:%d " MSG, __FILE__, __LINE__, __VA_ARGS__)
++#else
++#define gomp_assert(...)
++#endif
++
+ struct gomp_task;
+ struct gomp_taskgroup;
+ struct htab;
+@@ -857,6 +866,14 @@ struct gomp_team
+   /* Number of tasks waiting for their completion event to be fulfilled.  */
+   unsigned int task_detach_count;
+ 
++  /* Cache to help initialise each secondary threads `task` when re-using a
++     team very many times.  This allows each secondary thread to perform the
++     re-initialisation instead of having the primary thread need to perform
++     that initialisation.  */
++  struct gomp_task_icv task_icv_init;
++  struct gomp_task *task_parent_init;
++  struct gomp_taskgroup *task_taskgroup;
++
+   /* This array contains structures for implicit tasks.  */
+   struct gomp_task implicit_task[];
+ };
+@@ -926,6 +943,7 @@ struct gomp_thread_pool
+ 
+   /* This barrier holds and releases threads waiting in thread pools.  */
+   gomp_simple_barrier_t threads_dock;
++  gomp_barrier_t *prev_barrier;
+ };
+ 
+ enum gomp_cancel_kind
+@@ -1099,7 +1117,8 @@ extern unsigned gomp_dynamic_max_threads (void);
+ extern void gomp_init_task (struct gomp_task *, struct gomp_task *,
+ 			    struct gomp_task_icv *);
+ extern void gomp_end_task (void);
+-extern void gomp_barrier_handle_tasks (gomp_barrier_state_t);
++extern void gomp_barrier_handle_tasks (gomp_barrier_state_t, gomp_barrier_t *,
++				       unsigned);
+ extern void gomp_task_maybe_wait_for_dependencies (void **);
+ extern bool gomp_create_target_task (struct gomp_device_descr *,
+ 				     void (*) (void *), size_t, void **,
+diff --git a/libgomp/single.c b/libgomp/single.c
+index 6512600..1c6afc6 100644
+--- a/libgomp/single.c
++++ b/libgomp/single.c
+@@ -77,7 +77,7 @@ GOMP_single_copy_start (void)
+     }
+   else
+     {
+-      gomp_team_barrier_wait (&thr->ts.team->barrier);
++      gomp_team_barrier_wait (&thr->ts.team->barrier, thr->ts.team_id);
+ 
+       ret = thr->ts.work_share->copyprivate;
+       gomp_work_share_end_nowait ();
+@@ -98,7 +98,7 @@ GOMP_single_copy_end (void *data)
+   if (team != NULL)
+     {
+       thr->ts.work_share->copyprivate = data;
+-      gomp_team_barrier_wait (&team->barrier);
++      gomp_team_barrier_wait (&team->barrier, thr->ts.team_id);
+     }
+ 
+   gomp_work_share_end_nowait ();
+diff --git a/libgomp/task.c b/libgomp/task.c
+index cbba285..0374df4 100644
+--- a/libgomp/task.c
++++ b/libgomp/task.c
+@@ -1549,10 +1549,39 @@ gomp_task_run_post_remove_taskgroup (struct gomp_task *child_task)
+ }
+ 
+ void
+-gomp_barrier_handle_tasks (gomp_barrier_state_t state)
++gomp_barrier_handle_tasks (gomp_barrier_state_t state, gomp_barrier_t *bar,
++			   unsigned increment)
+ {
+   struct gomp_thread *thr = gomp_thread ();
+-  struct gomp_team *team = thr->ts.team;
++  /* acquire-release between the store in `gomp_team_start` because otherwise
++     very small chance that the `team->barrier` we just read is seen as
++     uninitialised (despite happening before the assignment of `nthr->ts.team`
++     in the primary thread) and that uninitialised value happens to match
++     `bar`.  */
++  struct gomp_team *team = __atomic_load_n (&thr->ts.team, MEMMODEL_ACQUIRE);
++  /* When performing the barrier in between iterations of non-nested threads in
++     `gomp_thread_start`, there's the race condition where:
++     - Secondary thread calls this function.
++     - Some other thread finishes the last task.
++     - Barrier is marked as completed.
++     - Primary thread continues to starting a new parallel region.
++     - Primary thread creates a new team.
++     - Primary thread stores the team on this secondary threads TLS storage
++       (before we read the `thr->ts.team` value above.
++     We pass `bar` in from the barrier functions in order to identify this
++     case.  When this happens we know that all tasks on the barrier have
++     completed (otherwise the primary thread would not have continued past the
++     barrier).  Hence we can simply return.
++
++     This race condition was mostly harmless (attempt to run tasks on the
++     barrier of this new team, but new team would have no tasks on it anyway).
++     With the switch to only have one barrier per iteration in
++     `gomp_thread_start` we add the possibility that we could perform tasks on
++     "the next" parallel region (no longer a second synch point between the
++     above race condition and where new tasks could be scheduled).  This
++     outcome is something we want to avoid.  */
++  if (&team->barrier != bar)
++    return;
+   struct gomp_task *task = thr->task;
+   struct gomp_task *child_task = NULL;
+   struct gomp_task *to_free = NULL;
+@@ -1570,7 +1599,7 @@ gomp_barrier_handle_tasks (gomp_barrier_state_t state)
+      When `task_count == 0` we're not going to perform tasks anyway, so the
+      problem of PR122314 is naturally avoided.  */
+   if (team->task_count != 0
+-      && gomp_barrier_has_completed (state, &team->barrier))
++      && gomp_barrier_has_completed (state, &team->barrier, increment))
+     {
+       gomp_mutex_unlock (&team->task_lock);
+       return;
+@@ -1580,7 +1609,7 @@ gomp_barrier_handle_tasks (gomp_barrier_state_t state)
+     {
+       if (team->task_count == 0)
+ 	{
+-	  gomp_team_barrier_done (&team->barrier, state);
++	  gomp_team_barrier_done (&team->barrier, state, increment);
+ 	  gomp_mutex_unlock (&team->task_lock);
+ 	  gomp_team_barrier_wake (&team->barrier, 0);
+ 	  return;
+@@ -1617,7 +1646,7 @@ gomp_barrier_handle_tasks (gomp_barrier_state_t state)
+       else if (team->task_count == 0
+ 	       && gomp_team_barrier_waiting_for_tasks (&team->barrier))
+ 	{
+-	  gomp_team_barrier_done (&team->barrier, state);
++	  gomp_team_barrier_done (&team->barrier, state, increment);
+ 	  gomp_mutex_unlock (&team->task_lock);
+ 	  gomp_team_barrier_wake (&team->barrier, 0);
+ 	  if (to_free)
+@@ -2243,7 +2272,7 @@ GOMP_taskgroup_end (void)
+ 	 is #pragma omp target nowait that creates an implicit
+ 	 team with a single thread.  In this case, we want to wait
+ 	 for all outstanding tasks in this team.  */
+-      gomp_team_barrier_wait (&team->barrier);
++      gomp_team_barrier_wait (&team->barrier, thr->ts.team_id);
+       return;
+     }
+ 
+@@ -2698,7 +2727,7 @@ GOMP_workshare_task_reduction_unregister (bool cancelled)
+     htab_free ((struct htab *) data[5]);
+ 
+   if (!cancelled)
+-    gomp_team_barrier_wait (&team->barrier);
++    gomp_team_barrier_wait (&team->barrier, thr->ts.team_id);
+ }
+ 
+ int
+diff --git a/libgomp/team.c b/libgomp/team.c
+index 5282a31..08c03fc 100644
+--- a/libgomp/team.c
++++ b/libgomp/team.c
+@@ -31,6 +31,24 @@
+ #include <stdlib.h>
+ #include <string.h>
+ 
++static void
++gomp_release_held_threads (struct gomp_thread_pool *pool,
++			   struct gomp_team *team, unsigned team_id)
++{
++  gomp_assert (team_id == 0, "Releasing threads from non-primary thread %u",
++	       team_id);
++  if (pool->prev_barrier)
++    {
++      struct gomp_team *saved_team __attribute__ ((unused))
++      = pool->last_team ? pool->last_team : team;
++      gomp_assert (pool->prev_barrier == &saved_team->barrier,
++		   "prev_barrier not within cached team: %p != %p",
++		   pool->prev_barrier, &saved_team->barrier);
++      gomp_team_barrier_done_final (pool->prev_barrier, team_id);
++      pool->prev_barrier = NULL;
++    }
++}
++
+ #ifdef LIBGOMP_USE_PTHREADS
+ pthread_attr_t gomp_thread_attr;
+ 
+@@ -62,7 +80,6 @@ struct gomp_thread_start_data
+   pthread_t handle;
+ };
+ 
+-
+ /* This function is a pthread_create entry point.  This contains the idle
+    loop in which a thread waits to be called up to become part of a team.  */
+ 
+@@ -109,12 +126,12 @@ gomp_thread_start (void *xdata)
+       struct gomp_team *team = thr->ts.team;
+       struct gomp_task *task = thr->task;
+ 
+-      gomp_barrier_wait (&team->barrier);
++      gomp_barrier_wait (&team->barrier, thr->ts.team_id);
+ 
+       local_fn (local_data);
+-      gomp_team_barrier_wait_final (&team->barrier);
++      gomp_team_barrier_wait_final (&team->barrier, thr->ts.team_id);
+       gomp_finish_task (task);
+-      gomp_barrier_wait_last (&team->barrier);
++      gomp_barrier_wait_last (&team->barrier, thr->ts.team_id);
+     }
+   else
+     {
+@@ -127,10 +144,36 @@ gomp_thread_start (void *xdata)
+ 	  struct gomp_task *task = thr->task;
+ 
+ 	  local_fn (local_data);
+-	  gomp_team_barrier_wait_final (&team->barrier);
++	  gomp_team_barrier_wait_final (&team->barrier, thr->ts.team_id);
+ 	  gomp_finish_task (task);
+-
+-	  gomp_simple_barrier_wait (&pool->threads_dock);
++	  /* Hold at the simple barrier if we're exiting.
++	     Do this in order to synchronise with the primary thread that could
++	     (after the next piece of work has been performed) free our team.
++	     Need to ensure that the barrier waited on above is not freed until
++	     we've completed it.  With any threads that will be used in the
++	     next iteration we know that it will synchronise with the primary
++	     thread before it frees this team because it will synchronise with
++	     the primary thread in the next iteration of this loop (in
++	     `gomp_team_barrier_wait_final`).  */
++	  if (!gomp_barrier_can_hold (&team->barrier) || thr->fn == NULL)
++	    gomp_simple_barrier_wait (&pool->threads_dock);
++
++	  /* Early exit because if `thr->fn == NULL` then we can't guarantee
++	     the `thr->ts.team` hasn't been freed by the primary thread racing
++	     ahead.  Hence we don't want to write to it.  */
++	  if (thr->fn == NULL)
++	    break;
++	  team = thr->ts.team;
++	  thr->ts.work_share = &team->work_shares[0];
++	  thr->ts.last_work_share = NULL;
++#ifdef HAVE_SYNC_BUILTINS
++	  thr->ts.single_count = 0;
++#endif
++	  thr->ts.static_trip = 0;
++	  thr->task = &team->implicit_task[thr->ts.team_id];
++	  gomp_init_task (thr->task, team->task_parent_init,
++			  &team->task_icv_init);
++	  thr->task->taskgroup = team->task_taskgroup;
+ 
+ 	  local_fn = thr->fn;
+ 	  local_data = thr->data;
+@@ -153,13 +196,20 @@ get_last_team (unsigned nthreads)
+   struct gomp_thread *thr = gomp_thread ();
+   if (thr->ts.team == NULL)
+     {
++      gomp_assert (thr->ts.level == 0,
++		   "Looking for cached team in nested region %u thr->ts.level",
++		   thr->ts.level);
+       struct gomp_thread_pool *pool = gomp_get_thread_pool (thr, nthreads);
+       struct gomp_team *last_team = pool->last_team;
+       if (last_team != NULL && last_team->nthreads == nthreads)
+         {
+-          pool->last_team = NULL;
+-          return last_team;
+-        }
++	  gomp_assert (!pool->prev_barrier
++			 || pool->prev_barrier == &pool->last_team->barrier,
++		       "prev_barrier not within cached team: %p != %p",
++		       pool->prev_barrier, &pool->last_team->barrier);
++	  pool->last_team = NULL;
++	  return last_team;
++	}
+     }
+   return NULL;
+ }
+@@ -278,7 +328,9 @@ gomp_free_thread (void *arg __attribute__((unused)))
+ 	      nthr->data = pool;
+ 	    }
+ 	  /* This barrier undocks threads docked on pool->threads_dock.  */
+-	  gomp_simple_barrier_wait (&pool->threads_dock);
++	  gomp_release_held_threads (pool, NULL, thr->ts.team_id);
++	  if (!gomp_barrier_can_hold (pool->prev_barrier))
++	    gomp_simple_barrier_wait (&pool->threads_dock);
+ 	  /* And this waits till all threads have called gomp_barrier_wait_last
+ 	     in gomp_free_pool_helper.  */
+ 	  gomp_simple_barrier_wait (&pool->threads_dock);
+@@ -315,6 +367,21 @@ gomp_free_thread (void *arg __attribute__((unused)))
+ /* Launch a team.  */
+ 
+ #ifdef LIBGOMP_USE_PTHREADS
++static unsigned
++gomp_barrier_calc_wait (unsigned num_new_threads, unsigned num_exiting_threads,
++			unsigned old_threads_used, unsigned nthreads,
++			unsigned affinity_count, bool can_hold)
++{
++  if (can_hold)
++    {
++      unsigned tmp = num_new_threads + num_exiting_threads;
++      return tmp ? tmp + 1 : 0;
++    }
++  if (!affinity_count)
++    return old_threads_used > nthreads ? old_threads_used : nthreads;
++  return nthreads + affinity_count;
++}
++
+ void
+ gomp_team_start (void (*fn) (void *), void *data, unsigned nthreads,
+ 		 unsigned flags, struct gomp_team *team,
+@@ -327,6 +394,10 @@ gomp_team_start (void (*fn) (void *), void *data, unsigned nthreads,
+   bool nested;
+   struct gomp_thread_pool *pool;
+   unsigned i, n, old_threads_used = 0;
++  unsigned simple_barrier_n = 0;
++  unsigned num_new_threads = 0;
++  unsigned spawned_new_threads __attribute__ ((unused)) = 0;
++  unsigned num_exiting_threads = 0;
+   pthread_attr_t thread_attr, *attr;
+   unsigned long nthreads_var;
+   char bind, bind_var;
+@@ -383,6 +454,15 @@ gomp_team_start (void (*fn) (void *), void *data, unsigned nthreads,
+   thr->task->taskgroup = taskgroup;
+   team->implicit_task[0].icv.nthreads_var = nthreads_var;
+   team->implicit_task[0].icv.bind_var = bind_var;
++  /* Copy entirely rather than copy pointer so that we have an immutable copy
++     for the secondary threads to take from for the time-frame that said
++     secondary threads are executing on.  Can't copy from
++     `team->implicit_task[0].icv` because primary thread could have adjusted
++     its per-task ICV by the time the secondary thread gets around to
++     initialising things.   */
++  team->task_icv_init = team->implicit_task[0].icv;
++  team->task_parent_init = task;
++  team->task_taskgroup = taskgroup;
+ 
+   if (nthreads == 1)
+     return;
+@@ -464,22 +544,52 @@ gomp_team_start (void (*fn) (void *), void *data, unsigned nthreads,
+      only the initial program thread will modify gomp_threads.  */
+   if (!nested)
+     {
++      gomp_assert (team->prev_ts.team_id == 0,
++		   "Starting a team from thread with id %u in previous team\n",
++		   team->prev_ts.team_id);
+       old_threads_used = pool->threads_used;
+ 
+-      if (nthreads <= old_threads_used)
+-	n = nthreads;
++      if (nthreads == old_threads_used)
++	{
++	  n = nthreads;
++	  num_new_threads = 0;
++	  num_exiting_threads = 0;
++	  simple_barrier_n = gomp_barrier_calc_wait (
++	    num_new_threads, num_exiting_threads, old_threads_used, nthreads,
++	    affinity_count, gomp_barrier_can_hold (pool->prev_barrier));
++	  if (gomp_barrier_can_hold (pool->prev_barrier))
++	    gomp_simple_barrier_reinit (&pool->threads_dock, simple_barrier_n);
++	}
++      else if (nthreads < old_threads_used)
++	{
++	  n = nthreads;
++	  num_new_threads = 0;
++	  num_exiting_threads = old_threads_used - nthreads;
++	  simple_barrier_n = gomp_barrier_calc_wait (
++	    num_new_threads, num_exiting_threads, old_threads_used, nthreads,
++	    affinity_count, gomp_barrier_can_hold (pool->prev_barrier));
++	  if (gomp_barrier_can_hold (pool->prev_barrier))
++	    gomp_simple_barrier_reinit (&pool->threads_dock, simple_barrier_n);
++	}
+       else if (old_threads_used == 0)
+ 	{
+ 	  n = 0;
++	  num_new_threads = nthreads - 1;
++	  num_exiting_threads = 0;
++	  simple_barrier_n = nthreads;
+ 	  gomp_simple_barrier_init (&pool->threads_dock, nthreads);
+ 	}
+       else
+ 	{
+ 	  n = old_threads_used;
+-
++	  num_new_threads = nthreads - old_threads_used;
++	  num_exiting_threads = 0;
++	  simple_barrier_n = gomp_barrier_calc_wait (
++	    num_new_threads, num_exiting_threads, old_threads_used, nthreads,
++	    affinity_count, gomp_barrier_can_hold (pool->prev_barrier));
+ 	  /* Increase the barrier threshold to make sure all new
+ 	     threads arrive before the team is released.  */
+-	  gomp_simple_barrier_reinit (&pool->threads_dock, nthreads);
++	  gomp_simple_barrier_reinit (&pool->threads_dock, simple_barrier_n);
+ 	}
+ 
+       /* Not true yet, but soon will be.  We're going to release all
+@@ -640,27 +750,16 @@ gomp_team_start (void (*fn) (void *), void *data, unsigned nthreads,
+ 	    }
+ 	  else
+ 	    nthr = pool->threads[i];
+-	  nthr->ts.team = team;
+-	  nthr->ts.work_share = &team->work_shares[0];
+-	  nthr->ts.last_work_share = NULL;
++	  __atomic_store_n (&nthr->ts.team, team, MEMMODEL_RELEASE);
+ 	  nthr->ts.team_id = i;
+ 	  nthr->ts.level = team->prev_ts.level + 1;
+ 	  nthr->ts.active_level = thr->ts.active_level;
+ 	  nthr->ts.place_partition_off = place_partition_off;
+ 	  nthr->ts.place_partition_len = place_partition_len;
+ 	  nthr->ts.def_allocator = thr->ts.def_allocator;
+-#ifdef HAVE_SYNC_BUILTINS
+-	  nthr->ts.single_count = 0;
+-#endif
+-	  nthr->ts.static_trip = 0;
+ 	  nthr->num_teams = thr->num_teams;
+ 	  nthr->team_num = thr->team_num;
+-	  nthr->task = &team->implicit_task[i];
+ 	  nthr->place = place;
+-	  gomp_init_task (nthr->task, task, icv);
+-	  team->implicit_task[i].icv.nthreads_var = nthreads_var;
+-	  team->implicit_task[i].icv.bind_var = bind_var;
+-	  nthr->task->taskgroup = taskgroup;
+ 	  nthr->fn = fn;
+ 	  nthr->data = data;
+ 	  team->ordered_release[i] = &nthr->release;
+@@ -719,14 +818,63 @@ gomp_team_start (void (*fn) (void *), void *data, unsigned nthreads,
+ 		 threads and all the threads we're going to let die
+ 		 arrive before the team is released.  */
+ 	      if (affinity_count)
+-		gomp_simple_barrier_reinit (&pool->threads_dock,
+-					    nthreads + affinity_count);
++		{
++		  /* Total number of threads running is:
++		     nthreads + affinity_count
++		     Equation to be satisfied is:
++		      (nthreads + affinity_count == old_threads_used +
++		     num_new_threads). So num_new_threads
++			 == (nthreads + affinity_count - old_threads_used)
++		     Originally
++		      num_new_threads == nthreads > old_threads_used
++			  ? (nthreads - old_threads_used)
++			  : 0;
++
++		     Now:
++		       nthreads + num_exiting_threads
++			 == old_threads_used + num_new_threads
++		     So:
++		       num_exiting_threads
++			 == old_threads_used + num_new_threads - nthreads
++			 == affinity_count
++		     */
++		  gomp_assert (nthreads + affinity_count > old_threads_used,
++			       "Not spawning more threads but "
++			       "reinitialising barrier "
++			       "nthreads = %u"
++			       ", affinity_count = %u"
++			       ", old_threads_used = %u",
++			       nthreads, affinity_count, old_threads_used);
++		  num_new_threads
++		    = (nthreads + affinity_count) - old_threads_used;
++		  num_exiting_threads = affinity_count;
++		  simple_barrier_n = gomp_barrier_calc_wait (
++		    num_new_threads, num_exiting_threads, old_threads_used,
++		    nthreads, affinity_count,
++		    gomp_barrier_can_hold (pool->prev_barrier));
++		  gomp_simple_barrier_reinit (&pool->threads_dock,
++					      simple_barrier_n);
++		}
+ 	    }
+ 	}
+ 
+       if (i == nthreads)
+-	goto do_release;
+-
++	{
++	  gomp_assert (num_new_threads == 0,
++		       "Calculated need %u new threads but spawning none",
++		       num_new_threads);
++	  gomp_assert (
++	    gomp_barrier_can_hold (pool->prev_barrier)
++	      ? (simple_barrier_n
++		 == (num_exiting_threads ? num_exiting_threads + 1 : 0))
++	      : simple_barrier_n == old_threads_used,
++	    "Have calculated need simple_barrier_n == %u"
++	    " starting 0 threads, affinity_count == %u, old_threads_used == "
++	    "%u, calculated num_exiting_threads == %u, nthreads == %u",
++	    simple_barrier_n, affinity_count, old_threads_used,
++	    num_exiting_threads, nthreads);
++	  goto do_release;
++	}
+     }
+ 
+   if (__builtin_expect (nthreads + affinity_count > old_threads_used, 0))
+@@ -858,19 +1006,49 @@ gomp_team_start (void (*fn) (void *), void *data, unsigned nthreads,
+       attr = gomp_adjust_thread_attr (attr, &thread_attr);
+       err = pthread_create (&start_data->handle, attr, gomp_thread_start,
+ 			    start_data);
++      spawned_new_threads += 1;
+       start_data++;
+       if (err != 0)
+ 	gomp_fatal ("Thread creation failed: %s", strerror (err));
+     }
++  if (!nested)
++    {
++      gomp_assert (spawned_new_threads == num_new_threads,
++		   "Calculated num_new_threads != spawned_new_threads: "
++		   " %u != %u",
++		   num_new_threads, spawned_new_threads);
++      bool calc_check __attribute__ ((unused)) = false;
++      if (old_threads_used == 0)
++	calc_check = (num_new_threads == (simple_barrier_n - 1));
++      else if (gomp_barrier_can_hold (pool->prev_barrier))
++	calc_check
++	  = ((num_new_threads + num_exiting_threads) == (simple_barrier_n - 1));
++      else
++	calc_check = (num_new_threads == (simple_barrier_n - old_threads_used));
++      gomp_assert (calc_check,
++		   "simple barrier calculation incorrect for %s team: "
++		   "simple_barrier_n: %u"
++		   ", nthreads: %u"
++		   ", num_new_threads: %u"
++		   ", num_exiting_threads: %u"
++		   ", old_threads_used: %u",
++		   nested ? "nested" : "top-level", simple_barrier_n, nthreads,
++		   num_new_threads, num_exiting_threads, old_threads_used);
++    }
+ 
+   if (__builtin_expect (attr == &thread_attr, 0))
+     pthread_attr_destroy (&thread_attr);
+ 
+  do_release:
+   if (nested)
+-    gomp_barrier_wait (&team->barrier);
++    gomp_barrier_wait (&team->barrier, thr->ts.team_id);
+   else
+-    gomp_simple_barrier_wait (&pool->threads_dock);
++    {
++      gomp_release_held_threads (pool, team, thr->ts.team_id);
++      if (num_new_threads || num_exiting_threads
++	  || !gomp_barrier_can_hold (pool->prev_barrier))
++	gomp_simple_barrier_wait (&pool->threads_dock);
++    }
+ 
+   /* Decrease the barrier threshold to match the number of threads
+      that should arrive back at the end of this team.  The extra
+@@ -898,6 +1076,14 @@ gomp_team_start (void (*fn) (void *), void *data, unsigned nthreads,
+       gomp_mutex_unlock (&gomp_managed_threads_lock);
+ #endif
+     }
++  else if (!nested && gomp_barrier_can_hold (pool->prev_barrier))
++    {
++      /* Also need to adjust the barrier threshold when it's been in order to
++	 account for all threads that would need to be waited on in something
++	 like `gomp_free_thread` or `gomp_pause_thread`.  */
++      gomp_simple_barrier_reinit (&pool->threads_dock, nthreads);
++    }
++
+   if (__builtin_expect (gomp_display_affinity_var, 0))
+     {
+       if (nested
+@@ -949,12 +1135,15 @@ gomp_team_end (void)
+ {
+   struct gomp_thread *thr = gomp_thread ();
+   struct gomp_team *team = thr->ts.team;
++  unsigned team_id = thr->ts.team_id;
+ 
+   /* This barrier handles all pending explicit threads.
+      As #pragma omp cancel parallel might get awaited count in
+      team->barrier in a inconsistent state, we need to use a different
+      counter here.  */
+-  gomp_team_barrier_wait_final (&team->barrier);
++  gomp_team_barrier_wait_final (&team->barrier, team_id);
++  /* After this point all tasking has finished.  Just haven't told all
++     secondary threads that they're good to continue.  */
+   if (__builtin_expect (team->team_cancelled, 0))
+     {
+       struct gomp_work_share *ws = team->work_shares_to_free;
+@@ -974,8 +1163,11 @@ gomp_team_end (void)
+   gomp_end_task ();
+   thr->ts = team->prev_ts;
+ 
++  bool finished_threads __attribute__ ((unused)) = false;
+   if (__builtin_expect (thr->ts.level != 0, 0))
+     {
++      gomp_team_barrier_done_final (&team->barrier, team_id);
++      finished_threads = true;
+ #ifdef HAVE_SYNC_BUILTINS
+       __sync_fetch_and_add (&gomp_managed_threads, 1L - team->nthreads);
+ #else
+@@ -985,7 +1177,7 @@ gomp_team_end (void)
+ #endif
+       /* This barrier has gomp_barrier_wait_last counterparts
+ 	 and ensures the team can be safely destroyed.  */
+-      gomp_barrier_wait (&team->barrier);
++      gomp_barrier_wait (&team->barrier, team_id);
+     }
+ 
+   if (__builtin_expect (team->work_shares[0].next_alloc != NULL, 0))
+@@ -1001,15 +1193,33 @@ gomp_team_end (void)
+     }
+   gomp_sem_destroy (&team->master_release);
+ 
+-  if (__builtin_expect (thr->ts.team != NULL, 0)
++  if (__builtin_expect (thr->ts.team != NULL
++			  && (thr->ts.team->nthreads != 1
++			      || thr->ts.level != 0),
++			0)
+       || __builtin_expect (team->nthreads == 1, 0))
+-    free_team (team);
++    {
++      gomp_assert (finished_threads || team->nthreads == 1,
++		   "Freeing team while threads may be waiting on it."
++		   " team = %p, level = %u",
++		   team, thr->ts.level + 1);
++      free_team (team);
++    }
+   else
+     {
+       struct gomp_thread_pool *pool = thr->thread_pool;
+       if (pool->last_team)
+ 	free_team (pool->last_team);
+       pool->last_team = team;
++      gomp_assert (!finished_threads,
++		   "Have let threads go while still recording prev_barrier"
++		   " level = %u, team = %p, nthreads = %u",
++		   thr->ts.level + 1, team, team->nthreads);
++      gomp_assert (!pool->prev_barrier,
++		   "Previous barrier not released before it gets overridden"
++		   " level = %u, team = %p, nthreads = %u",
++		   thr->ts.level + 1, team, team->nthreads);
++      pool->prev_barrier = &team->barrier;
+       gomp_release_thread_pool (pool);
+     }
+ }
+@@ -1081,9 +1291,11 @@ gomp_pause_host (void)
+ 	      thrs[i] = gomp_thread_to_pthread_t (nthr);
+ 	    }
+ 	  /* This barrier undocks threads docked on pool->threads_dock.  */
+-	  gomp_simple_barrier_wait (&pool->threads_dock);
+-	  /* And this waits till all threads have called gomp_barrier_wait_last
+-	     in gomp_pause_pool_helper.  */
++	  gomp_release_held_threads (pool, NULL, thr->ts.team_id);
++	  if (!gomp_barrier_can_hold (pool->prev_barrier))
++	    gomp_simple_barrier_wait (&pool->threads_dock);
++	  /* And this waits till all threads have called
++	     gomp_simple_barrier_wait_last in gomp_pause_pool_helper.  */
+ 	  gomp_simple_barrier_wait (&pool->threads_dock);
+ 	  /* Now it is safe to destroy the barrier and free the pool.  */
+ 	  gomp_simple_barrier_destroy (&pool->threads_dock);
+diff --git a/libgomp/work.c b/libgomp/work.c
+index 5f23232..e7b5e57 100644
+--- a/libgomp/work.c
++++ b/libgomp/work.c
+@@ -240,10 +240,14 @@ gomp_work_share_end (void)
+       return;
+     }
+ 
+-  bstate = gomp_barrier_wait_start (&team->barrier);
++  bstate = gomp_barrier_wait_start (&team->barrier, thr->ts.team_id);
+ 
+   if (gomp_barrier_last_thread (bstate))
+     {
++      /* For some targets the state returning "last" no longer indicates that
++	 we're *already* last, instead it indicates that we *should be* last.
++	 Perform the relevant synchronisation.  */
++      gomp_team_barrier_ensure_last (&team->barrier, thr->ts.team_id, bstate);
+       if (__builtin_expect (thr->ts.last_work_share != NULL, 1))
+ 	{
+ 	  team->work_shares_to_free = thr->ts.work_share;
+@@ -251,7 +255,7 @@ gomp_work_share_end (void)
+ 	}
+     }
+ 
+-  gomp_team_barrier_wait_end (&team->barrier, bstate);
++  gomp_team_barrier_wait_end (&team->barrier, bstate, thr->ts.team_id);
+   thr->ts.last_work_share = NULL;
+ }
+ 
+@@ -266,19 +270,27 @@ gomp_work_share_end_cancel (void)
+   gomp_barrier_state_t bstate;
+ 
+   /* Cancellable work sharing constructs cannot be orphaned.  */
+-  bstate = gomp_barrier_wait_cancel_start (&team->barrier);
++  bstate = gomp_barrier_wait_cancel_start (&team->barrier, thr->ts.team_id);
+ 
+   if (gomp_barrier_last_thread (bstate))
+     {
+-      if (__builtin_expect (thr->ts.last_work_share != NULL, 1))
++      if (gomp_team_barrier_ensure_cancel_last (&team->barrier, thr->ts.team_id,
++						bstate))
+ 	{
+-	  team->work_shares_to_free = thr->ts.work_share;
+-	  free_work_share (team, thr->ts.last_work_share);
++	  if (__builtin_expect (thr->ts.last_work_share != NULL, 1))
++	    {
++	      team->work_shares_to_free = thr->ts.work_share;
++	      free_work_share (team, thr->ts.last_work_share);
++	    }
+ 	}
++      else
++	gomp_reset_cancellable_primary_threadgen (&team->barrier,
++						  thr->ts.team_id);
+     }
+   thr->ts.last_work_share = NULL;
+ 
+-  return gomp_team_barrier_wait_cancel_end (&team->barrier, bstate);
++  return gomp_team_barrier_wait_cancel_end (&team->barrier, bstate,
++					    thr->ts.team_id);
+ }
+ 
+ /* The current thread is done with its current work sharing construct.
