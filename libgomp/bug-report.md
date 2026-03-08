@@ -1,12 +1,12 @@
-# libgomp Flat Barrier Bug Report
+# libgomp Bug Report
 
 ## Summary
 
-- **Target**: NVIDIA's flat barrier patch (Patch 3/5) for GCC's libgomp OpenMP runtime
-- **Patch series**: [gcc-patches mailing list, 2025](https://gcc.gnu.org/pipermail/gcc-patches/)
-- **Bug found**: 1 (cancel+task race in `gomp_barrier_handle_tasks`)
-- **Trigger path**: Final barrier (implicit barrier at end of parallel region)
-- **Legitimate reproduction**: Yes (standard OpenMP only, no compiler bypass)
+- **Target**: GCC's libgomp OpenMP runtime (bugs affect stock GCC, not specific to any patch)
+- **Bugs found**: 2
+  - Bug #28: BAR_CANCELLED overwrite in `gomp_barrier_handle_tasks` (NVIDIA flat barrier patch)
+  - Bug #29: Missing BAR_TASK_PENDING in `omp_fulfill_event` unshackled thread path (stock GCC, all versions since GCC 11)
+- **Legitimate reproduction**: Yes (standard OpenMP 5.0 API only, zero invasiveness)
 
 ### Model Checking Coverage
 
@@ -134,6 +134,115 @@ The bug was discovered through TLA+ model checking of the flat barrier protocol.
 Key invariant violated: `BarrierSafety` — asserts that no secondary thread proceeds past the barrier before all secondaries have arrived (`threadGen` ordering). The violation is indirect: `PrimaryHandleTaskLast` completes the barrier (increments generation) without checking BAR_CANCELLED, causing a split-brain where one secondary sees the cancel (undoes its arrival) while another sees the generation increment (passes normally). This creates inconsistent `threadGen` values among secondaries at "done".
 
 Note: The model found this violation on the cancel barrier path (`BAR_CANCEL_INCR`). Investigation of the real code shows this path is blocked in practice by an early return at bar.c:860-861. However, the same root cause (`gomp_increment_gen` stripping BAR_CANCELLED) is reachable via the final barrier path (`BAR_HOLDING_SECONDARIES`), where it triggers the checking assertion at bar.c:521-534.
+
+---
+
+## Bug #29: Missing BAR_TASK_PENDING in omp_fulfill_event (Deadlock)
+
+- **Severity**: Critical (deterministic deadlock in production builds)
+- **Affects**: All GCC versions since 11 (commit d656bfda, Feb 2021). Unfixed in GCC trunk as of March 2026.
+- **Affects all barrier implementations**: centralized (Linux), flat (NVIDIA patch), POSIX — all use identical BAR_TASK_PENDING gating
+- **Status**: Not yet reported upstream
+- **Root cause**: `omp_fulfill_event` from unshackled thread wakes a barrier thread without setting BAR_TASK_PENDING
+
+### Root Cause
+
+In `libgomp/task.c`, the `omp_fulfill_event` function has two wake paths:
+
+**Path 1 — dependent tasks exist (`new_tasks > 0`)**: Correctly sets BAR_TASK_PENDING before waking (fixed in [commit ba886d0c](https://github.com/gcc-mirror/gcc/commit/ba886d0c488ebea2eb2df95c2069a3e207704dac), May 2021):
+```c
+if (new_tasks > 0)
+  {
+    gomp_team_barrier_set_task_pending (&team->barrier);  // ← correct
+    do_wake = team->nthreads - team->task_running_count;
+  }
+```
+
+**Path 2 — no dependent tasks, unshackled thread (`!shackled_thread_p`)**: Only wakes, does NOT set BAR_TASK_PENDING (introduced in [commit d656bfda](https://github.com/gcc-mirror/gcc/commit/d656bfda2d8316627d0bbb18b10954e6aaf3c88c), Feb 2021):
+```c
+if (!shackled_thread_p
+    && !do_wake
+    && team->task_detach_count == 0
+    && gomp_team_barrier_waiting_for_tasks (&team->barrier))
+  do_wake = 1;  // ← BUG: no gomp_team_barrier_set_task_pending
+```
+
+### Why This Causes Deadlock
+
+The barrier wait loop (same pattern in all 3 barrier implementations) uses BAR_TASK_PENDING as the **sole gate** for entering `gomp_barrier_handle_tasks`:
+
+```c
+// config/linux/bar.c (centralized barrier, lines 113-125):
+do {
+    do_wait ((int *) &bar->generation, generation);
+    gen = __atomic_load_n (&bar->generation, MEMMODEL_ACQUIRE);
+    if (__builtin_expect (gen & BAR_TASK_PENDING, 0))  // ← gate
+        gomp_barrier_handle_tasks (state);
+    generation |= gen & BAR_WAITING_FOR_TASK;
+} while (!gomp_barrier_state_is_incremented (gen, state));
+```
+
+`gomp_barrier_handle_tasks` is not just "run tasks" — it is also responsible for calling `gomp_team_barrier_done` when `task_count == 0`, which is the **only** path to complete a barrier when tasks are involved.
+
+The deadlock sequence:
+1. Detached task body completes → task becomes `GOMP_TASK_DETACHED`, `task_count > 0`
+2. All team threads enter barrier wait loop, see no tasks to run, enter `futex_wait`
+3. External thread calls `omp_fulfill_event` → `task_count` drops to 0
+4. `gomp_team_barrier_wake` wakes one thread via `futex_wake`
+5. **BUG**: BAR_TASK_PENDING is NOT set, so `bar->generation` is unchanged
+6. Woken thread loads `bar->generation`, sees no change, loops back to `futex_wait`
+7. **DEADLOCK** — no thread ever calls `gomp_team_barrier_done`
+
+Key insight: `futex_wake` only wakes threads from `futex_wait`; it does **not** change `bar->generation`. Without BAR_TASK_PENDING modifying `bar->generation`, the wake is a no-op from the woken thread's perspective.
+
+### Reproduction
+
+**File**: `repro/detach_fulfill_deadlock.c`
+
+The reproduction is **100% non-invasive** — uses only standard OpenMP 5.0 `detach` clause and POSIX `pthread_create`. Its structure is nearly identical to GCC's own test case `task-detach-13.c` ([commit ba886d0c](https://github.com/gcc-mirror/gcc/commit/ba886d0c488ebea2eb2df95c2069a3e207704dac)), except without `depend` clauses (to trigger the `new_tasks == 0` path).
+
+```bash
+gcc -fopenmp -O2 -lpthread -o detach_repro detach_fulfill_deadlock.c
+
+# Deadlocks with any GCC (system or NVIDIA-patched):
+timeout 5 ./detach_repro
+echo $?  # 124 = deadlock
+
+# Succeeds with patched libgomp:
+timeout 5 LD_LIBRARY_PATH=/path/to/patched/.libs ./detach_repro
+echo $?  # 0 = success
+```
+
+**Tested**: 5/5 deadlock (unpatched) vs 5/5 success (patched), using identical source/compiler/flags builds differing only by the one-line fix.
+
+### Suggested Fix
+
+Add `gomp_team_barrier_set_task_pending` before `do_wake = 1` in the unshackled thread path:
+
+```c
+if (!shackled_thread_p
+    && !do_wake
+    && team->task_detach_count == 0
+    && gomp_team_barrier_waiting_for_tasks (&team->barrier))
+  {
+    gomp_team_barrier_set_task_pending (&team->barrier);
+    do_wake = 1;
+  }
+```
+
+This is the same pattern used in:
+- The `new_tasks > 0` path (task.c, same function, 3 lines above)
+- `gomp_target_task_completion` (task.c:835)
+
+### Patch
+
+See `repro/patches/bug29-fulfill-event-set-task-pending.patch`
+
+### Why This Bug Survived
+
+1. **Test gap**: GCC's test `task-detach-13.c` uses `depend(out/in)` → triggers `new_tasks > 0` path (correctly fixed by ba886d0c). No test covers the `new_tasks == 0` + unshackled thread combination.
+2. **Subtle mechanism**: The developer (Kwok Cheung Yeung) correctly identified the need for `do_wake = 1` but missed that `futex_wake` alone doesn't change `bar->generation`, making the wake invisible to the woken thread.
+3. **Same-author oversight**: The `set_task_pending` fix (ba886d0c, May 2021) was applied 3 months after the original code (d656bfda, Feb 2021) but only to the `new_tasks > 0` path, not the symmetric `!shackled_thread_p` path.
 
 ---
 
