@@ -91,9 +91,74 @@ The 5ms delay (`usleep(5000)`) ensures cancel arrives during the task execution
 window (~22ms total). In production, this timing gap occurs naturally from
 workload variation and OS scheduling jitter.
 
+---
+
+## Bug #29: omp_fulfill_event Deadlock (Unshackled Thread)
+
+**Severity**: Critical — deterministic deadlock
+**Affects**: All GCC versions since 11 (stock GCC, not patch-specific)
+
+### Quick Test (uses system libgomp)
+
+```bash
+cd repro/
+gcc -fopenmp -O2 -lpthread -o detach_repro detach_fulfill_deadlock.c
+timeout 5 ./detach_repro
+echo $?  # 124 = deadlock confirmed
+```
+
+### Full A/B Controlled Test
+
+The script `test_bug29.sh` performs a rigorous A/B comparison:
+
+1. Clones GCC 14.2 source (sparse checkout, libgomp only)
+2. Builds **unpatched** libgomp from source
+3. Applies the one-line fix and builds **patched** libgomp
+4. Runs the same reproduction program against both
+5. Reports results
+
+```bash
+cd repro/
+chmod +x test_bug29.sh
+./test_bug29.sh
+```
+
+Expected output:
+```
+  Unpatched: 5/5 deadlocked, 0/5 passed
+  Patched:   0/5 deadlocked, 5/5 passed
+
+  BUG CONFIRMED: 5/5 deadlock without fix, 5/5 pass with fix.
+```
+
+The two libgomp builds differ by **exactly one line** in `task.c`:
+```c
+gomp_team_barrier_set_task_pending (&team->barrier);
+```
+
+### How the Reproduction Works
+
+The program (`detach_fulfill_deadlock.c`) creates:
+1. A parallel region with 4 threads
+2. A detached task (via `#pragma omp task detach(ev)`) with **no dependent tasks**
+3. An external pthread that calls `omp_fulfill_event` after 200ms
+
+The 200ms delay ensures all team threads have entered the barrier wait loop
+before the event is fulfilled.  Without the delay, the bug still exists but
+may not trigger deterministically (the task body might not have returned yet).
+
+The program uses only standard OpenMP 5.0 API and POSIX threads.  It is
+structurally identical to GCC's own test `task-detach-13.c` (commit ba886d0c),
+except without `depend` clauses — which is what triggers the buggy code path.
+
+---
+
 ## Files
 
 | File | Description |
 |------|-------------|
-| `final_barrier_cancel_task.c` | Legitimate trigger via final barrier (standard OpenMP) |
+| `final_barrier_cancel_task.c` | Bug #28: cancel+task race trigger (standard OpenMP) |
+| `detach_fulfill_deadlock.c` | Bug #29: detach fulfill deadlock (standard OpenMP 5.0 + pthread) |
+| `test_bug29.sh` | Bug #29: self-contained A/B test script |
+| `patches/bug29-fulfill-event-set-task-pending.patch` | Bug #29: GCC patch |
 | `README.md` | This file |

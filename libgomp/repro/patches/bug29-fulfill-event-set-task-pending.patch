@@ -1,0 +1,59 @@
+From: Specula <specula@example.com>
+Subject: [PATCH] libgomp: Set BAR_TASK_PENDING in omp_fulfill_event for unshackled threads
+
+When omp_fulfill_event is called from an unshackled (non-OpenMP) thread
+for a detached task with no dependent tasks (new_tasks == 0), the code
+calls gomp_team_barrier_wake to wake a barrier thread but does not set
+BAR_TASK_PENDING on bar->generation.
+
+The barrier wait loop uses BAR_TASK_PENDING as the sole gate for entering
+gomp_barrier_handle_tasks.  Without it set, the woken thread sees no
+change in bar->generation and goes back to futex_wait.  Since
+gomp_barrier_handle_tasks is the only path that calls
+gomp_team_barrier_done (which completes the barrier when task_count == 0),
+this results in a deadlock: all team threads sleep in the barrier and
+nobody ever completes it.
+
+The fix adds gomp_team_barrier_set_task_pending before the wake, matching
+the pattern already used in the new_tasks > 0 path (added in commit
+ba886d0c) and in gomp_target_task_completion.
+
+Affects all three barrier implementations (centralized, flat/NVIDIA, POSIX)
+since all use the same BAR_TASK_PENDING gating pattern.
+
+libgomp/ChangeLog:
+
+	* task.c (omp_fulfill_event): Call gomp_team_barrier_set_task_pending
+	before waking barrier thread in unshackled-thread path when
+	new_tasks == 0.
+
+---
+ libgomp/task.c | 13 ++++++++++---
+ 1 file changed, 10 insertions(+), 3 deletions(-)
+
+diff --git a/libgomp/task.c b/libgomp/task.c
+index e2d7f21..1ea4ed4 100644
+--- a/libgomp/task.c
++++ b/libgomp/task.c
+@@ -2754,9 +2754,16 @@ omp_fulfill_event (omp_event_handle_t event)
+       && !do_wake
+       && team->task_detach_count == 0
+       && gomp_team_barrier_waiting_for_tasks (&team->barrier))
+-    /* Ensure that at least one thread is woken up to signal that the
+-       barrier can finish.  */
+-    do_wake = 1;
++    {
++      /* Ensure that at least one thread is woken up to signal that the
++	 barrier can finish.  Set BAR_TASK_PENDING so the woken thread
++	 enters gomp_barrier_handle_tasks to discover task_count == 0
++	 and call gomp_team_barrier_done.  Without this, the futex_wake
++	 alone does not change bar->generation, so the woken thread sees
++	 no change and goes back to sleep -- deadlock.  */
++      gomp_team_barrier_set_task_pending (&team->barrier);
++      do_wake = 1;
++    }
+
+   /* If we are running in an unshackled thread, the team might vanish before
+      gomp_team_barrier_wake is run if we release the lock first, so keep the
+--
+2.43.0
