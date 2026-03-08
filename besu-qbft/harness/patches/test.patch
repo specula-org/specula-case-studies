@@ -1,0 +1,227 @@
+diff --git a/consensus/qbft-core/src/integration-test/java/org/hyperledger/besu/consensus/qbft/core/test/TlaTraceTest.java b/consensus/qbft-core/src/integration-test/java/org/hyperledger/besu/consensus/qbft/core/test/TlaTraceTest.java
+new file mode 100644
+index 000000000..74fa322f4
+--- /dev/null
++++ b/consensus/qbft-core/src/integration-test/java/org/hyperledger/besu/consensus/qbft/core/test/TlaTraceTest.java
+@@ -0,0 +1,221 @@
++/*
++ * Integration test that exercises the real QBFT state machine and
++ * collects NDJSON traces for TLA+ trace validation.
++ *
++ * Activate with: -Dtla.trace.file=<path>
++ */
++package org.hyperledger.besu.consensus.qbft.core.test;
++
++import static org.assertj.core.api.Assertions.assertThat;
++import static org.hyperledger.besu.consensus.qbft.core.support.IntegrationTestHelpers.createSignedCommitPayload;
++
++import org.hyperledger.besu.consensus.common.bft.ConsensusRoundIdentifier;
++import org.hyperledger.besu.consensus.common.bft.events.BlockTimerExpiry;
++import org.hyperledger.besu.consensus.common.bft.events.RoundExpiry;
++import org.hyperledger.besu.consensus.qbft.core.payload.MessageFactory;
++import org.hyperledger.besu.consensus.qbft.core.statemachine.TlaTracer;
++import org.hyperledger.besu.consensus.qbft.core.support.RoundSpecificPeers;
++import org.hyperledger.besu.consensus.qbft.core.support.TestContext;
++import org.hyperledger.besu.consensus.qbft.core.support.TestContextBuilder;
++import org.hyperledger.besu.consensus.qbft.core.types.QbftBlock;
++import org.hyperledger.besu.consensus.qbft.core.types.QbftNewChainHead;
++
++import java.io.File;
++import java.time.Clock;
++import java.time.Instant;
++import java.time.ZoneId;
++import java.util.Collections;
++
++import org.junit.jupiter.api.AfterAll;
++import org.junit.jupiter.api.BeforeAll;
++import org.junit.jupiter.api.Test;
++/**
++ * Generates NDJSON traces from the real QBFT state machine for TLA+ validation.
++ */
++public class TlaTraceTest {
++
++  private static final int NETWORK_SIZE = 4;
++  private static final long BLOCK_TIMESTAMP = 100;
++  private static final Clock FIXED_CLOCK =
++      Clock.fixed(Instant.ofEpochSecond(BLOCK_TIMESTAMP), ZoneId.systemDefault());
++
++  private static final String TRACE_DIR =
++      System.getProperty("user.dir") + "/";
++
++  @AfterAll
++  static void closeTracer() {
++    TlaTracer.close();
++  }
++
++  private static void startTrace(final String filename) {
++    TlaTracer.close();
++    System.setProperty("tla.trace.file", TRACE_DIR + filename);
++    TlaTracer.init();
++  }
++
++  /**
++   * Basic consensus: local node is proposer.
++   * Flow: BlockTimerExpiry -> (sends Proposal+Prepare) ->
++   *       peers send Prepare -> (sends Commit) ->
++   *       peers send Commit -> block imported -> NewChainHead
++   */
++  @Test
++  void basicConsensusLocalProposer() {
++    startTrace("tla_trace_basic.ndjson");
++
++    final TestContext context = new TestContextBuilder()
++        .validatorCount(NETWORK_SIZE)
++        .indexOfFirstLocallyProposedBlock(1) // local node is proposer for height 1
++        .clock(FIXED_CLOCK)
++        .buildAndStart();
++
++    // Register node address mappings for TLA+ trace
++    registerNodes(context);
++
++    final ConsensusRoundIdentifier roundId = new ConsensusRoundIdentifier(1, 0);
++    final RoundSpecificPeers peers = context.roundSpecificPeers(roundId);
++    final QbftBlock block = context.createBlockForProposalFromChainHead(BLOCK_TIMESTAMP);
++
++    TlaTracer.setBlockchainHeight(0);
++
++    // 1. Block timer fires -> local node proposes
++    context.getController().handleBlockTimerExpiry(new BlockTimerExpiry(roundId));
++    peers.clearReceivedMessages();
++
++    // 2. Peers send Prepare messages
++    peers.getNonProposing(0).injectPrepare(roundId, block.getHash());
++    peers.getNonProposing(1).injectPrepare(roundId, block.getHash());
++    peers.clearReceivedMessages();
++
++    // 3. Peers send Commit messages -> quorum reached, block imported
++    peers.getNonProposing(0).injectCommit(roundId, block);
++    peers.getNonProposing(1).injectCommit(roundId, block);
++
++    // Verify block was imported
++    assertThat(context.getCurrentChainHeight()).isEqualTo(1);
++
++    // 4. NewChainHead event
++    context.getController().handleNewBlockEvent(new QbftNewChainHead(block.getHeader()));
++    peers.clearReceivedMessages();
++  }
++
++  /**
++   * Consensus where local node is NOT the proposer.
++   * Flow: BlockTimerExpiry (starts round) ->
++   *       Proposal from remote proposer -> (sends Prepare) ->
++   *       Prepare from peers -> (sends Commit) ->
++   *       Commit from peers -> block imported -> NewChainHead
++   */
++  @Test
++  void basicConsensusRemoteProposer() {
++    startTrace("tla_trace_remote_proposer.ndjson");
++
++    final TestContext context = new TestContextBuilder()
++        .validatorCount(NETWORK_SIZE)
++        .indexOfFirstLocallyProposedBlock(0) // local node is NOT proposer for height 1
++        .clock(FIXED_CLOCK)
++        .buildAndStart();
++
++    registerNodes(context);
++
++    final ConsensusRoundIdentifier roundId = new ConsensusRoundIdentifier(1, 0);
++    final RoundSpecificPeers peers = context.roundSpecificPeers(roundId);
++    // Block must be created with the PROPOSER's address (not local node)
++    final QbftBlock block =
++        context.createBlockForProposalFromChainHead(
++            BLOCK_TIMESTAMP, peers.getProposer().getNodeAddress());
++
++    TlaTracer.setBlockchainHeight(0);
++
++    // 1. Block timer fires (non-proposer: just starts round)
++    context.getController().handleBlockTimerExpiry(new BlockTimerExpiry(roundId));
++    peers.clearReceivedMessages();
++
++    // 2. Remote proposer sends Proposal -> local sends Prepare
++    peers.getProposer().injectProposal(roundId, block);
++    peers.clearReceivedMessages();
++
++    // 3. Peers send Prepare (local already prepared on proposal accept,
++    //    need 2 more prepares for quorum=3) -> local sends Commit
++    peers.getNonProposing(0).injectPrepare(roundId, block.getHash());
++    peers.getNonProposing(1).injectPrepare(roundId, block.getHash());
++    peers.clearReceivedMessages();
++
++    // 4. Peers send Commit (local auto-committed, need 2 more for quorum=3)
++    peers.getNonProposing(0).injectCommit(roundId, block);
++    peers.getNonProposing(1).injectCommit(roundId, block);
++
++    // Verify block imported
++    assertThat(context.getCurrentChainHeight()).isEqualTo(1);
++
++    // 5. NewChainHead
++    context.getController().handleNewBlockEvent(new QbftNewChainHead(block.getHeader()));
++    peers.clearReceivedMessages();
++  }
++
++  /**
++   * Round change scenario: round 0 times out, round 1 proposal.
++   */
++  @Test
++  void roundChangeScenario() {
++    startTrace("tla_trace_round_change.ndjson");
++
++    final TestContext context = new TestContextBuilder()
++        .validatorCount(NETWORK_SIZE)
++        .indexOfFirstLocallyProposedBlock(1) // local proposer for round 0
++        .clock(FIXED_CLOCK)
++        .buildAndStart();
++
++    registerNodes(context);
++
++    final ConsensusRoundIdentifier round0 = new ConsensusRoundIdentifier(1, 0);
++    final ConsensusRoundIdentifier round1 = new ConsensusRoundIdentifier(1, 1);
++    final RoundSpecificPeers peers0 = context.roundSpecificPeers(round0);
++
++    TlaTracer.setBlockchainHeight(0);
++
++    // 1. Block timer -> local node proposes in round 0
++    context.getController().handleBlockTimerExpiry(new BlockTimerExpiry(round0));
++    peers0.clearReceivedMessages();
++
++    // 2. Round 0 times out
++    context.getController().handleRoundExpiry(new RoundExpiry(round0));
++    peers0.clearReceivedMessages();
++
++    // 3. Peers also send round change for round 1
++    final RoundSpecificPeers peers1 = context.roundSpecificPeers(round1);
++    peers1.getNonProposing(0).injectRoundChange(round1, java.util.Optional.empty());
++    peers1.getNonProposing(1).injectRoundChange(round1, java.util.Optional.empty());
++    peers1.clearReceivedMessages();
++
++    // 4. If local node is proposer for round 1, it creates a new proposal
++    // If not, wait for proposal from round 1 proposer
++    final QbftBlock block1 = context.createBlockForProposalFromChainHead(BLOCK_TIMESTAMP, 1);
++    if (peers1.getProposer() != null) {
++      // Remote is proposer for round 1
++      peers1.getProposer().injectProposal(round1, block1);
++    }
++    peers1.clearReceivedMessages();
++  }
++
++  private void registerNodes(final TestContext context) {
++    // Local node = s1
++    TlaTracer.registerNode(context.getLocalNodeParams().getAddress(), "s1");
++    // Remote peers: proposer (if remote) + non-proposing
++    final var roundId = new ConsensusRoundIdentifier(1, 0);
++    final var peers = context.roundSpecificPeers(roundId);
++    int idx = 2;
++    if (peers.getProposer() != null) {
++      TlaTracer.registerNode(peers.getProposer().getNodeAddress(), "s" + idx);
++      idx++;
++    }
++    for (int i = 0; idx <= NETWORK_SIZE; i++) {
++      try {
++        TlaTracer.registerNode(peers.getNonProposing(i).getNodeAddress(), "s" + idx);
++        idx++;
++      } catch (final IndexOutOfBoundsException e) {
++        break;
++      }
++    }
++  }
++}
