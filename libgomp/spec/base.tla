@@ -47,6 +47,7 @@ VARIABLE cancelled       \* BOOLEAN: BAR_CANCELLED flag (bar.h:75)
 VARIABLE secondaryArrived \* BOOLEAN: BAR_SECONDARY_ARRIVED on generation (bar.h:79)
 VARIABLE holding         \* BOOLEAN: BAR_HOLDING_SECONDARIES flag (bar.h:83)
 VARIABLE taskCount       \* Nat: team->task_count
+VARIABLE taskDetachCount \* Nat: team->task_detach_count (tasks in GOMP_TASK_DETACHED state)
 
 \* --- Per-thread local state (bar.h:41-45: thread_lock_data) ---
 VARIABLE threadGen       \* [Thread -> Nat]: threadgens[i].gen
@@ -77,13 +78,14 @@ VARIABLE threadBarPtr    \* [Thread -> Nat]: barrier pointer captured at handle_
 
 globalBarVars  == <<generation, taskPending, waitingForTask, cancelled,
                     secondaryArrived, holding, taskCount>>
+detachVars     == <<taskDetachCount>>
 threadGenVars  == <<threadGen, primaryWaiting>>
 cancelVars     == <<cancelArrived, threadCGen, primaryWaitingC>>
 controlVars    == <<pc, scanIndex, barrierRound, barrierType>>
 holdingVars    == <<prevHolding>>
 teamVars       == <<teamId, threadTeamId, threadBarPtr>>
 
-allVars == <<globalBarVars, threadGenVars, cancelVars, controlVars, holdingVars, teamVars>>
+allVars == <<globalBarVars, threadGenVars, cancelVars, controlVars, holdingVars, teamVars, detachVars>>
 
 \* ============================================================================
 \* TYPE INVARIANT
@@ -97,6 +99,7 @@ TypeOK ==
     /\ secondaryArrived \in BOOLEAN
     /\ holding \in BOOLEAN
     /\ taskCount \in Nat
+    /\ taskDetachCount \in Nat
     /\ threadGen \in [Thread -> Nat]
     /\ primaryWaiting \in [Thread -> BOOLEAN]
     /\ cancelArrived \in BOOLEAN
@@ -147,6 +150,7 @@ Init ==
     /\ secondaryArrived = FALSE
     /\ holding = FALSE
     /\ taskCount = 0
+    /\ taskDetachCount = 0
     \* Per-thread generation
     /\ threadGen = [t \in Thread |-> 0]
     /\ primaryWaiting = [t \in Thread |-> FALSE]
@@ -189,7 +193,7 @@ PrimaryEnterBarrier ==
             /\ UNCHANGED <<globalBarVars, threadGenVars, primaryWaiting,
                            cancelArrived, primaryWaitingC>>
        ELSE /\ UNCHANGED <<globalBarVars, threadGenVars, cancelVars>>
-    /\ UNCHANGED <<barrierRound, barrierType, holdingVars, teamVars>>
+    /\ UNCHANGED <<barrierRound, barrierType, holdingVars, teamVars, detachVars>>
 
 (*
  * Secondary enters non-cancellable barrier.
@@ -205,7 +209,7 @@ SecondaryEnterBarrier(t) ==
     /\ threadGen' = [threadGen EXCEPT ![t] = threadGen[t] + 1]
     /\ pc' = [pc EXCEPT ![t] = "sec_arrived"]
     /\ UNCHANGED <<globalBarVars, primaryWaiting, cancelVars,
-                   scanIndex, barrierRound, barrierType, holdingVars, teamVars>>
+                   scanIndex, barrierRound, barrierType, holdingVars, teamVars, detachVars>>
 
 (*
  * Secondary checks if PRIMARY_WAITING_TG was set when it incremented.
@@ -227,7 +231,7 @@ SecondaryCheckFallback(t) ==
             /\ pc' = [pc EXCEPT ![t] = "waiting"]
             /\ UNCHANGED globalBarVars
     /\ UNCHANGED <<threadGenVars, cancelVars, scanIndex, barrierRound,
-                   barrierType, holdingVars, teamVars>>
+                   barrierType, holdingVars, teamVars, detachVars>>
 
 (*
  * Secondary enters cancellable barrier.
@@ -247,7 +251,7 @@ SecondaryEnterCancelBarrier(t) ==
     /\ pc' = [pc EXCEPT ![t] = "sec_cancel_arrived"]
     /\ UNCHANGED <<globalBarVars, primaryWaiting,
                    cancelArrived, primaryWaitingC,
-                   scanIndex, barrierRound, barrierType, holdingVars, teamVars>>
+                   scanIndex, barrierRound, barrierType, holdingVars, teamVars, detachVars>>
 
 (*
  * Secondary checks fallback for cancellable barrier.
@@ -269,7 +273,7 @@ SecondaryCheckCancelFallback(t) ==
             /\ UNCHANGED cancelArrived
     /\ UNCHANGED <<globalBarVars, threadGenVars, primaryWaiting,
                    threadCGen, primaryWaitingC,
-                   scanIndex, barrierRound, barrierType, holdingVars, teamVars>>
+                   scanIndex, barrierRound, barrierType, holdingVars, teamVars, detachVars>>
 
 (*
  * Secondary sees BAR_CANCELLED at cancel barrier entry.
@@ -282,7 +286,7 @@ SecondarySeeCancelled(t) ==
     /\ cancelled
     /\ pc' = [pc EXCEPT ![t] = "done"]
     /\ UNCHANGED <<globalBarVars, threadGenVars, cancelVars,
-                   scanIndex, barrierRound, barrierType, holdingVars, teamVars>>
+                   scanIndex, barrierRound, barrierType, holdingVars, teamVars, detachVars>>
 
 \* ============================================================================
 \* ACTIONS: PRIMARY SCANNING (ensure_last / ensure_cancel_last)
@@ -327,7 +331,7 @@ PrimaryCheckThread ==
             ELSE \* bar.c:400-401: neither changed, enter futex_waitv/fallback
                  /\ pc' = [pc EXCEPT ![Primary] = "enter_fallback"]
                  /\ UNCHANGED <<globalBarVars, threadGenVars, scanIndex>>
-    /\ UNCHANGED <<cancelVars, barrierRound, barrierType, holdingVars, teamVars>>
+    /\ UNCHANGED <<cancelVars, barrierRound, barrierType, holdingVars, teamVars, detachVars>>
 
 (*
  * Primary checks current secondary's cgen (cancel barrier).
@@ -366,7 +370,7 @@ PrimaryCheckCancelThread ==
             /\ pc' = [pc EXCEPT ![Primary] = "enter_cancel_fallback"]
             /\ UNCHANGED <<scanIndex, cancelVars>>
     /\ UNCHANGED <<globalBarVars, threadGenVars, barrierRound, barrierType,
-                   holdingVars, teamVars>>
+                   holdingVars, teamVars, detachVars>>
 
 \* ============================================================================
 \* ACTIONS: FUTEX_WAITV FALLBACK (Family 1)
@@ -394,7 +398,7 @@ PrimaryEnterFallback ==
             /\ pc' = [pc EXCEPT ![Primary] = "fallback_waiting"]
             /\ UNCHANGED scanIndex
     /\ UNCHANGED <<globalBarVars, threadGen, cancelVars,
-                   barrierRound, barrierType, holdingVars, teamVars>>
+                   barrierRound, barrierType, holdingVars, teamVars, detachVars>>
 
 (*
  * Primary wakes from fallback wait (futex_wait returned).
@@ -409,7 +413,7 @@ PrimaryWakeFromFallback ==
        \/ ThreadArrived(scanIndex)  \* secondary arrived while we were setting up
     /\ pc' = [pc EXCEPT ![Primary] = "scanning"]  \* Go back to check loop
     /\ UNCHANGED <<globalBarVars, threadGenVars, cancelVars,
-                   scanIndex, barrierRound, barrierType, holdingVars, teamVars>>
+                   scanIndex, barrierRound, barrierType, holdingVars, teamVars, detachVars>>
 
 (*
  * Primary enters cancel fallback.
@@ -427,7 +431,7 @@ PrimaryEnterCancelFallback ==
             /\ pc' = [pc EXCEPT ![Primary] = "cancel_fallback_waiting"]
             /\ UNCHANGED <<scanIndex, cancelArrived, threadCGen>>
     /\ UNCHANGED <<globalBarVars, threadGenVars, primaryWaiting,
-                   barrierRound, barrierType, holdingVars, teamVars>>
+                   barrierRound, barrierType, holdingVars, teamVars, detachVars>>
 
 PrimaryWakeFromCancelFallback ==
     /\ pc[Primary] = "cancel_fallback_waiting"
@@ -437,7 +441,7 @@ PrimaryWakeFromCancelFallback ==
        \/ threadCGen[scanIndex] > threadCGen[Primary] - 1
     /\ pc' = [pc EXCEPT ![Primary] = "scanning"]
     /\ UNCHANGED <<globalBarVars, threadGenVars, cancelVars,
-                   scanIndex, barrierRound, barrierType, holdingVars, teamVars>>
+                   scanIndex, barrierRound, barrierType, holdingVars, teamVars, detachVars>>
 
 \* ============================================================================
 \* ACTIONS: BARRIER COMPLETION
@@ -483,7 +487,7 @@ PrimaryCompleteBarrier ==
             /\ UNCHANGED <<taskPending, waitingForTask, cancelled,
                            secondaryArrived, holding, taskCount>>
     /\ UNCHANGED <<threadGenVars, cancelVars, scanIndex, barrierRound,
-                   barrierType, holdingVars, teamVars>>
+                   barrierType, holdingVars, teamVars, detachVars>>
 
 (*
  * Primary after cancel detected during scan.
@@ -497,7 +501,7 @@ PrimaryCancelDetected ==
     /\ pc' = [pc EXCEPT ![Primary] = "done"]
     /\ UNCHANGED <<globalBarVars, threadGenVars, primaryWaiting,
                    cancelArrived, primaryWaitingC,
-                   scanIndex, barrierRound, barrierType, holdingVars, teamVars>>
+                   scanIndex, barrierRound, barrierType, holdingVars, teamVars, detachVars>>
 
 \* ============================================================================
 \* ACTIONS: SECONDARY WAITING
@@ -518,7 +522,7 @@ SecondaryPassBarrier(t) ==
     /\ ~holding  \* If holding, secondaries must NOT proceed (bar.h:403-404)
     /\ pc' = [pc EXCEPT ![t] = "done"]
     /\ UNCHANGED <<globalBarVars, threadGenVars, cancelVars,
-                   scanIndex, barrierRound, barrierType, holdingVars, teamVars>>
+                   scanIndex, barrierRound, barrierType, holdingVars, teamVars, detachVars>>
 
 (*
  * Secondary in cancel wait loop — either cancelled or barrier completes.
@@ -550,7 +554,7 @@ SecondaryPassCancelBarrier(t) ==
        ELSE FALSE  \* Neither cancelled nor completed — keep waiting
     /\ UNCHANGED <<globalBarVars, primaryWaiting,
                    cancelArrived, primaryWaitingC,
-                   scanIndex, barrierRound, barrierType, holdingVars, teamVars>>
+                   scanIndex, barrierRound, barrierType, holdingVars, teamVars, detachVars>>
 
 \* Note: SecondaryTryHandleTaskWhileHeld is implicit — SecondaryPassBarrier
 \* is DISABLED when holding=TRUE, and SecondaryHandleTask guards ~holding.
@@ -570,7 +574,21 @@ ScheduleTask ==
     /\ taskCount' = taskCount + 1
     /\ taskPending' = TRUE
     /\ UNCHANGED <<generation, waitingForTask, cancelled, secondaryArrived,
-                   holding, threadGenVars, cancelVars, controlVars,
+                   holding, taskDetachCount, threadGenVars, cancelVars, controlVars,
+                   holdingVars, teamVars>>
+
+(*
+ * A detachable task becomes pending (has detach clause).
+ * Models: #pragma omp task detach(ev) — task is deferred/scheduled.
+ * At this point the task is in the queue like a normal task; the detach
+ * semantics only matter when the task body completes.
+ *)
+ScheduleDetachTask ==
+    /\ taskCount < MaxTasks
+    /\ taskCount' = taskCount + 1
+    /\ taskPending' = TRUE
+    /\ UNCHANGED <<generation, waitingForTask, cancelled, secondaryArrived,
+                   holding, taskDetachCount, threadGenVars, cancelVars, controlVars,
                    holdingVars, teamVars>>
 
 (*
@@ -580,15 +598,20 @@ ScheduleTask ==
  *)
 PrimaryHandleTask ==
     /\ pc[Primary] = "primary_handle_task"
-    /\ taskPending
     \* task.c:1583: &team->barrier != bar check (Family 4)
     /\ threadTeamId[Primary] = teamId  \* No ABA — still on correct team
-    /\ taskCount' = taskCount - 1
-    /\ taskPending' = IF taskCount - 1 > 0 THEN TRUE ELSE FALSE
+    /\ IF taskPending /\ taskCount > 0
+       THEN \* Tasks available — execute one
+            /\ taskCount' = taskCount - 1
+            /\ taskPending' = IF taskCount - 1 > 0 THEN TRUE ELSE FALSE
+       ELSE \* TOCTOU: taskPending was TRUE in PrimaryCheckThread/PrimaryCheckCancelThread
+            \* but a secondary consumed the last task before we got here.
+            \* task.c:1637-1724: gomp_barrier_handle_tasks finds empty queue, returns.
+            /\ UNCHANGED <<taskCount, taskPending>>
     /\ pc' = [pc EXCEPT ![Primary] = "scanning"]  \* Resume scanning
     /\ UNCHANGED <<generation, waitingForTask, cancelled, secondaryArrived,
                    holding, threadGenVars, cancelVars, scanIndex,
-                   barrierRound, barrierType, holdingVars, teamVars>>
+                   barrierRound, barrierType, holdingVars, teamVars, detachVars>>
 
 (*
  * Primary handles task as the "last" thread (all arrived, tasks remain).
@@ -601,7 +624,16 @@ PrimaryHandleTaskLast ==
             /\ taskCount' = taskCount - 1
             /\ taskPending' = IF taskCount - 1 > 0 THEN TRUE ELSE FALSE
             /\ UNCHANGED <<generation, waitingForTask, cancelled,
-                           secondaryArrived, holding, pc>>
+                           secondaryArrived, holding, pc,
+                           threadGenVars, detachVars>>
+       ELSE IF taskCount > 0
+       THEN \* No runnable tasks but tasks outstanding (detached tasks waiting
+            \* for omp_fulfill_event). Primary exits gomp_barrier_handle_tasks
+            \* and returns to barrier wait loop.
+            \* task.c:1637-1724: gomp_task_dequeue returns NULL, break, return.
+            /\ threadGen' = [threadGen EXCEPT ![Primary] = generation + 1]
+            /\ pc' = [pc EXCEPT ![Primary] = "waiting"]
+            /\ UNCHANGED <<globalBarVars, primaryWaiting, detachVars>>
        ELSE \* task.c:1646-1657: all tasks done, complete barrier
             IF barrierType = BarrierFinal
             THEN \* task.c:1649 with BAR_HOLDING_SECONDARIES
@@ -609,26 +641,30 @@ PrimaryHandleTaskLast ==
                  /\ waitingForTask' = FALSE
                  /\ pc' = [pc EXCEPT ![Primary] = "done"]
                  /\ UNCHANGED <<generation, taskPending, cancelled,
-                                secondaryArrived, taskCount>>
+                                secondaryArrived, taskCount,
+                                threadGenVars, detachVars>>
             ELSE IF barrierType = BarrierCancel
             THEN IF cancelled
                  THEN \* Cancel detected during task handling — don't complete
                       /\ waitingForTask' = FALSE
                       /\ pc' = [pc EXCEPT ![Primary] = "cancel_detected"]
                       /\ UNCHANGED <<generation, taskPending, cancelled,
-                                     secondaryArrived, holding, taskCount>>
+                                     secondaryArrived, holding, taskCount,
+                                     threadGenVars, detachVars>>
                  ELSE /\ generation' = generation + 1
                       /\ waitingForTask' = FALSE
                       /\ pc' = [pc EXCEPT ![Primary] = "done"]
                       /\ UNCHANGED <<taskPending, cancelled,
-                                     secondaryArrived, holding, taskCount>>
+                                     secondaryArrived, holding, taskCount,
+                                     threadGenVars, detachVars>>
             ELSE \* task.c:1649: gomp_team_barrier_done + wake
                  /\ generation' = generation + 1
                  /\ waitingForTask' = FALSE
                  /\ pc' = [pc EXCEPT ![Primary] = "done"]
                  /\ UNCHANGED <<taskPending, cancelled, secondaryArrived,
-                                holding, taskCount>>
-    /\ UNCHANGED <<threadGenVars, cancelVars, scanIndex,
+                                holding, taskCount,
+                                threadGenVars, detachVars>>
+    /\ UNCHANGED <<cancelVars, scanIndex,
                    barrierRound, barrierType, holdingVars, teamVars>>
 
 (*
@@ -651,7 +687,95 @@ SecondaryHandleTask(t) ==
     \* Only the primary (wait_on_was_last=TRUE) can complete the barrier.
     /\ UNCHANGED <<generation, waitingForTask, holding,
                    cancelled, secondaryArrived, pc, threadGenVars, cancelVars,
-                   scanIndex, barrierRound, barrierType, holdingVars, teamVars>>
+                   scanIndex, barrierRound, barrierType, holdingVars, teamVars, detachVars>>
+
+(*
+ * A thread executes a detachable task's body. The task transitions to
+ * GOMP_TASK_DETACHED state — body is done but event not yet fulfilled.
+ * taskCount stays (task not fully completed). taskPending clears (no
+ * more runnable tasks in the queue).
+ *
+ * Models: task.c:1637-1724 — dequeue, execute, task kind -> GOMP_TASK_DETACHED.
+ *         After the task body returns, the thread finds no more tasks in the
+ *         queue and exits gomp_barrier_handle_tasks.
+ *)
+DetachTaskBodyComplete ==
+    /\ taskCount > 0
+    /\ taskPending
+    /\ \E t \in Thread : pc[t] \in {"primary_handle_task", "primary_handle_task_last",
+                                     "waiting", "cancel_waiting"}
+    /\ taskDetachCount' = taskDetachCount + 1
+    /\ taskPending' = FALSE
+    /\ UNCHANGED <<generation, waitingForTask, cancelled, secondaryArrived,
+                   holding, taskCount, threadGenVars, cancelVars, controlVars,
+                   holdingVars, teamVars>>
+
+(*
+ * An unshackled (external/non-OpenMP) thread calls omp_fulfill_event
+ * for a detached task with no dependent tasks (new_tasks == 0).
+ *
+ * BUG (task.c:2753-2759): The code sets do_wake = 1 (wakes a barrier thread
+ * via gomp_team_barrier_wake) but does NOT call
+ * gomp_team_barrier_set_task_pending. The woken thread sees no change in
+ * bar->generation (BAR_TASK_PENDING not set), loops back to futex_wait.
+ * Nobody enters gomp_barrier_handle_tasks, nobody calls
+ * gomp_team_barrier_done. DEADLOCK.
+ *
+ * FIX: Add gomp_team_barrier_set_task_pending(&team->barrier) before do_wake.
+ * To model the FIX, uncomment the taskPending' = TRUE line below.
+ *)
+FulfillEvent ==
+    /\ taskDetachCount > 0
+    /\ taskCount' = taskCount - 1
+    /\ taskDetachCount' = taskDetachCount - 1
+    \* BUG: no gomp_team_barrier_set_task_pending — taskPending stays unchanged
+    /\ UNCHANGED <<generation, taskPending, waitingForTask, cancelled,
+                   secondaryArrived, holding>>
+    \* FIX (uncomment next line, remove taskPending from UNCHANGED above):
+    \* /\ taskPending' = TRUE
+    /\ UNCHANGED <<threadGenVars, cancelVars, controlVars, holdingVars, teamVars>>
+
+(*
+ * Primary re-enters gomp_barrier_handle_tasks from the barrier wait loop,
+ * sees BAR_TASK_PENDING, and discovers taskCount == 0 with
+ * BAR_WAITING_FOR_TASK set. Calls gomp_team_barrier_done to complete
+ * the barrier (increment generation).
+ *
+ * Models: task.c:1601-1608 — only the was_last thread (primary) can call
+ *         gomp_team_barrier_done. Secondaries enter handle_tasks with
+ *         was_last=FALSE and return without completing.
+ * This is the ONLY path to complete a barrier when the primary has exited
+ * handle_tasks to the wait loop (detached task path).
+ *)
+WaitingPrimaryCompleteBarrier ==
+    /\ pc[Primary] = "waiting"
+    /\ taskPending
+    /\ taskCount = 0
+    /\ waitingForTask
+    /\ ~holding
+    /\ threadTeamId[Primary] = teamId
+    /\ generation' = generation + 1
+    /\ waitingForTask' = FALSE
+    /\ taskPending' = FALSE
+    /\ pc' = [pc EXCEPT ![Primary] = "done"]
+    /\ UNCHANGED <<cancelled, secondaryArrived, holding, taskCount,
+                   threadGen, primaryWaiting, cancelVars, scanIndex,
+                   barrierRound, barrierType, holdingVars, teamVars, detachVars>>
+
+(*
+ * Primary passes barrier from wait loop (reached "waiting" via detached
+ * task path — exited gomp_barrier_handle_tasks when no runnable tasks).
+ * Another thread completed the barrier by incrementing generation.
+ *
+ * Models: bar.c:468-469 gomp_barrier_state_is_incremented for primary
+ *)
+PrimaryPassBarrierFromWaiting ==
+    /\ pc[Primary] = "waiting"
+    /\ generation >= threadGen[Primary]
+    /\ ~holding
+    /\ pc' = [pc EXCEPT ![Primary] = "done"]
+    /\ UNCHANGED <<globalBarVars, threadGenVars, cancelVars,
+                   scanIndex, barrierRound, barrierType, holdingVars, teamVars, detachVars>>
 
 \* ============================================================================
 \* ACTIONS: CANCELLATION (Family 2)
@@ -670,7 +794,7 @@ CancelBarrier ==
     /\ cancelArrived' = FALSE
     /\ UNCHANGED <<generation, taskPending, waitingForTask, secondaryArrived,
                    holding, taskCount, threadGenVars, threadCGen,
-                   primaryWaitingC, controlVars, holdingVars, teamVars>>
+                   primaryWaitingC, controlVars, holdingVars, teamVars, detachVars>>
 
 \* ============================================================================
 \* ACTIONS: BAR_HOLDING_SECONDARIES LIFECYCLE (Family 3)
@@ -690,7 +814,7 @@ PrimaryReleasePrev ==
     /\ prevHolding' = FALSE
     /\ UNCHANGED <<taskPending, waitingForTask, cancelled, secondaryArrived,
                    taskCount, threadGenVars, cancelVars,
-                   pc, scanIndex, barrierRound, barrierType, teamVars>>
+                   pc, scanIndex, barrierRound, barrierType, teamVars, detachVars>>
 
 (*
  * Primary completes a barrier round (was "done") — transitions to next round.
@@ -715,6 +839,7 @@ PrimaryStartNextRound ==
     /\ waitingForTask' = FALSE
     /\ taskPending' = FALSE
     /\ taskCount' = 0
+    /\ taskDetachCount' = 0
     \* Family 4: new team (models team.c:753 __atomic_store_n(&nthr->ts.team,...))
     /\ teamId' = teamId + 1
     /\ threadTeamId' = [t \in Thread |-> teamId + 1]
@@ -750,9 +875,14 @@ Next ==
     \/ \E t \in Secondaries : SecondaryPassBarrier(t)
     \/ \E t \in Secondaries : SecondaryPassCancelBarrier(t)
     \/ ScheduleTask
+    \/ ScheduleDetachTask
     \/ PrimaryHandleTask
     \/ PrimaryHandleTaskLast
     \/ \E t \in Secondaries : SecondaryHandleTask(t)
+    \/ DetachTaskBodyComplete
+    \/ FulfillEvent
+    \/ WaitingPrimaryCompleteBarrier
+    \/ PrimaryPassBarrierFromWaiting
     \/ CancelBarrier
     \/ PrimaryReleasePrev
     \/ PrimaryStartNextRound
@@ -871,6 +1001,41 @@ PrimaryFallbackConsistency ==
 NoUseAfterFree ==
     \A t \in Thread :
         pc[t] \notin {"idle", "done"} => threadTeamId[t] = teamId
+
+(*
+ * Family 3: In a BarrierFinal round, secondaries must NEVER reach "done"
+ * (= released to run user code in next region) while the barrier type is
+ * still BarrierFinal. They should be held in "waiting" by BAR_HOLDING_SECONDARIES.
+ * Without this invariant, a bug that treats BarrierFinal like BarrierNormal
+ * (incrementing generation instead of setting holding) goes undetected.
+ *)
+FinalBarrierRequiresHolding ==
+    barrierType = BarrierFinal =>
+        \A t \in Secondaries : pc[t] # "done"
+
+(*
+ * Family 3: If all threads are idle (start of a new round) and some secondary's
+ * threadGen exceeds the global generation, then prevHolding must be TRUE.
+ * This means there are unreleased secondaries from a previous BarrierFinal
+ * round, and PrimaryReleasePrev must fire to increment generation before
+ * the next barrier can start. Catches bugs where the holding->prevHolding
+ * transfer is lost.
+ *)
+UnreleasedSecondariesRequirePrevHolding ==
+    ((\A t \in Thread : pc[t] = "idle") /\ \E t \in Secondaries : threadGen[t] > generation)
+        => prevHolding
+
+(*
+ * Bug #29 detection: If all threads are waiting, taskCount is 0,
+ * waitingForTask is TRUE, and taskPending is FALSE, the barrier is
+ * deadlocked — no thread will enter gomp_barrier_handle_tasks to call
+ * gomp_team_barrier_done.
+ *)
+DetachFulfillNoDeadlock ==
+    ~(/\ \A t \in Thread : pc[t] = "waiting"
+      /\ taskCount = 0
+      /\ waitingForTask
+      /\ ~taskPending)
 
 \* ============================================================================
 \* LIVENESS PROPERTIES

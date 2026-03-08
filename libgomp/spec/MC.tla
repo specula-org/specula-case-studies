@@ -7,6 +7,7 @@
  *
  * Counter-bounded actions (non-deterministic injection):
  *   - ScheduleTask (external task scheduling)
+ *   - ScheduleDetachTask (detachable task scheduling)
  *   - CancelBarrier (cancellation event)
  *
  * Restricted actions:
@@ -27,6 +28,7 @@ libgomp == INSTANCE base
 \* ============================================================================
 
 CONSTANT MaxScheduleTaskLimit  \* Max task scheduling events
+CONSTANT MaxDetachScheduleLimit \* Max detach task scheduling events
 CONSTANT MaxCancelLimit        \* Max cancellation events
 CONSTANT BarrierTypeSet        \* Subset of {BarrierNormal, BarrierFinal, BarrierCancel}
 
@@ -47,6 +49,12 @@ MCScheduleTask ==
     /\ faultCounters.schedule < MaxScheduleTaskLimit
     /\ libgomp!ScheduleTask
     /\ faultCounters' = [faultCounters EXCEPT !.schedule = @ + 1]
+
+\* --- ScheduleDetachTask: bound detachable task injection ---
+MCScheduleDetachTask ==
+    /\ faultCounters.detachSchedule < MaxDetachScheduleLimit
+    /\ libgomp!ScheduleDetachTask
+    /\ faultCounters' = [faultCounters EXCEPT !.detachSchedule = @ + 1]
 
 \* --- CancelBarrier: bound cancellation events ---
 MCCancelBarrier ==
@@ -72,6 +80,7 @@ MCPrimaryStartNextRound ==
     /\ waitingForTask' = FALSE
     /\ taskPending' = FALSE
     /\ taskCount' = 0
+    /\ taskDetachCount' = 0
     /\ teamId' = teamId + 1
     /\ threadTeamId' = [t \in Thread |-> teamId + 1]
     /\ threadBarPtr' = [t \in Thread |-> teamId + 1]
@@ -112,9 +121,15 @@ MCNext ==
     \/ (\E t \in Secondaries : SecondaryPassCancelBarrier(t) /\ UNCHANGED faultVars)
     \* --- Task handling (unbounded for handlers, bounded for scheduling) ---
     \/ MCScheduleTask
+    \/ MCScheduleDetachTask
     \/ (PrimaryHandleTask /\ UNCHANGED faultVars)
     \/ (PrimaryHandleTaskLast /\ UNCHANGED faultVars)
     \/ (\E t \in Secondaries : SecondaryHandleTask(t) /\ UNCHANGED faultVars)
+    \* --- Detach task lifecycle (unbounded, reactive) ---
+    \/ (DetachTaskBodyComplete /\ UNCHANGED faultVars)
+    \/ (FulfillEvent /\ UNCHANGED faultVars)
+    \/ (WaitingPrimaryCompleteBarrier /\ UNCHANGED faultVars)
+    \/ (PrimaryPassBarrierFromWaiting /\ UNCHANGED faultVars)
     \* --- Cancellation (bounded) ---
     \/ MCCancelBarrier
     \* --- Holding lifecycle (unbounded, reactive) ---
@@ -128,7 +143,7 @@ MCNext ==
 
 MCInit ==
     /\ Init
-    /\ faultCounters = [schedule |-> 0, cancel |-> 0]
+    /\ faultCounters = [schedule |-> 0, detachSchedule |-> 0, cancel |-> 0]
 
 \* ============================================================================
 \* SPECIFICATION
