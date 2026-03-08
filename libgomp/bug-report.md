@@ -19,6 +19,7 @@
 | MC_hunt_family2.cfg | BFS | ~18K | All hold |
 | MC_hunt_family3.cfg | BFS | ~12K | All hold |
 | MC_hunt_family4.cfg | BFS | ~20K | All hold |
+| MC_hunt_detach_deadlock.cfg | BFS | 492 | **DetachFulfillNoDeadlock violated** |
 
 ---
 
@@ -237,6 +238,27 @@ This is the same pattern used in:
 ### Patch
 
 See `repro/patches/bug29-fulfill-event-set-task-pending.patch`
+
+### TLA+ Model
+
+The bug was discovered through TLA+ model checking. The specification extends the flat barrier model with detached task lifecycle:
+- `ScheduleDetachTask`: models `#pragma omp task detach(ev)` — task enters the queue
+- `DetachTaskBodyComplete`: task body finishes, task becomes `GOMP_TASK_DETACHED` (`taskDetachCount++`, `taskPending` cleared)
+- `FulfillEvent`: external thread calls `omp_fulfill_event` — `taskCount--`, `taskDetachCount--`, but **`taskPending` stays unchanged** (the bug)
+- `WaitingPrimaryCompleteBarrier`: primary re-enters `gomp_barrier_handle_tasks` from wait loop when `taskPending` is set
+
+Key invariant violated: `DetachFulfillNoDeadlock` — asserts that the system never reaches a state where all threads are in the barrier wait loop (`pc[t] = "waiting"`), `taskCount = 0`, `waitingForTask = TRUE`, and `~taskPending`. This state is a deadlock because no thread will enter `gomp_barrier_handle_tasks` to call `gomp_team_barrier_done`.
+
+The counterexample trace (13 states) shows the exact deadlock sequence:
+1. Detach task scheduled → `taskCount=1`, `taskPending=TRUE`
+2. All threads enter barrier, primary scans, all arrived
+3. Primary enters `handle_tasks` (`waitingForTask=TRUE`)
+4. Task body completes → `taskDetachCount=1`, `taskPending=FALSE` (queue empty)
+5. Primary sees no runnable tasks, exits to wait loop (`pc[Primary]="waiting"`)
+6. `FulfillEvent`: `taskCount→0`, but `taskPending` stays `FALSE`
+7. **Deadlock**: all threads waiting, `taskCount=0`, `~taskPending` — invariant violated
+
+Applying the fix (`taskPending' = TRUE` in `FulfillEvent`) eliminates the violation: TLC explores 662 states with no errors.
 
 ### Why This Bug Survived
 
