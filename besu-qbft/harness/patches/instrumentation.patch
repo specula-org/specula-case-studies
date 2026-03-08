@@ -1,0 +1,292 @@
+diff --git a/consensus/qbft-core/src/main/java/org/hyperledger/besu/consensus/qbft/core/statemachine/QbftBlockHeightManager.java b/consensus/qbft-core/src/main/java/org/hyperledger/besu/consensus/qbft/core/statemachine/QbftBlockHeightManager.java
+index 49099c2c1..b7b4172b3 100644
+--- a/consensus/qbft-core/src/main/java/org/hyperledger/besu/consensus/qbft/core/statemachine/QbftBlockHeightManager.java
++++ b/consensus/qbft-core/src/main/java/org/hyperledger/besu/consensus/qbft/core/statemachine/QbftBlockHeightManager.java
+@@ -176,6 +176,9 @@ public class QbftBlockHeightManager implements BaseQbftBlockHeightManager {
+ 
+     logValidatorChanges(qbftRound);
+ 
++    // TLA+ trace: BlockTimerExpiry
++    TlaTracer.emitFromRound("BlockTimerExpiry", qbftRound, finalState.getLocalAddress());
++
+     if (roundIdentifier.equals(qbftRound.getRoundIdentifier())) {
+       buildBlockAndMaybePropose(roundIdentifier, qbftRound);
+     } else {
+@@ -278,6 +281,9 @@ public class QbftBlockHeightManager implements BaseQbftBlockHeightManager {
+       return;
+     }
+ 
++    // TLA+ trace: RoundExpiry
++    TlaTracer.emitFromRound("RoundExpiry", qbftRound, finalState.getLocalAddress());
++
+     doRoundChange(qbftRound.getRoundIdentifier().getRoundNumber() + 1);
+   }
+ 
+diff --git a/consensus/qbft-core/src/main/java/org/hyperledger/besu/consensus/qbft/core/statemachine/QbftController.java b/consensus/qbft-core/src/main/java/org/hyperledger/besu/consensus/qbft/core/statemachine/QbftController.java
+index d43e9de45..bc5fc4f74 100644
+--- a/consensus/qbft-core/src/main/java/org/hyperledger/besu/consensus/qbft/core/statemachine/QbftController.java
++++ b/consensus/qbft-core/src/main/java/org/hyperledger/besu/consensus/qbft/core/statemachine/QbftController.java
+@@ -255,6 +255,11 @@ public class QbftController implements QbftEventHandler {
+       return;
+     }
+     startNewHeightManager(newBlockHeader);
++    // TLA+ trace: NewChainHead (after starting new height manager)
++    TlaTracer.setBlockchainHeight(newBlockHeader.getNumber());
++    TlaTracer.emitNodeEvent("NewChainHead", finalState.getLocalAddress(),
++        newBlockHeader.getNumber() + 1, -1, "Proposing",
++        false, false);
+   }
+ 
+   @Override
+diff --git a/consensus/qbft-core/src/main/java/org/hyperledger/besu/consensus/qbft/core/statemachine/QbftRound.java b/consensus/qbft-core/src/main/java/org/hyperledger/besu/consensus/qbft/core/statemachine/QbftRound.java
+index 832149e2f..8ef144c27 100644
+--- a/consensus/qbft-core/src/main/java/org/hyperledger/besu/consensus/qbft/core/statemachine/QbftRound.java
++++ b/consensus/qbft-core/src/main/java/org/hyperledger/besu/consensus/qbft/core/statemachine/QbftRound.java
+@@ -228,6 +228,9 @@ public class QbftRound {
+         msg.getAuthor());
+     final QbftBlock block = msg.getSignedPayload().getPayload().getProposedBlock();
+     if (updateStateWithProposedBlock(msg)) {
++      // TLA+ trace: HandleProposal (after state update)
++      TlaTracer.emitMsgFromRound("HandleProposal", this, localAddress,
++          msg.getAuthor(), "ProposalMsg");
+       sendPrepare(block);
+     }
+   }
+@@ -326,6 +329,9 @@ public class QbftRound {
+   private void peerIsPrepared(final Prepare msg) {
+     final boolean wasPrepared = roundState.isPrepared();
+     roundState.addPrepareMessage(msg);
++    // TLA+ trace: HandlePrepare (after addPrepareMessage)
++    TlaTracer.emitMsgFromRound("HandlePrepare", this, localAddress,
++        msg.getAuthor(), "PrepareMsg");
+     if (wasPrepared != roundState.isPrepared()) {
+       LOG.debug("Sending commit message. round={}", roundState.getRoundIdentifier());
+       final QbftBlock block = roundState.getProposedBlock().get();
+@@ -342,6 +348,9 @@ public class QbftRound {
+   private void peerIsCommitted(final Commit msg) {
+     final boolean wasCommitted = roundState.isCommitted();
+     roundState.addCommitMessage(msg);
++    // TLA+ trace: HandleCommit (after addCommitMessage)
++    TlaTracer.emitMsgFromRound("HandleCommit", this, localAddress,
++        msg.getAuthor(), "CommitMsg");
+     if (wasCommitted != roundState.isCommitted()) {
+       importBlockToChain();
+     }
+diff --git a/consensus/qbft-core/src/main/java/org/hyperledger/besu/consensus/qbft/core/statemachine/TlaTracer.java b/consensus/qbft-core/src/main/java/org/hyperledger/besu/consensus/qbft/core/statemachine/TlaTracer.java
+new file mode 100644
+index 000000000..e2aa5fe90
+--- /dev/null
++++ b/consensus/qbft-core/src/main/java/org/hyperledger/besu/consensus/qbft/core/statemachine/TlaTracer.java
+@@ -0,0 +1,212 @@
++/*
++ * TLA+ trace emitter for QBFT consensus.
++ * Emits NDJSON lines compatible with Trace.tla.
++ *
++ * Activated by setting system property: -Dtla.trace.file=/path/to/trace.ndjson
++ * When not set, all methods are no-ops.
++ */
++package org.hyperledger.besu.consensus.qbft.core.statemachine;
++
++import org.hyperledger.besu.consensus.common.bft.ConsensusRoundIdentifier;
++import org.hyperledger.besu.datatypes.Address;
++
++import java.io.BufferedWriter;
++import java.io.IOException;
++import java.nio.charset.StandardCharsets;
++import java.nio.file.Files;
++import java.nio.file.Paths;
++import java.time.Instant;
++import java.util.Locale;
++import java.util.Map;
++import java.util.concurrent.ConcurrentHashMap;
++import java.util.concurrent.atomic.AtomicReference;
++
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
++
++/** Static trace emitter for TLA+ NDJSON traces. Thread-safe, globally enabled via system prop. */
++public final class TlaTracer {
++
++  private static final Logger LOG = LoggerFactory.getLogger(TlaTracer.class);
++  private static final AtomicReference<BufferedWriter> WRITER = new AtomicReference<>();
++  private static final Map<String, String> ADDRESS_MAP = new ConcurrentHashMap<>();
++  private static volatile long blockchainHeight = 0;
++
++  private TlaTracer() {}
++
++  /** Initialize tracer from system property. Call once at test setup. */
++  public static void init() {
++    final String path = System.getProperty("tla.trace.file");
++    if (path == null || path.isEmpty()) {
++      return;
++    }
++    try {
++      WRITER.set(Files.newBufferedWriter(Paths.get(path), StandardCharsets.UTF_8));
++    } catch (final IOException e) {
++      throw new RuntimeException("Failed to open TLA trace file: " + path, e);
++    }
++  }
++
++  /** Register address-to-TLA-name mapping. */
++  public static void registerNode(final Address addr, final String tlaName) {
++    ADDRESS_MAP.put(addr.toHexString().toLowerCase(Locale.ROOT), tlaName);
++  }
++
++  /** Set current blockchain height (call from test after block import). */
++  public static void setBlockchainHeight(final long h) {
++    blockchainHeight = h;
++  }
++
++  /** Close the trace file. */
++  public static void close() {
++    final BufferedWriter w = WRITER.getAndSet(null);
++    if (w != null) {
++      try {
++        w.flush();
++        w.close();
++      } catch (final IOException e) {
++        LOG.warn("Failed to close TLA trace file", e);
++      }
++    }
++    ADDRESS_MAP.clear();
++  }
++
++  static boolean isEnabled() {
++    return WRITER.get() != null;
++  }
++
++  /** Map an Address to its TLA+ name (e.g. "s1"). */
++  public static String nid(final Address addr) {
++    final String hex = addr.toHexString().toLowerCase(Locale.ROOT);
++    return ADDRESS_MAP.getOrDefault(hex, hex);
++  }
++
++  /** Emit a node event (no message info). */
++  public static void emitNodeEvent(
++      final String eventName,
++      final Address node,
++      final long height,
++      final int round,
++      final String phase,
++      final boolean committed,
++      final boolean blockImported) {
++    if (!isEnabled()) {
++      return;
++    }
++    final String json =
++        String.format(
++            "{\"tag\":\"trace\",\"ts\":\"%s\",\"event\":{\"name\":\"%s\",\"nid\":\"%s\","
++                + "\"state\":{\"height\":%d,\"round\":%d,\"phase\":\"%s\","
++                + "\"committed\":%b,\"blockImported\":%b,\"blockchainHeight\":%d}}}",
++            Instant.now().toString(),
++            eventName,
++            nid(node),
++            height,
++            round,
++            phase,
++            committed,
++            blockImported,
++            blockchainHeight);
++    writeLine(json);
++  }
++
++  /** Emit a message event. */
++  public static void emitMsgEvent(
++      final String eventName,
++      final Address node,
++      final long height,
++      final int round,
++      final String phase,
++      final boolean committed,
++      final boolean blockImported,
++      final Address msgFrom,
++      final String msgType,
++      final int msgRound) {
++    if (!isEnabled()) {
++      return;
++    }
++    final String json =
++        String.format(
++            "{\"tag\":\"trace\",\"ts\":\"%s\",\"event\":{\"name\":\"%s\",\"nid\":\"%s\","
++                + "\"state\":{\"height\":%d,\"round\":%d,\"phase\":\"%s\","
++                + "\"committed\":%b,\"blockImported\":%b,\"blockchainHeight\":%d},"
++                + "\"msg\":{\"from\":\"%s\",\"to\":\"%s\",\"type\":\"%s\",\"round\":%d}}}",
++            Instant.now().toString(),
++            eventName,
++            nid(node),
++            height,
++            round,
++            phase,
++            committed,
++            blockImported,
++            blockchainHeight,
++            nid(msgFrom),
++            nid(node),
++            msgType,
++            msgRound);
++    writeLine(json);
++  }
++
++  static String phaseOf(final RoundState rs) {
++    if (rs.isCommitted()) {
++      return "Committed";
++    }
++    if (rs.isPrepared()) {
++      return "Prepared";
++    }
++    return "Proposing";
++  }
++
++  /** Emit from QbftRound context (has RoundState + roundId). */
++  public static void emitFromRound(
++      final String eventName, final QbftRound round, final Address localAddr) {
++    final RoundState rs = round.getRoundState();
++    final ConsensusRoundIdentifier rid = round.getRoundIdentifier();
++    emitNodeEvent(
++        eventName,
++        localAddr,
++        rid.getSequenceNumber(),
++        rid.getRoundNumber(),
++        phaseOf(rs),
++        rs.isCommitted(),
++        false);
++  }
++
++  /** Emit a message event from QbftRound context. */
++  public static void emitMsgFromRound(
++      final String eventName,
++      final QbftRound round,
++      final Address localAddr,
++      final Address msgFrom,
++      final String msgType) {
++    final RoundState rs = round.getRoundState();
++    final ConsensusRoundIdentifier rid = round.getRoundIdentifier();
++    emitMsgEvent(
++        eventName,
++        localAddr,
++        rid.getSequenceNumber(),
++        rid.getRoundNumber(),
++        phaseOf(rs),
++        rs.isCommitted(),
++        false,
++        msgFrom,
++        msgType,
++        rid.getRoundNumber());
++  }
++
++  private static void writeLine(final String json) {
++    final BufferedWriter w = WRITER.get();
++    if (w == null) {
++      return;
++    }
++    synchronized (w) {
++      try {
++        w.write(json);
++        w.newLine();
++        w.flush();
++      } catch (final IOException e) {
++        LOG.warn("Failed to write TLA trace line", e);
++      }
++    }
++  }
++}
