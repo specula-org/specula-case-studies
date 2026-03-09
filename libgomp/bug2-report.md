@@ -1,14 +1,15 @@
-# Missing BAR_TASK_PENDING in omp_fulfill_event (Deadlock)
+# Deadlock due to Missing BAR_TASK_PENDING in omp_fulfill_event
 
 `omp_fulfill_event` from an unshackled thread wakes a barrier thread without setting BAR_TASK_PENDING, which can lead to a deadlock.
 
-Affects all GCC versions since 11 (commit d656bfda, Feb 2021) and all barrier implementations (centralized, flat, POSIX) — they all use identical BAR_TASK_PENDING gating.
+This affects all GCC versions since 11 (commit d656bfda, Feb 2021) and all barrier implementations (centralized, flat, POSIX), as they all use identical BAR_TASK_PENDING gating.
 
 ## Root Cause
 
 In `libgomp/task.c`, the `omp_fulfill_event` function has two wake paths:
 
 **Path 1 — dependent tasks exist (`new_tasks > 0`)**: Correctly sets BAR_TASK_PENDING before waking (fixed in [commit ba886d0c](https://github.com/gcc-mirror/gcc/commit/ba886d0c488ebea2eb2df95c2069a3e207704dac), May 2021):
+
 ```c
 if (new_tasks > 0)
   {
@@ -18,6 +19,7 @@ if (new_tasks > 0)
 ```
 
 **Path 2 — no dependent tasks, unshackled thread (`!shackled_thread_p`)**: Only wakes, does NOT set BAR_TASK_PENDING (introduced in [commit d656bfda](https://github.com/gcc-mirror/gcc/commit/d656bfda2d8316627d0bbb18b10954e6aaf3c88c), Feb 2021):
+
 ```c
 if (!shackled_thread_p
     && !do_wake
@@ -44,6 +46,7 @@ do {
 `gomp_barrier_handle_tasks` is not only responsible for running tasks — it also calls `gomp_team_barrier_done` when `task_count == 0`, which appears to be the main path for completing a barrier when tasks are involved.
 
 The deadlock sequence:
+
 1. Detached task body completes → task becomes `GOMP_TASK_DETACHED`, `task_count > 0`
 2. All team threads enter barrier wait loop, see no tasks to run, enter `futex_wait`
 3. External thread calls `omp_fulfill_event` → `task_count` drops to 0
@@ -56,9 +59,9 @@ Key insight: `futex_wake` only wakes threads from `futex_wait`; it does **not** 
 
 ## Reproduction
 
-**File**: `repro/detach_fulfill_deadlock.c`
+In `repro/detach_fulfill_deadlock.c`. See `repro/README.md` for step-by-step reproduction instructions.
 
-The reproduction uses only standard OpenMP 5.0 `detach` clause and POSIX `pthread_create`. Its structure is similar to GCC's own test case `task-detach-13.c` ([commit ba886d0c](https://github.com/gcc-mirror/gcc/commit/ba886d0c488ebea2eb2df95c2069a3e207704dac)), but without `depend` clauses (to exercise the `new_tasks == 0` path).
+The reproduction is similar to GCC's own test case `task-detach-13.c` ([commit ba886d0c](https://github.com/gcc-mirror/gcc/commit/ba886d0c488ebea2eb2df95c2069a3e207704dac)), but without `depend` clauses (to exercise the `new_tasks == 0` path).
 
 ```bash
 gcc -fopenmp -O2 -lpthread -o detach_repro detach_fulfill_deadlock.c
@@ -72,11 +75,11 @@ timeout 5 LD_LIBRARY_PATH=/path/to/patched/.libs ./detach_repro
 echo $?  # 0 = success
 ```
 
-**Tested**: 5/5 deadlock (unpatched) vs 5/5 success (patched), using identical source/compiler/flags builds differing only by the one-line fix.
+We ran this a few times and got 5/5 deadlock, vs 5/5 success with the patch below.
 
 ## Suggested Fix
 
-Add `gomp_team_barrier_set_task_pending` before `do_wake = 1` in the unshackled thread path:
+See `repro/patches/bug29-fulfill-event-set-task-pending.patch`. We can simply add `gomp_team_barrier_set_task_pending` before `do_wake = 1` in the unshackled thread path:
 
 ```c
 if (!shackled_thread_p
@@ -89,17 +92,10 @@ if (!shackled_thread_p
   }
 ```
 
-This is the same pattern used in:
-- The `new_tasks > 0` path (task.c, same function, 3 lines above)
-- `gomp_target_task_completion` (task.c:835)
-
-### Patch
-
-See `repro/patches/bug29-fulfill-event-set-task-pending.patch`
-
 ## TLA+ Model
 
 The bug was discovered through TLA+ model checking. The specification extends the flat barrier model with detached task lifecycle:
+
 - `ScheduleDetachTask`: models `#pragma omp task detach(ev)` — task enters the queue
 - `DetachTaskBodyComplete`: task body finishes, task becomes `GOMP_TASK_DETACHED` (`taskDetachCount++`, `taskPending` cleared)
 - `FulfillEvent`: external thread calls `omp_fulfill_event` — `taskCount--`, `taskDetachCount--`, but **`taskPending` stays unchanged** (the bug)
@@ -108,6 +104,7 @@ The bug was discovered through TLA+ model checking. The specification extends th
 Key invariant violated: `DetachFulfillNoDeadlock` — asserts that the system never reaches a state where all threads are in the barrier wait loop (`pc[t] = "waiting"`), `taskCount = 0`, `waitingForTask = TRUE`, and `~taskPending`. This state is a deadlock because no thread will enter `gomp_barrier_handle_tasks` to call `gomp_team_barrier_done`.
 
 The counterexample trace (13 states) shows the exact deadlock sequence:
+
 1. Detach task scheduled → `taskCount=1`, `taskPending=TRUE`
 2. All threads enter barrier, primary scans, all arrived
 3. Primary enters `handle_tasks` (`waitingForTask=TRUE`)
@@ -118,14 +115,13 @@ The counterexample trace (13 states) shows the exact deadlock sequence:
 
 Applying the fix (`taskPending' = TRUE` in `FulfillEvent`) eliminates the violation: TLC explores 662 states with no errors.
 
-## Discussion
+<details>
+<summary>Discussion</summary>
 
-This is an understandably easy issue to miss:
+It seems like this issue was caused by:
 
 1. **Narrow test coverage gap**: The existing test `task-detach-13.c` uses `depend(out/in)`, which triggers the `new_tasks > 0` path (correctly fixed by ba886d0c). The `new_tasks == 0` + unshackled thread combination is a less common scenario that hasn't been covered yet.
 2. **Subtle `futex_wake` semantics**: It's natural to expect that `futex_wake` + `do_wake = 1` would be sufficient to unblock a waiting thread. The subtlety is that `futex_wake` doesn't modify `bar->generation`, so without BAR_TASK_PENDING the woken thread sees no change and loops back to sleep.
 3. **Incremental development**: The `set_task_pending` pattern (ba886d0c, May 2021) was added 3 months after the original unshackled-thread code (d656bfda, Feb 2021), but only to the `new_tasks > 0` path. The symmetric `!shackled_thread_p` path could benefit from the same treatment.
 
-## Reproduction Instructions
-
-See `repro/README.md` for step-by-step reproduction instructions.
+</details>
