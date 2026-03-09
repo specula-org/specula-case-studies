@@ -23,6 +23,39 @@
 
 ---
 
+## Candidate #30 (Under Investigation): Relaxed Publish Ordering in Cancel Fallback
+
+- **Severity**: Unknown (memory-order dependent; architecture dependent)
+- **Status**: Under investigation (not yet counted as confirmed runtime bug)
+- **Location**: `artifact/gcc/libgomp/config/linux/bar.c:610-612`
+
+### Concern
+
+In the cancellable fallback path, secondary publishes `BAR_SECONDARY_CANCELLABLE_ARRIVED`
+using relaxed ordering:
+
+```c
+__atomic_fetch_or (&bar->generation,
+                   BAR_SECONDARY_CANCELLABLE_ARRIVED,
+                   MEMMODEL_RELAXED);
+```
+
+Primary then uses this signal while coordinating with per-thread `cgen` state in
+`gomp_team_barrier_ensure_cancel_last`. With relaxed publish, there is no explicit
+cross-location ordering guarantee that seeing the flag also implies up-to-date
+visibility of the corresponding `cgen` update.
+
+### Standalone Reproduction Artifact
+
+See `repro/weakmem_relaxed_publish_litmus.c` and `repro/test_weakmem.sh`.
+
+- The litmus is intentionally a focused publication-order witness.
+- It reports stale observations (`flag=1` while `cgen=0`) and exits non-zero on detection.
+- This demonstrates the ordering hazard pattern directly; it is not by itself a full
+  end-to-end libgomp workload reproducer.
+
+---
+
 ## Bug #28: BAR_CANCELLED Overwrite in gomp_barrier_handle_tasks
 
 - **Severity**: Medium (code defect; checking builds: assertion failure at bar.c:521; production builds: no observable impact due to `team_cancelled` fallback)
