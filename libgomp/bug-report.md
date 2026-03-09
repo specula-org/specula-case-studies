@@ -23,36 +23,12 @@
 
 ---
 
-## Candidate #30 (Under Investigation): Relaxed Publish Ordering in Cancel Fallback
+## Candidate #30 (Dismissed): Relaxed Publish Ordering in Cancel Fallback
 
-- **Severity**: Unknown (memory-order dependent; architecture dependent)
-- **Status**: Under investigation (not yet counted as confirmed runtime bug)
+- **Status**: False positive — RELAXED ordering is intentional and correct
 - **Location**: `artifact/gcc/libgomp/config/linux/bar.c:610-612`
 
-### Concern
-
-In the cancellable fallback path, secondary publishes `BAR_SECONDARY_CANCELLABLE_ARRIVED`
-using relaxed ordering:
-
-```c
-__atomic_fetch_or (&bar->generation,
-                   BAR_SECONDARY_CANCELLABLE_ARRIVED,
-                   MEMMODEL_RELAXED);
-```
-
-Primary then uses this signal while coordinating with per-thread `cgen` state in
-`gomp_team_barrier_ensure_cancel_last`. With relaxed publish, there is no explicit
-cross-location ordering guarantee that seeing the flag also implies up-to-date
-visibility of the corresponding `cgen` update.
-
-### Standalone Reproduction Artifact
-
-See `repro/weakmem_relaxed_publish_litmus.c` and `repro/test_weakmem.sh`.
-
-- The litmus is intentionally a focused publication-order witness.
-- It reports stale observations (`flag=1` while `cgen=0`) and exits non-zero on detection.
-- This demonstrates the ordering hazard pattern directly; it is not by itself a full
-  end-to-end libgomp workload reproducer.
+The `MEMMODEL_RELAXED` on `BAR_SECONDARY_CANCELLABLE_ARRIVED` was flagged as a potential weak-memory ordering bug. Code audit concluded this is safe: the flag is purely a wakeup signal, not a data-publishing mechanism. The primary thread always re-reads `cgen` with `ACQUIRE` after handling the flag, forming a proper release-acquire pair with the secondary's `RELEASE` write (bar.c:600). The author confirms this design in `gomp_team_barrier_cancel` (bar.c:879-883): "No thread infers anything about any other data having been set based on these flags."
 
 ---
 

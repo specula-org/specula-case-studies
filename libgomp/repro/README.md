@@ -153,50 +153,12 @@ except without `depend` clauses — which is what triggers the buggy code path.
 
 ---
 
-## Candidate #30: Relaxed Publish Probe (Execution Repro)
-
-This is an execution-path stress repro for the relaxed publish candidate in the
-cancellable barrier fallback path.
-
-### Build
-
-```bash
-cd repro/
-gcc -O2 -g -fopenmp -pthread -o cancel_relaxed_publish_probe cancel_relaxed_publish_probe.c
-```
-
-### Run
-
-```bash
-cd repro/
-LIBGOMP_DIR=/path/to/libgomp/.libs ./test_bug30_candidate.sh
-```
-
-Useful knobs:
-
-```bash
-TRIALS=10000 THREADS=16 RUN_TIMEOUT=120 \
-LIBGOMP_DIR=/path/to/libgomp/.libs \
-./test_bug30_candidate.sh
-```
-
-Expected interpretation:
-- If output/log contains `WEAKMEM_PROBE_STALE`, script exits non-zero (`FAIL`).
-- If no probe hit is observed, script exits 0 (`inconclusive`, not a proof of absence).
-
-Note: this script checks for runtime probe output; it is most useful with a
-libgomp build that includes weak-memory probe instrumentation.
-
----
-
 ## Files
 
 | File | Description |
 |------|-------------|
 | `final_barrier_cancel_task.c` | Bug #28: cancel+task race trigger (standard OpenMP) |
 | `detach_fulfill_deadlock.c` | Bug #29: detach fulfill deadlock (standard OpenMP 5.0 + pthread) |
-| `cancel_relaxed_publish_probe.c` | Candidate #30: cancel-path stress workload |
 | `test_bug29.sh` | Bug #29: self-contained A/B test script |
-| `test_bug30_candidate.sh` | Candidate #30: probe runner |
 | `patches/bug29-fulfill-event-set-task-pending.patch` | Bug #29: GCC patch |
 | `README.md` | This file |
