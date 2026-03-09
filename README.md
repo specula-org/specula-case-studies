@@ -4,13 +4,7 @@ Case studies with [Specula](https://github.com/specula-org/Specula): TLA+ specif
 
 ## Case Studies
 
-| Case study                                                                  | Spec folder                                                                    | Language | Family |
-| --------------------------------------------------------------------------- | ------------------------------------------------------------------------------ | -------- | ------ |
-| [Etcd Raft](https://github.com/etcd-io/raft)                                | [`etcd-raft/scenarios/`](./etcd-raft/scenarios/)                               | Go       | Raft   |
-| [Hashicorp Raft](https://github.com/hashicorp/raft)                         | [`hashicorp-raft/scenarios/base/spec/`](./hashicorp-raft/scenarios/base/spec/) | Go       | Raft   |
-| [SwiftPaxos](https://github.com/imdea-software/swiftpaxos)                  | [`swiftpaxos/spec/`](./swiftpaxos/spec/)                                       | Go       | Paxos  |
-| [EPaxos](https://github.com/imdea-software/swiftpaxos/tree/master/epaxos)   | [`epaxos/spec/`](./epaxos/spec/)                                               | Go       | Paxos  |
-| [N2Paxos](https://github.com/imdea-software/swiftpaxos/tree/master/n2paxos) | [`n2paxos/spec/`](./n2paxos/spec/)                                             | Go       | Paxos  |
+We have currently run case studies on a variety of distributed systems protocols (Raft, Paxos, BFT) in Go, Java, Rust, and C++. See subfolders for more information.
 
 ## Structure
 
