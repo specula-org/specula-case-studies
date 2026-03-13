@@ -1,0 +1,222 @@
+diff --git a/crossbeam-epoch/src/internal.rs b/crossbeam-epoch/src/internal.rs
+index 9abc113..88c4d1a 100644
+--- a/crossbeam-epoch/src/internal.rs
++++ b/crossbeam-epoch/src/internal.rs
+@@ -195,6 +195,12 @@ impl Global {
+ 
+         let epoch = self.epoch.load(Ordering::Relaxed);
+         self.queue.push(bag.seal(epoch), guard);
++
++        // TRACE: PushLocalBag — bag sealed with current epoch and pushed to global queue
++        #[cfg(all(feature = "std", not(crossbeam_loom)))]
++        if crate::tla_trace::is_active() {
++            crate::tla_trace::emit_bag_event("PushLocalBag", epoch, None);
++        }
+     }
+ 
+     /// Collects several bags from the global queue and executes deferred functions in them.
+@@ -220,7 +226,18 @@ impl Global {
+                 guard,
+             ) {
+                 None => break,
+-                Some(sealed_bag) => drop(sealed_bag),
++                Some(sealed_bag) => {
++                    // TRACE: CollectExpiredBag — popped an expired bag
++                    #[cfg(all(feature = "std", not(crossbeam_loom)))]
++                    if crate::tla_trace::is_active() {
++                        crate::tla_trace::emit_bag_event(
++                            "CollectExpiredBag",
++                            global_epoch,
++                            Some(sealed_bag.epoch),
++                        );
++                    }
++                    drop(sealed_bag)
++                }
+             }
+         }
+     }
+@@ -275,6 +292,12 @@ impl Global {
+         #[cfg(not(crossbeam_sanitize_thread))]
+         atomic::fence(Ordering::Acquire);
+ 
++        // TRACE: ScanForAdvance — scan succeeded, all pinned locals at current epoch
++        #[cfg(all(feature = "std", not(crossbeam_loom)))]
++        if crate::tla_trace::is_active() {
++            crate::tla_trace::emit_weak_event("ScanForAdvance", global_epoch, true);
++        }
++
+         // All pinned participants were pinned in the current global epoch.
+         // Now let's advance the global epoch...
+         //
+@@ -284,6 +307,13 @@ impl Global {
+         // advanced two steps ahead of it.
+         let new_epoch = global_epoch.successor();
+         self.epoch.store(new_epoch, Ordering::Release);
++
++        // TRACE: StoreAdvancedEpoch — new epoch stored
++        #[cfg(all(feature = "std", not(crossbeam_loom)))]
++        if crate::tla_trace::is_active() {
++            crate::tla_trace::emit_weak_event("StoreAdvancedEpoch", new_epoch, true);
++        }
++
+         new_epoch
+     }
+ }
+@@ -408,6 +438,19 @@ impl Local {
+ 
+         if guard_count == 0 {
+             let global_epoch = self.global().epoch.load(Ordering::Relaxed);
++
++            // TRACE: ReadGlobalForPin — after reading global epoch, before storing local
++            #[cfg(all(feature = "std", not(crossbeam_loom)))]
++            if crate::tla_trace::is_active() {
++                crate::tla_trace::emit_epoch_event(
++                    "ReadGlobalForPin",
++                    global_epoch,
++                    self.epoch.load(Ordering::Relaxed),
++                    false,
++                    0,
++                );
++            }
++
+             let new_epoch = global_epoch.pinned();
+ 
+             // Now we must store `new_epoch` into `self.epoch` and execute a `SeqCst` fence.
+@@ -447,6 +490,18 @@ impl Local {
+                 atomic::fence(Ordering::SeqCst);
+             }
+ 
++            // TRACE: CompletePin — after epoch stored + fence
++            #[cfg(all(feature = "std", not(crossbeam_loom)))]
++            if crate::tla_trace::is_active() {
++                crate::tla_trace::emit_epoch_event(
++                    "CompletePin",
++                    self.global().epoch.load(Ordering::Relaxed),
++                    self.epoch.load(Ordering::Relaxed),
++                    true,
++                    1,
++                );
++            }
++
+             // Increment the pin counter.
+             let count = self.pin_count.get();
+             self.pin_count.set(count + Wrapping(1));
+@@ -456,6 +511,18 @@ impl Local {
+             if count.0 % Self::PINNINGS_BETWEEN_COLLECT == 0 {
+                 self.global().collect(&guard);
+             }
++        } else {
++            // TRACE: NestedPin — guard_count was > 0, just incremented
++            #[cfg(all(feature = "std", not(crossbeam_loom)))]
++            if crate::tla_trace::is_active() {
++                crate::tla_trace::emit_epoch_event(
++                    "NestedPin",
++                    self.global().epoch.load(Ordering::Relaxed),
++                    self.epoch.load(Ordering::Relaxed),
++                    true,
++                    guard_count + 1,
++                );
++            }
+         }
+ 
+         guard
+@@ -470,11 +537,35 @@ impl Local {
+         if guard_count == 1 {
+             self.epoch.store(Epoch::starting(), Ordering::Release);
+ 
++            // TRACE: Unpin (last guard) — epoch cleared, pinned = false
++            #[cfg(all(feature = "std", not(crossbeam_loom)))]
++            if crate::tla_trace::is_active() {
++                crate::tla_trace::emit_epoch_event(
++                    "Unpin",
++                    self.global().epoch.load(Ordering::Relaxed),
++                    Epoch::starting(),
++                    false,
++                    0,
++                );
++            }
++
+             if self.handle_count.get() == 0 {
+                 unsafe {
+                     Self::finalize(self);
+                 }
+             }
++        } else {
++            // TRACE: Unpin (nested) — still pinned
++            #[cfg(all(feature = "std", not(crossbeam_loom)))]
++            if crate::tla_trace::is_active() {
++                crate::tla_trace::emit_epoch_event(
++                    "Unpin",
++                    self.global().epoch.load(Ordering::Relaxed),
++                    self.epoch.load(Ordering::Relaxed),
++                    true,
++                    guard_count - 1,
++                );
++            }
+         }
+     }
+ 
+@@ -519,6 +610,16 @@ impl Local {
+             (*this).handle_count.set(handle_count - 1);
+         }
+ 
++        // TRACE: ReleaseHandle
++        #[cfg(all(feature = "std", not(crossbeam_loom)))]
++        if crate::tla_trace::is_active() {
++            crate::tla_trace::emit_lifecycle_event(
++                "ReleaseHandle",
++                handle_count - 1,
++                guard_count,
++            );
++        }
++
+         if guard_count == 0 && handle_count == 1 {
+             unsafe {
+                 Self::finalize(this);
+@@ -534,6 +635,11 @@ impl Local {
+             debug_assert_eq!((*this).handle_count.get(), 0);
+         }
+ 
++        // TRACE: Suppress intermediate pin/push/unpin events during finalize.
++        // The spec models finalize as a single atomic action.
++        #[cfg(all(feature = "std", not(crossbeam_loom)))]
++        crate::tla_trace::suppress(true);
++
+         // Temporarily increment handle count. This is required so that the following call to `pin`
+         // doesn't call `finalize` again.
+         unsafe {
+@@ -558,9 +664,20 @@ impl Local {
+             // `Local` as deleted.
+             let collector: Collector = ptr::read((*this).collector.with(|c| &*(*c)));
+ 
++            // Capture global epoch before dropping collector (which may destroy Global)
++            #[cfg(all(feature = "std", not(crossbeam_loom)))]
++            let _ge = collector.global.epoch.load(Ordering::Relaxed);
++
+             // Mark this node in the linked list as deleted.
+             (*this).entry.delete(unprotected());
+ 
++            // TRACE: Finalize — emit after all internal operations complete
++            #[cfg(all(feature = "std", not(crossbeam_loom)))]
++            {
++                crate::tla_trace::suppress(false);
++                crate::tla_trace::emit_finalize_event(_ge);
++            }
++
+             // Finally, drop the reference to the global. Note that this might be the last reference
+             // to the `Global`. If so, the global data will be destroyed and all deferred functions
+             // in its queue will be executed.
+diff --git a/crossbeam-epoch/src/lib.rs b/crossbeam-epoch/src/lib.rs
+index 97d46f6..7f749e8 100644
+--- a/crossbeam-epoch/src/lib.rs
++++ b/crossbeam-epoch/src/lib.rs
+@@ -167,6 +167,9 @@ mod internal;
+ #[cfg(all(feature = "alloc", target_has_atomic = "ptr"))]
+ mod sync;
+ 
++#[cfg(all(feature = "std", target_has_atomic = "ptr", not(crossbeam_loom)))]
++mod tla_trace;
++
+ #[cfg(all(feature = "alloc", target_has_atomic = "ptr"))]
+ pub use crate::{
+     atomic::{
