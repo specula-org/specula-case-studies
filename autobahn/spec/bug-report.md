@@ -85,6 +85,7 @@ value, preventing a Byzantine node from reusing a QC for a different value.
 **Severity**: CRITICAL — Enables forged timeout certificates
 **Family**: 2 (View Change Safety)
 **Found by**: Code analysis (messages.rs:1349-1358)
+**MC confirmed**: MC_hunt_da23.cfg, simulation, 1s, 26-state counterexample (AgreementSafety violated)
 
 ### Summary
 
@@ -125,6 +126,7 @@ slot, view, or context.
 **Severity**: CRITICAL — Enables forged timeout certificates
 **Family**: 2 (View Change Safety)
 **Found by**: Code analysis (messages.rs:1405-1411, 1518-1546)
+**MC confirmed**: MC_hunt_da23.cfg, simulation, 1s, 26-state counterexample (AgreementSafety violated)
 
 ### Summary
 
@@ -200,6 +202,7 @@ Byzantine one — can send a Prepare that honest nodes will accept and vote on.
 **Severity**: CRITICAL — May select wrong value after view change
 **Family**: 2 (View Change Safety)
 **Found by**: Code analysis (messages.rs:1436-1499)
+**MC confirmed**: MC_hunt_da5v2.cfg, simulation, 1s, 28-state counterexample (ViewChangeSafety violated)
 
 ### Summary
 
@@ -274,6 +277,438 @@ due to Bug DA-1), the second overwrites the first.
 
 ---
 
+## Bug DA-27: HashMap Iteration Causes Non-Deterministic Commit Order (HIGH)
+
+**Severity**: HIGH — Replicas derive different total orders
+**Family**: 6 (Commit Ordering Determinism)
+**Found by**: MC_hunt_ordering.cfg, BFS, <1s, 9-state counterexample
+**Author confirmed**: Known bug — "proposals should be a BTreeMap instead of a HashMap"
+
+### Summary
+
+When a slot is committed, the Committer processes proposal lanes by iterating
+over `HashMap<PublicKey, Proposal>`. HashMap iteration order is non-deterministic
+(depends on internal hash state). Different replicas process the same proposal
+lanes in different order, producing different total orders for committed headers.
+
+This violates the fundamental SMR (State Machine Replication) requirement that
+all replicas execute operations in the same total order.
+
+### Root Cause
+
+```rust
+// committer.rs:132-133 (process_commit_message)
+ConsensusMessage::Commit { slot: _, view: _, qc: _, proposals } => {
+    for (pk, proposal) in proposals {  // HashMap — non-deterministic!
+        // ... fetch headers for this lane and send to tx_output
+    }
+}
+```
+
+The `proposals` field is `HashMap<PublicKey, Proposal>` (messages.rs:101,107,113).
+Each entry represents one validator's "lane" — a chain of headers to deliver.
+The iteration order determines which validator's headers are committed first.
+
+### Counterexample Trace (9 steps)
+
+```
+1.  Init
+2.  s1 enters slot 1 (view=1)
+3.  s3 (leader) sends Prepare(v1)
+4.  s1 votes Prepare
+5.  s2 votes Prepare
+6.  s4 votes Prepare → 4/4 = fast quorum
+7.  s1 sends FastCommit(v1)
+8.  s1 receives Commit → commitOrder = <<s1, s2, s3, s4>>
+9.  s2 receives Commit → commitOrder = <<s1, s2, s4, s3>>
+    *** ExecutionOrderAgreement VIOLATED ***
+```
+
+No Byzantine behavior required. The bug occurs in a completely honest execution.
+
+### Related: Latent Bug in proposal_digest()
+
+The `proposal_digest()` function (messages.rs:210-231) also iterates over
+`HashMap<PublicKey, Proposal>`. If Bug DA-1 is fixed by uncommenting
+`proposal_digest()` calls WITHOUT also changing HashMap to BTreeMap,
+different replicas will compute different digests for the same proposal set,
+breaking QC verification.
+
+### Affected Code
+
+| File | Lines | Issue |
+|------|-------|-------|
+| `committer.rs` | 132-133 | Iterates HashMap for commit execution order |
+| `messages.rs` | 96-115 | ConsensusMessage proposals field is HashMap |
+| `messages.rs` | 210-231 | proposal_digest() iterates HashMap for hashing |
+
+### Fix
+
+Replace `HashMap<PublicKey, Proposal>` with `BTreeMap<PublicKey, Proposal>`
+in the `ConsensusMessage` enum (messages.rs:101,107,113). BTreeMap iterates
+in key order (deterministic), ensuring all replicas derive the same total order.
+
+---
+
+## Bug DA-7: handle_tc() Is a Near-No-Op (MEDIUM)
+
+**Severity**: MEDIUM — Liveness violation, non-leader nodes stuck after view change
+**Family**: 2 (View Change Safety)
+**Found by**: Code analysis (core.rs:1916-1922)
+
+### Summary
+
+`handle_tc()` does not verify the TC, does not update the node's view, and does
+not start a new timer. It only calls `generate_prepare_from_tc()`, which is
+leader-only. Non-leader nodes that receive a TC do nothing — they remain in the
+old view and cannot participate in the new view's consensus.
+
+### Root Cause
+
+```rust
+// core.rs:1916-1922
+fn handle_tc(&mut self, tc: TC) {
+    // No TC verification (relies on DA-3's broken TC::verify())
+    // No view update: self.views.insert(slot, new_view)
+    // No timer restart for new view
+    self.generate_prepare_from_tc(tc);  // Only useful for leader
+}
+```
+
+A correct implementation should: (1) verify the TC, (2) update the node's view
+to `tc.view + 1`, (3) restart the consensus timer for the new view.
+
+### Affected Code
+
+- `core.rs:1916-1922` — handle_tc(): missing TC verification, view update, and timer start
+
+---
+
+## Bug DA-8: No Committed-Slot Check on Prepare Voting (MEDIUM)
+
+**Severity**: MEDIUM — Defense-in-depth violation
+**Location**: `core.rs:1108-1166` (`is_valid` for Prepare), `core.rs:1452-1517` (`process_prepare_message`)
+
+### Summary
+
+`is_valid()` for Prepare does not check whether the slot has already been
+committed. An honest node that has committed value v1 for slot s will still
+accept and vote for new Prepare messages targeting slot s. The final validity
+check (line 1211) only verifies duplicate voting and view, not commit status:
+
+```rust
+!self.last_voted_consensus.contains(&(*slot, *view)) && ticket_valid && self.views.get(slot).unwrap() == view
+// Missing: && !self.committed_slots.contains_key(slot)
+```
+
+### Impact
+
+In any correct BFT implementation, a node should skip voting on already-committed
+slots. While this does not independently cause a safety violation (with DA-3
+fixed, TC verification prevents conflicting proposals), it is unnecessary work
+and violates the principle that committed state is final.
+
+---
+
+## Bug DA-9: Header Digest Excludes Consensus Messages (HIGH)
+
+**Severity**: HIGH — Enables dissemination-layer equivocation
+**Family**: 1 (Proposal Binding & Equivocation)
+**Found by**: Code analysis (messages.rs:570-593)
+
+### Summary
+
+`Header::digest()` does not include the `consensus_messages` field in the hash.
+A Byzantine proposer can create two headers with identical digests but different
+embedded consensus messages, enabling equivocation at the DAG dissemination layer.
+
+### Root Cause
+
+```rust
+// messages.rs:570-593 (Header::digest)
+fn digest(&self) -> Digest {
+    let mut hasher = Sha512::new();
+    hasher.update(&self.author);
+    hasher.update(self.height.to_le_bytes());
+    for (x, y) in &self.payload {
+        hasher.update(x);
+        hasher.update(y.to_le_bytes());
+    }
+    hasher.update(&self.parent_cert.header_digest);
+
+    //TODO: Sign Consensus Messages too.
+    //     // for (dig, _) in &self.consensus_messages {
+    //     //     hasher.update(dig);
+    //     // }
+
+    Digest(hasher.finalize().as_slice()[..32].try_into().unwrap())
+}
+```
+
+The `consensus_messages` field (`HashMap<Digest, ConsensusMessage>`, line 432)
+carries Prepare/Confirm/Commit messages embedded in the header. Since these are
+excluded from the digest, the header signature does not cover consensus content.
+
+### Attack
+
+1. Byzantine proposer creates Header H with `consensus_messages = {Prepare(v1)}`
+2. Peers vote on H based on its digest (which only covers author, height, payload, parent)
+3. Byzantine creates H' with same (author, height, payload, parent) but `consensus_messages = {Prepare(v2)}`
+4. H and H' have the **same digest and same valid signature**
+5. Byzantine sends H to some peers, H' to others — equivocation at the dissemination layer
+
+### Affected Code
+
+- `messages.rs:570-593` — Header::digest(): consensus_messages excluded from hash
+- `messages.rs:432` — Header struct: `consensus_messages: HashMap<Digest, ConsensusMessage>`
+
+### Fix
+
+Uncomment the consensus_messages hashing loop in `Header::digest()` so the
+header digest (and thus signature) binds to the embedded consensus content.
+
+---
+
+## Bug DA-11: panic! Crashes Node on QC ID Mismatch (HIGH)
+
+**Severity**: HIGH — Remote node crash (DoS)
+**Family**: 3 (Message Acceptance Guards)
+**Found by**: Code analysis (messages.rs:159)
+
+### Summary
+
+In `verify_commit()`, the slow-path QC ID check uses `panic!("ids don't match")`
+instead of `return false`. A Byzantine node can craft a Commit message with a
+mismatched QC ID, causing any honest node that receives it to crash.
+
+### Root Cause
+
+```rust
+// messages.rs:134-164 (verify_commit)
+if qc.votes.len() == committee.size() {  // Fast path (3f+1)
+    if prepare_id != qc.id {
+        return false;                     // Correct: returns false
+    }
+} else {                                  // Slow path (2f+1)
+    if confirm_id != qc.id {
+        panic!("ids don't match");        // BUG: crashes the node!
+        return false;                     // Dead code
+    }
+}
+```
+
+The fast path (line 138) correctly returns `false` on ID mismatch. The slow path
+(line 159) panics instead, crashing the entire node process.
+
+### Attack
+
+A Byzantine node sends a Commit message with a valid-looking but mismatched QC
+(slow-path size, wrong ID). Every honest node that processes this message will
+panic and crash. This is a remote denial-of-service attack requiring only a
+single Byzantine node.
+
+### Affected Code
+
+- `messages.rs:159` — `panic!("ids don't match")` instead of `return false`
+
+### Fix
+
+Replace `panic!("ids don't match")` with `return false` to match the fast-path
+behavior.
+
+---
+
+## Bug DA-20: Commit Not Stored for Retry on Missing Proposals (HIGH)
+
+**Severity**: HIGH — Liveness violation, possible permanent stall
+**Family**: 5 (Message Delivery & Retry)
+**Found by**: Code analysis (core.rs:1581-1607)
+
+### Summary
+
+When `process_commit_message()` receives a Commit but the referenced proposal
+headers have not yet been synced locally, the message is not persisted. It relies
+on an asynchronous loopback mechanism to retry, but if the loopback fails (channel
+full, node restart, etc.), the Commit is permanently lost.
+
+### Impact
+
+A node that loses a Commit message will never learn that the slot was committed.
+It cannot advance to subsequent slots that depend on this commitment (slot s+K
+requires slot s committed). If multiple nodes lose the same Commit, the protocol
+can permanently stall.
+
+### Affected Code
+
+- `core.rs:1581-1607` — process_commit_message: no persistent storage before async retry
+
+### Fix
+
+Persist the Commit message to durable storage before attempting async proposal
+fetching, so it can be retried after any transient failure.
+
+---
+
+## Bug DA-22: tokio::select! Priority Bias Starves Timers (HIGH)
+
+**Severity**: HIGH — Liveness violation under adversarial conditions
+**Family**: 5 (Message Delivery & Retry)
+**Found by**: Code analysis (core.rs:2067-2172)
+
+### Summary
+
+The main event loop uses `tokio::select!` with network messages as the first
+branch and timers as the last. When multiple branches are ready simultaneously,
+`tokio::select!` preferentially matches earlier branches. Under high message load
+(e.g., a Byzantine leader flooding garbage), the timer branch is starved and
+view change timeouts never fire.
+
+### Root Cause
+
+```rust
+// core.rs:2067-2172
+tokio::select! {
+    msg = self.rx_network.recv() => { ... },    // Priority 1: network
+    msg = self.rx_proposer.recv() => { ... },   // Priority 2: proposer
+    msg = self.rx_loopback.recv() => { ... },   // Priority 3: loopback
+    timer = self.timer_futures.next() => { ... } // Priority 4: timers (starved!)
+}
+```
+
+### Impact
+
+A Byzantine leader can prevent honest nodes from ever triggering a view change
+by flooding them with messages. The nodes cannot escape the Byzantine leader's
+view, violating liveness. This is exploitable without any cryptographic forgery —
+just network-level message flooding.
+
+### Fix
+
+Use `tokio::select!` with `biased;` removed or use a fair scheduling strategy
+(e.g., process timers in a separate task, or alternate priority each iteration).
+
+---
+
+## Bug DA-17: clean_slot_periods() Deletes Future Slot State (MEDIUM)
+
+**Severity**: MEDIUM — Liveness violation when K > 1
+**Family**: 4 (Garbage Collection)
+**Found by**: Code analysis (core.rs:1674-1690)
+
+### Summary
+
+`clean_slot_periods()` uses a retain predicate with `&&` instead of `||`, causing
+it to delete consensus state for ALL future slots (s > committed slot), not just
+completed slots in the same period. When K > 1 (concurrent slots), committing one
+slot destroys in-progress state for other active slots.
+
+### Root Cause
+
+```rust
+// core.rs:1681-1686
+self.consensus_instances.retain(|(s, _), _| s % k != slot_period && s <= &slot);
+self.consensus_cancel_handlers.retain(|s, _| s % k != slot_period && s <= &slot);
+self.qc_makers.retain(|(s, _), _| s % k != slot_period && s <= &slot);
+```
+
+The retain predicate keeps entries where BOTH conditions hold:
+1. `s % k != slot_period` (different period)
+2. `s <= slot` (not in the future)
+
+This means entries with `s > slot` are ALWAYS deleted regardless of period.
+With K=3, committing slot 5 deletes consensus instances for slots 6, 7, 8, etc.
+
+### Fix
+
+Change `&&` to `||` so only same-period past entries are deleted:
+```rust
+self.consensus_instances.retain(|(s, _), _| s % k != slot_period || s > &slot);
+```
+
+This keeps entries that are either in a different period OR in the future.
+
+### Affected Code
+
+- `core.rs:1681` — consensus_instances retain
+- `core.rs:1682` — consensus_cancel_handlers retain
+- `core.rs:1686` — qc_makers retain
+
+---
+
+## Bug DA-23: enough_coverage() Panics on Missing Key (MEDIUM)
+
+**Severity**: MEDIUM — Conditional remote node crash (DoS)
+**Family**: 3 (Message Acceptance Guards)
+**Found by**: Code analysis (core.rs:1561-1578)
+
+### Summary
+
+`enough_coverage()` calls `prepare_proposals.get(&pk).unwrap()` without checking
+if the key exists. If a Byzantine leader constructs a Prepare message with an
+incomplete proposals map (missing some validators' keys), any honest node that
+is the leader of the next slot will panic when evaluating coverage.
+
+### Root Cause
+
+```rust
+// core.rs:1572-1575
+let new_tips: HashMap<&PublicKey, &Proposal> = current_proposals
+    .iter()
+    .filter(|(pk, proposal)| proposal.height > prepare_proposals.get(&pk).unwrap().height)
+    //                                                                      ^^^^^^^^^ panic!
+    .collect();
+```
+
+`current_proposals` contains all validators' keys (local state). If
+`prepare_proposals` (from received Prepare message) is missing a key,
+`unwrap()` panics.
+
+### Affected Code
+
+- `core.rs:1574` — `prepare_proposals.get(&pk).unwrap()` without None check
+
+### Fix
+
+Replace `.unwrap()` with `.unwrap_or(&default)` or skip missing keys, or
+validate that `prepare_proposals` contains all required keys before calling
+`enough_coverage()`.
+
+---
+
+## ~~DA-28~~: Missing Vote Lock Check (RETRACTED — Not an Independent Bug)
+
+**Status**: RETRACTED after code audit (Phase 1 of bug confirmation)
+
+### What MC Found
+
+MC_noDA1 (DA-1 fixed spec variant) found AgreementSafety violation via a
+21-state counterexample: Byzantine sends Prepare(v2, view=2) without TC,
+honest servers vote for v2 (no lock check), conflicting commits occur.
+
+### Why It's Not a Real Bug
+
+Code audit revealed our spec's `ByzantinePrepare` was **unfaithful to the code**:
+
+1. **`is_valid` enforces TC for view > 1** (`core.rs:1200`):
+   `ticket_valid = ticket_valid && *view == 1` — Prepare without TC is
+   rejected for any view > 1. Our spec did not model this constraint.
+
+2. **With a fake TC?** DA-3 (TC::verify always passes) would allow a fake TC,
+   making the attack possible. But this is just DA-3's consequence, not a new bug.
+
+3. **If DA-3 is fixed**: Byzantine needs a real TC (2f+1 valid timeout sigs).
+   Real TC's `get_winning_proposals()` returns the locked value (v1). Lines
+   1172-1176 of `is_valid` enforce proposals match winning_proposals. Byzantine
+   leader **cannot propose v2** — forced to propose v1.
+
+**Conclusion**: The missing lock check in `ReceivePrepare` is a defense-in-depth
+weakness, but the lock is effectively enforced via TC verification +
+`get_winning_proposals()` + proposals matching check. Once DA-3 is fixed, this
+code path has no independent safety impact. The MC violation was a spec fidelity
+false positive.
+
+---
+
 ## Model Checking Results Summary
 
 | Config | Invariant | Result | Time | States |
@@ -283,11 +718,68 @@ due to Bug DA-1), the second overwrites the first.
 | MC_hunt_viewchange v2 | AgreementSafety | **VIOLATED** | 10min | 19.5M gen, 4.8M distinct |
 | MC_hunt_guards | AgreementSafety | No violation (51M states) | 17min | 51M gen, 9.8M distinct |
 | MC.cfg (standard) | All invariants | No violation (timeout) | 10min | 17M gen, 3.3M distinct |
+| MC_hunt_ordering | ExecutionOrderAgreement | **VIOLATED** | <1s | 1K gen, 361 distinct |
+| MC_hunt_nolock (DA-1 fixed) | AgreementSafety | **VIOLATED** | <2min | 146M gen, 2.1M distinct |
+| MC_hunt_da23 (DA-1 fixed) | AgreementSafety | **VIOLATED** | 1s | 424K gen (simulation) |
+| MC_hunt_da5v2 (DA-1 fixed) | ViewChangeSafety | **VIOLATED** | 1s | 22K gen (simulation) |
 
-Both AgreementSafety violations are caused by Bug DA-1 (QC not binding to value).
-The guards config did not independently find AgreementSafety violations because
-the guard bugs (DA-4, DA-6, DA-18) are "defense in depth" issues that amplify
-the equivocation attack but don't independently break safety.
+The first two AgreementSafety violations are caused by Bug DA-1.
+The MC_hunt_nolock violation was RETRACTED after code audit: the spec's
+ByzantinePrepare did not model the TC requirement for view > 1 (core.rs:1200).
+The attack only works if DA-3 is also present (fake TC passes verification).
+
+### DA-2+DA-3 Attack Trace (26 steps, MC_hunt_da23.cfg)
+
+With DA-1 fixed, Byzantine exploits DA-2/DA-3 (forgeable timeouts + broken TC verification)
+plus Byzantine vote injection to break AgreementSafety:
+
+```
+View 1:
+  s1(Byz) injects ByzantineVotePrepare(v2) → prepareVotesFor[v2] = {s1}
+  s3(honest leader) proposes v2 via SendPrepare
+  s3, s4 vote Prepare(v2) → prepareVotesFor[v2] = {s1,s3,s4}
+  s1(Byz) sends ByzantinePrepare(v2) to provide message for s2
+  s2 votes Prepare(v2) → fast quorum (4/4)
+  s4 sends FastCommit(v2) → CommitMsg(v2, view=1)
+  s2 receives CommitMsg(v2) → committed[s2] = v2
+
+View change:
+  s2, s4 timeout from view 1; s3 timeouts from view 2
+  s1(Byz) injects ByzantineVotePrepare(v1, view 2) × 2
+
+View 2:
+  s4(honest leader) proposes v1
+  s1(Byz) injects ByzantineVotePrepare(v1, view 2)
+  s2, s3, s4 vote Prepare(v1) → fast quorum (4/4)
+  s4 sends FastCommit(v1) → CommitMsg(v1, view=2)
+  s4 receives CommitMsg(v2, view=1) → committed[s4] = v2
+  s2 receives CommitMsg(v1, view=2) → committed[s2] = v1 (overwrites v2! DA-14)
+
+Final: s2=v1, s4=v2 → AgreementSafety VIOLATED
+```
+
+### DA-5 Attack Trace (28 steps, MC_hunt_da5v2.cfg)
+
+With DA-1 fixed, Byzantine exploits DA-2/DA-3 + DA-8 (no committed-slot check)
+plus buggy winning view selection to break ViewChangeSafety:
+
+```
+View 2:
+  s4(honest leader) proposes v1
+  s1(Byz) injects ByzantineVotePrepare(v1) × 2
+  s2, s3, s4 vote Prepare(v1) → fast quorum (4/4)
+  FastCommit(v1) → s2, s3, s4 commit v1
+
+View 3:
+  s1(Byz) proposes v2 via ByzantinePrepare
+  s1(Byz) injects ByzantineVoteConfirm(v2, view 3)
+  s2, s3, s4 vote Prepare(v2) DESPITE already committed (DA-8)
+  s3 sends Confirm(v2) → s2, s4 vote Confirm(v2)
+  confirmVotesFor[view 3][v2] = {s1, s2, s4} = quorum → ConfirmQC(v2, view 3)
+
+Final: committed=v1, ConfirmQC(v2, view 3) exists, v1 ∉ proposed[view 3]
+  → ViewChangeSafety VIOLATED
+```
 
 ---
 

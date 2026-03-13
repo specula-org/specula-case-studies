@@ -207,4 +207,7 @@ MCViewBound == autobahn!ViewBound
 MCViewChangeSafety == autobahn!ViewChangeSafety
 MCFastPathCorrectness == autobahn!FastPathCorrectness
 
+\* Family 6: Commit ordering determinism
+MCExecutionOrderAgreement == autobahn!ExecutionOrderAgreement
+
 ====

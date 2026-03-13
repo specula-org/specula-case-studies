@@ -17,7 +17,7 @@
  * Vote collection is modeled globally (not as individual messages).
  *)
 
-EXTENDS Integers, FiniteSets, TLC
+EXTENDS Integers, FiniteSets, Sequences, TLC
 
 \* ============================================================================
 \* CONSTANTS
@@ -73,6 +73,13 @@ ServerSeq == CHOOSE seq \in [1..N -> Server] :
 
 Leader(sl, v) == ServerSeq[((v + sl) % N) + 1]
 
+\* All permutations of a set S as sequences of length |S|.
+\* Models HashMap non-deterministic iteration order.
+\* For |S|=4: 24 permutations. For |S|=3: 6.
+AllPerms(S) ==
+    LET n == Cardinality(S)
+    IN {f \in [1..n -> S] : \A i, j \in 1..n : i /= j => f[i] /= f[j]}
+
 \* ============================================================================
 \* VARIABLES
 \* ============================================================================
@@ -106,12 +113,26 @@ VARIABLE highPropValue      \* [Server -> [Slot -> Values \cup {Nil}]]
 \* --- Decision state ---
 VARIABLE committed          \* [Server -> [Slot -> Values \cup {Nil}]]
 
+\* --- Commit execution order (Family 6: HashMap iteration) ---
+\* Reference: committer.rs:132-133 — iterates HashMap<PublicKey, Proposal>
+\* Each server independently picks an iteration order when committing.
+\* HashMap iteration is non-deterministic, so different servers may
+\* process lanes in different order → different total execution order.
+\* <<>> means not yet committed for this slot.
+VARIABLE commitOrder        \* [Server -> [Slot -> Seq(Server) \cup {<<>>}]]
+
 \* --- Vote collection (global per-slot, per-view) ---
 \* Tracks WHICH servers voted, NOT what value they voted for.
 \* Family 1: Votes don't bind to proposals (digest excludes proposals).
 \* messages.rs:246 FIXME: proposal_digest not included.
 VARIABLE prepareVotes       \* [Slot -> [View -> SUBSET Server]]
 VARIABLE confirmVotes       \* [Slot -> [View -> SUBSET Server]]
+
+\* --- Per-value vote tracking (for DA-1-fixed analysis) ---
+\* When DA-1 is fixed, QC binds to a specific value.
+\* These track which servers voted for which value.
+VARIABLE prepareVotesFor    \* [Slot -> [View -> [Values -> SUBSET Server]]]
+VARIABLE confirmVotesFor    \* [Slot -> [View -> [Values -> SUBSET Server]]]
 
 \* --- Timeout tracking ---
 VARIABLE timeoutSent        \* [Slot -> [View -> SUBSET Server]]
@@ -138,14 +159,19 @@ VARIABLE messages           \* Set of message records
 
 serverVars == <<views, votedPrepare, votedConfirm>>
 evidenceVars == <<highQCView, highQCValue, highPropView, highPropValue>>
-decisionVars == <<committed>>
-voteVars == <<prepareVotes, confirmVotes>>
+decisionVars == <<committed, commitOrder>>
+voteVars == <<prepareVotes, confirmVotes, prepareVotesFor, confirmVotesFor>>
 timeoutVars == <<timeoutSent, timeoutHighQCView, timeoutHighQCValue,
                  timeoutHighPropView, timeoutHighPropValue>>
 proposalVars == <<proposed>>
 
 vars == <<serverVars, evidenceVars, decisionVars, voteVars,
           timeoutVars, proposalVars, messages>>
+
+\* Per-value quorum helpers (used by MC_noDA1 where QC binds to value)
+IsQuorumFor(sl, v, val) == IsQuorum(prepareVotesFor[sl][v][val])
+IsFastQuorumFor(sl, v, val) == IsFastQuorum(prepareVotesFor[sl][v][val])
+IsConfirmQuorumFor(sl, v, val) == IsQuorum(confirmVotesFor[sl][v][val])
 
 \* ============================================================================
 \* TYPE INVARIANT
@@ -174,8 +200,11 @@ Init ==
     /\ highPropView = [s \in Server |-> [sl \in Slot |-> 0]]
     /\ highPropValue = [s \in Server |-> [sl \in Slot |-> Nil]]
     /\ committed = [s \in Server |-> [sl \in Slot |-> Nil]]
+    /\ commitOrder = [s \in Server |-> [sl \in Slot |-> <<>>]]
     /\ prepareVotes = [sl \in Slot |-> [v \in View |-> {}]]
     /\ confirmVotes = [sl \in Slot |-> [v \in View |-> {}]]
+    /\ prepareVotesFor = [sl \in Slot |-> [v \in View |-> [val \in Values |-> {}]]]
+    /\ confirmVotesFor = [sl \in Slot |-> [v \in View |-> [val \in Values |-> {}]]]
     /\ timeoutSent = [sl \in Slot |-> [v \in View |-> {}]]
     /\ proposed = [sl \in Slot |-> [v \in View |-> {}]]
     /\ timeoutHighQCView = [sl \in Slot |-> [v \in View |->
@@ -272,12 +301,13 @@ ReceivePrepare(s, sl, v) ==
         /\ views' = [views EXCEPT ![s][sl] = v]
         /\ votedPrepare' = [votedPrepare EXCEPT ![s][sl] = v]
         /\ prepareVotes' = [prepareVotes EXCEPT ![sl][v] = @ \cup {s}]
+        /\ prepareVotesFor' = [prepareVotesFor EXCEPT ![sl][v][m.mvalue] = @ \cup {s}]
         \* core.rs:1452: update highProp (Family 4: only if use_fast_path)
         /\ highPropView' = [highPropView EXCEPT ![s][sl] = v]
         /\ highPropValue' = [highPropValue EXCEPT ![s][sl] = m.mvalue]
         /\ UNCHANGED <<votedConfirm, highQCView, highQCValue,
-                       decisionVars, confirmVotes, timeoutVars,
-                       proposalVars, messages>>
+                       decisionVars, confirmVotes, confirmVotesFor,
+                       timeoutVars, proposalVars, messages>>
 
 \* --------------------------------------------------------------------------
 \* SendConfirm: Leader sends Confirm after PrepareQC (2f+1 votes, slow path).
@@ -341,12 +371,13 @@ ReceiveConfirm(s, sl, v) ==
         /\ views' = [views EXCEPT ![s][sl] = v]
         /\ votedConfirm' = [votedConfirm EXCEPT ![s][sl] = v]
         /\ confirmVotes' = [confirmVotes EXCEPT ![sl][v] = @ \cup {s}]
+        /\ confirmVotesFor' = [confirmVotesFor EXCEPT ![sl][v][m.mvalue] = @ \cup {s}]
         \* core.rs:1483: update highQC
         /\ highQCView' = [highQCView EXCEPT ![s][sl] = v]
         /\ highQCValue' = [highQCValue EXCEPT ![s][sl] = m.mvalue]
         /\ UNCHANGED <<votedPrepare, highPropView, highPropValue,
-                       decisionVars, prepareVotes, timeoutVars,
-                       proposalVars, messages>>
+                       decisionVars, prepareVotes, prepareVotesFor,
+                       timeoutVars, proposalVars, messages>>
 
 \* --------------------------------------------------------------------------
 \* SendCommit: Leader sends Commit after ConfirmQC (2f+1 Confirm votes).
@@ -422,6 +453,11 @@ ReceiveCommit(s, sl, v) ==
         \* Bug DA-14: NO check for already committed
         \* Commit the value
         /\ committed' = [committed EXCEPT ![s][sl] = m.mvalue]
+        \* Family 6: committer.rs:132-133 iterates HashMap<PK, Proposal>.
+        \* HashMap iteration is non-deterministic, so each server
+        \* independently picks a lane processing order.
+        /\ \E perm \in AllPerms(Server) :
+             commitOrder' = [commitOrder EXCEPT ![s][sl] = perm]
         /\ UNCHANGED <<serverVars, evidenceVars, voteVars,
                        timeoutVars, proposalVars, messages>>
 
@@ -662,6 +698,23 @@ CommitValidity ==
     \A s \in Honest : \A sl \in Slot :
         committed[s][sl] /= Nil =>
             \E v \in View : committed[s][sl] \in proposed[sl][v]
+
+\* --------------------------------------------------------------------------
+\* ExecutionOrderAgreement: All honest servers that commit the same slot
+\* must process proposal lanes in the same order.
+\*
+\* Reference: committer.rs:132-133 — iterates HashMap<PublicKey, Proposal>
+\* in non-deterministic order. This means different replicas may derive
+\* different total orders for the committed headers, violating SMR.
+\*
+\* The fix is to use BTreeMap (sorted by key) instead of HashMap.
+\*
+\* Targets: Family 6 (Commit Ordering Determinism)
+\* --------------------------------------------------------------------------
+ExecutionOrderAgreement ==
+    \A s1, s2 \in Honest : \A sl \in Slot :
+        (commitOrder[s1][sl] /= <<>> /\ commitOrder[s2][sl] /= <<>>)
+        => commitOrder[s1][sl] = commitOrder[s2][sl]
 
 \* --------------------------------------------------------------------------
 \* Structural invariants
