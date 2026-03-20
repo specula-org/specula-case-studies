@@ -1,0 +1,202 @@
+From e6207336ebb12eb8badb96b8f2f715d99d874764 Mon Sep 17 00:00:00 2001
+From: Qian-Cheng-nju <Qian-Cheng-nju@users.noreply.github.com>
+Date: Wed, 18 Mar 2026 10:30:53 +0000
+Subject: [PATCH] [libomp] Add reproducer for steal-after-finish race in proxy
+ task OOO path
+
+---
+ .../test/tasking/bug_steal_after_finish.c     | 117 ++++++++++++++++++
+ .../patches/steal-after-finish-delay.patch    |  57 +++++++++
+ 2 files changed, 174 insertions(+)
+ create mode 100644 openmp/runtime/test/tasking/bug_steal_after_finish.c
+ create mode 100644 openmp/runtime/test/tasking/patches/steal-after-finish-delay.patch
+
+diff --git a/openmp/runtime/test/tasking/bug_steal_after_finish.c b/openmp/runtime/test/tasking/bug_steal_after_finish.c
+new file mode 100644
+index 000000000..ad5cf41eb
+--- /dev/null
++++ b/openmp/runtime/test/tasking/bug_steal_after_finish.c
+@@ -0,0 +1,117 @@
++/**
++ * Reproduction: steal-after-finish race via proxy task OOO completion
++ *
++ * The race: __kmpc_proxy_task_completed_ooo re-enqueues a proxy task into a
++ * deque and THEN decrements td_incomplete_child_tasks (ICC) to 0. If all
++ * threads mark finished (unfinished→0) before picking up the proxy, the
++ * primary deactivates the task team with a task still in a deque.
++ *
++ * Key: worker deques must be pre-allocated (otherwise __kmpc_give_task
++ * falls back to the primary's deque, and the primary picks it up).
++ *
++ * Requires libomp built with -DLIBOMP_REPRO_DELAY (delays in
++ * execute_tasks_template + barrier spin loop to widen race window).
++ */
++#include <omp.h>
++#include <pthread.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <stdatomic.h>
++#include <unistd.h>
++#include <signal.h>
++#include <string.h>
++
++#define NUM_THREADS  4
++#define NUM_TRIALS   500
++
++static omp_event_handle_t g_event;
++static atomic_int g_event_ready;
++
++static void *fulfiller_fn(void *arg) {
++    while (!atomic_load_explicit(&g_event_ready, memory_order_acquire))
++        ;
++    /* Wait for barrier entry + first inner loop so fulfiller fires
++       during the 500us delay window in execute_tasks_template. */
++    usleep(1000);
++    omp_fulfill_event(g_event);
++    return NULL;
++}
++
++static void crash_handler(int sig) {
++    const char *msg = "\n*** BUG REPRODUCED ***\n"
++        "  Steal-after-finish: orphaned proxy task in deactivated task team\n\n";
++    write(STDERR_FILENO, msg, strlen(msg));
++    _exit(1);
++}
++
++int main(int argc, char *argv[]) {
++    int trials = NUM_TRIALS;
++    if (argc > 1)
++        trials = atoi(argv[1]);
++
++    signal(SIGSEGV, crash_handler);
++    signal(SIGBUS, crash_handler);
++    signal(SIGABRT, crash_handler);
++
++    omp_set_num_threads(NUM_THREADS);
++
++    printf("steal-after-finish race reproducer\n");
++    printf("  Threads: %d, Trials: %d\n", NUM_THREADS, trials);
++    printf("  Requires: libomp built with -DLIBOMP_REPRO_DELAY\n\n");
++
++    for (int trial = 0; trial < trials; trial++) {
++        atomic_store_explicit(&g_event_ready, 0, memory_order_relaxed);
++
++        pthread_t fulfiller;
++        pthread_create(&fulfiller, NULL, fulfiller_fn, NULL);
++
++        #pragma omp parallel num_threads(NUM_THREADS)
++        {
++            int tid = omp_get_thread_num();
++
++            /* Phase 1: Every thread creates a dummy task to force deque
++               allocation for all threads IN THE SAME task team that the
++               implicit barrier will use. NO explicit barrier here — an
++               explicit barrier toggles th_task_state, causing the implicit
++               barrier to use a DIFFERENT task team whose deques are NOT
++               allocated, so the proxy ends up in thread 0's own deque. */
++            volatile int dummy = 0;
++            #pragma omp task firstprivate(dummy)
++            {
++                dummy = 1;  /* trivial work */
++            }
++
++            /* Phase 2: Thread 0 creates the detachable task.
++               Same task team as the dummy tasks → all worker deques exist →
++               __kmpc_give_task can enqueue proxy to a WORKER's deque. */
++            if (tid == 0) {
++                omp_event_handle_t evt;
++                #pragma omp task detach(evt)
++                {
++                    g_event = evt;
++                    atomic_store_explicit(&g_event_ready, 1,
++                                          memory_order_release);
++                    /* Body returns WITHOUT fulfilling → proxy task.
++                       External pthread fulfills via OOO path:
++                       1. Re-enqueues proxy to a worker's deque
++                       2. Decrements ICC → 0
++                       With delays in libomp:
++                       - 500us in execute_tasks_template (all threads)
++                       - 1000us in barrier spin loop (workers only)
++                       Primary deactivates while proxy sits in worker's deque. */
++                }
++            }
++            /* Implicit barrier at end of parallel region.
++               The detachable task is executed during this barrier's
++               task-execution phase. */
++        }
++
++        pthread_join(fulfiller, NULL);
++
++        if ((trial + 1) % 50 == 0)
++            printf("  [%d/%d] trials...\n", trial + 1, trials);
++    }
++
++    printf("\nCompleted %d trials.\n", trials);
++    return 0;
++}
+diff --git a/openmp/runtime/test/tasking/patches/steal-after-finish-delay.patch b/openmp/runtime/test/tasking/patches/steal-after-finish-delay.patch
+new file mode 100644
+index 000000000..e61d0ccb4
+--- /dev/null
++++ b/openmp/runtime/test/tasking/patches/steal-after-finish-delay.patch
+@@ -0,0 +1,57 @@
++diff --git a/openmp/runtime/src/kmp_tasking.cpp b/openmp/runtime/src/kmp_tasking.cpp
++--- a/openmp/runtime/src/kmp_tasking.cpp
+++++ b/openmp/runtime/src/kmp_tasking.cpp
++@@ -3184,6 +3184,14 @@
++   while (1) { // Outer loop keeps trying to find tasks in case of single thread
++     // getting tasks from target constructs
++     while (1) { // Inner loop to find a task and execute it
+++#ifdef LIBOMP_REPRO_DELAY
+++      // BUG REPRODUCTION: Workers that already marked finished delay before
+++      // checking deques. This prevents them from stealing the proxy task
+++      // that was re-enqueued by the OOO path, giving the primary time to
+++      // deactivate the task team with the proxy still in a deque.
+++      if (final_spin && *thread_finished && !KMP_MASTER_TID(tid))
+++        usleep(10000);  // 10ms: worker already finished, prevent stealing
+++#endif
++ #if ENABLE_LIBOMPTARGET
++       // Give an opportunity to the offload runtime to make progress
++       if (UNLIKELY(kmp_target_sync_cb))
++@@ -3366,6 +3374,13 @@
++       }
++     }
++
+++#ifdef LIBOMP_REPRO_DELAY
+++    // BUG REPRODUCTION: Widen the race window between "no tasks found"
+++    // and the ICC check below. Gives the external proxy-task fulfiller
+++    // time to re-enqueue the proxy and decrement ICC to 0.
+++    if (final_spin)
+++      usleep(500);
+++#endif
+++
++     // The task source has been exhausted. If in final spin loop of barrier,
++     // check if termination condition is satisfied. The work queue may be empty
++     // but there might be proxy tasks still executing.
++@@ -4077,6 +4092,22 @@
++     TCW_SYNC_4(task_team->tt.tt_active, FALSE);
++     KMP_MB();
++
++     TCW_PTR(this_thr->th.th_task_team, NULL);
+++
+++#ifdef LIBOMP_REPRO_DELAY
+++    // SAFETY PROPERTY CHECK: after deactivation, no deque should have tasks.
+++    if (task_team->tt.tt_threads_data) {
+++      for (int i = 0; i < task_team->tt.tt_nproc; i++) {
+++        int ntasks = TCR_4(task_team->tt.tt_threads_data[i].td.td_deque_ntasks);
+++        if (ntasks > 0) {
+++          fprintf(stderr,
+++                  "\n*** BUG REPRODUCED: orphaned task after deactivation ***\n"
+++                  "  deque[%d] has %d task(s) in deactivated task team %p\n"
+++                  "  This is the steal-after-finish race.\n\n",
+++                  i, ntasks, (void *)task_team);
+++          abort();
+++        }
+++      }
+++    }
+++#endif
++   }
++ }
+-- 
+2.43.0
+
