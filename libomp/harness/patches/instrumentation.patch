@@ -1,0 +1,382 @@
+diff --git a/openmp/runtime/src/CMakeLists.txt b/openmp/runtime/src/CMakeLists.txt
+index 97ffa2991..675decc7b 100644
+--- a/openmp/runtime/src/CMakeLists.txt
++++ b/openmp/runtime/src/CMakeLists.txt
+@@ -134,6 +134,7 @@ else()
+   libomp_append(LIBOMP_CXXFILES kmp_stats_timing.cpp LIBOMP_STATS)
+   libomp_append(LIBOMP_CXXFILES kmp_taskdeps.cpp)
+   libomp_append(LIBOMP_CXXFILES kmp_cancel.cpp)
++  libomp_append(LIBOMP_CXXFILES omp_trace.cpp)
+ endif()
+ # Files common to stubs and normal library
+ libomp_append(LIBOMP_CXXFILES kmp_ftn_cdecl.cpp)
+diff --git a/openmp/runtime/src/kmp_barrier.cpp b/openmp/runtime/src/kmp_barrier.cpp
+index 4d7989d1c..d92e9e865 100644
+--- a/openmp/runtime/src/kmp_barrier.cpp
++++ b/openmp/runtime/src/kmp_barrier.cpp
+@@ -11,6 +11,7 @@
+ //===----------------------------------------------------------------------===//
+ 
+ #include "kmp_wait_release.h"
++#include "omp_trace.h"
+ #include "kmp_barrier.h"
+ #include "kmp_itt.h"
+ #include "kmp_os.h"
+@@ -1912,6 +1913,26 @@ static int __kmp_barrier_template(enum barrier_type bt, int gtid, int is_split,
+     if (KMP_MASTER_TID(tid) && __kmp_tasking_mode != tskm_immediate_exec)
+       __kmp_task_team_setup(this_thr, team);
+ 
++#ifdef LIBOMP_TRACE
++    /* Reset one-shot WorkerStartTasks flag for this barrier visit */
++    OMP_TRACE_IF_ENABLED(__omp_trace_reset_worker_started(tid));
++    if (KMP_MASTER_TID(tid)) {
++      OMP_TRACE_IF_ENABLED(
++        __omp_trace_emit_barrier_event("PrimaryEnterBarrier", tid,
++          "barrier_gather", this_thr->th.th_task_state, 0,
++          atomic_load(&__omp_trace_writer.barrier_round),
++          KMP_ATOMIC_LD_RLX(&team->t.t_cancel_request) != cancel_noreq)
++      );
++    } else {
++      OMP_TRACE_IF_ENABLED(
++        __omp_trace_emit_barrier_event("WorkerEnterBarrier", tid,
++          "barrier_gather", this_thr->th.th_task_state, 0,
++          atomic_load(&__omp_trace_writer.barrier_round),
++          KMP_ATOMIC_LD_RLX(&team->t.t_cancel_request) != cancel_noreq)
++      );
++    }
++#endif
++
+     if (cancellable) {
+       cancelled = __kmp_linear_barrier_gather_cancellable(
+           bt, this_thr, gtid, tid, reduce USE_ITT_BUILD_ARG(itt_sync_obj));
+@@ -1949,6 +1970,14 @@ static int __kmp_barrier_template(enum barrier_type bt, int gtid, int is_split,
+     if (KMP_MASTER_TID(tid)) {
+       status = 0;
+       if (__kmp_tasking_mode != tskm_immediate_exec && !cancelled) {
++#ifdef LIBOMP_TRACE
++        OMP_TRACE_IF_ENABLED(
++          __omp_trace_emit_barrier_event("PrimaryStartTaskWait", tid,
++            "barrier_tasks", this_thr->th.th_task_state, 0,
++            atomic_load(&__omp_trace_writer.barrier_round),
++            KMP_ATOMIC_LD_RLX(&team->t.t_cancel_request) != cancel_noreq)
++        );
++#endif
+         __kmp_task_team_wait(this_thr, team USE_ITT_BUILD_ARG(itt_sync_obj));
+       }
+ #if USE_DEBUGGER
+@@ -2025,6 +2054,16 @@ static int __kmp_barrier_template(enum barrier_type bt, int gtid, int is_split,
+         __kmp_itt_barrier_middle(gtid, itt_sync_obj);
+ #endif /* USE_ITT_BUILD */
+     }
++#ifdef LIBOMP_TRACE
++    if (KMP_MASTER_TID(tid) && !cancelled) {
++      OMP_TRACE_IF_ENABLED(
++        __omp_trace_emit_barrier_event("PrimaryRelease", tid,
++          "barrier_release", this_thr->th.th_task_state, 1,
++          atomic_load(&__omp_trace_writer.barrier_round),
++          KMP_ATOMIC_LD_RLX(&team->t.t_cancel_request) != cancel_noreq)
++      );
++    }
++#endif
+     if ((status == 1 || !is_split) && !cancelled) {
+       if (cancellable) {
+         cancelled = __kmp_linear_barrier_release_cancellable(
+@@ -2060,9 +2099,32 @@ static int __kmp_barrier_template(enum barrier_type bt, int gtid, int is_split,
+         }
+         }
+       }
++#ifdef LIBOMP_TRACE
++      if (!KMP_MASTER_TID(tid) && !cancelled) {
++        OMP_TRACE_IF_ENABLED(
++          __omp_trace_emit_barrier_event("WorkerReceiveRelease", tid,
++            "barrier_release", this_thr->th.th_task_state, 1,
++            atomic_load(&__omp_trace_writer.barrier_round),
++            KMP_ATOMIC_LD_RLX(&team->t.t_cancel_request) != cancel_noreq)
++        );
++      }
++#endif
+       if (__kmp_tasking_mode != tskm_immediate_exec && !cancelled) {
+         __kmp_task_team_sync(this_thr, team);
+       }
++#ifdef LIBOMP_TRACE
++      if (!cancelled) {
++        OMP_TRACE_IF_ENABLED(
++          __omp_trace_emit_simple("BarrierDone", tid)
++        );
++        if (KMP_MASTER_TID(tid)) {
++          int new_round = atomic_fetch_add(&__omp_trace_writer.barrier_round, 1) + 1;
++          OMP_TRACE_IF_ENABLED(
++            __omp_trace_emit_start_next_round(new_round)
++          );
++        }
++      }
++#endif
+     }
+ 
+ #if USE_ITT_BUILD
+diff --git a/openmp/runtime/src/kmp_cancel.cpp b/openmp/runtime/src/kmp_cancel.cpp
+index d1290493d..c7436ae2a 100644
+--- a/openmp/runtime/src/kmp_cancel.cpp
++++ b/openmp/runtime/src/kmp_cancel.cpp
+@@ -8,6 +8,7 @@
+ //===----------------------------------------------------------------------===//
+ 
+ #include "kmp.h"
++#include "omp_trace.h"
+ #include "kmp_i18n.h"
+ #include "kmp_io.h"
+ #include "kmp_str.h"
+@@ -50,6 +51,14 @@ kmp_int32 __kmpc_cancel(ident_t *loc_ref, kmp_int32 gtid, kmp_int32 cncl_kind) {
+         KMP_DEBUG_ASSERT(this_team);
+         kmp_int32 old = cancel_noreq;
+         this_team->t.t_cancel_request.compare_exchange_strong(old, cncl_kind);
++#ifdef LIBOMP_TRACE
++        if (cncl_kind == cancel_parallel && (old == cancel_noreq || old == cncl_kind)) {
++          OMP_TRACE_IF_ENABLED(
++            __omp_trace_emit_simple("CancelBarrier",
++              __kmp_tid_from_gtid(gtid))
++          );
++        }
++#endif
+         if (old == cancel_noreq || old == cncl_kind) {
+ // we do not have a cancellation request in this team or we do have
+ // one that matches the current request -> cancel
+diff --git a/openmp/runtime/src/kmp_runtime.cpp b/openmp/runtime/src/kmp_runtime.cpp
+index 3277a09c6..96266e012 100644
+--- a/openmp/runtime/src/kmp_runtime.cpp
++++ b/openmp/runtime/src/kmp_runtime.cpp
+@@ -11,6 +11,7 @@
+ //===----------------------------------------------------------------------===//
+ 
+ #include "kmp.h"
++#include "omp_trace.h"
+ #include "kmp_affinity.h"
+ #include "kmp_atomic.h"
+ #include "kmp_environment.h"
+@@ -7070,6 +7071,10 @@ static void __kmp_do_serial_initialize(void) {
+   ompd_init();
+ #endif
+ 
++#ifdef LIBOMP_TRACE
++  __omp_trace_init();
++#endif
++
+   __kmp_validate_locks();
+ 
+ #if ENABLE_LIBOMPTARGET
+@@ -8240,6 +8245,10 @@ static int __kmp_load_balance_nproc(kmp_root_t *root, int set_nproc) {
+ void __kmp_cleanup(void) {
+   int f;
+ 
++#ifdef LIBOMP_TRACE
++  __omp_trace_shutdown();
++#endif
++
+   KA_TRACE(10, ("__kmp_cleanup: enter\n"));
+ 
+   if (TCR_4(__kmp_init_parallel)) {
+diff --git a/openmp/runtime/src/kmp_tasking.cpp b/openmp/runtime/src/kmp_tasking.cpp
+index 37836fb45..9645e0b9c 100644
+--- a/openmp/runtime/src/kmp_tasking.cpp
++++ b/openmp/runtime/src/kmp_tasking.cpp
+@@ -11,6 +11,7 @@
+ //===----------------------------------------------------------------------===//
+ 
+ #include "kmp.h"
++#include "omp_trace.h"
+ #include "kmp_i18n.h"
+ #include "kmp_itt.h"
+ #include "kmp_stats.h"
+@@ -897,7 +898,12 @@ static void __kmp_task_finish(kmp_int32 gtid, kmp_task_t *task,
+ 
+         // no access to taskdata after this point!
+         // __kmp_fulfill_event might free taskdata at any time from now
+-
++#ifdef LIBOMP_TRACE
++        OMP_TRACE_IF_ENABLED(
++          __omp_trace_emit_task_event("DetachTask", __kmp_tid_from_gtid(gtid),
++            (void *)taskdata)
++        );
++#endif
+         taskdata->td_flags.proxy = TASK_PROXY; // proxify!
+         completed = false;
+       }
+@@ -926,6 +932,16 @@ static void __kmp_task_finish(kmp_int32 gtid, kmp_task_t *task,
+ #if OMPX_TASKGRAPH
+     taskdata->td_flags.onced = 1; // mark the task as ran once already
+ #endif
++#ifdef LIBOMP_TRACE
++    OMP_TRACE_IF_ENABLED({
++      int parent_children = -1;
++      if (__kmp_track_children_task(taskdata) && taskdata->td_parent) {
++        parent_children = KMP_ATOMIC_LD_ACQ(&taskdata->td_parent->td_incomplete_child_tasks);
++      }
++      __omp_trace_emit_complete_task(__kmp_tid_from_gtid(gtid),
++        (void *)taskdata, parent_children);
++    });
++#endif
+ 
+ #if OMPT_SUPPORT
+     // This is not a detached task, we are done here
+@@ -1851,18 +1867,35 @@ kmp_int32 __kmp_omp_task(kmp_int32 gtid, kmp_task_t *new_task,
+     if (serialize_immediate)
+       new_taskdata->td_flags.task_serial = 1;
+     __kmp_invoke_task(gtid, new_task, current_task);
+-  } else if (__kmp_dflt_blocktime != KMP_MAX_BLOCKTIME &&
++  } else {
++#ifdef LIBOMP_TRACE
++    OMP_TRACE_IF_ENABLED({
++      int trace_tid = __kmp_tid_from_gtid(gtid);
++      int detachable = new_taskdata->td_flags.detachable == TASK_DETACHABLE;
++      void *parent_ptr = (void *)new_taskdata->td_parent;
++      /* Only map parent if it's an explicit task (not implicit) */
++      void *trace_parent = (parent_ptr && new_taskdata->td_parent->td_flags.tasktype == TASK_EXPLICIT) ? parent_ptr : NULL;
++      __omp_trace_emit_schedule_task(
++        detachable ? "ScheduleDetachTask" : "ScheduleTask",
++        trace_tid,
++        (void *)new_taskdata,
++        detachable,
++        trace_parent);
++    });
++#endif
++    if (__kmp_dflt_blocktime != KMP_MAX_BLOCKTIME &&
+              __kmp_wpolicy_passive) {
+-    kmp_info_t *this_thr = __kmp_threads[gtid];
+-    kmp_team_t *team = this_thr->th.th_team;
+-    kmp_int32 nthreads = this_thr->th.th_team_nproc;
+-    for (int i = 0; i < nthreads; ++i) {
+-      kmp_info_t *thread = team->t.t_threads[i];
+-      if (thread == this_thr)
+-        continue;
+-      if (thread->th.th_sleep_loc != NULL) {
+-        __kmp_null_resume_wrapper(thread);
+-        break; // awake one thread at a time
++      kmp_info_t *this_thr = __kmp_threads[gtid];
++      kmp_team_t *team = this_thr->th.th_team;
++      kmp_int32 nthreads = this_thr->th.th_team_nproc;
++      for (int i = 0; i < nthreads; ++i) {
++        kmp_info_t *thread = team->t.t_threads[i];
++        if (thread == this_thr)
++          continue;
++        if (thread->th.th_sleep_loc != NULL) {
++          __kmp_null_resume_wrapper(thread);
++          break; // awake one thread at a time
++        }
+       }
+     }
+   }
+@@ -3128,6 +3161,13 @@ static kmp_task_t *__kmp_steal_task(kmp_int32 victim_tid, kmp_int32 gtid,
+ 
+   __kmp_release_bootstrap_lock(&victim_td->td.td_deque_lock);
+ 
++#ifdef LIBOMP_TRACE
++  OMP_TRACE_IF_ENABLED(
++    __omp_trace_emit_steal(__kmp_tid_from_gtid(gtid), victim_tid,
++      (void *)taskdata)
++  );
++#endif
++
+   KMP_COUNT_BLOCK(TASK_stolen);
+   KA_TRACE(10,
+            ("__kmp_steal_task(exit #5): T#%d stole task %p from T#%d: "
+@@ -3173,6 +3213,15 @@ static inline int __kmp_execute_tasks_template(
+                 gtid, final_spin, *thread_finished));
+ 
+   thread->th.th_reap_state = KMP_NOT_SAFE_TO_REAP;
++#ifdef LIBOMP_TRACE
++  if (!KMP_MASTER_TID(tid)) {
++    OMP_TRACE_IF_ENABLED(
++      __omp_trace_emit_worker_start_tasks(tid,
++        thread->th.th_task_state, *thread_finished,
++        atomic_load(&__omp_trace_writer.barrier_round))
++    );
++  }
++#endif
+   threads_data = (kmp_thread_data_t *)TCR_PTR(task_team->tt.tt_threads_data);
+ 
+   KMP_DEBUG_ASSERT(threads_data != NULL);
+@@ -3271,6 +3320,12 @@ static inline int __kmp_execute_tasks_template(
+         break; // break out of tasking loop
+ 
+ // Found a task; execute it
++#ifdef LIBOMP_TRACE
++      OMP_TRACE_IF_ENABLED(
++        __omp_trace_emit_task_event("ExecuteTask", tid,
++          (void *)KMP_TASK_TO_TASKDATA(task))
++      );
++#endif
+ #if USE_ITT_BUILD && USE_ITT_NOTIFY
+       if (__itt_sync_create_ptr || KMP_ITT_DEBUG) {
+         if (itt_sync_obj == NULL) { // we are at fork barrier where we could not
+@@ -3329,6 +3384,13 @@ static inline int __kmp_execute_tasks_template(
+                       "unfinished_threads to %d task_team=%p\n",
+                       gtid, count, task_team));
+         *thread_finished = TRUE;
++#ifdef LIBOMP_TRACE
++        OMP_TRACE_IF_ENABLED(
++          __omp_trace_emit_thread_finish(tid,
++            KMP_ATOMIC_LD_ACQ(unfinished_threads),
++            thread->th.th_task_state)
++        );
++#endif
+       }
+ 
+       // It is now unsafe to reference thread->th.th_team !!!
+@@ -4030,6 +4092,13 @@ void __kmp_task_team_sync(kmp_info_t *this_thr, kmp_team_t *team) {
+   // the current thread.
+   TCW_PTR(this_thr->th.th_task_team,
+           team->t.t_task_team[this_thr->th.th_task_state]);
++#ifdef LIBOMP_TRACE
++  OMP_TRACE_IF_ENABLED(
++    __omp_trace_emit_task_team_sync(
++      this_thr->th.th_info.ds.ds_tid,
++      this_thr->th.th_task_state)
++  );
++#endif
+   KA_TRACE(20,
+            ("__kmp_task_team_sync: Thread T#%d task team switched to task_team "
+             "%p from Team #%d (parity=%d)\n",
+@@ -4077,6 +4146,11 @@ void __kmp_task_team_wait(
+     KMP_CHECK_UPDATE(task_team->tt.tt_untied_task_encountered, 0);
+     TCW_SYNC_4(task_team->tt.tt_active, FALSE);
+     KMP_MB();
++#ifdef LIBOMP_TRACE
++    OMP_TRACE_IF_ENABLED(
++      __omp_trace_emit_primary_task_wait(this_thr->th.th_task_state)
++    );
++#endif
+ 
+     TCW_PTR(this_thr->th.th_task_team, NULL);
+   }
+@@ -4265,6 +4339,13 @@ static void __kmp_bottom_half_finish_proxy(kmp_int32 gtid, kmp_task_t *ptask) {
+           PROXY_TASK_FLAG) > 0)
+     ;
+ 
++#ifdef LIBOMP_TRACE
++  OMP_TRACE_IF_ENABLED(
++    __omp_trace_emit_task_event("ProxyTaskComplete", __kmp_tid_from_gtid(gtid),
++      (void *)taskdata)
++  );
++#endif
++
+   __kmp_release_deps(gtid, taskdata);
+   __kmp_free_task_and_ancestors(gtid, taskdata, thread);
+ }
+@@ -4388,7 +4469,17 @@ void __kmp_fulfill_event(kmp_event_t *event) {
+     __kmp_acquire_tas_lock(&event->lock, gtid);
+     if (taskdata->td_flags.proxy == TASK_PROXY) {
+       detached = true;
++#ifdef LIBOMP_TRACE
++      OMP_TRACE_IF_ENABLED(
++        __omp_trace_emit_fulfill("FulfillEvent", (void *)taskdata, gtid >= 0 ? __kmp_tid_from_gtid(gtid) : -2)
++      );
++#endif
+     } else {
++#ifdef LIBOMP_TRACE
++      OMP_TRACE_IF_ENABLED(
++        __omp_trace_emit_fulfill("EarlyFulfillEvent", (void *)taskdata, gtid >= 0 ? __kmp_tid_from_gtid(gtid) : -2)
++      );
++#endif
+ #if OMPT_SUPPORT
+       // The OMPT event must occur under mutual exclusion,
+       // otherwise the tool might access ptask after free
