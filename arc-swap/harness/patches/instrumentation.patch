@@ -1,0 +1,188 @@
+diff --git a/src/debt/mod.rs b/src/debt/mod.rs
+index 3f0a02b..1e5a2b8 100644
+--- a/src/debt/mod.rs
++++ b/src/debt/mod.rs
+@@ -89,27 +89,56 @@ impl Debt {
+             // Pre-pay one ref count that can be safely put into a debt slot to pay it.
+             T::inc(&val);
+ 
++            // TRACE: WriterPayInit
++            #[cfg(not(feature = "experimental-thread-local"))]
++            if crate::tla_trace::is_active() {
++                crate::tla_trace::emit_writer_pay_init(ptr as usize);
++            }
++
+             Node::traverse::<(), _>(|node| {
+                 // Make the cooldown trick know we are poking into this node.
+                 let _reservation = node.reserve_writer();
+ 
+                 local.help(node, storage_addr, &replacement);
+ 
++                let node_addr = node as *const Node as usize;
+                 let all_slots = node
+                     .fast_slots()
+                     .chain(core::iter::once(node.helping_slot()));
++                let mut slot_idx: usize = 0;
+                 for slot in all_slots {
++                    slot_idx += 1;
++                    let slot_value = slot.0.load(core::sync::atomic::Ordering::Relaxed);
+                     // Note: Release is enough even here. That makes sure the increment is
+                     // visible to whoever might acquire on this slot and can't leak below this.
+                     // And we are the ones doing decrements anyway.
+-                    if slot.pay::<T>(ptr) {
++                    let paid = slot.pay::<T>(ptr);
++                    if paid {
+                         // Pre-pay one more, for another future slot
+                         T::inc(&val);
+                     }
++
++                    // TRACE: WriterScanSlot
++                    #[cfg(not(feature = "experimental-thread-local"))]
++                    if crate::tla_trace::is_active() {
++                        crate::tla_trace::emit_writer_scan_slot(
++                            node_addr,
++                            slot_idx,
++                            slot_value,
++                            paid,
++                        );
++                    }
+                 }
+ 
+                 None
+             });
++
++            // TRACE: WriterPayDone
++            #[cfg(not(feature = "experimental-thread-local"))]
++            if crate::tla_trace::is_active() {
++                crate::tla_trace::emit_writer_pay_done();
++            }
++
+             // Implicit dec by dropping val in here, pair for the above
+         })
+     }
+diff --git a/src/lib.rs b/src/lib.rs
+index 0794f8f..11ef2da 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -139,6 +139,8 @@ mod ref_cnt;
+ #[cfg(feature = "serde")]
+ mod serde;
+ pub mod strategy;
++#[cfg(not(feature = "experimental-thread-local"))]
++pub(crate) mod tla_trace;
+ #[cfg(feature = "weak")]
+ mod weak;
+ 
+@@ -481,8 +483,20 @@ impl<T: RefCnt, S: Strategy<T>> ArcSwapAny<T, S> {
+         //
+         // SeqCst to synchronize the time lines with the group counters.
+         let old = self.ptr.swap(new, Ordering::SeqCst);
++        // TRACE: WriterSwap
++        #[cfg(not(feature = "experimental-thread-local"))]
++        if tla_trace::is_active() {
++            tla_trace::emit_writer_swap(new as usize, old as usize);
++            tla_trace::set_in_swap(true);
++        }
+         unsafe {
+             self.strategy.wait_for_readers(old, &self.ptr);
++            // TRACE: WriterReturn
++            #[cfg(not(feature = "experimental-thread-local"))]
++            if tla_trace::is_active() {
++                tla_trace::set_in_swap(false);
++                tla_trace::emit_writer_return(old as usize);
++            }
+             T::from_ptr(old)
+         }
+     }
+diff --git a/src/strategy/hybrid.rs b/src/strategy/hybrid.rs
+index 633a4eb..21f0eda 100644
+--- a/src/strategy/hybrid.rs
++++ b/src/strategy/hybrid.rs
+@@ -45,12 +45,27 @@ impl<T: RefCnt> HybridProtection<T> {
+         // Try to get a debt slot. If not possible, fail.
+         let debt = node.new_fast(ptr as usize)?;
+ 
++        // TRACE: ReaderAcquireFast
++        #[cfg(not(feature = "experimental-thread-local"))]
++        if crate::tla_trace::is_active() {
++            crate::tla_trace::emit_reader_acquire_fast(
++                ptr as usize,
++                storage.load(Relaxed) as usize,
++                0,
++            );
++        }
++
+         // Acquire to get the data.
+         //
+         // SeqCst to make sure the storage vs. the debt are well ordered.
+         let confirm = storage.load(SeqCst);
+         if ptr == confirm {
+             // Successfully got a debt
++            // TRACE: ReaderConfirmFast (matched)
++            #[cfg(not(feature = "experimental-thread-local"))]
++            if crate::tla_trace::is_active() {
++                crate::tla_trace::emit_reader_confirm_fast(confirm as usize, true, true);
++            }
+             // NOTE: we *must* use `confirm` here instead of `ptr`. The address may compare equal,
+             // but they could have different provenance, if the pointer is freed and then
+             // subsequently reused.
+@@ -58,10 +73,22 @@ impl<T: RefCnt> HybridProtection<T> {
+         } else if debt.pay::<T>(ptr) {
+             // It changed in the meantime, we return the debt (that is on the outdated pointer,
+             // possibly destroyed) and fail.
++            // TRACE: ReaderConfirmFast (mismatch) + ReaderResolveFast (pay succeeded)
++            #[cfg(not(feature = "experimental-thread-local"))]
++            if crate::tla_trace::is_active() {
++                crate::tla_trace::emit_reader_confirm_fast(ptr as usize, false, true);
++                crate::tla_trace::emit_reader_resolve_fast(ptr as usize, true);
++            }
+             None
+         } else {
+             // It changed in the meantime, but the debt for the previous pointer was already paid
+             // for by someone else, so we are fine using it.
++            // TRACE: ReaderConfirmFast (mismatch) + ReaderResolveFast (pay failed)
++            #[cfg(not(feature = "experimental-thread-local"))]
++            if crate::tla_trace::is_active() {
++                crate::tla_trace::emit_reader_confirm_fast(ptr as usize, false, true);
++                crate::tla_trace::emit_reader_resolve_fast(ptr as usize, false);
++            }
+             Some(unsafe { Self::new(ptr, None) })
+         }
+     }
+@@ -81,6 +108,11 @@ impl<T: RefCnt> HybridProtection<T> {
+         match node.confirm_helping(gen, candidate as usize) {
+             Ok(debt) => {
+                 // The fast path -> we got the debt confirmed alright.
++                // TRACE: ReaderFallbackLoad (with debt)
++                #[cfg(not(feature = "experimental-thread-local"))]
++                if crate::tla_trace::is_active() {
++                    crate::tla_trace::emit_reader_fallback_load(candidate as usize, true);
++                }
+                 Self::from_inner(unsafe { Self::new(candidate, Some(debt)).into_inner() })
+             }
+             Err((unused_debt, replacement)) => {
+@@ -89,6 +121,11 @@ impl<T: RefCnt> HybridProtection<T> {
+                 if !unused_debt.pay::<T>(candidate) {
+                     unsafe { T::dec(candidate) };
+                 }
++                // TRACE: ReaderFallbackLoad (no debt, writer helped)
++                #[cfg(not(feature = "experimental-thread-local"))]
++                if crate::tla_trace::is_active() {
++                    crate::tla_trace::emit_reader_fallback_load(replacement, false);
++                }
+                 // We got a (possibly) different pointer out. But that one is already protected and
+                 // the slot is paid back.
+                 unsafe { Self::new(replacement as *mut _, None) }
+@@ -105,6 +142,12 @@ impl<T: RefCnt> HybridProtection<T> {
+ impl<T: RefCnt> Drop for HybridProtection<T> {
+     #[inline]
+     fn drop(&mut self) {
++        // TRACE: ReaderDropGuard
++        #[cfg(not(feature = "experimental-thread-local"))]
++        if crate::tla_trace::is_active() {
++            let ptr = T::as_ptr(&self.ptr);
++            crate::tla_trace::emit_reader_drop_guard(ptr as usize, self.debt.is_some());
++        }
+         match self.debt.take() {
+             // We have our own copy of Arc, so we don't need a protection. Do nothing (but release
+             // the Arc below).

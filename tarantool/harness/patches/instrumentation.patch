@@ -1,0 +1,138 @@
+diff --git a/src/lib/raft/raft.c b/src/lib/raft/raft.c
+index 99bf5ca18..dcce4b6bb 100644
+--- a/src/lib/raft/raft.c
++++ b/src/lib/raft/raft.c
+@@ -30,6 +30,14 @@
+  */
+ #include "raft.h"
+ #include "raft_ev.h"
++
++#ifdef RAFT_TLA_TRACE
++#include "tla_trace.h"
++#define TLA_TRACE(fn, ...) do { if (tla_trace_is_enabled()) fn(__VA_ARGS__); } while(0)
++#else
++#define TLA_TRACE(fn, ...) ((void)0)
++#endif
++
+ #include "exception.h"
+ #include "fiber.h"
+ #include "tt_static.h"
+@@ -521,7 +529,7 @@ raft_process_msg(struct raft *raft, const struct raft_msg *req, uint32_t source)
+ 		say_info("RAFT: the message is ignored due to outdated term - "
+ 			 "current term is %llu",
+ 			 (long long)raft->volatile_term);
+-		return 0;
++		return 0; /* Skip trace for ignored messages. */
+ 	}
+ 
+ 	/* Term bump. */
+@@ -624,11 +632,11 @@ raft_process_msg(struct raft *raft, const struct raft_msg *req, uint32_t source)
+ 			if (raft->is_cfg_candidate)
+ 				raft_sm_schedule_new_election(raft);
+ 		}
+-		return 0;
++		goto trace_and_return;
+ 	}
+ 	/* The node is a leader, but it is already known. */
+ 	if (source == raft->leader)
+-		return 0;
++		goto trace_and_return;
+ 	/*
+ 	 * XXX: A message from a conflicting leader. Split brain, basically.
+ 	 * Need to decide what to do. Current solution is to do nothing. In
+@@ -638,7 +646,7 @@ raft_process_msg(struct raft *raft, const struct raft_msg *req, uint32_t source)
+ 	if (raft->leader != 0) {
+ 		say_warn("RAFT: conflicting leader detected in one term - "
+ 			 "known is %u, received %u", raft->leader, source);
+-		return 0;
++		goto trace_and_return;
+ 	}
+ 
+ 	/*
+@@ -650,6 +658,8 @@ raft_process_msg(struct raft *raft, const struct raft_msg *req, uint32_t source)
+ 	(void)changed;
+ 	/* New leader was elected. */
+ 	raft_sm_follow_leader(raft, source);
++trace_and_return:
++	TLA_TRACE(tla_trace_receive_message, raft, req, source);
+ 	return 0;
+ }
+ 
+@@ -693,6 +703,7 @@ raft_process_heartbeat(struct raft *raft, uint32_t source)
+ 	}
+ 	raft_leader_see(raft);
+ 	raft_sm_wait_leader_dead(raft);
++	TLA_TRACE(tla_trace_receive_heartbeat, raft, source);
+ }
+ 
+ /* Dump Raft state to WAL in a blocking way. */
+@@ -734,6 +745,7 @@ raft_worker_handle_io(struct raft *raft)
+ 							  raft->vclock);
+ 			}
+ 		}
++		TLA_TRACE(tla_trace_complete_wal_write, raft);
+ 	} else {
+ 		memset(&req, 0, sizeof(req));
+ 		assert(raft->volatile_term >= raft->term);
+@@ -763,6 +775,7 @@ raft_worker_handle_io(struct raft *raft)
+ 				 "vclock is not acceptable anymore",
+ 				 raft->volatile_vote);
+ 			raft_revoke_vote(raft);
++			TLA_TRACE(tla_trace_wal_write_revoke_vote, raft);
+ 			assert(raft_is_fully_on_disk(raft));
+ 			goto end_dump;
+ 		}
+@@ -786,6 +799,21 @@ raft_worker_handle_io(struct raft *raft)
+ 		assert(req.term >= raft->term);
+ 		raft->term = req.term;
+ 		raft->vote = req.vote;
++		/*
++		 * TLA+ trace: emit WAL write event based on what was written.
++		 * req.vote != 0 means vote was included (term_and_vote).
++		 * Otherwise it's term-only (with or without pending vote).
++		 */
++#ifdef RAFT_TLA_TRACE
++		if (tla_trace_is_enabled()) {
++			if (req.vote != 0)
++				tla_trace_wal_write_term_and_vote(raft);
++			else if (raft->volatile_vote != 0)
++				tla_trace_wal_write_term_only(raft);
++			else
++				tla_trace_wal_write_term_no_vote(raft);
++		}
++#endif
+ 		/*
+ 		 * Persistent state is visible, and it was changed - broadcast.
+ 		 */
+@@ -804,6 +832,7 @@ raft_worker_handle_broadcast(struct raft *raft)
+ 	raft_checkpoint_remote(raft, &req);
+ 	raft_broadcast(raft, &req);
+ 	raft->is_broadcast_scheduled = false;
++	TLA_TRACE(tla_trace_broadcast_state, raft);
+ }
+ 
+ void
+@@ -980,6 +1009,7 @@ raft_sm_election_update_cb(struct ev_loop *loop, struct ev_timer *timer,
+ 	raft_restore(raft);
+ 	raft_schedule_broadcast(raft);
+ 	raft_sm_election_update(raft);
++	TLA_TRACE(tla_trace_election_timeout, raft);
+ }
+ 
+ static void
+@@ -1217,6 +1247,7 @@ raft_promote(struct raft *raft)
+ 	raft_sm_schedule_new_term(raft, raft->volatile_term + 1);
+ 	raft_start_candidate(raft);
+ 	raft_sm_schedule_new_vote(raft, raft->self, raft->vclock);
++	TLA_TRACE(tla_trace_promote, raft);
+ }
+ 
+ void
+@@ -1225,6 +1256,7 @@ raft_resign(struct raft *raft)
+ 	assert(raft->state == RAFT_STATE_LEADER);
+ 	say_warn("RAFT: resigning from leader state");
+ 	raft_stop_candidate(raft);
++	TLA_TRACE(tla_trace_leader_resign, raft);
+ }
+ 
+ void

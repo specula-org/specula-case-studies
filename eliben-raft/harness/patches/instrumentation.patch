@@ -1,0 +1,166 @@
+diff --git a/part3/raft/raft.go b/part3/raft/raft.go
+index 4c1c1bd..92f2f9e 100644
+--- a/part3/raft/raft.go
++++ b/part3/raft/raft.go
+@@ -168,6 +168,10 @@ func (cm *ConsensusModule) Submit(command any) int {
+ 		submitIndex := len(cm.log)
+ 		cm.log = append(cm.log, LogEntry{Command: command, Term: cm.currentTerm})
+ 		cm.persistToStorage()
++		cm.traceEvent("ClientRequest", map[string]any{
++			"commitIndex":  cm.commitIndex + 1,
++			"lastLogIndex": len(cm.log),
++		})
+ 		cm.dlog("... log=%v", cm.log)
+ 		cm.mu.Unlock()
+ 		cm.triggerAEChan <- struct{}{}
+@@ -293,6 +297,13 @@ func (cm *ConsensusModule) RequestVote(args RequestVoteArgs, reply *RequestVoteR
+ 	}
+ 	reply.Term = cm.currentTerm
+ 	cm.persistToStorage()
++	cm.traceEvent("HandleRequestVoteRequest", map[string]any{
++		"votedFor":     cm.votedFor,
++		"commitIndex":  cm.commitIndex + 1,
++		"lastLogIndex": len(cm.log),
++		"from":         args.CandidateId,
++		"msgTerm":      args.Term,
++	})
+ 	cm.dlog("... RequestVote reply: %+v", reply)
+ 	return nil
+ }
+@@ -403,6 +414,14 @@ func (cm *ConsensusModule) AppendEntries(args AppendEntriesArgs, reply *AppendEn
+ 
+ 	reply.Term = cm.currentTerm
+ 	cm.persistToStorage()
++	cm.traceEvent("HandleAppendEntriesRequest", map[string]any{
++		"votedFor":     cm.votedFor,
++		"commitIndex":  cm.commitIndex + 1,
++		"lastLogIndex": len(cm.log),
++		"from":         args.LeaderId,
++		"msgTerm":      args.Term,
++		"success":      reply.Success,
++	})
+ 	cm.dlog("AppendEntries reply: %+v", *reply)
+ 	return nil
+ }
+@@ -474,6 +493,9 @@ func (cm *ConsensusModule) startElection() {
+ 	savedCurrentTerm := cm.currentTerm
+ 	cm.electionResetEvent = time.Now()
+ 	cm.votedFor = cm.id
++	cm.traceEvent("Timeout", map[string]any{
++		"votedFor": cm.id,
++	})
+ 	cm.dlog("becomes Candidate (currentTerm=%d); log=%v", savedCurrentTerm, cm.log)
+ 
+ 	votesReceived := 1
+@@ -507,6 +529,9 @@ func (cm *ConsensusModule) startElection() {
+ 				if reply.Term > savedCurrentTerm {
+ 					cm.dlog("term out of date in RequestVoteReply")
+ 					cm.becomeFollower(reply.Term)
++					cm.traceEvent("HandleRequestVoteResponse", map[string]any{
++						"from": peerId, "msgTerm": reply.Term, "voteGranted": reply.VoteGranted,
++					})
+ 					return
+ 				} else if reply.Term == savedCurrentTerm {
+ 					if reply.VoteGranted {
+@@ -514,11 +539,17 @@ func (cm *ConsensusModule) startElection() {
+ 						if votesReceived*2 > len(cm.peerIds)+1 {
+ 							// Won the election!
+ 							cm.dlog("wins election with %d votes", votesReceived)
++							cm.traceEvent("HandleRequestVoteResponse", map[string]any{
++								"from": peerId, "msgTerm": reply.Term, "voteGranted": reply.VoteGranted,
++							})
+ 							cm.startLeader()
+ 							return
+ 						}
+ 					}
+ 				}
++				cm.traceEvent("HandleRequestVoteResponse", map[string]any{
++					"from": peerId, "msgTerm": reply.Term, "voteGranted": reply.VoteGranted,
++				})
+ 			}
+ 		}()
+ 	}
+@@ -548,6 +579,10 @@ func (cm *ConsensusModule) startLeader() {
+ 		cm.nextIndex[peerId] = len(cm.log)
+ 		cm.matchIndex[peerId] = -1
+ 	}
++	cm.traceEvent("BecomeLeader", map[string]any{
++		"commitIndex":  cm.commitIndex + 1,
++		"lastLogIndex": len(cm.log),
++	})
+ 	cm.dlog("becomes Leader; term=%d, nextIndex=%v, matchIndex=%v; log=%v", cm.currentTerm, cm.nextIndex, cm.matchIndex, cm.log)
+ 
+ 	// This goroutine runs in the background and sends AEs to peers:
+@@ -626,6 +661,14 @@ func (cm *ConsensusModule) leaderSendAEs() {
+ 				Entries:      entries,
+ 				LeaderCommit: cm.commitIndex,
+ 			}
++			traceEmitRaw(map[string]any{
++				"event": "AppendEntries",
++				"node":  cm.id,
++				"from":  cm.id,
++				"to":    peerId,
++				"term":  savedCurrentTerm,
++				"role":  "Leader",
++			})
+ 			cm.mu.Unlock()
+ 			cm.dlog("sending AppendEntries to %v: ni=%d, args=%+v", peerId, ni, args)
+ 			var reply AppendEntriesReply
+@@ -638,6 +681,9 @@ func (cm *ConsensusModule) leaderSendAEs() {
+ 				if reply.Term > cm.currentTerm {
+ 					cm.dlog("term out of date in heartbeat reply")
+ 					cm.becomeFollower(reply.Term)
++					cm.traceEvent("HandleAppendEntriesResponse", map[string]any{
++						"from": peerId, "success": reply.Success,
++					})
+ 					cm.mu.Unlock()
+ 					return
+ 				}
+@@ -663,6 +709,12 @@ func (cm *ConsensusModule) leaderSendAEs() {
+ 						}
+ 						cm.dlog("AppendEntries reply from %d success: nextIndex := %v, matchIndex := %v; commitIndex := %d", peerId, cm.nextIndex, cm.matchIndex, cm.commitIndex)
+ 						if cm.commitIndex != savedCommitIndex {
++							cm.traceEvent("HandleAppendEntriesResponse", map[string]any{
++								"from": peerId, "success": reply.Success,
++							})
++							cm.traceEvent("AdvanceCommitIndex", map[string]any{
++								"commitIndex": cm.commitIndex + 1,
++							})
+ 							cm.dlog("leader sets commitIndex := %d", cm.commitIndex)
+ 							// Commit index changed: the leader considers new entries to be
+ 							// committed. Send new entries on the commit channel to this
+@@ -671,6 +723,9 @@ func (cm *ConsensusModule) leaderSendAEs() {
+ 							cm.newCommitReadyChan <- struct{}{}
+ 							cm.triggerAEChan <- struct{}{}
+ 						} else {
++							cm.traceEvent("HandleAppendEntriesResponse", map[string]any{
++								"from": peerId, "success": reply.Success,
++							})
+ 							cm.mu.Unlock()
+ 						}
+ 					} else {
+@@ -691,6 +746,9 @@ func (cm *ConsensusModule) leaderSendAEs() {
+ 							cm.nextIndex[peerId] = reply.ConflictIndex
+ 						}
+ 						cm.dlog("AppendEntries reply from %d !success: nextIndex := %d", peerId, ni-1)
++						cm.traceEvent("HandleAppendEntriesResponse", map[string]any{
++							"from": peerId, "success": reply.Success,
++						})
+ 						cm.mu.Unlock()
+ 					}
+ 				} else {
+diff --git a/part3/raft/testharness.go b/part3/raft/testharness.go
+index 73420dd..ec76ae5 100644
+--- a/part3/raft/testharness.go
++++ b/part3/raft/testharness.go
+@@ -152,6 +152,10 @@ func (h *Harness) CrashPeer(id int) {
+ 	tlog("Crash %d", id)
+ 	h.DisconnectPeer(id)
+ 	h.alive[id] = false
++	traceEmitRaw(map[string]any{
++		"event": "Crash",
++		"node":  id,
++	})
+ 	h.cluster[id].Shutdown()
+ 
+ 	// Clear out the commits slice for the crashed server; Raft assumes the client

@@ -1,0 +1,528 @@
+diff --git a/async-raft/src/core/append_entries.rs b/async-raft/src/core/append_entries.rs
+index cf3594a..d037226 100644
+--- a/async-raft/src/core/append_entries.rs
++++ b/async-raft/src/core/append_entries.rs
+@@ -1,6 +1,7 @@
+ use crate::core::{RaftCore, State, UpdateCurrentLeader};
+ use crate::error::RaftResult;
+ use crate::raft::{AppendEntriesRequest, AppendEntriesResponse, ConflictOpt, Entry, EntryPayload};
++use crate::tla_trace;
+ use crate::{AppData, AppDataResponse, RaftNetwork, RaftStorage};
+ 
+ impl<D: AppData, R: AppDataResponse, N: RaftNetwork<D>, S: RaftStorage<D, R>> RaftCore<D, R, N, S> {
+@@ -12,14 +13,33 @@ impl<D: AppData, R: AppDataResponse, N: RaftNetwork<D>, S: RaftStorage<D, R>> Ra
+         fields(term=msg.term, leader_id=msg.leader_id, prev_log_index=msg.prev_log_index, prev_log_term=msg.prev_log_term, leader_commit=msg.leader_commit),
+     )]
+     pub(super) async fn handle_append_entries_request(&mut self, msg: AppendEntriesRequest<D>) -> RaftResult<AppendEntriesResponse> {
++        let _tla_leader_id = msg.leader_id;
++        let _tla_msg_term = msg.term;
++        let _tla_prev_log_index = msg.prev_log_index;
++        let _tla_prev_log_term = msg.prev_log_term;
++        let _tla_has_entries = !msg.entries.is_empty();
++
+         // If message's term is less than most recent term, then we do not honor the request.
+         if msg.term < self.current_term {
+             tracing::trace!({self.current_term, rpc_term=msg.term}, "AppendEntries RPC term is less than current term");
+-            return Ok(AppendEntriesResponse {
++            let resp = AppendEntriesResponse {
+                 term: self.current_term,
+                 success: false,
+                 conflict_opt: None,
+-            });
++            };
++            if tla_trace::is_active() {
++                let state = tla_trace::RaftState {
++                    term: self.current_term, role: tla_trace::role_str(&self.target_state),
++                    voted_for: self.voted_for, commit_index: self.commit_index,
++                    last_log_index: self.last_log_index, last_log_term: self.last_log_term,
++                };
++                let msg_json = format!(
++                    r#"{{"from":"{}","to":"{}","term":{},"success":{},"prevLogIndex":{},"prevLogTerm":{}}}"#,
++                    tla_trace::nid(_tla_leader_id), tla_trace::nid(self.id), _tla_msg_term, resp.success, _tla_prev_log_index, _tla_prev_log_term
++                );
++                tla_trace::emit_full("HandleAppendEntriesRequest", self.id, &state, Some(&msg_json));
++            }
++            return Ok(resp);
+         }
+ 
+         // Update election timeout.
+@@ -51,11 +71,20 @@ impl<D: AppData, R: AppDataResponse, N: RaftNetwork<D>, S: RaftStorage<D, R>> Ra
+             if report_metrics {
+                 self.report_metrics();
+             }
+-            return Ok(AppendEntriesResponse {
+-                term: self.current_term,
+-                success: true,
+-                conflict_opt: None,
+-            });
++            let resp = AppendEntriesResponse { term: self.current_term, success: true, conflict_opt: None };
++            if tla_trace::is_active() {
++                let state = tla_trace::RaftState {
++                    term: self.current_term, role: tla_trace::role_str(&self.target_state),
++                    voted_for: self.voted_for, commit_index: self.commit_index,
++                    last_log_index: self.last_log_index, last_log_term: self.last_log_term,
++                };
++                let msg_json = format!(
++                    r#"{{"from":"{}","to":"{}","term":{},"success":{},"prevLogIndex":{},"prevLogTerm":{}}}"#,
++                    tla_trace::nid(_tla_leader_id), tla_trace::nid(self.id), _tla_msg_term, resp.success, _tla_prev_log_index, _tla_prev_log_term
++                );
++                tla_trace::emit_full("HandleAppendEntriesRequest", self.id, &state, Some(&msg_json));
++            }
++            return Ok(resp);
+         }
+ 
+         // If RPC's `prev_log_index` is 0, or the RPC's previous log info matches the local
+@@ -68,11 +97,20 @@ impl<D: AppData, R: AppDataResponse, N: RaftNetwork<D>, S: RaftStorage<D, R>> Ra
+             if report_metrics {
+                 self.report_metrics();
+             }
+-            return Ok(AppendEntriesResponse {
+-                term: self.current_term,
+-                success: true,
+-                conflict_opt: None,
+-            });
++            let resp = AppendEntriesResponse { term: self.current_term, success: true, conflict_opt: None };
++            if tla_trace::is_active() {
++                let state = tla_trace::RaftState {
++                    term: self.current_term, role: tla_trace::role_str(&self.target_state),
++                    voted_for: self.voted_for, commit_index: self.commit_index,
++                    last_log_index: self.last_log_index, last_log_term: self.last_log_term,
++                };
++                let msg_json = format!(
++                    r#"{{"from":"{}","to":"{}","term":{},"success":{},"prevLogIndex":{},"prevLogTerm":{}}}"#,
++                    tla_trace::nid(_tla_leader_id), tla_trace::nid(self.id), _tla_msg_term, resp.success, _tla_prev_log_index, _tla_prev_log_term
++                );
++                tla_trace::emit_full("HandleAppendEntriesRequest", self.id, &state, Some(&msg_json));
++            }
++            return Ok(resp);
+         }
+ 
+         /////////////////////////////////////
+@@ -93,14 +131,23 @@ impl<D: AppData, R: AppDataResponse, N: RaftNetwork<D>, S: RaftStorage<D, R>> Ra
+                 if report_metrics {
+                     self.report_metrics();
+                 }
+-                return Ok(AppendEntriesResponse {
+-                    term: self.current_term,
+-                    success: false,
+-                    conflict_opt: Some(ConflictOpt {
+-                        term: self.last_log_term,
+-                        index: self.last_log_index,
+-                    }),
+-                });
++                let resp = AppendEntriesResponse {
++                    term: self.current_term, success: false,
++                    conflict_opt: Some(ConflictOpt { term: self.last_log_term, index: self.last_log_index }),
++                };
++                if tla_trace::is_active() {
++                    let state = tla_trace::RaftState {
++                        term: self.current_term, role: tla_trace::role_str(&self.target_state),
++                        voted_for: self.voted_for, commit_index: self.commit_index,
++                        last_log_index: self.last_log_index, last_log_term: self.last_log_term,
++                    };
++                    let msg_json = format!(
++                        r#"{{"from":"{}","to":"{}","term":{},"success":{},"prevLogIndex":{},"prevLogTerm":{}}}"#,
++                        tla_trace::nid(_tla_leader_id), tla_trace::nid(self.id), _tla_msg_term, false, _tla_prev_log_index, _tla_prev_log_term
++                    );
++                    tla_trace::emit_full("HandleAppendEntriesRequest", self.id, &state, Some(&msg_json));
++                }
++                return Ok(resp);
+             }
+         };
+ 
+@@ -143,11 +190,20 @@ impl<D: AppData, R: AppDataResponse, N: RaftNetwork<D>, S: RaftStorage<D, R>> Ra
+             if report_metrics {
+                 self.report_metrics();
+             }
+-            return Ok(AppendEntriesResponse {
+-                term: self.current_term,
+-                success: false,
+-                conflict_opt: opt,
+-            });
++            let resp = AppendEntriesResponse { term: self.current_term, success: false, conflict_opt: opt };
++            if tla_trace::is_active() {
++                let state = tla_trace::RaftState {
++                    term: self.current_term, role: tla_trace::role_str(&self.target_state),
++                    voted_for: self.voted_for, commit_index: self.commit_index,
++                    last_log_index: self.last_log_index, last_log_term: self.last_log_term,
++                };
++                let msg_json = format!(
++                    r#"{{"from":"{}","to":"{}","term":{},"success":{},"prevLogIndex":{},"prevLogTerm":{}}}"#,
++                    tla_trace::nid(_tla_leader_id), tla_trace::nid(self.id), _tla_msg_term, false, _tla_prev_log_index, _tla_prev_log_term
++                );
++                tla_trace::emit_full("HandleAppendEntriesRequest", self.id, &state, Some(&msg_json));
++            }
++            return Ok(resp);
+         }
+ 
+         ///////////////////////////////////
+@@ -159,11 +215,20 @@ impl<D: AppData, R: AppDataResponse, N: RaftNetwork<D>, S: RaftStorage<D, R>> Ra
+         if report_metrics {
+             self.report_metrics();
+         }
+-        Ok(AppendEntriesResponse {
+-            term: self.current_term,
+-            success: true,
+-            conflict_opt: None,
+-        })
++        let resp = AppendEntriesResponse { term: self.current_term, success: true, conflict_opt: None };
++        if tla_trace::is_active() {
++            let state = tla_trace::RaftState {
++                term: self.current_term, role: tla_trace::role_str(&self.target_state),
++                voted_for: self.voted_for, commit_index: self.commit_index,
++                last_log_index: self.last_log_index, last_log_term: self.last_log_term,
++            };
++            let msg_json = format!(
++                r#"{{"from":"{}","to":"{}","term":{},"success":{},"prevLogIndex":{},"prevLogTerm":{}}}"#,
++                tla_trace::nid(_tla_leader_id), tla_trace::nid(self.id), _tla_msg_term, resp.success, _tla_prev_log_index, _tla_prev_log_term
++            );
++            tla_trace::emit_full("HandleAppendEntriesRequest", self.id, &state, Some(&msg_json));
++        }
++        Ok(resp)
+     }
+ 
+     /// Append the given entries to the log.
+diff --git a/async-raft/src/core/client.rs b/async-raft/src/core/client.rs
+index 011ae4a..d76d321 100644
+--- a/async-raft/src/core/client.rs
++++ b/async-raft/src/core/client.rs
+@@ -11,6 +11,7 @@ use crate::error::{ClientReadError, ClientWriteError, RaftError, RaftResult};
+ use crate::raft::AppendEntriesRequest;
+ use crate::raft::{ClientReadResponseTx, ClientWriteRequest, ClientWriteResponse, ClientWriteResponseTx, Entry, EntryPayload};
+ use crate::replication::RaftEvent;
++use crate::tla_trace;
+ use crate::{AppData, AppDataResponse, RaftNetwork, RaftStorage};
+ 
+ /// A wrapper around a ClientRequest which has been transformed into an Entry, along with its response channel.
+@@ -237,6 +238,22 @@ impl<'a, D: AppData, R: AppDataResponse, N: RaftNetwork<D>, S: RaftStorage<D, R>
+             .await
+             .map_err(|err| self.core.map_fatal_storage_error(err))?;
+         self.core.last_log_index = entry.index;
++
++        // TLA+ trace: ClientRequest (all entry types including initial leader entry)
++        // Note: last_log_term may not be updated yet (it's set after this function returns
++        // in commit_initial_leader_entry). Use entry.term which is always current_term.
++        if tla_trace::is_active() {
++            let state = tla_trace::RaftState {
++                term: self.core.current_term,
++                role: tla_trace::role_str(&self.core.target_state),
++                voted_for: self.core.voted_for,
++                commit_index: self.core.commit_index,
++                last_log_index: self.core.last_log_index,
++                last_log_term: entry.term,
++            };
++            tla_trace::emit_full("ClientRequest", self.core.id, &state, None);
++        }
++
+         Ok(entry)
+     }
+ 
+diff --git a/async-raft/src/core/mod.rs b/async-raft/src/core/mod.rs
+index 6cb1a4e..8fa6f95 100644
+--- a/async-raft/src/core/mod.rs
++++ b/async-raft/src/core/mod.rs
+@@ -27,6 +27,7 @@ use crate::raft::{
+ };
+ use crate::replication::{RaftEvent, ReplicaEvent, ReplicationStream};
+ use crate::storage::HardState;
++use crate::tla_trace;
+ use crate::{AppData, AppDataResponse, NodeId, RaftNetwork, RaftStorage};
+ 
+ /// The core type implementing the Raft protocol.
+@@ -607,6 +608,15 @@ impl<'a, D: AppData, R: AppDataResponse, N: RaftNetwork<D>, S: RaftStorage<D, R>
+         self.core.update_current_leader(UpdateCurrentLeader::ThisNode);
+         self.core.report_metrics();
+ 
++        // TLA+ trace: BecomeLeader
++        if tla_trace::is_active() {
++            let state = tla_trace::RaftStateWeak {
++                term: self.core.current_term,
++                role: "Leader",
++            };
++            tla_trace::emit_weak("BecomeLeader", self.core.id, &state, None);
++        }
++
+         // Per §8, commit an initial entry as part of becoming the cluster leader.
+         self.commit_initial_leader_entry().await?;
+ 
+@@ -789,6 +799,19 @@ impl<'a, D: AppData, R: AppDataResponse, N: RaftNetwork<D>, S: RaftStorage<D, R>
+             self.core.save_hard_state().await?;
+             self.core.report_metrics();
+ 
++            // TLA+ trace: Timeout
++            if tla_trace::is_active() {
++                let state = tla_trace::RaftState {
++                    term: self.core.current_term,
++                    role: "Candidate",
++                    voted_for: self.core.voted_for,
++                    commit_index: self.core.commit_index,
++                    last_log_index: self.core.last_log_index,
++                    last_log_term: self.core.last_log_term,
++                };
++                tla_trace::emit_full("Timeout", self.core.id, &state, None);
++            }
++
+             // Send RPCs to all members in parallel.
+             let mut pending_votes = self.spawn_parallel_vote_requests();
+ 
+diff --git a/async-raft/src/core/replication.rs b/async-raft/src/core/replication.rs
+index fc198d1..368323f 100644
+--- a/async-raft/src/core/replication.rs
++++ b/async-raft/src/core/replication.rs
+@@ -5,6 +5,7 @@ use crate::core::{ConsensusState, LeaderState, ReplicationState, SnapshotState,
+ use crate::error::RaftResult;
+ use crate::replication::{RaftEvent, ReplicaEvent, ReplicationStream};
+ use crate::storage::CurrentSnapshotData;
++use crate::tla_trace;
+ use crate::{AppData, AppDataResponse, NodeId, RaftNetwork, RaftStorage};
+ 
+ impl<'a, D: AppData, R: AppDataResponse, N: RaftNetwork<D>, S: RaftStorage<D, R>> LeaderState<'a, D, R, N, S> {
+@@ -113,6 +114,19 @@ impl<'a, D: AppData, R: AppDataResponse, N: RaftNetwork<D>, S: RaftStorage<D, R>
+             return Ok(());
+         }
+ 
++        // TLA+ trace: HandleAppendEntriesResponse
++        if tla_trace::is_active() {
++            let state = tla_trace::RaftStateWeak {
++                term: self.core.current_term,
++                role: tla_trace::role_str(&self.core.target_state),
++            };
++            let msg_json = format!(
++                r#"{{"from":"{}","to":"{}","matchIndex":{},"matchTerm":{},"success":true}}"#,
++                tla_trace::nid(target), tla_trace::nid(self.core.id), match_index, match_term
++            );
++            tla_trace::emit_weak("HandleAppendEntriesResponse", self.core.id, &state, Some(&msg_json));
++        }
++
+         // Update target's match index & check if it is awaiting removal.
+         let mut needs_removal = false;
+         match self.nodes.get_mut(&target) {
+@@ -165,6 +179,16 @@ impl<'a, D: AppData, R: AppDataResponse, N: RaftNetwork<D>, S: RaftStorage<D, R>
+         if has_new_commit_index {
+             self.core.commit_index = std::cmp::min(commit_index_c0, commit_index_c1);
+ 
++            // TLA+ trace: AdvanceCommitIndex
++            if tla_trace::is_active() {
++                let state = tla_trace::RaftStateCommit {
++                    term: self.core.current_term,
++                    role: tla_trace::role_str(&self.core.target_state),
++                    commit_index: self.core.commit_index,
++                };
++                tla_trace::emit_commit("AdvanceCommitIndex", self.core.id, &state, None);
++            }
++
+             // Update all replication streams based on new commit index.
+             for node in self.nodes.values() {
+                 let _ = node.replstream.repltx.send(RaftEvent::UpdateCommitIndex {
+diff --git a/async-raft/src/core/vote.rs b/async-raft/src/core/vote.rs
+index ba9ff68..0e720cb 100644
+--- a/async-raft/src/core/vote.rs
++++ b/async-raft/src/core/vote.rs
+@@ -5,6 +5,7 @@ use tracing_futures::Instrument;
+ use crate::core::{CandidateState, RaftCore, State, UpdateCurrentLeader};
+ use crate::error::RaftResult;
+ use crate::raft::{VoteRequest, VoteResponse};
++use crate::tla_trace;
+ use crate::{AppData, AppDataResponse, NodeId, RaftNetwork, RaftStorage};
+ 
+ impl<D: AppData, R: AppDataResponse, N: RaftNetwork<D>, S: RaftStorage<D, R>> RaftCore<D, R, N, S> {
+@@ -16,10 +17,20 @@ impl<D: AppData, R: AppDataResponse, N: RaftNetwork<D>, S: RaftStorage<D, R>> Ra
+         // If candidate's current term is less than this nodes current term, reject.
+         if msg.term < self.current_term {
+             tracing::trace!({candidate=msg.candidate_id, self.current_term, rpc_term=msg.term}, "RequestVote RPC term is less than current term");
+-            return Ok(VoteResponse {
+-                term: self.current_term,
+-                vote_granted: false,
+-            });
++            let resp = VoteResponse { term: self.current_term, vote_granted: false };
++            if tla_trace::is_active() {
++                let state = tla_trace::RaftState {
++                    term: self.current_term, role: tla_trace::role_str(&self.target_state),
++                    voted_for: self.voted_for, commit_index: self.commit_index,
++                    last_log_index: self.last_log_index, last_log_term: self.last_log_term,
++                };
++                let msg_json = format!(
++                    r#"{{"from":"{}","to":"{}","term":{},"granted":{},"lastLogTerm":{},"lastLogIndex":{}}}"#,
++                    tla_trace::nid(msg.candidate_id), tla_trace::nid(self.id), msg.term, resp.vote_granted, msg.last_log_term, msg.last_log_index
++                );
++                tla_trace::emit_full("HandleRequestVoteRequest", self.id, &state, Some(&msg_json));
++            }
++            return Ok(resp);
+         }
+ 
+         // Do not respond to the request if we've received a heartbeat within the election timeout minimum.
+@@ -31,10 +42,20 @@ impl<D: AppData, R: AppDataResponse, N: RaftNetwork<D>, S: RaftStorage<D, R>> Ra
+                     { candidate = msg.candidate_id },
+                     "rejecting vote request received within election timeout minimum"
+                 );
+-                return Ok(VoteResponse {
+-                    term: self.current_term,
+-                    vote_granted: false,
+-                });
++                let resp = VoteResponse { term: self.current_term, vote_granted: false };
++                if tla_trace::is_active() {
++                    let state = tla_trace::RaftState {
++                        term: self.current_term, role: tla_trace::role_str(&self.target_state),
++                        voted_for: self.voted_for, commit_index: self.commit_index,
++                        last_log_index: self.last_log_index, last_log_term: self.last_log_term,
++                    };
++                    let msg_json = format!(
++                        r#"{{"from":"{}","to":"{}","term":{},"granted":{},"lastLogTerm":{},"lastLogIndex":{}}}"#,
++                        tla_trace::nid(msg.candidate_id), tla_trace::nid(self.id), msg.term, resp.vote_granted, msg.last_log_term, msg.last_log_index
++                    );
++                    tla_trace::emit_full("HandleRequestVoteRequest", self.id, &state, Some(&msg_json));
++                }
++                return Ok(resp);
+             }
+         }
+ 
+@@ -56,27 +77,37 @@ impl<D: AppData, R: AppDataResponse, N: RaftNetwork<D>, S: RaftStorage<D, R>> Ra
+                 { candidate = msg.candidate_id },
+                 "rejecting vote request as candidate's log is not up-to-date"
+             );
+-            return Ok(VoteResponse {
+-                term: self.current_term,
+-                vote_granted: false,
+-            });
++            let resp = VoteResponse { term: self.current_term, vote_granted: false };
++            if tla_trace::is_active() {
++                let state = tla_trace::RaftState {
++                    term: self.current_term, role: tla_trace::role_str(&self.target_state),
++                    voted_for: self.voted_for, commit_index: self.commit_index,
++                    last_log_index: self.last_log_index, last_log_term: self.last_log_term,
++                };
++                let msg_json = format!(
++                    r#"{{"from":"{}","to":"{}","term":{},"granted":{},"lastLogTerm":{},"lastLogIndex":{}}}"#,
++                    tla_trace::nid(msg.candidate_id), tla_trace::nid(self.id), msg.term, resp.vote_granted, msg.last_log_term, msg.last_log_index
++                );
++                tla_trace::emit_full("HandleRequestVoteRequest", self.id, &state, Some(&msg_json));
++            }
++            return Ok(resp);
+         }
+ 
+         // TODO: add hook for PreVote optimization here. If the RPC is a PreVote, then at this
+         // point we can respond to the candidate telling them that we would vote for them.
+ 
+         // Candidate's log is up-to-date so handle voting conditions.
+-        match &self.voted_for {
++        let resp = match &self.voted_for {
+             // This node has already voted for the candidate.
+-            Some(candidate_id) if candidate_id == &msg.candidate_id => Ok(VoteResponse {
++            Some(candidate_id) if candidate_id == &msg.candidate_id => VoteResponse {
+                 term: self.current_term,
+                 vote_granted: true,
+-            }),
++            },
+             // This node has already voted for a different candidate.
+-            Some(_) => Ok(VoteResponse {
++            Some(_) => VoteResponse {
+                 term: self.current_term,
+                 vote_granted: false,
+-            }),
++            },
+             // This node has not yet voted for the current term, so vote for the candidate.
+             None => {
+                 self.voted_for = Some(msg.candidate_id);
+@@ -84,12 +115,28 @@ impl<D: AppData, R: AppDataResponse, N: RaftNetwork<D>, S: RaftStorage<D, R>> Ra
+                 self.update_next_election_timeout(false);
+                 self.save_hard_state().await?;
+                 tracing::trace!({candidate=msg.candidate_id, msg.term}, "voted for candidate");
+-                Ok(VoteResponse {
++                VoteResponse {
+                     term: self.current_term,
+                     vote_granted: true,
+-                })
++                }
+             }
++        };
++
++        // TLA+ trace: HandleRequestVoteRequest
++        if tla_trace::is_active() {
++            let state = tla_trace::RaftState {
++                term: self.current_term, role: tla_trace::role_str(&self.target_state),
++                voted_for: self.voted_for, commit_index: self.commit_index,
++                last_log_index: self.last_log_index, last_log_term: self.last_log_term,
++            };
++            let msg_json = format!(
++                r#"{{"from":"{}","to":"{}","term":{},"granted":{},"lastLogTerm":{},"lastLogIndex":{}}}"#,
++                tla_trace::nid(msg.candidate_id), tla_trace::nid(self.id), msg.term, resp.vote_granted, msg.last_log_term, msg.last_log_index
++            );
++            tla_trace::emit_full("HandleRequestVoteRequest", self.id, &state, Some(&msg_json));
+         }
++
++        Ok(resp)
+     }
+ }
+ 
+@@ -97,6 +144,19 @@ impl<'a, D: AppData, R: AppDataResponse, N: RaftNetwork<D>, S: RaftStorage<D, R>
+     /// Handle response from a vote request sent to a peer.
+     #[tracing::instrument(level = "trace", skip(self, res, target))]
+     pub(super) async fn handle_vote_response(&mut self, res: VoteResponse, target: NodeId) -> RaftResult<()> {
++        // TLA+ trace: HandleRequestVoteResponse
++        if tla_trace::is_active() {
++            let state = tla_trace::RaftStateWeak {
++                term: self.core.current_term,
++                role: tla_trace::role_str(&self.core.target_state),
++            };
++            let msg_json = format!(
++                r#"{{"from":"{}","to":"{}","term":{},"granted":{}}}"#,
++                tla_trace::nid(target), tla_trace::nid(self.core.id), res.term, res.vote_granted
++            );
++            tla_trace::emit_weak("HandleRequestVoteResponse", self.core.id, &state, Some(&msg_json));
++        }
++
+         // If peer's term is greater than current term, revert to follower state.
+         if res.term > self.core.current_term {
+             self.core.update_current_term(res.term, None);
+diff --git a/async-raft/src/lib.rs b/async-raft/src/lib.rs
+index eaa1681..ddbcc70 100644
+--- a/async-raft/src/lib.rs
++++ b/async-raft/src/lib.rs
+@@ -9,6 +9,7 @@ pub mod network;
+ pub mod raft;
+ mod replication;
+ pub mod storage;
++pub mod tla_trace;
+ 
+ use serde::{de::DeserializeOwned, Serialize};
+ 
+diff --git a/async-raft/src/replication/mod.rs b/async-raft/src/replication/mod.rs
+index 4d717cf..cf3231d 100644
+--- a/async-raft/src/replication/mod.rs
++++ b/async-raft/src/replication/mod.rs
+@@ -13,6 +13,7 @@ use crate::config::{Config, SnapshotPolicy};
+ use crate::error::RaftResult;
+ use crate::raft::{AppendEntriesRequest, Entry, EntryPayload, InstallSnapshotRequest};
+ use crate::storage::CurrentSnapshotData;
++use crate::tla_trace;
+ use crate::{AppData, AppDataResponse, NodeId, RaftNetwork, RaftStorage};
+ 
+ /// The public handle to a spawned replication stream.
+@@ -209,6 +210,27 @@ impl<D: AppData, R: AppDataResponse, N: RaftNetwork<D>, S: RaftStorage<D, R>> Re
+             entries: self.outbound_buffer.iter().map(|entry| entry.as_ref().clone()).collect(),
+         };
+ 
++        // TLA+ trace: SendReplicateEntries or SendHeartbeat
++        if tla_trace::is_active() {
++            let state = tla_trace::RaftStateWeak {
++                term: self.term,
++                role: "Leader",
++            };
++            if payload.entries.is_empty() {
++                let msg_json = format!(
++                    r#"{{"from":"{}","to":"{}","term":{}}}"#,
++                    tla_trace::nid(self.id), tla_trace::nid(self.target), self.term
++                );
++                tla_trace::emit_weak("SendHeartbeat", self.id, &state, Some(&msg_json));
++            } else {
++                let msg_json = format!(
++                    r#"{{"from":"{}","to":"{}","term":{},"prevLogIndex":{},"prevLogTerm":{}}}"#,
++                    tla_trace::nid(self.id), tla_trace::nid(self.target), self.term, self.match_index, self.match_term
++                );
++                tla_trace::emit_weak("SendReplicateEntries", self.id, &state, Some(&msg_json));
++            }
++        }
++
+         // Send the payload.
+         let res = match timeout(self.heartbeat_timeout, self.network.append_entries(self.target, payload)).await {
+             Ok(outer_res) => match outer_res {

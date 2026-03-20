@@ -1,0 +1,523 @@
+diff --git a/src/clustering/generic/raft_core.tcc b/src/clustering/generic/raft_core.tcc
+index 48288232b0..359143f83a 100644
+--- a/src/clustering/generic/raft_core.tcc
++++ b/src/clustering/generic/raft_core.tcc
+@@ -31,6 +31,17 @@ inline std::string show_member_id(const raft_member_id_t &mid) {
+ #define RAFT_DEBUG_VAR UNUSED
+ #endif /* ENABLE_RAFT_DEBUG */
+ 
++/* TLA+ trace instrumentation. Define RETHINKDB_TLA_TRACE to emit NDJSON trace events.
++   Set RAFT_TRACE_FILE environment variable to the output path. */
++#ifdef RETHINKDB_TLA_TRACE
++#include "raft_trace.hpp"
++/* Mode-to-string helper — mode_t is private, so we define this as a macro
++   that's used at each call site where `mode` is in scope. */
++#define RAFT_TRACE_ROLE \
++    ((mode == mode_t::follower) ? "follower" \
++     : (mode == mode_t::candidate) ? "candidate" : "leader")
++#endif /* RETHINKDB_TLA_TRACE */
++
+ template<class state_t>
+ raft_persistent_state_t<state_t>
+ raft_persistent_state_t<state_t>::make_initial(
+@@ -207,6 +218,11 @@ raft_member_t<state_t>::propose_change(
+     leader_append_log_entry(new_entry, &change_lock->mutex_acq);
+     guarantee(ps().log.get_latest_index() == log_index);
+ 
++#ifdef RETHINKDB_TLA_TRACE
++    raft_trace_emit_node("client_request", this_member_id,
++        RAFT_TRACE_STATE_ARGS, ",\"value\":\"v1\"");
++#endif
++
+     DEBUG_ONLY_CODE(check_invariants(&change_lock->mutex_acq));
+     return change_token;
+ }
+@@ -244,6 +260,24 @@ raft_member_t<state_t>::propose_config_change(
+     leader_append_log_entry(new_entry, &change_lock->mutex_acq);
+     guarantee(ps().log.get_latest_index() == log_index);
+ 
++#ifdef RETHINKDB_TLA_TRACE
++    {
++        auto &tw = raft_trace_writer_t::get();
++        if (tw.enabled()) {
++            std::string cfg_arr = ",\"new_config\":[";
++            bool first = true;
++            for (const raft_member_id_t &m : new_config.voting_members) {
++                if (!first) cfg_arr += ",";
++                cfg_arr += "\"" + tw.nid(m) + "\"";
++                first = false;
++            }
++            cfg_arr += "]";
++            raft_trace_emit_node("propose_config_change", this_member_id,
++                RAFT_TRACE_STATE_ARGS, cfg_arr.c_str());
++        }
++    }
++#endif
++
+     /* Now that we've put a config entry into the log, we'll have to flip
+     `readiness_for_config_change` */
+     update_readiness_for_change();
+@@ -436,6 +470,15 @@ void raft_member_t<state_t>::on_request_vote_rpc(
+             show_member_id(request.candidate_id).c_str(), request.term);
+         reply_out->term = ps().current_term;
+         reply_out->vote_granted = false;
++#ifdef RETHINKDB_TLA_TRACE
++        {
++            char _extra[128];
++            snprintf(_extra, sizeof(_extra),
++                ",\"msg_term\":%" PRIu64 ",\"vote_granted\":false", request.term);
++            raft_trace_emit_recv("request_vote_recv", this_member_id,
++                request.candidate_id, RAFT_TRACE_STATE_ARGS, _extra);
++        }
++#endif
+         return;
+     }
+ 
+@@ -453,6 +496,15 @@ void raft_member_t<state_t>::on_request_vote_rpc(
+     if (request.term < ps().current_term) {
+         reply_out->term = ps().current_term;
+         reply_out->vote_granted = false;
++#ifdef RETHINKDB_TLA_TRACE
++        {
++            char _extra[128];
++            snprintf(_extra, sizeof(_extra),
++                ",\"msg_term\":%" PRIu64 ",\"vote_granted\":false", request.term);
++            raft_trace_emit_recv("request_vote_recv", this_member_id,
++                request.candidate_id, RAFT_TRACE_STATE_ARGS, _extra);
++        }
++#endif
+         DEBUG_ONLY_CODE(check_invariants(&mutex_acq));
+         return;
+     }
+@@ -473,6 +525,15 @@ void raft_member_t<state_t>::on_request_vote_rpc(
+     if (!ps().voted_for.is_nil() && ps().voted_for != request.candidate_id) {
+         reply_out->term = ps().current_term;
+         reply_out->vote_granted = false;
++#ifdef RETHINKDB_TLA_TRACE
++        {
++            char _extra[128];
++            snprintf(_extra, sizeof(_extra),
++                ",\"msg_term\":%" PRIu64 ",\"vote_granted\":false", request.term);
++            raft_trace_emit_recv("request_vote_recv", this_member_id,
++                request.candidate_id, RAFT_TRACE_STATE_ARGS, _extra);
++        }
++#endif
+         DEBUG_ONLY_CODE(check_invariants(&mutex_acq));
+         return;
+     }
+@@ -491,6 +552,15 @@ void raft_member_t<state_t>::on_request_vote_rpc(
+             show_member_id(request.candidate_id).c_str(), request.term);
+         reply_out->term = ps().current_term;
+         reply_out->vote_granted = false;
++#ifdef RETHINKDB_TLA_TRACE
++        {
++            char _extra[128];
++            snprintf(_extra, sizeof(_extra),
++                ",\"msg_term\":%" PRIu64 ",\"vote_granted\":false", request.term);
++            raft_trace_emit_recv("request_vote_recv", this_member_id,
++                request.candidate_id, RAFT_TRACE_STATE_ARGS, _extra);
++        }
++#endif
+         DEBUG_ONLY_CODE(check_invariants(&mutex_acq));
+         return;
+     }
+@@ -516,6 +586,16 @@ void raft_member_t<state_t>::on_request_vote_rpc(
+     reply_out->term = ps().current_term;
+     reply_out->vote_granted = true;
+ 
++#ifdef RETHINKDB_TLA_TRACE
++    {
++        char _extra[128];
++        snprintf(_extra, sizeof(_extra),
++            ",\"msg_term\":%" PRIu64 ",\"vote_granted\":true", request.term);
++        raft_trace_emit_recv("request_vote_recv", this_member_id,
++            request.candidate_id, RAFT_TRACE_STATE_ARGS, _extra);
++    }
++#endif
++
+     DEBUG_ONLY_CODE(check_invariants(&mutex_acq));
+ }
+ 
+@@ -531,6 +611,16 @@ void raft_member_t<state_t>::on_install_snapshot_rpc(
+         /* Raft paper, Figure 2: term should be set to "currentTerm, for leader to update
+         itself" */
+         reply_out->term = ps().current_term;
++#ifdef RETHINKDB_TLA_TRACE
++        {
++            char _extra[128];
++            snprintf(_extra, sizeof(_extra),
++                ",\"msg_term\":%" PRIu64 ",\"lastIncludedIndex\":%" PRIu64,
++                request.term, static_cast<uint64_t>(request.last_included_index));
++            raft_trace_emit_recv("install_snapshot_recv", this_member_id,
++                request.leader_id, RAFT_TRACE_STATE_ARGS, _extra);
++        }
++#endif
+         DEBUG_ONLY_CODE(check_invariants(&mutex_acq));
+         return;
+     }
+@@ -557,6 +647,16 @@ void raft_member_t<state_t>::on_install_snapshot_rpc(
+                 "committed entry at the same index.");
+         }
+         reply_out->term = ps().current_term;
++#ifdef RETHINKDB_TLA_TRACE
++        {
++            char _extra[128];
++            snprintf(_extra, sizeof(_extra),
++                ",\"msg_term\":%" PRIu64 ",\"lastIncludedIndex\":%" PRIu64,
++                request.term, static_cast<uint64_t>(request.last_included_index));
++            raft_trace_emit_recv("install_snapshot_recv", this_member_id,
++                request.leader_id, RAFT_TRACE_STATE_ARGS, _extra);
++        }
++#endif
+         DEBUG_ONLY_CODE(check_invariants(&mutex_acq));
+         return;
+     } else if (request.last_included_index <= ps().log.get_latest_index() &&
+@@ -619,6 +719,17 @@ void raft_member_t<state_t>::on_install_snapshot_rpc(
+ 
+     reply_out->term = ps().current_term;
+ 
++#ifdef RETHINKDB_TLA_TRACE
++    {
++        char _extra[128];
++        snprintf(_extra, sizeof(_extra),
++            ",\"msg_term\":%" PRIu64 ",\"lastIncludedIndex\":%" PRIu64,
++            request.term, static_cast<uint64_t>(request.last_included_index));
++        raft_trace_emit_recv("install_snapshot_recv", this_member_id,
++            request.leader_id, RAFT_TRACE_STATE_ARGS, _extra);
++    }
++#endif
++
+     DEBUG_ONLY_CODE(check_invariants(&mutex_acq));
+ }
+ 
+@@ -635,6 +746,15 @@ void raft_member_t<state_t>::on_append_entries_rpc(
+         itself" */
+         reply_out->term = ps().current_term;
+         reply_out->success = false;
++#ifdef RETHINKDB_TLA_TRACE
++        {
++            char _extra[128];
++            snprintf(_extra, sizeof(_extra),
++                ",\"msg_term\":%" PRIu64 ",\"success\":false", request.term);
++            raft_trace_emit_recv("append_entries_recv", this_member_id,
++                request.leader_id, RAFT_TRACE_STATE_ARGS, _extra);
++        }
++#endif
+         DEBUG_ONLY_CODE(check_invariants(&mutex_acq));
+         return;
+     }
+@@ -652,6 +772,15 @@ void raft_member_t<state_t>::on_append_entries_rpc(
+                     request.entries.prev_term)) {
+         reply_out->term = ps().current_term;
+         reply_out->success = false;
++#ifdef RETHINKDB_TLA_TRACE
++        {
++            char _extra[128];
++            snprintf(_extra, sizeof(_extra),
++                ",\"msg_term\":%" PRIu64 ",\"success\":false", request.term);
++            raft_trace_emit_recv("append_entries_recv", this_member_id,
++                request.leader_id, RAFT_TRACE_STATE_ARGS, _extra);
++        }
++#endif
+         DEBUG_ONLY_CODE(check_invariants(&mutex_acq));
+         return;
+     }
+@@ -731,6 +860,16 @@ void raft_member_t<state_t>::on_append_entries_rpc(
+     reply_out->term = ps().current_term;
+     reply_out->success = true;
+ 
++#ifdef RETHINKDB_TLA_TRACE
++    {
++        char _extra[128];
++        snprintf(_extra, sizeof(_extra),
++            ",\"msg_term\":%" PRIu64 ",\"success\":true", request.term);
++        raft_trace_emit_recv("append_entries_recv", this_member_id,
++            request.leader_id, RAFT_TRACE_STATE_ARGS, _extra);
++    }
++#endif
++
+     DEBUG_ONLY_CODE(check_invariants(&mutex_acq));
+ }
+ 
+@@ -933,6 +1072,15 @@ void raft_member_t<state_t>::on_connected_members_change(
+                             new watchdog_timer_t::blocker_t(watchdog.get()));
+                         virtual_heartbeat_watchdog_blockers[1].init(
+                             new watchdog_timer_t::blocker_t(watchdog_leader_only.get()));
++#ifdef RETHINKDB_TLA_TRACE
++                        {
++                            char _extra[64];
++                            snprintf(_extra, sizeof(_extra),
++                                ",\"term\":%" PRIu64, term);
++                            raft_trace_emit_send("virtual_heartbeat_start",
++                                member_id, this_member_id, _extra);
++                        }
++#endif
+                     }
+                 }
+ 
+@@ -944,6 +1092,10 @@ void raft_member_t<state_t>::on_connected_members_change(
+     } else if (virtual_heartbeat_sender == member_id) {
+         /* We've received a "stop virtual heartbeats" message, or lost contact with the
+         member that was sending virtual heartbeats. */
++#ifdef RETHINKDB_TLA_TRACE
++        raft_trace_emit_send("virtual_heartbeat_stop",
++            member_id, this_member_id);
++#endif
+         virtual_heartbeat_sender = raft_member_id_t();
+ 
+         /* Now that we're no longer receiving virtual heartbeats, unblock the watchdogs.
+@@ -1510,6 +1662,9 @@ bool raft_member_t<state_t>::candidate_run_election(
+     /* Raft paper, Section 5.2: "To begin an election, a follower increments its current
+     term and transitions to candidate state. It then votes for itself." */
+     update_term(ps().current_term + 1, this_member_id, mutex_acq->get());
++#ifdef RETHINKDB_TLA_TRACE
++    raft_trace_emit_node("timeout", this_member_id, RAFT_TRACE_STATE_ARGS);
++#endif
+     votes_for_us.insert(this_member_id);
+     if (latest_state.get_ref().config.is_quorum(votes_for_us)) {
+         /* In some degenerate cases, like if the cluster has only one node, then
+@@ -1552,6 +1707,11 @@ bool raft_member_t<state_t>::candidate_run_election(
+                     raft_rpc_request_t<state_t> request_wrapper;
+                     request_wrapper.request = request;
+ 
++#ifdef RETHINKDB_TLA_TRACE
++                    raft_trace_emit_send("request_vote_send",
++                        this_member_id, peer);
++#endif
++
+                     raft_rpc_reply_t reply_wrapper;
+                     bool ok = network->send_rpc(peer, request_wrapper,
+                         request_vote_keepalive.get_drain_signal(), &reply_wrapper);
+@@ -1595,6 +1755,27 @@ bool raft_member_t<state_t>::candidate_run_election(
+                             if (latest_state.get_ref().config.is_quorum(votes_for_us)) {
+                                 we_won_the_election.pulse_if_not_already_pulsed();
+                             }
++                        }
++#ifdef RETHINKDB_TLA_TRACE
++                        {
++                            char _extra[128];
++                            snprintf(_extra, sizeof(_extra),
++                                ",\"vote_granted\":%s",
++                                reply->vote_granted ? "true" : "false");
++                            raft_trace_emit_recv("request_vote_response",
++                                this_member_id, peer,
++                                this->ps().current_term, RAFT_TRACE_ROLE,
++                                this->ps().commit_index,
++                                this->ps().log.get_latest_index(),
++                                this->ps().log.get_entry_term(
++                                    this->ps().log.get_latest_index()),
++                                this->ps().voted_for,
++                                static_cast<uint64_t>(this->ps().log.prev_index),
++                                static_cast<uint64_t>(this->ps().log.prev_term),
++                                _extra);
++                        }
++#endif
++                        if (reply->vote_granted) {
+                             break;
+                         }
+ 
+@@ -1779,6 +1960,18 @@ void raft_member_t<state_t>::leader_send_updates(
+                 raft_rpc_request_t<state_t> request_wrapper;
+                 request_wrapper.request = request;
+ 
++#ifdef RETHINKDB_TLA_TRACE
++                {
++                    char _extra[128];
++                    snprintf(_extra, sizeof(_extra),
++                        ",\"msg_term\":%" PRIu64 ",\"lastIncludedIndex\":%" PRIu64,
++                        request.term,
++                        static_cast<uint64_t>(request.last_included_index));
++                    raft_trace_emit_send("install_snapshot_send",
++                        this_member_id, peer, _extra);
++                }
++#endif
++
+                 raft_rpc_reply_t reply_wrapper;
+                 DEBUG_ONLY_CODE(check_invariants(mutex_acq.get()));
+                 mutex_acq.reset();
+@@ -1824,6 +2017,10 @@ void raft_member_t<state_t>::leader_send_updates(
+                     peer,
+                     request.last_included_index,
+                     mutex_acq.get());
++#ifdef RETHINKDB_TLA_TRACE
++                raft_trace_emit_recv("install_snapshot_response",
++                    this_member_id, peer, RAFT_TRACE_STATE_ARGS);
++#endif
+                 send_even_if_empty = false;
+ 
+             } else if (next_index <= ps().log.get_latest_index() ||
+@@ -1848,6 +2045,22 @@ void raft_member_t<state_t>::leader_send_updates(
+                 raft_rpc_request_t<state_t> request_wrapper;
+                 request_wrapper.request = request;
+ 
++#ifdef RETHINKDB_TLA_TRACE
++                {
++                    char _extra[256];
++                    snprintf(_extra, sizeof(_extra),
++                        ",\"msg_term\":%" PRIu64 ",\"prevLogIndex\":%" PRIu64
++                        ",\"entries_count\":%" PRIu64,
++                        request.term,
++                        static_cast<uint64_t>(request.entries.prev_index),
++                        static_cast<uint64_t>(
++                            request.entries.get_latest_index() -
++                            request.entries.prev_index));
++                    raft_trace_emit_send("append_entries_send",
++                        this_member_id, peer, _extra);
++                }
++#endif
++
+                 raft_rpc_reply_t reply_wrapper;
+                 DEBUG_ONLY_CODE(check_invariants(mutex_acq.get()));
+                 mutex_acq.reset();
+@@ -1906,6 +2119,16 @@ void raft_member_t<state_t>::leader_send_updates(
+                     nextIndex and retries the AppendEntries RPC. */
+                     --next_index;
+                 }
++#ifdef RETHINKDB_TLA_TRACE
++                {
++                    char _extra[128];
++                    snprintf(_extra, sizeof(_extra),
++                        ",\"success\":%s",
++                        reply->success ? "true" : "false");
++                    raft_trace_emit_recv("append_entries_response",
++                        this_member_id, peer, RAFT_TRACE_STATE_ARGS, _extra);
++                }
++#endif
+                 send_even_if_empty = false;
+ 
+             } else {
+@@ -1954,6 +2177,15 @@ void raft_member_t<state_t>::leader_continue_reconfiguration(
+         intentionally step down, but it contains all the right logic. This has a side
+         effect of incrementing `current_term`, but I don't think that's a problem. */
+         RAFT_DEBUG_THIS("stepping down, new term: %" PRIu64 "\n", ps().current_term + 1);
++#ifdef RETHINKDB_TLA_TRACE
++        {
++            char _extra[64];
++            snprintf(_extra, sizeof(_extra),
++                ",\"new_term\":%" PRIu64, ps().current_term + 1);
++            raft_trace_emit_bare("step_down_config_change",
++                this_member_id, _extra);
++        }
++#endif
+         candidate_or_leader_note_term(ps().current_term + 1, mutex_acq);
+     } else if (committed_state.get_ref().config.is_joint_consensus() &&
+             latest_state.get_ref().config.is_joint_consensus()) {
+@@ -1973,6 +2205,10 @@ void raft_member_t<state_t>::leader_continue_reconfiguration(
+         new_entry.term = ps().current_term;
+ 
+         leader_append_log_entry(new_entry, mutex_acq);
++#ifdef RETHINKDB_TLA_TRACE
++        raft_trace_emit_node("continue_reconfiguration", this_member_id,
++            RAFT_TRACE_STATE_ARGS);
++#endif
+     }
+ }
+ 
+@@ -2011,6 +2247,24 @@ bool raft_member_t<state_t>::candidate_or_leader_note_term(
+                         this->candidate_or_leader_become_follower(&mutex_acq_2);
+                     }
+                     this->update_term(term, raft_member_id_t(), &mutex_acq_2);
++#ifdef RETHINKDB_TLA_TRACE
++                    {
++                        char _extra[64];
++                        snprintf(_extra, sizeof(_extra),
++                            ",\"new_term\":%" PRIu64, term);
++                        raft_trace_emit_node("complete_step_down",
++                            this_member_id,
++                            this->ps().current_term, RAFT_TRACE_ROLE,
++                            this->ps().commit_index,
++                            this->ps().log.get_latest_index(),
++                            this->ps().log.get_entry_term(
++                                this->ps().log.get_latest_index()),
++                            this->ps().voted_for,
++                            static_cast<uint64_t>(this->ps().log.prev_index),
++                            static_cast<uint64_t>(this->ps().log.prev_term),
++                            _extra);
++                    }
++#endif
+                 }
+                 DEBUG_ONLY_CODE(this->check_invariants(&mutex_acq_2));
+             } catch (const interrupted_exc_t &) {
+diff --git a/src/unittest/clustering_raft.cc b/src/unittest/clustering_raft.cc
+index 18a08458bc..b0aba81875 100644
+--- a/src/unittest/clustering_raft.cc
++++ b/src/unittest/clustering_raft.cc
+@@ -144,5 +144,24 @@ TPTEST(ClusteringRaft, Regression4234) {
+     traffic_generator.check_changes_present();
+ }
+ 
++/* 3-node cluster for TLA+ trace validation. Smaller state space. */
++TPTEST(ClusteringRaft, TraceBasic3) {
++    dummy_raft_cluster_t cluster(3, dummy_raft_state_t(), nullptr);
++    do_writes_raft(&cluster, 10, 60000);
++}
++
++/* 3-node cluster with failover for TLA+ trace validation. */
++TPTEST(ClusteringRaft, TraceFailover3) {
++    std::vector<raft_member_id_t> member_ids;
++    dummy_raft_cluster_t cluster(3, dummy_raft_state_t(), &member_ids);
++    do_writes_raft(&cluster, 5, 60000);
++    /* Kill the leader (or first member) */
++    cluster.set_live(member_ids[0], dummy_raft_cluster_t::live_t::dead);
++    do_writes_raft(&cluster, 5, 60000);
++    /* Bring it back */
++    cluster.set_live(member_ids[0], dummy_raft_cluster_t::live_t::alive);
++    do_writes_raft(&cluster, 5, 60000);
++}
++
+ }   /* namespace unittest */
+ 
+diff --git a/src/unittest/clustering_utils_raft.cc b/src/unittest/clustering_utils_raft.cc
+index 6ab0470d3b..c6f440a7e7 100644
+--- a/src/unittest/clustering_utils_raft.cc
++++ b/src/unittest/clustering_utils_raft.cc
+@@ -1,5 +1,9 @@
+ #include "unittest/clustering_utils_raft.hpp"
+ 
++#ifdef RETHINKDB_TLA_TRACE
++#include "clustering/generic/raft_trace.hpp"
++#endif
++
+ namespace unittest {
+ 
+ const char *dummy_raft_cluster_t::show_live(dummy_raft_cluster_t::live_t l) {
+@@ -35,6 +39,9 @@ dummy_raft_cluster_t::dummy_raft_cluster_t(
+             auto_drainer_t::lock_t(&drainer)));
+         })
+ {
++#ifdef RETHINKDB_TLA_TRACE
++    raft_trace_writer_t::get().init_from_env();
++#endif
+     raft_config_t initial_config;
+     for (size_t i = 0; i < num; ++i) {
+         raft_member_id_t member_id(generate_uuid());
+@@ -59,6 +66,9 @@ dummy_raft_cluster_t::~dummy_raft_cluster_t() {
+     for (const auto &pair : members) {
+         set_live(pair.first, live_t::dead);
+     }
++#ifdef RETHINKDB_TLA_TRACE
++    raft_trace_writer_t::get().shutdown();
++#endif
+ }
+ 
+ /* `join()` adds a new member to the cluster. The caller is responsible for running a
+@@ -105,6 +115,9 @@ void dummy_raft_cluster_t::set_live(const raft_member_id_t &member_id, live_t li
+     }
+     {
+         if (i->live != live_t::dead && live == live_t::dead) {
++#ifdef RETHINKDB_TLA_TRACE
++            raft_trace_emit_bare("crash", member_id);
++#endif
+             scoped_ptr_t<auto_drainer_t> dummy;
+             std::swap(i->member_drainer, dummy);
+             dummy.reset();
+@@ -345,6 +358,9 @@ void dummy_raft_cluster_t::member_info_t::block() {
+ void dummy_raft_cluster_t::add_member(
+         const raft_member_id_t &member_id,
+         raft_persistent_state_t<dummy_raft_state_t> initial_state) {
++#ifdef RETHINKDB_TLA_TRACE
++    raft_trace_writer_t::get().register_server(member_id);
++#endif
+     scoped_ptr_t<member_info_t> i(new member_info_t(/* this, */ member_id, initial_state));
+     members[member_id] = std::move(i);
+     set_live(member_id, live_t::alive);

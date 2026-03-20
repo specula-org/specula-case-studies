@@ -1,0 +1,191 @@
+diff --git a/deps/raft/src/raft_server.c b/deps/raft/src/raft_server.c
+index 62969d7..487cc19 100644
+--- a/deps/raft/src/raft_server.c
++++ b/deps/raft/src/raft_server.c
+@@ -19,6 +19,18 @@
+ #include "raft.h"
+ #include "raft_private.h"
+ 
++#ifdef REDISRAFT_ENABLE_TRACE
++#include "tla_trace.h"
++/* Helper: extract node ID from a config change entry's data.
++ * Uses the get_node_id callback if available, else returns -1. */
++static raft_node_id_t __raft_trace_get_cfg_node_id(raft_server_t *me, raft_entry_t *ety) {
++    if (me->cb.get_node_id) {
++        return me->cb.get_node_id(me, me->udata, ety, 0);
++    }
++    return RAFT_NODE_ID_NONE;
++}
++#endif
++
+ #ifndef min
+     #define min(a, b) ((a) < (b) ? (a) : (b))
+ #endif
+@@ -492,6 +504,10 @@ int raft_become_leader(raft_server_t *me)
+ 
+     raft_log(me, "become leader, term:%ld", me->current_term);
+ 
++#ifdef REDISRAFT_ENABLE_TRACE
++    tla_trace_event(me, "BecomeLeader");
++#endif
++
+     return 0;
+ }
+ 
+@@ -555,6 +571,10 @@ int raft_become_candidate(raft_server_t *me)
+ 
+     raft_log(me, "become candidate, term:%ld", me->current_term);
+ 
++#ifdef REDISRAFT_ENABLE_TRACE
++    tla_trace_event(me, "Timeout");
++#endif
++
+     return 0;
+ }
+ 
+@@ -813,6 +833,12 @@ int raft_recv_appendentries_response(raft_server_t *me,
+     }
+     assert(resp->msg_id <= me->msg_id);
+ 
++#ifdef REDISRAFT_ENABLE_TRACE
++    tla_trace_event_ae_resp_weak(me, "HandleAppendEntriesResponse",
++                                 raft_node_get_id(node), raft_get_nodeid(me),
++                                 resp->success, resp->current_idx);
++#endif
++
+     if (me->auto_flush) {
+         return raft_flush(me, 0);
+     }
+@@ -984,6 +1010,15 @@ out:
+              "id:%lu, t:%ld, s:%d, ci:%ld",
+              raft_get_nodeid(me), raft_node_get_id(node),
+              resp->msg_id, resp->term, resp->success, resp->current_idx);
++
++#ifdef REDISRAFT_ENABLE_TRACE
++    tla_trace_event_ae_req(me, "HandleAppendEntriesRequest",
++                           req->leader_id, raft_get_nodeid(me),
++                           req->term,
++                           req->prev_log_idx, req->prev_log_term,
++                           req->leader_commit);
++#endif
++
+     return e;
+ }
+ 
+@@ -1077,6 +1112,14 @@ done:
+              raft_get_nodeid(me), raft_node_get_id(node), resp->prevote,
+              resp->request_term, resp->term, resp->vote_granted);
+ 
++#ifdef REDISRAFT_ENABLE_TRACE
++    if (!req->prevote) {
++        tla_trace_event_rv(me, "HandleRequestVoteRequest",
++                           req->candidate_id, raft_get_nodeid(me),
++                           resp->vote_granted);
++    }
++#endif
++
+     return e;
+ }
+ 
+@@ -1112,6 +1155,13 @@ int raft_recv_requestvote_response(raft_server_t *me,
+         }
+ 
+         raft_become_follower(me);
++#ifdef REDISRAFT_ENABLE_TRACE
++        if (!resp->prevote) {
++            tla_trace_event_rv_resp_weak(me, "HandleRequestVoteResponse",
++                                         raft_node_get_id(node), raft_get_nodeid(me),
++                                         resp->vote_granted);
++        }
++#endif
+         return 0;
+     }
+ 
+@@ -1128,6 +1178,17 @@ int raft_recv_requestvote_response(raft_server_t *me,
+         }
+     }
+ 
++#ifdef REDISRAFT_ENABLE_TRACE
++    /* Emit BEFORE majority check / become_leader so the trace order matches
++     * the spec's action decomposition: HandleRequestVoteResponse first,
++     * then BecomeLeader as a separate step. */
++    if (!resp->prevote) {
++        tla_trace_event_rv_resp_weak(me, "HandleRequestVoteResponse",
++                                     raft_node_get_id(node), raft_get_nodeid(me),
++                                     resp->vote_granted);
++    }
++#endif
++
+     if (resp->vote_granted) {
+         if (node) {
+             raft_node_set_voted_for_me(node, 1);
+@@ -1198,6 +1259,19 @@ int raft_recv_entry(raft_server_t *me,
+              ety->term, ety->id, ety->type, ety->data_len,
+              raft_get_current_idx(me));
+ 
++#ifdef REDISRAFT_ENABLE_TRACE
++    if (ety->type == RAFT_LOGTYPE_NORMAL) {
++        tla_trace_event(me, "ClientRequest");
++    } else if (ety->type == RAFT_LOGTYPE_ADD_NODE ||
++               ety->type == RAFT_LOGTYPE_ADD_NONVOTING_NODE) {
++        raft_node_id_t target = __raft_trace_get_cfg_node_id(me, ety);
++        tla_trace_event_config(me, "ProposeAddServer", target);
++    } else if (ety->type == RAFT_LOGTYPE_REMOVE_NODE) {
++        raft_node_id_t target = __raft_trace_get_cfg_node_id(me, ety);
++        tla_trace_event_config(me, "ProposeRemoveServer", target);
++    }
++#endif
++
+     if (me->auto_flush) {
+         e = me->log_impl->sync(me->log);
+         if (e != 0) {
+@@ -1878,6 +1952,10 @@ int raft_end_snapshot(raft_server_t *me)
+ 
+     me->stats.snapshots_created++;
+ 
++#ifdef REDISRAFT_ENABLE_TRACE
++    tla_trace_event_snapshot(me, "TakeSnapshot");
++#endif
++
+     if (!raft_is_leader(me))
+         return 0;
+ 
+@@ -1952,6 +2030,13 @@ int raft_begin_load_snapshot(raft_server_t *me,
+     raft_log(me, "begin loading snapshot lii:%ld lit:%ld",
+              last_included_index, last_included_term);
+ 
++#ifdef REDISRAFT_ENABLE_TRACE
++    /* Use weak capture — log is empty, commitIndex/lastLogIndex are reset */
++    tla_trace_event_is_req_weak(me, "HandleInstallSnapshotRequest",
++                                RAFT_NODE_ID_NONE, raft_get_nodeid(me),
++                                last_included_index, last_included_term);
++#endif
++
+     return 0;
+ }
+ 
+@@ -1974,6 +2059,10 @@ int raft_end_load_snapshot(raft_server_t *me)
+     raft_log(me, "loaded snapshot sli:%ld slt:%ld",
+              me->snapshot_last_idx, me->snapshot_last_term);
+ 
++#ifdef REDISRAFT_ENABLE_TRACE
++    tla_trace_event_snapshot(me, "EndLoadSnapshot");
++#endif
++
+     return 0;
+ }
+ 
+@@ -2231,8 +2320,12 @@ static void raft_update_commit_idx(raft_server_t* me)
+     if (commit > me->commit_idx) {
+         /* Leader can only commit entries from the current term */
+         raft_entry_t *ety = raft_get_entry_from_idx(me, commit);
+-        if (ety->term == me->current_term)
++        if (ety->term == me->current_term) {
+             raft_set_commit_idx(me, commit);
++#ifdef REDISRAFT_ENABLE_TRACE
++            tla_trace_event_commit(me, "AdvanceCommitIndex");
++#endif
++        }
+ 
+         raft_entry_release(ety);
+     }

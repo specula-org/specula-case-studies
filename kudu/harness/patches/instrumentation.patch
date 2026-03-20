@@ -1,0 +1,440 @@
+diff --git a/src/kudu/consensus/CMakeLists.txt b/src/kudu/consensus/CMakeLists.txt
+index 0000001..0000002 100644
+--- a/src/kudu/consensus/CMakeLists.txt
++++ b/src/kudu/consensus/CMakeLists.txt
+@@ -96,6 +96,7 @@ set(CONSENSUS_SRCS
+   consensus_meta.cc
+   consensus_meta_manager.cc
+   consensus_peers.cc
++  tla_trace.cc
+   consensus_queue.cc
+   leader_election.cc
+   log_cache.cc
+diff --git a/src/kudu/consensus/raft_consensus.cc b/src/kudu/consensus/raft_consensus.cc
+index 0000001..0000002 100644
+--- a/src/kudu/consensus/raft_consensus.cc
++++ b/src/kudu/consensus/raft_consensus.cc
+@@ -63,6 +63,7 @@
+ #include "kudu/consensus/quorum_util.h"
+ #include "kudu/consensus/raft_consensus.h"
+ #include "kudu/consensus/time_manager.h"
++#include "kudu/consensus/tla_trace.h"
+ #include "kudu/fs/fs_manager.h"
+ #include "kudu/gutil/casts.h"
+ #include "kudu/gutil/map-util.h"
+@@ -511,6 +512,24 @@ Status RaftConsensus::StartElection(ElectionMode mode, ElectionReason reason) {
+       RETURN_NOT_OK(SetVotedForCurrentTermUnlocked(peer_uuid()));
+     }
+
++    // --- TLA+ trace: BecomeCandidate / PreVote ---
++    if (tla_trace::IsEnabled()) {
++      tla_trace::TraceState ts;
++      ts.term = CurrentTermUnlocked();
++      ts.role = "Candidate";
++      ts.votedFor = (mode != PRE_ELECTION)
++          ? tla_trace::Nid(peer_uuid()) : (HasVotedCurrentTermUnlocked()
++          ? tla_trace::Nid(GetVotedForCurrentTermUnlocked()) : "");
++      ts.commitIndex = pending_->GetCommittedIndex();
++      OpId last = queue_->GetLastOpIdInLog();
++      ts.lastLogIndex = last.index();
++      ts.lastLogTerm = last.term();
++      const char* ename = (mode == PRE_ELECTION) ? "PreVote" : "BecomeCandidate";
++      tla_trace::TraceEvent(ename)
++          .Node(tla_trace::Nid(peer_uuid()))
++          .State(ts)
++          .Emit();
++    }
++
+     RaftConfigPB active_config = cmeta_->ActiveConfig();
+     LOG_WITH_PREFIX_UNLOCKED(INFO) << "Starting " << mode_str << " with config: "
+                                    << SecureShortDebugString(active_config);
+@@ -528,6 +547,22 @@ Status RaftConsensus::StartElection(ElectionMode mode, ElectionReason reason) {
+                       << CurrentTermUnlocked();
+
++    // --- TLA+ trace: self-vote HandleRequestVoteResponse ---
++    if (tla_trace::IsEnabled()) {
++      tla_trace::TraceState ts;
++      ts.term = CurrentTermUnlocked();
++      ts.role = "Candidate";
++      ts.votedFor = (mode != PRE_ELECTION)
++          ? tla_trace::Nid(peer_uuid()) : (HasVotedCurrentTermUnlocked()
++          ? tla_trace::Nid(GetVotedForCurrentTermUnlocked()) : "");
++      ts.commitIndex = pending_->GetCommittedIndex();
++      OpId last = queue_->GetLastOpIdInLog();
++      ts.lastLogIndex = last.index();
++      ts.lastLogTerm = last.term();
++      tla_trace::TraceEvent("HandleRequestVoteResponse")
++          .Node(tla_trace::Nid(peer_uuid()))
++          .State(ts)
++          .MsgStr("from", tla_trace::Nid(peer_uuid()))
++          .MsgStr("to", tla_trace::Nid(peer_uuid()))
++          .MsgBool("voteGranted", true)
++          .MsgInt("term", CurrentTermUnlocked())
++          .Emit();
++    }
++
+     VoteRequestPB request;
+     request.set_ignore_live_leader(mode == ELECT_EVEN_IF_LEADER_IS_ALIVE);
+     request.set_candidate_uuid(peer_uuid());
+@@ -593,6 +628,19 @@ Status RaftConsensus::StepDown(LeaderStepDownResponsePB* resp) {
+   RETURN_NOT_OK(HandleTermAdvanceUnlocked(CurrentTermUnlocked() + 1,
+                                           SKIP_FLUSH_TO_DISK));
++  // --- TLA+ trace: StepDown ---
++  if (tla_trace::IsEnabled()) {
++    tla_trace::TraceState ts;
++    ts.term = CurrentTermUnlocked();
++    ts.role = "Follower";
++    ts.votedFor = "";
++    ts.commitIndex = pending_->GetCommittedIndex();
++    OpId last = queue_->GetLastOpIdInLog();
++    ts.lastLogIndex = last.index();
++    ts.lastLogTerm = last.term();
++    tla_trace::TraceEvent("StepDown")
++        .Node(tla_trace::Nid(peer_uuid()))
++        .State(ts)
++        .Emit();
++  }
+   // Snooze the failure detector for an extra leader failure timeout.
+   SnoozeFailureDetector(string("explicit stepdown request"), MonoDelta::FromMilliseconds(
+@@ -732,6 +780,20 @@ Status RaftConsensus::BecomeLeaderUnlocked() {
+   RETURN_NOT_OK(AppendNewRoundToQueueUnlocked(round));
+   leader_is_ready_ = true;
+
++  // --- TLA+ trace: BecomeLeader ---
++  if (tla_trace::IsEnabled()) {
++    tla_trace::TraceState ts;
++    ts.term = CurrentTermUnlocked();
++    ts.role = "Leader";
++    ts.votedFor = tla_trace::Nid(peer_uuid());
++    ts.commitIndex = pending_->GetCommittedIndex();
++    OpId last = queue_->GetLastOpIdInLog();
++    ts.lastLogIndex = last.index();
++    ts.lastLogTerm = last.term();
++    tla_trace::TraceEvent("BecomeLeader")
++        .Node(tla_trace::Nid(peer_uuid()))
++        .State(ts)
++        .Emit();
++  }
++
+   return Status::OK();
+ }
+
+@@ -916,6 +978,21 @@ void RaftConsensus::NotifyCommitIndex(int64_t commit_index) {
+   CHECK_OK(pending_->AdvanceCommittedIndex(commit_index));
+
++  // --- TLA+ trace: AdvanceCommitIndex ---
++  if (tla_trace::IsEnabled() && cmeta_->active_role() == RaftPeerPB::LEADER) {
++    tla_trace::TraceState ts;
++    ts.term = CurrentTermUnlocked();
++    ts.role = "Leader";
++    ts.votedFor = tla_trace::Nid(peer_uuid());
++    ts.commitIndex = pending_->GetCommittedIndex();
++    OpId last = queue_->GetLastOpIdInLog();
++    ts.lastLogIndex = last.index();
++    ts.lastLogTerm = last.term();
++    tla_trace::TraceEvent("AdvanceCommitIndex")
++        .Node(tla_trace::Nid(peer_uuid()))
++        .State(ts)
++        .Emit();
++  }
++
+   if (cmeta_->active_role() == RaftPeerPB::LEADER) {
+     peer_manager_->SignalRequest(false);
+   }
+@@ -1656,6 +1733,22 @@ Status RaftConsensus::UpdateReplica(const ConsensusRequestPB* request,
+     FillConsensusResponseOKUnlocked(response);
++
++    // --- TLA+ trace: HandleAppendEntriesRequest ---
++    if (tla_trace::IsEnabled()) {
++      tla_trace::TraceState ts;
++      ts.term = CurrentTermUnlocked();
++      ts.role = "Follower";
++      ts.votedFor = HasVotedCurrentTermUnlocked()
++          ? tla_trace::Nid(GetVotedForCurrentTermUnlocked()) : "";
++      ts.commitIndex = pending_->GetCommittedIndex();
++      OpId last = queue_->GetLastOpIdInLog();
++      ts.lastLogIndex = last.index();
++      ts.lastLogTerm = last.term();
++      tla_trace::TraceEvent("HandleAppendEntriesRequest")
++          .Node(tla_trace::Nid(peer_uuid()))
++          .State(ts)
++          .MsgStr("from", tla_trace::Nid(request->caller_uuid()))
++          .MsgStr("to", tla_trace::Nid(peer_uuid()))
++          .MsgInt("term", request->caller_term())
++          .MsgInt("prevLogIndex", request->preceding_id().index())
++          .MsgInt("prevLogTerm", request->preceding_id().term())
++          .Emit();
++    }
+   }
+   // Release the lock while we wait for the log append to finish
+@@ -2370,6 +2463,22 @@ Status RaftConsensus::RequestVoteRespondInvalidTerm(const VoteRequestPB* request,
+   StatusToPB(Status::InvalidArgument(msg), response->mutable_consensus_error()->mutable_status());
++  // --- TLA+ trace: HandleRequestVoteRequest (rejected: invalid term) ---
++  if (tla_trace::IsEnabled()) {
++    tla_trace::TraceState ts;
++    ts.term = CurrentTermUnlocked();
++    ts.role = tla_trace::RoleStr(cmeta_->active_role());
++    ts.votedFor = HasVotedCurrentTermUnlocked()
++        ? tla_trace::Nid(GetVotedForCurrentTermUnlocked()) : "";
++    ts.commitIndex = pending_->GetCommittedIndex();
++    OpId last = queue_->GetLastOpIdInLog();
++    ts.lastLogIndex = last.index();
++    ts.lastLogTerm = last.term();
++    tla_trace::TraceEvent("HandleRequestVoteRequest")
++        .Node(tla_trace::Nid(peer_uuid()))
++        .State(ts)
++        .MsgStr("from", tla_trace::Nid(request->candidate_uuid()))
++        .MsgStr("to", tla_trace::Nid(peer_uuid()))
++        .MsgInt("term", request->candidate_term())
++        .MsgBool("preElection", request->is_pre_election())
++        .MsgBool("voteGranted", false)
++        .Emit();
++  }
+   return Status::OK();
+ }
+
+@@ -2381,6 +2490,22 @@ Status RaftConsensus::RequestVoteRespondVoteAlreadyGranted(const VoteRequestPB* r
+                           request->candidate_uuid(),
+                           request->candidate_term());
++  // --- TLA+ trace: HandleRequestVoteRequest (already granted) ---
++  if (tla_trace::IsEnabled()) {
++    tla_trace::TraceState ts;
++    ts.term = CurrentTermUnlocked();
++    ts.role = tla_trace::RoleStr(cmeta_->active_role());
++    ts.votedFor = HasVotedCurrentTermUnlocked()
++        ? tla_trace::Nid(GetVotedForCurrentTermUnlocked()) : "";
++    ts.commitIndex = pending_->GetCommittedIndex();
++    OpId last = queue_->GetLastOpIdInLog();
++    ts.lastLogIndex = last.index();
++    ts.lastLogTerm = last.term();
++    tla_trace::TraceEvent("HandleRequestVoteRequest")
++        .Node(tla_trace::Nid(peer_uuid()))
++        .State(ts)
++        .MsgStr("from", tla_trace::Nid(request->candidate_uuid()))
++        .MsgStr("to", tla_trace::Nid(peer_uuid()))
++        .MsgInt("term", request->candidate_term())
++        .MsgBool("preElection", request->is_pre_election())
++        .MsgBool("voteGranted", true)
++        .Emit();
++  }
+   return Status::OK();
+ }
+
+@@ -2395,6 +2520,22 @@ Status RaftConsensus::RequestVoteRespondAlreadyVotedForOther(const VoteRequestPB*
+   StatusToPB(Status::InvalidArgument(msg), response->mutable_consensus_error()->mutable_status());
++  // --- TLA+ trace: HandleRequestVoteRequest (voted for other) ---
++  if (tla_trace::IsEnabled()) {
++    tla_trace::TraceState ts;
++    ts.term = CurrentTermUnlocked();
++    ts.role = tla_trace::RoleStr(cmeta_->active_role());
++    ts.votedFor = HasVotedCurrentTermUnlocked()
++        ? tla_trace::Nid(GetVotedForCurrentTermUnlocked()) : "";
++    ts.commitIndex = pending_->GetCommittedIndex();
++    OpId last = queue_->GetLastOpIdInLog();
++    ts.lastLogIndex = last.index();
++    ts.lastLogTerm = last.term();
++    tla_trace::TraceEvent("HandleRequestVoteRequest")
++        .Node(tla_trace::Nid(peer_uuid()))
++        .State(ts)
++        .MsgStr("from", tla_trace::Nid(request->candidate_uuid()))
++        .MsgStr("to", tla_trace::Nid(peer_uuid()))
++        .MsgInt("term", request->candidate_term())
++        .MsgBool("preElection", request->is_pre_election())
++        .MsgBool("voteGranted", false)
++        .Emit();
++  }
+   return Status::OK();
+ }
+
+@@ -2412,6 +2553,22 @@ Status RaftConsensus::RequestVoteRespondLastOpIdTooOld(const OpId& local_last_log
+   StatusToPB(Status::InvalidArgument(msg), response->mutable_consensus_error()->mutable_status());
++  // --- TLA+ trace: HandleRequestVoteRequest (log too old) ---
++  if (tla_trace::IsEnabled()) {
++    tla_trace::TraceState ts;
++    ts.term = CurrentTermUnlocked();
++    ts.role = tla_trace::RoleStr(cmeta_->active_role());
++    ts.votedFor = HasVotedCurrentTermUnlocked()
++        ? tla_trace::Nid(GetVotedForCurrentTermUnlocked()) : "";
++    ts.commitIndex = pending_->GetCommittedIndex();
++    OpId last = queue_->GetLastOpIdInLog();
++    ts.lastLogIndex = last.index();
++    ts.lastLogTerm = last.term();
++    tla_trace::TraceEvent("HandleRequestVoteRequest")
++        .Node(tla_trace::Nid(peer_uuid()))
++        .State(ts)
++        .MsgStr("from", tla_trace::Nid(request->candidate_uuid()))
++        .MsgStr("to", tla_trace::Nid(peer_uuid()))
++        .MsgInt("term", request->candidate_term())
++        .MsgBool("preElection", request->is_pre_election())
++        .MsgBool("voteGranted", false)
++        .Emit();
++  }
+   return Status::OK();
+ }
+
+@@ -2472,6 +2629,22 @@ Status RaftConsensus::RequestVoteRespondVoteGranted(const VoteRequestPB* request,
+                           request->candidate_uuid(),
+                           CurrentTermUnlocked());
++  // --- TLA+ trace: HandleRequestVoteRequest (vote granted) ---
++  if (tla_trace::IsEnabled()) {
++    tla_trace::TraceState ts;
++    ts.term = CurrentTermUnlocked();
++    ts.role = tla_trace::RoleStr(cmeta_->active_role());
++    ts.votedFor = HasVotedCurrentTermUnlocked()
++        ? tla_trace::Nid(GetVotedForCurrentTermUnlocked()) : "";
++    ts.commitIndex = pending_->GetCommittedIndex();
++    OpId last = queue_->GetLastOpIdInLog();
++    ts.lastLogIndex = last.index();
++    ts.lastLogTerm = last.term();
++    tla_trace::TraceEvent("HandleRequestVoteRequest")
++        .Node(tla_trace::Nid(peer_uuid()))
++        .State(ts)
++        .MsgStr("from", tla_trace::Nid(request->candidate_uuid()))
++        .MsgStr("to", tla_trace::Nid(peer_uuid()))
++        .MsgInt("term", request->candidate_term())
++        .MsgBool("preElection", request->is_pre_election())
++        .MsgBool("voteGranted", true)
++        .Emit();
++  }
+   return Status::OK();
+ }
+
+diff --git a/src/kudu/consensus/consensus_peers.cc b/src/kudu/consensus/consensus_peers.cc
+index 0000001..0000002 100644
+--- a/src/kudu/consensus/consensus_peers.cc
++++ b/src/kudu/consensus/consensus_peers.cc
+@@ -44,6 +44,7 @@
+ #include "kudu/consensus/consensus_queue.h"
+ #include "kudu/consensus/metadata.pb.h"
+ #include "kudu/consensus/multi_raft_batcher.h"
++#include "kudu/consensus/tla_trace.h"
+ #include "kudu/gutil/strings/substitute.h"
+ #include "kudu/rpc/messenger.h"
+ #include "kudu/rpc/periodic.h"
+@@ -347,6 +348,24 @@ void Peer::SendNextRequest(bool even_if_queue_empty, MultiRaftConsensusData* mrc_
+       << SecureShortDebugString(request_);
+
++  // --- TLA+ trace: SendEntries / SendHeartbeat ---
++  if (tla_trace::IsEnabled()) {
++    tla_trace::TraceState ts;
++    ts.term = request_.caller_term();
++    ts.role = "Leader";
++    ts.is_weak = true;
++    const char* ename = (request_.ops_size() > 0) ? "SendEntries" : "SendHeartbeat";
++    tla_trace::TraceEvent(ename)
++        .Node(tla_trace::Nid(leader_uuid_))
++        .State(ts)
++        .MsgStr("to", tla_trace::Nid(peer_pb_.permanent_uuid()))
++        .MsgInt("term", request_.caller_term())
++        .MsgInt("prevLogIndex", request_.preceding_id().index())
++        .MsgInt("prevLogTerm", request_.preceding_id().term())
++        .MsgInt("numEntries", request_.ops_size())
++        .MsgInt("commitIndex", request_.committed_index())
++        .Emit();
++  }
++
+   controller_.Reset();
+
+diff --git a/src/kudu/consensus/consensus_queue.cc b/src/kudu/consensus/consensus_queue.cc
+index 0000001..0000002 100644
+--- a/src/kudu/consensus/consensus_queue.cc
++++ b/src/kudu/consensus/consensus_queue.cc
+@@ -55,6 +55,7 @@
+ #include "kudu/consensus/opid_util.h"
+ #include "kudu/consensus/quorum_util.h"
+ #include "kudu/consensus/time_manager.h"
++#include "kudu/consensus/tla_trace.h"
+ #include "kudu/gutil/dynamic_annotations.h"
+ #include "kudu/gutil/map-util.h"
+ #include "kudu/gutil/strings/join.h"
+@@ -1267,6 +1268,19 @@ bool PeerMessageQueue::ResponseFromPeer(const std::string& peer_uuid,
+     VLOG_WITH_PREFIX_UNLOCKED(2)
+         << Substitute("Received Response from Peer ($0). Response: $1",
+                       peer->ToString(), SecureShortDebugString(response));
++
++    // --- TLA+ trace: HandleAppendEntriesResponse ---
++    if (tla_trace::IsEnabled()) {
++      bool success = (peer->last_exchange_status == PeerStatus::OK);
++      tla_trace::TraceState ts;
++      ts.term = queue_state_.current_term;
++      ts.role = (queue_state_.mode == LEADER) ? "Leader" : "Follower";
++      ts.is_weak = true;
++      tla_trace::TraceEvent("HandleAppendEntriesResponse")
++          .Node(tla_trace::Nid(local_peer_pb_.permanent_uuid()))
++          .State(ts)
++          .MsgStr("from", tla_trace::Nid(peer_uuid))
++          .MsgInt("matchIndex", peer->last_received.index())
++          .MsgBool("success", success)
++          .Emit();
++    }
+
+     mode_copy = queue_state_.mode;
+
+diff --git a/src/kudu/consensus/leader_election.cc b/src/kudu/consensus/leader_election.cc
+index 0000001..0000002 100644
+--- a/src/kudu/consensus/leader_election.cc
++++ b/src/kudu/consensus/leader_election.cc
+@@ -33,6 +33,7 @@
+ #include "kudu/consensus/metadata.pb.h"
+ #include "kudu/consensus/opid_util.h"
+ #include "kudu/consensus/raft_consensus.h"
++#include "kudu/consensus/tla_trace.h"
+ #include "kudu/gutil/map-util.h"
+ #include "kudu/gutil/port.h"
+ #include "kudu/gutil/strings/join.h"
+@@ -367,6 +368,27 @@ void LeaderElection::VoteResponseRpcCallback(const string& voter_uuid) {
+     }
+   }
+
++  // --- TLA+ trace: HandleRequestVoteResponse (remote vote) ---
++  if (tla_trace::IsEnabled()) {
++    bool is_pre = request_.is_pre_election();
++    int64_t cand_term = is_pre ? request_.candidate_term() - 1
++                               : request_.candidate_term();
++    tla_trace::TraceState ts;
++    ts.term = cand_term;
++    ts.role = "Candidate";
++    ts.votedFor = is_pre ? "" : tla_trace::Nid(request_.candidate_uuid());
++    ts.commitIndex = trace_commit_index_;
++    ts.lastLogIndex = request_.candidate_status().last_received().index();
++    ts.lastLogTerm = request_.candidate_status().last_received().term();
++    std::lock_guard guard2(lock_);
++    VoterState* vstate = FindOrDie(voter_state_, voter_uuid).get();
++    int64_t resp_term = vstate->response.has_responder_term()
++        ? vstate->response.responder_term() : cand_term;
++    tla_trace::TraceEvent("HandleRequestVoteResponse")
++        .Node(tla_trace::Nid(request_.candidate_uuid()))
++        .State(ts)
++        .MsgStr("from", tla_trace::Nid(voter_uuid))
++        .MsgStr("to", tla_trace::Nid(request_.candidate_uuid()))
++        .MsgBool("voteGranted", vstate->response.vote_granted())
++        .MsgInt("term", resp_term)
++        .Emit();
++  }
++
+   // Check for a decision outside the lock.
+   CheckForDecision();
+ }
+diff --git a/src/kudu/consensus/leader_election.h b/src/kudu/consensus/leader_election.h
+index 0000001..0000002 100644
+--- a/src/kudu/consensus/leader_election.h
++++ b/src/kudu/consensus/leader_election.h
+@@ -157,6 +157,9 @@ class LeaderElection : public RefCountedThreadSafe<LeaderElection> {
+                  ElectionDecisionCallback decision_callback);
+
++  // Commit index of candidate at election start (for TLA+ trace only).
++  void SetTraceCommitIndex(int64_t ci) { trace_commit_index_ = ci; }
++
+   // Run the election: send the vote request to followers.
+   void Run();
+
+@@ -248,6 +251,9 @@ class LeaderElection : public RefCountedThreadSafe<LeaderElection> {
+
+   // The election's start time
+   MonoTime start_time_;
++
++  // TLA+ trace: candidate's commit index at election start.
++  int64_t trace_commit_index_ = 0;
+ };
+
+ } // namespace consensus

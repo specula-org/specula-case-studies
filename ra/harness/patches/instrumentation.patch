@@ -1,0 +1,583 @@
+diff --git a/src/ra.hrl b/src/ra.hrl
+index f69851d..0786a34 100644
+--- a/src/ra.hrl
++++ b/src/ra.hrl
+@@ -150,7 +150,8 @@
+ %% Section 4.2
+ -record(request_vote_result,
+         {term :: ra_term(),
+-         vote_granted :: boolean()}).
++         vote_granted :: boolean(),
++         from :: undefined | ra_server_id()}).
+ 
+ %% pre-vote extension
+ -record(pre_vote_rpc,
+@@ -166,7 +167,8 @@
+ -record(pre_vote_result,
+         {term :: ra_term(),
+          token :: reference(),
+-         vote_granted :: boolean()}).
++         vote_granted :: boolean(),
++         from :: undefined | ra_server_id()}).
+ 
+ -type snapshot_meta() :: #{index := ra_index(),
+                            term := ra_term(),
+diff --git a/src/ra_kv.erl b/src/ra_kv.erl
+index ae5326d..f704ed9 100644
+--- a/src/ra_kv.erl
++++ b/src/ra_kv.erl
+@@ -268,7 +268,7 @@ apply(Meta,
+     end.
+ 
+ live_indexes(#?STATE{keys = Keys}) ->
+-    [Idx || _K := ?TUPLE(Idx, _) <- Keys].
++    maps:fold(fun(_K, ?TUPLE(Idx, _), Acc) -> [Idx | Acc] end, [], Keys).
+ 
+ -record(aux, {}).
+ 
+diff --git a/src/ra_server.erl b/src/ra_server.erl
+index 1dcb96e..f18fdc9 100644
+--- a/src/ra_server.erl
++++ b/src/ra_server.erl
+@@ -543,7 +543,8 @@ handle_leader({PeerId, #append_entries_reply{term = Term, success = true,
+             case State3 of
+                 #{cluster := #{Id := _}} ->
+                     % leader is in the cluster
+-                    {leader, State3, Effects2};
++                    tla_trace:ret(<<"handle_append_entries_response">>, #{from => PeerId},
++                    {leader, State3, Effects2});
+                 #{commit_index := CI,
+                   cluster_index_term := {CITIndex, _}}
+                   when CI >= CITIndex ->
+@@ -554,9 +555,11 @@ handle_leader({PeerId, #append_entries_reply{term = Term, success = true,
+                     %% need to make pipelined rpcs here as cannot use next event
+                     {State, _, Effects} =
+                         make_pipelined_rpc_effects(State3, Effects2),
+-                    {stop, State, Effects};
++                    tla_trace:ret(<<"handle_append_entries_response">>, #{from => PeerId},
++                    {stop, State, Effects});
+                 _ ->
+-                    {leader, State3, Effects2}
++                    tla_trace:ret(<<"handle_append_entries_response">>, #{from => PeerId},
++                    {leader, State3, Effects2})
+             end
+     end;
+ handle_leader({PeerId, #append_entries_reply{term = Term}},
+@@ -572,7 +575,8 @@ handle_leader({PeerId, #append_entries_reply{term = Term}},
+             ?NOTICE("~ts: leader saw append_entries_reply from ~w for term ~b "
+                     "abdicates term: ~b!",
+                     [LogId, PeerId, Term, CurTerm]),
+-            {follower, update_term(Term, State0#{leader_id => undefined}), []}
++            tla_trace:ret(<<"leader_step_down">>, #{from => PeerId},
++            {follower, update_term(Term, State0#{leader_id => undefined}), []})
+     end;
+ handle_leader({PeerId, #append_entries_reply{success = false}},
+               State0 = #{cfg := #cfg{log_id = LogId},
+@@ -681,7 +685,8 @@ handle_leader({command, Cmd}, #{cfg := #cfg{id = Self,
+                 make_pipelined_rpc_effects(State0, Effects00, Force),
+             % check if a reply is required.
+             Effects = after_log_append_reply(Cmd, Idx, Term, Effects0),
+-            {leader, State, Effects}
++            tla_trace:ret(<<"client_request">>,
++            {leader, State, Effects})
+     end;
+ handle_leader({commands, Cmds}, #{cfg := #cfg{id = Self,
+                                               log_id = LogId} = Cfg,
+@@ -779,7 +784,8 @@ handle_leader({PeerId, #install_snapshot_result{last_index = LastIndex}},
+             {State2, Effects1} = maybe_emit_pending_release_cursor(State1, Effects0),
+             Effects2 = maybe_promote_peer(PeerId, State2, Effects1),
+             {State, _, Effects} = make_pipelined_rpc_effects(State2, Effects2),
+-            {leader, State, Effects}
++            tla_trace:ret(<<"handle_install_snapshot_response">>, #{from => PeerId},
++            {leader, State, Effects})
+     end;
+ handle_leader(pipeline_rpcs, State0) ->
+     {State, More, Effects0} = make_pipelined_rpc_effects(State0, []),
+@@ -831,8 +837,9 @@ handle_leader(#append_entries_rpc{term = Term} = Msg,
+           "abdicates term: ~b!",
+           [LogId, Msg#append_entries_rpc.leader_id,
+            Term, CurTerm]),
++    tla_trace:ret(<<"leader_step_down">>, #{from => Msg#append_entries_rpc.leader_id},
+     {follower, update_term(Term, State0#{leader_id => undefined}),
+-     [{next_event, Msg}]};
++     [{next_event, Msg}]});
+ handle_leader(#append_entries_rpc{term = Term}, #{current_term := Term,
+                                                   cfg := #cfg{log_id = LogId}}) ->
+     ?ERR("~ts: leader saw append_entries_rpc for same term ~b"
+@@ -848,7 +855,8 @@ handle_leader({consistent_query, From, QueryFun},
+                 cluster_change_permitted := true} = State0) ->
+     QueryRef = {query, From, QueryFun, CommitIndex},
+     {State1, Effects} = make_heartbeat_rpc_effects(QueryRef, State0),
+-    {leader, State1, Effects};
++    tla_trace:ret(<<"consistent_query">>,
++    {leader, State1, Effects});
+ handle_leader({consistent_query, From, QueryFun},
+               #{commit_index := CommitIndex,
+                 cluster_change_permitted := false,
+@@ -876,8 +884,9 @@ handle_leader(#heartbeat_rpc{term = Term} = Msg,
+           "abdicates term: ~b!",
+           [LogId, Msg#heartbeat_rpc.leader_id,
+            Term, CurTerm]),
++    tla_trace:ret(<<"leader_step_down">>, #{from => Msg#heartbeat_rpc.leader_id},
+     {follower, update_term(Term, State0#{leader_id => undefined}),
+-     [{next_event, Msg}]};
++     [{next_event, Msg}]});
+ handle_leader(#heartbeat_rpc{term = Term,
+                              query_index = QueryIndex,
+                              leader_id = LeaderId},
+@@ -901,10 +910,12 @@ handle_leader({PeerId, #heartbeat_reply{query_index = ReplyQueryIndex,
+             %% Heartbeat confirmed
+             case heartbeat_rpc_quorum(ReplyQueryIndex, PeerId, State0) of
+                 {[], State} ->
+-                    {leader, State, []};
++                    tla_trace:ret(<<"handle_heartbeat_response">>, #{from => PeerId},
++                    {leader, State, []});
+                 {QueryRefs, State} ->
+                     Effects = apply_consistent_queries_effects(QueryRefs, State),
+-                    {leader, State, Effects}
++                    tla_trace:ret(<<"handle_heartbeat_response">>, #{from => PeerId},
++                    {leader, State, Effects})
+             end;
+         {CurHigher, TermLower} when CurHigher > TermLower ->
+             %% Heartbeat reply for lower term. Ignoring
+@@ -932,7 +943,8 @@ handle_leader(#request_vote_rpc{term = Term, candidate_id = Cand} = Msg,
+              [{next_event, Msg}]}
+     end;
+ handle_leader(#request_vote_rpc{}, State = #{current_term := Term}) ->
+-    Reply = #request_vote_result{term = Term, vote_granted = false},
++    Reply = #request_vote_result{term = Term, vote_granted = false,
++                                 from = id(State)},
+     {leader, State, [{reply, Reply}]};
+ handle_leader(#pre_vote_rpc{term = Term, candidate_id = Cand} = Msg,
+               #{current_term := CurTerm,
+@@ -1025,7 +1037,8 @@ handle_leader(Msg, State) ->
+ 
+ -spec handle_candidate(ra_msg() | election_timeout, ra_server_state()) ->
+     {ra_state(), ra_server_state(), effects()}.
+-handle_candidate(#request_vote_result{term = Term, vote_granted = true},
++handle_candidate(#request_vote_result{term = Term, vote_granted = true,
++                                      from = VoteFrom},
+                  #{cfg := #cfg{id = Id,
+                                log_id = LogId},
+                    current_term := Term,
+@@ -1038,33 +1051,42 @@ handle_candidate(#request_vote_result{term = Term, vote_granted = true},
+         NewVotes ->
+             State = initialise_peers(State0#{leader_id => Id}),
+             Effects = post_election_effects(State),
+-            {leader, maps:without([votes], State), Effects};
++            tla_trace:emit(<<"handle_request_vote_response">>, candidate,
++                           State0#{votes => NewVotes}, #{from => VoteFrom}),
++            tla_trace:ret(<<"become_leader">>,
++            {leader, maps:without([votes], State), Effects});
+         _ ->
+-            {candidate, State0#{votes => NewVotes}, []}
++            tla_trace:ret(<<"handle_request_vote_response">>, #{from => VoteFrom},
++            {candidate, State0#{votes => NewVotes}, []})
+     end;
+-handle_candidate(#request_vote_result{term = Term},
++handle_candidate(#request_vote_result{term = Term, from = VoteFrom},
+                  #{current_term := CurTerm,
+                    cfg := #cfg{log_id = LogId}} = State0)
+   when Term > CurTerm ->
+     ?INFO("~ts: candidate request_vote_result with higher term"
+            " received ~b -> ~b", [LogId, CurTerm, Term]),
+     State = update_term_and_voted_for(Term, undefined, State0),
+-    {follower, State, []};
++    tla_trace:ret(<<"handle_request_vote_response">>, #{from => VoteFrom},
++    {follower, State, []});
+ handle_candidate(#request_vote_result{vote_granted = false}, State) ->
+     {candidate, State, []};
+-handle_candidate(#append_entries_rpc{term = Term} = Msg,
++handle_candidate(#append_entries_rpc{term = Term,
++                                     leader_id = AERLeaderId} = Msg,
+                  #{current_term := CurTerm} = State0) when Term >= CurTerm ->
+     State = update_term_and_voted_for(Term, undefined, State0),
+-    {follower, State, [{next_event, Msg}]};
++    tla_trace:ret(<<"candidate_step_down">>, #{from => AERLeaderId},
++    {follower, State, [{next_event, Msg}]});
+ handle_candidate(#append_entries_rpc{leader_id = LeaderId},
+                  #{current_term := CurTerm} = State) ->
+     % term must be older return success=false
+     Reply = append_entries_reply(CurTerm, false, State),
+     {candidate, State, [{cast, LeaderId, {id(State), Reply}}]};
+-handle_candidate(#heartbeat_rpc{term = Term} = Msg,
++handle_candidate(#heartbeat_rpc{term = Term,
++                                leader_id = HBLeaderId} = Msg,
+                  #{current_term := CurTerm} = State0) when Term >= CurTerm ->
+     State = update_term_and_voted_for(Term, undefined, State0),
+-    {follower, State, [{next_event, Msg}]};
++    tla_trace:ret(<<"candidate_step_down">>, #{from => HBLeaderId},
++    {follower, State, [{next_event, Msg}]});
+ handle_candidate(#heartbeat_rpc{leader_id = LeaderId,
+                                 query_index = QueryIndex},
+                  #{current_term := CurTerm} = State) ->
+@@ -1105,7 +1127,8 @@ handle_candidate(#pre_vote_rpc{term = Term} = Msg,
+     State = update_term_and_voted_for(Term, undefined, State0),
+     {follower, State, [{next_event, Msg}]};
+ handle_candidate(#request_vote_rpc{}, State = #{current_term := Term}) ->
+-    Reply = #request_vote_result{term = Term, vote_granted = false},
++    Reply = #request_vote_result{term = Term, vote_granted = false,
++                                 from = id(State)},
+     {candidate, State, [{reply, Reply}]};
+ handle_candidate(#pre_vote_rpc{} = PreVote, State) ->
+     %% unlike request_vote_rpc, a candidate cannot simply reject 
+@@ -1191,7 +1214,7 @@ handle_pre_vote(#install_snapshot_rpc{term = Term} = ISR,
+   when Term >= CurTerm ->
+     {follower, State0#{votes => 0}, [{next_event, ISR}]};
+ handle_pre_vote(#pre_vote_result{term = Term, vote_granted = true,
+-                                 token = Token},
++                                 token = Token, from = PreVoteFrom},
+                 #{current_term := Term,
+                   votes := Votes,
+                   cfg := #cfg{log_id = LogId},
+@@ -1204,9 +1227,13 @@ handle_pre_vote(#pre_vote_result{term = Term, vote_granted = true,
+     State = update_term(Term, State0),
+     case required_quorum(Nodes) of
+         NewVotes ->
+-            call_for_election(candidate, State);
++            tla_trace:emit(<<"handle_pre_vote_response">>, pre_vote,
++                           State#{votes => NewVotes}, #{from => PreVoteFrom}),
++            tla_trace:ret(<<"win_pre_vote">>,
++                          call_for_election(candidate, State));
+         _ ->
+-            {pre_vote, State#{votes => NewVotes}, []}
++            tla_trace:ret(<<"handle_pre_vote_response">>, #{from => PreVoteFrom},
++            {pre_vote, State#{votes => NewVotes}, []})
+     end;
+ handle_pre_vote(#pre_vote_result{}, State) ->
+     %% just handle negative results to avoid printing an unhandled message log
+@@ -1303,8 +1330,9 @@ handle_follower(#append_entries_rpc{term = Term,
+                                 evaluate_commit_index_follower(State1, Effects0),
+                             %% log is validated so send a successful reply
+                             Reply = append_entries_reply(Term, true, State),
++                            tla_trace:ret(<<"handle_append_entries_request">>, #{from => LeaderId},
+                             {NextState, State,
+-                             [cast_reply(Id, LeaderId, Reply) | Effects]};
++                             [cast_reply(Id, LeaderId, Reply) | Effects]});
+                         false ->
+                             %% We need to ensure we make progress in case the
+                             %% leader is having to resend already received
+@@ -1323,8 +1351,9 @@ handle_follower(#append_entries_rpc{term = Term,
+                                                           next_index = LastValidatedIdx + 1,
+                                                           last_index = LastValidatedIdx,
+                                                           last_term = LVTerm},
++                            tla_trace:ret(<<"handle_append_entries_request">>, #{from => LeaderId},
+                             {follower, State,
+-                             [cast_reply(Id, LeaderId, Reply)]}
++                             [cast_reply(Id, LeaderId, Reply)]})
+                     end;
+                 [{FstIdx, _, _} | _] ->
+                     State1 = State0#{commit_index => LeaderCommit},
+@@ -1336,8 +1365,9 @@ handle_follower(#append_entries_rpc{term = Term,
+                                         State1, Entries),
+                     case ra_log:write(Entries, Log1) of
+                         {ok, Log2} ->
++                            tla_trace:ret(<<"handle_append_entries_request">>, #{from => LeaderId},
+                             evaluate_commit_index_follower(State#{log => Log2},
+-                                                           Effects0);
++                                                           Effects0));
+                         {error, wal_down} ->
+                             %% At this point we know the wal process exited
+                             %% but we dont know exactly which in flight messages
+@@ -1359,13 +1389,14 @@ handle_follower(#append_entries_rpc{term = Term,
+                   [LogId, PLIdx, PLTerm, LeaderId,
+                    Reply#append_entries_reply.next_index]),
+             Effects = [cast_reply(Id, LeaderId, Reply) | Effects0],
++            tla_trace:ret(<<"handle_append_entries_request">>, #{from => LeaderId},
+             {await_condition,
+              State#{condition =>
+                     #{predicate_fun => follower_catchup_cond_fun(missing),
+                       % repeat reply effect on condition timeout
+                       timeout => #{effects => Effects,
+                                    transition_to => follower}}},
+-             Effects};
++             Effects});
+         {term_mismatch, OtherTerm, Log0} ->
+             State1 = State0#{log => Log0},
+             LastApplied = maps:get(last_applied, State1),
+@@ -1385,13 +1416,14 @@ handle_follower(#append_entries_rpc{term = Term,
+             {Reply, State} = mismatch_append_entries_reply(Term, LastApplied,
+                                                            State1),
+             Effects = [cast_reply(Id, LeaderId, Reply) | Effects0],
++            tla_trace:ret(<<"handle_append_entries_request">>, #{from => LeaderId},
+             {await_condition,
+              State#{condition =>
+                     #{predicate_fun => follower_catchup_cond_fun(term_mismatch),
+                       % repeat reply effect on condition timeout
+                       timeout => #{effects => Effects,
+                                    transition_to => follower}}},
+-             Effects}
++             Effects})
+     end;
+ handle_follower(#append_entries_rpc{term = Term, leader_id = LeaderId},
+                 #{cfg := #cfg{id = Id, log_id = LogId} = Cfg,
+@@ -1402,7 +1434,8 @@ handle_follower(#append_entries_rpc{term = Term, leader_id = LeaderId},
+     ?DEBUG("~ts: follower got append_entries_rpc from ~w in"
+            " ~b but current term is: ~b",
+           [LogId, LeaderId, Term, CurTerm]),
+-    {follower, State, [cast_reply(Id, LeaderId, Reply)]};
++    tla_trace:ret(<<"handle_append_entries_request">>, #{from => LeaderId},
++    {follower, State, [cast_reply(Id, LeaderId, Reply)]});
+ handle_follower(#heartbeat_rpc{query_index = QueryIndex,
+                                term = Term,
+                                leader_id = LeaderId},
+@@ -1412,7 +1445,8 @@ handle_follower(#heartbeat_rpc{query_index = QueryIndex,
+     State1 = update_term(Term, State0),
+     State2 = State1#{leader_id => LeaderId},
+     Reply = heartbeat_reply(Term, QueryIndex),
+-    {follower, State2, [cast_reply(Id, LeaderId, Reply)]};
++    tla_trace:ret(<<"handle_heartbeat_request">>, #{from => LeaderId},
++    {follower, State2, [cast_reply(Id, LeaderId, Reply)]});
+ handle_follower(#heartbeat_rpc{leader_id = LeaderId,
+                                query_index = QueryIndex},
+                 #{current_term := CurTerm,
+@@ -1458,8 +1492,10 @@ handle_follower(#request_vote_rpc{candidate_id = Cand, term = Term},
+     % already voted for another in this term
+     ?DEBUG("~ts: follower request_vote_rpc for ~w already voted for ~w in ~b",
+            [LogId, Cand, VotedFor, Term]),
+-    Reply = #request_vote_result{term = Term, vote_granted = false},
+-    {follower, State, [{reply, Reply}]};
++    Reply = #request_vote_result{term = Term, vote_granted = false,
++                                 from = id(State)},
++    tla_trace:ret(<<"handle_request_vote_request">>, #{from => Cand},
++    {follower, State, [{reply, Reply}]});
+ handle_follower(#request_vote_rpc{term = Term, candidate_id = Cand,
+                                   last_log_index = LLIdx,
+                                   last_log_term = LLTerm},
+@@ -1473,16 +1509,20 @@ handle_follower(#request_vote_rpc{term = Term, candidate_id = Cand,
+             ?INFO("~ts: granting vote for ~w with last {index, term} ~w"
+                   " for term ~b previous term was ~b",
+                   [LogId, Cand, {LLIdx, LLTerm}, Term, CurTerm]),
+-            Reply = #request_vote_result{term = Term, vote_granted = true},
++            Reply = #request_vote_result{term = Term, vote_granted = true,
++                                         from = id(State1)},
+             State = update_term_and_voted_for(Term, Cand, State1),
+-            {follower, State, [{reply, Reply}]};
++            tla_trace:ret(<<"handle_request_vote_request">>, #{from => Cand},
++            {follower, State, [{reply, Reply}]});
+         false ->
+             ?INFO("~ts: declining vote for ~w for term ~b,"
+                   " candidate last log {index, term} was: ~w "
+                   " last log entry {index, term} is: ~w",
+                   [LogId, Cand, Term, {LLIdx, LLTerm}, {LastIdxTerm}]),
+-            Reply = #request_vote_result{term = Term, vote_granted = false},
+-            {follower, update_term(Term, State1), [{reply, Reply}]}
++            Reply = #request_vote_result{term = Term, vote_granted = false,
++                                         from = id(State1)},
++            tla_trace:ret(<<"handle_request_vote_request">>, #{from => Cand},
++            {follower, update_term(Term, State1), [{reply, Reply}]})
+     end;
+ handle_follower(#request_vote_rpc{term = Term, candidate_id = Candidate},
+                 State = #{current_term := CurTerm,
+@@ -1490,8 +1530,10 @@ handle_follower(#request_vote_rpc{term = Term, candidate_id = Candidate},
+   when Term < CurTerm ->
+     ?INFO("~ts: declining vote to ~w for term ~b, current term ~b",
+           [LogId, Candidate, Term, CurTerm]),
+-    Reply = #request_vote_result{term = CurTerm, vote_granted = false},
+-    {follower, State, [{reply, Reply}]};
++    Reply = #request_vote_result{term = CurTerm, vote_granted = false,
++                                 from = id(State)},
++    tla_trace:ret(<<"handle_request_vote_request">>, #{from => Candidate},
++    {follower, State, [{reply, Reply}]});
+ handle_follower({_PeerId, #append_entries_reply{term = TheirTerm}},
+                 State = #{current_term := CurTerm}) ->
+     Term = max(TheirTerm, CurTerm),
+@@ -1550,10 +1592,11 @@ handle_follower(#install_snapshot_rpc{term = Term,
+               _ ->
+                   Log1
+           end,
++    tla_trace:ret(<<"handle_install_snapshot_request">>, #{from => LeaderId},
+     {receive_snapshot, update_term(Term, State0#{log => Log,
+                                                  snapshot_phase => ChunkFlag,
+                                                  leader_id => LeaderId}),
+-     [{next_event, Rpc}, {record_leader_msg, LeaderId}]};
++     [{next_event, Rpc}, {record_leader_msg, LeaderId}]});
+ handle_follower(#install_snapshot_rpc{term = Term,
+                                       meta = #{index := SnapIdx,
+                                                machine_version := SnapMacVer,
+@@ -1849,7 +1892,8 @@ handle_receive_snapshot(#request_vote_rpc{term = Term} = Msg,
+ %% Handle request_vote_rpc with lower or equal term - reject without aborting
+ handle_receive_snapshot(#request_vote_rpc{},
+                         #{current_term := CurTerm} = State) ->
+-    Reply = #request_vote_result{term = CurTerm, vote_granted = false},
++    Reply = #request_vote_result{term = CurTerm, vote_granted = false,
++                                 from = id(State)},
+     {receive_snapshot, State, [{reply, Reply}]};
+ %% Handle pre_vote_rpc without leaving receive_snapshot state
+ handle_receive_snapshot(#pre_vote_rpc{} = PreVote, State) ->
+@@ -2235,6 +2279,10 @@ evaluate_commit_index_follower(#{commit_index := CommitIndex,
+             case LastApplied > LastApplied0 of
+                 true ->
+                     %% entries were applied, append eval_aux effect
++                    %% NOTE: apply_entries trace NOT emitted here because this
++                    %% fires mid-function, before the enclosing
++                    %% handle_append_entries_request trace (via tla_trace:ret).
++                    %% SilentApplyEntries in Trace.tla handles follower applies.
+                     {follower, State1, [{aux, eval} | Effects1]};
+                 false ->
+                     %% no entries were applied
+@@ -2848,7 +2896,7 @@ call_for_election(candidate, #{cfg := #cfg{id = Id, log_id = LogId} = Cfg,
+                                        last_log_term = LastTerm}}
+             || PeerId <- PeerIds],
+     % vote for self
+-    VoteForSelf = #request_vote_result{term = NewTerm, vote_granted = true},
++    VoteForSelf = #request_vote_result{term = NewTerm, vote_granted = true, from = Id},
+     State = update_term_and_voted_for(NewTerm, Id, State0),
+     {candidate, State#{leader_id => undefined, votes => 0},
+      [{next_event, cast, VoteForSelf},
+@@ -2872,12 +2920,13 @@ call_for_election(pre_vote, #{cfg := #cfg{id = Id,
+             || PeerId <- PeerIds],
+     % vote for self
+     VoteForSelf = #pre_vote_result{term = Term, token = Token,
+-                                   vote_granted = true},
++                                   vote_granted = true, from = Id},
+     State = update_term_and_voted_for(Term, Id, State0),
++    tla_trace:ret(<<"call_for_election_pre_vote">>,
+     {pre_vote, State#{leader_id => undefined, votes => 0,
+                       pre_vote_token => Token},
+      [{next_event, cast, VoteForSelf},
+-      {send_vote_requests, Reqs} | Effects]}.
++      {send_vote_requests, Reqs} | Effects]}).
+ 
+ process_pre_vote(FsmState, #pre_vote_rpc{term = Term, candidate_id = Cand,
+                                          version = Version,
+@@ -2885,7 +2934,8 @@ process_pre_vote(FsmState, #pre_vote_rpc{term = Term, candidate_id = Cand,
+                                          token = Token,
+                                          last_log_index = LLIdx,
+                                          last_log_term = LLTerm},
+-                 #{cfg := #cfg{machine_version = OurMacVer,
++                 #{cfg := #cfg{id = Id,
++                               machine_version = OurMacVer,
+                                effective_machine_version = EffMacVer},
+                    current_term := CurTerm} = State0)
+   when Term >= CurTerm  ->
+@@ -2895,7 +2945,8 @@ process_pre_vote(FsmState, #pre_vote_rpc{term = Term, candidate_id = Cand,
+         true when Version > ?RA_PROTO_VERSION->
+             ?DEBUG("~ts: declining pre-vote for ~w for protocol version ~b",
+                    [log_id(State0), Cand, Version]),
+-            {FsmState, State, [{reply, pre_vote_result(Term, Token, false)}]};
++            tla_trace:ret(<<"handle_pre_vote_request">>, #{from => Cand},
++            {FsmState, State, [{reply, pre_vote_result(Term, Token, false, Id)}]});
+         true when TheirMacVer == EffMacVer orelse
+                   (TheirMacVer >= EffMacVer andalso
+                    TheirMacVer =< OurMacVer) ->
+@@ -2905,14 +2956,16 @@ process_pre_vote(FsmState, #pre_vote_rpc{term = Term, candidate_id = Cand,
+                    " for term ~b previous term ~b",
+                    [log_id(State0), Cand, TheirMacVer, OurMacVer, EffMacVer,
+                     {LLIdx, LLTerm}, Term, CurTerm]),
++            tla_trace:ret(<<"handle_pre_vote_request">>, #{from => Cand},
+             {FsmState, State#{voted_for => Cand},
+-             [{reply, pre_vote_result(Term, Token, true)}]};
++             [{reply, pre_vote_result(Term, Token, true, Id)}]});
+         true ->
+             ?DEBUG("~ts: declining pre-vote for ~w their machine version ~b"
+                    " ours is ~b effective ~b",
+                    [log_id(State0), Cand, TheirMacVer, OurMacVer, EffMacVer]),
+-            {FsmState, State, [{reply, pre_vote_result(Term, Token, false)},
+-                               start_election_timeout]};
++            tla_trace:ret(<<"handle_pre_vote_request">>, #{from => Cand},
++            {FsmState, State, [{reply, pre_vote_result(Term, Token, false, Id)},
++                               start_election_timeout]});
+         false ->
+             ?DEBUG("~ts: declining pre-vote for ~w for term ~b,"
+                    " candidate last log {index, term} was: ~w "
+@@ -2920,26 +2973,31 @@ process_pre_vote(FsmState, #pre_vote_rpc{term = Term, candidate_id = Cand,
+                    [log_id(State0), Cand, Term, {LLIdx, LLTerm}, LastIdxTerm]),
+             case FsmState of
+                 follower ->
+-                    {FsmState, State, [start_election_timeout]};
++                    tla_trace:ret(<<"handle_pre_vote_request">>, #{from => Cand},
++                    {FsmState, State, [start_election_timeout]});
+                 _ ->
++                    tla_trace:ret(<<"handle_pre_vote_request">>, #{from => Cand},
+                     {FsmState, State,
+-                     [{reply, pre_vote_result(Term, Token, false)}]}
++                     [{reply, pre_vote_result(Term, Token, false, Id)}]})
+             end
+     end;
+ process_pre_vote(FsmState, #pre_vote_rpc{term = Term,
+                                          token = Token,
+                                          candidate_id = Candidate},
+-                #{current_term := CurTerm} = State)
++                #{cfg := #cfg{id = Id},
++                  current_term := CurTerm} = State)
+   when Term < CurTerm ->
+     ?DEBUG("~ts declining pre-vote to ~w for term ~b, current term ~b",
+            [log_id(State), Candidate, Term, CurTerm]),
++    tla_trace:ret(<<"handle_pre_vote_request">>, #{from => Candidate},
+     {FsmState, State,
+-     [{reply, pre_vote_result(CurTerm, Token, false)}]}.
++     [{reply, pre_vote_result(CurTerm, Token, false, Id)}]}).
+ 
+-pre_vote_result(Term, Token, Success) ->
++pre_vote_result(Term, Token, Success, From) ->
+     #pre_vote_result{term = Term,
+                      token = Token,
+-                     vote_granted = Success}.
++                     vote_granted = Success,
++                     from = From}.
+ 
+ new_peer() ->
+     #{next_index => 1,
+@@ -3550,13 +3608,14 @@ append_cluster_change(Cluster, From, ReplyMode,
+     % what happens if the write fails?
+     try ra_log:append({NextIdx, Term, Command}, Log0) of
+         Log ->
+-            {ok, NextIdx, Term,
+-             State#{log => Log,
+-                    cluster => Cluster,
+-                    cluster_change_permitted => false,
+-                    cluster_index_term => IdxTerm,
+-                    previous_cluster => {PrevCITIdx, PrevCITTerm, PrevCluster}},
+-             Effects}
++            NewState = State#{log => Log,
++                              cluster => Cluster,
++                              cluster_change_permitted => false,
++                              cluster_index_term => IdxTerm,
++                              previous_cluster => {PrevCITIdx, PrevCITTerm, PrevCluster}},
++            tla_trace:emit(<<"propose_config_change">>, leader, NewState,
++                           #{new_config => maps:keys(Cluster)}),
++            {ok, NextIdx, Term, NewState, Effects}
+     catch error:wal_down ->
+               {not_appended, wal_down, State, Effects}
+     end.
+@@ -3592,7 +3651,11 @@ evaluate_quorum(#{cfg := Cfg,
+                   false ->
+                       Effects0
+               end,
+-    {State1, Effects1} = apply_to(CI, State, Effects),
++    {#{last_applied := LA1} = State1, Effects1} = apply_to(CI, State, Effects),
++    case LA1 > maps:get(last_applied, State0) of
++        true -> tla_trace:emit(<<"apply_entries">>, leader, State1, #{});
++        false -> ok
++    end,
+     maybe_emit_pending_release_cursor(State1, Effects1).
+ 
+ increment_commit_index(State0 = #{current_term := CurrentTerm}) ->
+@@ -3601,6 +3664,8 @@ increment_commit_index(State0 = #{current_term := CurrentTerm}) ->
+     % log entry term matches the current term. See (§5.4.2)
+     case fetch_term(PotentialNewCommitIndex, State0) of
+         {CurrentTerm, State} ->
++            tla_trace:emit(<<"advance_commit_index">>, leader,
++                           State#{commit_index => PotentialNewCommitIndex}, #{}),
+             State#{commit_index => PotentialNewCommitIndex};
+         {_, State} ->
+             State
+diff --git a/src/ra_server_proc.erl b/src/ra_server_proc.erl
+index babe654..f58e7f6 100644
+--- a/src/ra_server_proc.erl
++++ b/src/ra_server_proc.erl
+@@ -1503,6 +1503,13 @@ handle_effects(RaftState, Effects0, EvtType, State0, Actions0) ->
+ handle_effect(_RaftState, {send_rpc, To, Rpc}, _,
+               #state{conf = Conf,
+                      server_state = SS} = State0, Actions) ->
++    %% TLA+ trace: emit replicate_entries for AppendEntries RPCs
++    case Rpc of
++        #append_entries_rpc{} ->
++            tla_trace:emit(<<"replicate_entries">>, leader, SS,
++                           #{to => To});
++        _ -> ok
++    end,
+     % fully qualified use only so that we can mock it for testing
+     % TODO: review / refactor to remove the mod call here
+     PeerStatus = ra_server:peer_status(To, SS),

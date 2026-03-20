@@ -1,0 +1,304 @@
+diff --git a/openraft/Cargo.toml b/openraft/Cargo.toml
+index ceb388c4..30ec0710 100644
+--- a/openraft/Cargo.toml
++++ b/openraft/Cargo.toml
+@@ -50,6 +50,9 @@ default = ["tokio-rt"]
+ # Enable the default Tokio runtime
+ tokio-rt = ["dep:openraft-rt-tokio"]
+ 
++# Enable TLA+ trace emission for formal verification
++tla-trace = ["dep:serde_json"]
++
+ # Enables benchmarks in unittest.
+ #
+ # Benchmark in openraft depends on the unstable feature `test` thus it cannot be used with stable rust.
+diff --git a/openraft/src/engine/engine_impl.rs b/openraft/src/engine/engine_impl.rs
+index 9aaa403c..1a5a384f 100644
+--- a/openraft/src/engine/engine_impl.rs
++++ b/openraft/src/engine/engine_impl.rs
+@@ -212,6 +212,9 @@ where C: RaftTypeConfig
+         // Safe unwrap(): it won't reject itself ˙–˙
+         self.vote_handler().update_vote(&new_vote).unwrap();
+ 
++        #[cfg(feature = "tla-trace")]
++        crate::tla_trace::emit_strong("Elect", &self.config.id, &*self.state);
++
+         self.output.push_command(Command::SendVote {
+             vote_req: VoteRequest::new(new_vote, last_log_id),
+         });
+@@ -282,6 +285,9 @@ where C: RaftTypeConfig
+ 
+         let res = self.vote_handler().update_vote(&req.vote);
+ 
++        #[cfg(feature = "tla-trace")]
++        crate::tla_trace::emit_msg_weak("HandleVoteRequest", &self.config.id, req.vote.leader_id().node_id(), &*self.state);
++
+         tracing::info!("handle vote request result: req: {}, result: {:?}", req, res);
+ 
+         // Return the updated vote, this way the candidate knows which vote is granted, in case
+@@ -313,6 +319,10 @@ where C: RaftTypeConfig
+                 tracing::info!("a quorum granted my vote");
+                 self.establish_leader();
+             }
++
++            #[cfg(feature = "tla-trace")]
++            crate::tla_trace::emit_msg_weak("HandleVoteResponse", &self.config.id, &target, &*self.state);
++
+             return;
+         }
+ 
+@@ -349,6 +359,9 @@ where C: RaftTypeConfig
+ 
+         // Update if resp.vote is greater.
+         self.vote_handler().update_vote(&vote).ok();
++
++        #[cfg(feature = "tla-trace")]
++        crate::tla_trace::emit_msg_weak("HandleVoteResponse", &self.config.id, &target, &*self.state);
+     }
+ 
+     /// Append entries to follower/learner.
+@@ -367,6 +380,9 @@ where C: RaftTypeConfig
+ 
+         let stream_result: StreamAppendResult<C> = self.append_entries(vote, segment).map_err(Into::into);
+ 
++        #[cfg(feature = "tla-trace")]
++        crate::tla_trace::emit_msg_weak("HandleAppendEntries", &self.config.id, vote.leader_id().node_id(), &*self.state);
++
+         let condition = if stream_result.is_ok() {
+             Some(Condition::IOFlushed {
+                 io_id: self.state.accepted_log_io().unwrap().clone(),
+@@ -422,6 +438,10 @@ where C: RaftTypeConfig
+         // The condition to satisfy before running other command that depends on the snapshot.
+         // In this case, the response can only be sent when the snapshot is installed.
+         let cond = fh.install_full_snapshot(snapshot);
++
++        #[cfg(feature = "tla-trace")]
++        crate::tla_trace::emit_msg_weak("HandleInstallSnapshot", &self.config.id, vote.leader_id().node_id(), &*self.state);
++
+         let res = SnapshotResponse {
+             vote: self.state.vote_ref().clone(),
+         };
+@@ -459,7 +479,15 @@ where C: RaftTypeConfig
+ 
+         #[allow(clippy::collapsible_if)]
+         if em.log_id().as_ref() <= self.state.committed() {
++            #[cfg(feature = "tla-trace")]
++            let _tla_was_leader = self.state.server_state == ServerState::Leader;
++
+             self.vote_handler().update_internal_server_state();
++
++            #[cfg(feature = "tla-trace")]
++            if _tla_was_leader && self.state.server_state != ServerState::Leader {
++                crate::tla_trace::emit_weak("LeaderStepDown", &self.config.id, &*self.state);
++            }
+         }
+     }
+ 
+@@ -669,6 +697,9 @@ where C: RaftTypeConfig
+         // IO progress is updated by the new blank log
+ 
+         self.try_leader_handler().unwrap().leader_append_entries([EntryPayload::Blank]);
++
++        #[cfg(feature = "tla-trace")]
++        crate::tla_trace::emit_strong("EstablishLeader", &self.config.id, &*self.state);
+     }
+ 
+     /// Check if a raft node is in a state that allows to initialize.
+@@ -750,6 +781,7 @@ where C: RaftTypeConfig
+ 
+     pub(crate) fn snapshot_handler(&mut self) -> SnapshotHandler<'_, '_, C, SM> {
+         SnapshotHandler {
++            config: &self.config,
+             state: &mut self.state,
+             output: &mut self.output,
+         }
+diff --git a/openraft/src/engine/handler/following_handler/mod.rs b/openraft/src/engine/handler/following_handler/mod.rs
+index e2f8690b..e72efc68 100644
+--- a/openraft/src/engine/handler/following_handler/mod.rs
++++ b/openraft/src/engine/handler/following_handler/mod.rs
+@@ -328,6 +328,7 @@ where C: RaftTypeConfig
+ 
+     fn snapshot_handler(&mut self) -> SnapshotHandler<'_, '_, C, SM> {
+         SnapshotHandler {
++            config: self.config,
+             state: self.state,
+             output: self.output,
+         }
+diff --git a/openraft/src/engine/handler/leader_handler/mod.rs b/openraft/src/engine/handler/leader_handler/mod.rs
+index 565e0957..2f04cba8 100644
+--- a/openraft/src/engine/handler/leader_handler/mod.rs
++++ b/openraft/src/engine/handler/leader_handler/mod.rs
+@@ -57,6 +57,9 @@ where C: RaftTypeConfig
+     where I: IntoIterator<Item = EntryPayloadOf<C>, IntoIter: ExactSizeIterator> {
+         let payloads = payloads.into_iter();
+ 
++        #[cfg(feature = "tla-trace")]
++        let mut _tla_has_value_entry = false;
++
+         let log_ids = self.leader.assign_log_ids(payloads.len())?;
+ 
+         self.state.extend_log_ids_from_same_leader(log_ids.clone());
+@@ -64,6 +67,10 @@ where C: RaftTypeConfig
+         let mut membership_entry = None;
+         let entries = Batch::from_iter(payloads.zip(log_ids.clone()).map(|(payload, log_id)| {
+             tracing::debug!("assign log id: {}", log_id);
++            #[cfg(feature = "tla-trace")]
++            if matches!(&payload, crate::entry::payload::EntryPayload::Normal(_)) {
++                _tla_has_value_entry = true;
++            }
+             let entry = C::Entry::new(log_id, payload);
+             if let Some(m) = entry.get_membership() {
+                 debug_assert!(
+@@ -98,6 +105,11 @@ where C: RaftTypeConfig
+ 
+         rh.initiate_replication();
+ 
++        #[cfg(feature = "tla-trace")]
++        if _tla_has_value_entry {
++            crate::tla_trace::emit_strong("ClientRequest", &self.config.id, self.state);
++        }
++
+         Some(log_ids)
+     }
+ 
+@@ -107,6 +119,9 @@ where C: RaftTypeConfig
+         let session_id = ReplicationSessionId::new(self.leader.committed_vote.clone(), membership_log_id.clone());
+ 
+         self.output.push_command(Command::BroadcastHeartbeat { session_id });
++
++        #[cfg(feature = "tla-trace")]
++        crate::tla_trace::emit_term("SendHeartbeat", &self.config.id, self.state);
+     }
+ 
+     /// Get the log id for a linearizable read.
+diff --git a/openraft/src/engine/handler/log_handler/mod.rs b/openraft/src/engine/handler/log_handler/mod.rs
+index de06ccb5..0b7e50ad 100644
+--- a/openraft/src/engine/handler/log_handler/mod.rs
++++ b/openraft/src/engine/handler/log_handler/mod.rs
+@@ -46,6 +46,9 @@ where C: RaftTypeConfig
+ 
+         st.purge_log(&upto);
+         self.output.push_command(Command::PurgeLog { upto });
++
++        #[cfg(feature = "tla-trace")]
++        crate::tla_trace::emit_term("PurgeLog", &self.config.id, self.state);
+     }
+ 
+     /// Update the next log id to purge up to, if more logs can be purged, according to the
+diff --git a/openraft/src/engine/handler/replication_handler/mod.rs b/openraft/src/engine/handler/replication_handler/mod.rs
+index 0d86d4ed..b933d45f 100644
+--- a/openraft/src/engine/handler/replication_handler/mod.rs
++++ b/openraft/src/engine/handler/replication_handler/mod.rs
+@@ -195,6 +195,9 @@ where C: RaftTypeConfig
+         );
+ 
+         self.try_commit_quorum_accepted(quorum_accepted);
++
++        #[cfg(feature = "tla-trace")]
++        crate::tla_trace::emit_msg_weak("HandleAppendEntriesResponse", &self.config.id, &node_id, self.state);
+     }
+ 
+     /// Commit the log id that is granted(accepted) by a quorum of voters.
+@@ -216,6 +219,9 @@ where C: RaftTypeConfig
+             self.output.push_command(Command::ReplicateCommitted {
+                 committed: self.state.committed().cloned(),
+             });
++
++            #[cfg(feature = "tla-trace")]
++            crate::tla_trace::emit_strong("AdvanceCommitIndex", &self.config.id, self.state);
+         }
+     }
+ 
+@@ -240,6 +246,9 @@ where C: RaftTypeConfig
+         let mut updater = progress::entry::update::Updater::new(self.config, prog_entry);
+ 
+         updater.update_conflicting(conflict.index(), inflight_id);
++
++        #[cfg(feature = "tla-trace")]
++        crate::tla_trace::emit_msg_weak("HandleAppendEntriesResponse", &self.config.id, &target, self.state);
+     }
+ 
+     /// Enable one-time replication reset for a specific node upon log reversion detection.
+@@ -359,6 +368,16 @@ where C: RaftTypeConfig
+ 
+             match t {
+                 Ok(inflight) => {
++                    #[cfg(feature = "tla-trace")]
++                    {
++                        let event_name = if matches!(inflight, Inflight::Snapshot { .. }) {
++                            "SendInstallSnapshot"
++                        } else {
++                            "ReplicateEntries"
++                        };
++                        crate::tla_trace::emit_target_term(event_name, &self.config.id, &item.id, self.state);
++                    }
++
+                     let leader_vote = self.leader.committed_vote.clone();
+                     Self::send_to_target(self.output, leader_vote, &item.id, inflight);
+                 }
+diff --git a/openraft/src/engine/handler/snapshot_handler/mod.rs b/openraft/src/engine/handler/snapshot_handler/mod.rs
+index c426fd9a..9a03a0bf 100644
+--- a/openraft/src/engine/handler/snapshot_handler/mod.rs
++++ b/openraft/src/engine/handler/snapshot_handler/mod.rs
+@@ -6,6 +6,7 @@ use crate::core::sm;
+ use crate::display_ext::DisplayOptionExt;
+ use crate::engine::Command;
+ use crate::engine::EngineOutput;
++use crate::engine::engine_config::EngineConfig;
+ use crate::raft_state::LogStateReader;
+ use crate::type_config::alias::SnapshotMetaOf;
+ 
+@@ -18,6 +19,7 @@ mod update_snapshot_test;
+ pub(crate) struct SnapshotHandler<'st, 'out, C, SM = ()>
+ where C: RaftTypeConfig
+ {
++    pub(crate) config: &'st EngineConfig<C>,
+     pub(crate) state: &'st mut RaftState<C>,
+     pub(crate) output: &'out mut EngineOutput<C, SM>,
+ }
+@@ -40,6 +42,10 @@ where C: RaftTypeConfig
+         self.state.io_state.set_building_snapshot(true);
+ 
+         self.output.push_command(Command::from(sm::Command::build_snapshot()));
++
++        #[cfg(feature = "tla-trace")]
++        crate::tla_trace::emit_term("TriggerSnapshot", &self.config.id, self.state);
++
+         true
+     }
+ 
+diff --git a/openraft/src/lib.rs b/openraft/src/lib.rs
+index 8bbfeff0..a7f9a5ef 100644
+--- a/openraft/src/lib.rs
++++ b/openraft/src/lib.rs
+@@ -35,6 +35,9 @@ pub extern crate openraft_macros;
+ pub extern crate openraft_macros as macros;
+ pub extern crate openraft_rt as rt;
+ 
++#[cfg(feature = "tla-trace")]
++pub mod tla_trace;
++
+ mod change_members;
+ mod config;
+ mod core;
+diff --git a/tests/Cargo.toml b/tests/Cargo.toml
+index 92e9ada9..9799f6d0 100644
+--- a/tests/Cargo.toml
++++ b/tests/Cargo.toml
+@@ -18,7 +18,7 @@ repository    = { workspace = true }
+ [dependencies]
+ 
+ [dev-dependencies]
+-openraft           = { path = "../openraft", version = "0.10.0-alpha.17", features = ["type-alias"] }
++openraft = { path = "../openraft", version = "0.10.0-alpha.17", features = ["type-alias", "tla-trace"] }
+ openraft-memstore  = { path = "../stores/memstore" }
+ openraft-legacy = { path = "../legacy" }
+ 
+@@ -40,3 +40,7 @@ tracing-subscriber = { workspace = true }
+ 
+ bt = ["openraft/bt"]
+ single-term-leader = ["openraft-memstore/single-term-leader"]
++
++[[test]]
++name = "tla_trace"
++path = "tests/tla_trace/main.rs"

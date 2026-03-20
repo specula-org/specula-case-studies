@@ -1,0 +1,201 @@
+diff --git a/peer.go b/peer.go
+index 9b5c9df..80650e3 100644
+--- a/peer.go
++++ b/peer.go
+@@ -175,8 +175,14 @@ func (p *Peer) flush() {
+ 	entries, prevLogTerm := p.server.log.getEntriesAfter(prevLogIndex, p.server.maxLogEntriesPerRequest)
+ 
+ 	if entries != nil {
++		if len(entries) > 0 {
++			emitReplicate(p.server, p.Name, prevLogIndex, len(entries))
++		} else {
++			emitSendHeartbeat(p.server, p.Name, term)
++		}
+ 		p.sendAppendEntriesRequest(newAppendEntriesRequest(term, prevLogIndex, prevLogTerm, p.server.log.CommitIndex(), p.server.name, entries))
+ 	} else {
++		emitSendSnapshotRequest(p.server, p.Name)
+ 		p.sendSnapshotRequest(newSnapshotRequest(p.server.name, p.server.snapshot))
+ 	}
+ }
+@@ -282,6 +288,7 @@ func (p *Peer) sendSnapshotRequest(req *SnapshotRequest) {
+ // Sends an Snapshot Recovery request to the peer through the transport.
+ func (p *Peer) sendSnapshotRecoveryRequest() {
+ 	req := newSnapshotRecoveryRequest(p.server.name, p.server.snapshot)
++	emitSendSnapshotRecoveryRequest(p.server, p.Name)
+ 	debugln("peer.snap.recovery.send: ", p.Name)
+ 	resp := p.server.Transporter().SendSnapshotRecoveryRequest(p.server, p, req)
+ 
+diff --git a/server.go b/server.go
+index 8a9d05c..d559c77 100644
+--- a/server.go
++++ b/server.go
+@@ -710,7 +710,9 @@ func (s *server) followerLoop() {
+ 		case <-timeoutChan:
+ 			// only allow synced follower to promote to candidate
+ 			if s.promotable() {
++				pre := capturePre(s)
+ 				s.setState(Candidate)
++				emitTimeout(s, pre)
+ 			} else {
+ 				update = true
+ 			}
+@@ -744,8 +746,10 @@ func (s *server) candidateLoop() {
+ 	for s.State() == Candidate {
+ 		if doVote {
+ 			// Increment current term, vote for self.
++			pre := capturePre(s)
+ 			s.currentTerm++
+ 			s.votedFor = s.name
++			emitRequestVote(s, pre)
+ 
+ 			// Send RequestVote RPCs to all other servers.
+ 			respChan = make(chan *RequestVoteResponse, len(s.peers))
+@@ -771,7 +775,9 @@ func (s *server) candidateLoop() {
+ 		// And return from the candidate loop
+ 		if votesGranted == s.QuorumSize() {
+ 			s.debugln("server.candidate.recv.enough.votes")
++			pre := capturePre(s)
+ 			s.setState(Leader)
++			emitBecomeLeader(s, pre)
+ 			return
+ 		}
+ 
+@@ -782,10 +788,12 @@ func (s *server) candidateLoop() {
+ 			return
+ 
+ 		case resp := <-respChan:
++			preVR := capturePre(s)
+ 			if success := s.processVoteResponse(resp); success {
+ 				s.debugln("server.candidate.vote.granted: ", votesGranted)
+ 				votesGranted++
+ 			}
++			emitHandleRequestVoteResponse(s, resp, preVR)
+ 
+ 		case e := <-s.c:
+ 			var err error
+@@ -900,6 +908,7 @@ func (s *server) Do(command Command) (interface{}, error) {
+ // Processes a command.
+ func (s *server) processCommand(command Command, e *ev) {
+ 	s.debugln("server.command.process")
++	pre := capturePre(s)
+ 
+ 	// Create an entry for the command in the log.
+ 	entry, err := s.log.createEntry(s.currentTerm, command, e)
+@@ -916,6 +925,15 @@ func (s *server) processCommand(command Command, e *ev) {
+ 		return
+ 	}
+ 
++	// Emit trace event: distinguish NOP from client request
++	if _, ok := command.(NOPCommand); ok {
++		emitAppendNOP(s, pre)
++	} else if _, ok := command.(*NOPCommand); ok {
++		emitAppendNOP(s, pre)
++	} else {
++		emitClientRequest(s, pre)
++	}
++
+ 	s.syncedPeer[s.Name()] = true
+ 	if len(s.peers) == 0 {
+ 		commitIndex := s.log.currentIndex()
+@@ -936,7 +954,13 @@ func (s *server) AppendEntries(req *AppendEntriesRequest) *AppendEntriesResponse
+ }
+ 
+ // Processes the "append entries" request.
+-func (s *server) processAppendEntriesRequest(req *AppendEntriesRequest) (*AppendEntriesResponse, bool) {
++func (s *server) processAppendEntriesRequest(req *AppendEntriesRequest) (aeResp *AppendEntriesResponse, aeUpdate bool) {
++	pre := capturePre(s)
++	defer func() {
++		if traceActive && aeResp != nil {
++			emitHandleAppendEntriesRequest(s, req, aeResp, pre)
++		}
++	}()
+ 	s.traceln("server.ae.process")
+ 
+ 	if req.Term < s.currentTerm {
+@@ -988,14 +1012,18 @@ func (s *server) processAppendEntriesRequest(req *AppendEntriesRequest) (*Append
+ // processed when the server is a leader. Responses received during other
+ // states are dropped.
+ func (s *server) processAppendEntriesResponse(resp *AppendEntriesResponse) {
++	pre := capturePre(s)
++
+ 	// If we find a higher term then change to a follower and exit.
+ 	if resp.Term() > s.Term() {
+ 		s.updateCurrentTerm(resp.Term(), "")
++		emitHandleAppendEntriesResponse(s, resp, pre)
+ 		return
+ 	}
+ 
+ 	// panic response if it's not successful.
+ 	if !resp.Success() {
++		emitHandleAppendEntriesResponse(s, resp, pre)
+ 		return
+ 	}
+ 
+@@ -1005,6 +1033,8 @@ func (s *server) processAppendEntriesResponse(resp *AppendEntriesResponse) {
+ 		s.syncedPeer[resp.peer] = true
+ 	}
+ 
++	emitHandleAppendEntriesResponse(s, resp, pre)
++
+ 	// Increment the commit count to make sure we have a quorum before committing.
+ 	if len(s.syncedPeer) < s.QuorumSize() {
+ 		return
+@@ -1024,9 +1054,11 @@ func (s *server) processAppendEntriesResponse(resp *AppendEntriesResponse) {
+ 
+ 	if commitIndex > committedIndex {
+ 		// leader needs to do a fsync before committing log entries
++		preCI := capturePre(s)
+ 		s.log.sync()
+ 		s.log.setCommitIndex(commitIndex)
+ 		s.debugln("commit index ", commitIndex)
++		emitAdvanceCommitIndex(s, preCI)
+ 	}
+ }
+ 
+@@ -1063,7 +1095,13 @@ func (s *server) RequestVote(req *RequestVoteRequest) *RequestVoteResponse {
+ }
+ 
+ // Processes a "request vote" request.
+-func (s *server) processRequestVoteRequest(req *RequestVoteRequest) (*RequestVoteResponse, bool) {
++func (s *server) processRequestVoteRequest(req *RequestVoteRequest) (rvResp *RequestVoteResponse, rvUpdate bool) {
++	pre := capturePre(s)
++	defer func() {
++		if traceActive && rvResp != nil {
++			emitHandleRequestVoteRequest(s, req, rvResp, pre)
++		}
++	}()
+ 
+ 	// If the request is coming from an old term then reject it.
+ 	if req.Term < s.Term() {
+@@ -1265,6 +1303,7 @@ func (s *server) RequestSnapshot(req *SnapshotRequest) *SnapshotResponse {
+ }
+ 
+ func (s *server) processSnapshotRequest(req *SnapshotRequest) *SnapshotResponse {
++	pre := capturePre(s)
+ 	// If the follower’s log contains an entry at the snapshot’s last index with a term
+ 	// that matches the snapshot’s last term, then the follower already has all the
+ 	// information found in the snapshot and can reply false.
+@@ -1276,6 +1315,7 @@ func (s *server) processSnapshotRequest(req *SnapshotRequest) *SnapshotResponse
+ 
+ 	// Update state.
+ 	s.setState(Snapshotting)
++	emitHandleSnapshotRequest(s, pre)
+ 
+ 	return newSnapshotResponse(true)
+ }
+@@ -1287,6 +1327,7 @@ func (s *server) SnapshotRecoveryRequest(req *SnapshotRecoveryRequest) *Snapshot
+ }
+ 
+ func (s *server) processSnapshotRecoveryRequest(req *SnapshotRecoveryRequest) *SnapshotRecoveryResponse {
++	pre := capturePre(s)
+ 	// Recover state sent from request.
+ 	if err := s.stateMachine.Recovery(req.State); err != nil {
+ 		panic("cannot recover from previous state")
+@@ -1308,6 +1349,7 @@ func (s *server) processSnapshotRecoveryRequest(req *SnapshotRecoveryRequest) *S
+ 
+ 	// Clear the previous log entries.
+ 	s.log.compact(req.LastIndex, req.LastTerm)
++	emitHandleSnapshotRecoveryRequest(s, pre)
+ 
+ 	return newSnapshotRecoveryResponse(req.LastTerm, true, req.LastIndex)
+ }

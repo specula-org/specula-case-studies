@@ -1,0 +1,237 @@
+diff --git a/src/cluster/DotNext.Net.Cluster/Net/Cluster/Consensus/Raft/CandidateState.cs b/src/cluster/DotNext.Net.Cluster/Net/Cluster/Consensus/Raft/CandidateState.cs
+index ca1657eaa..1696e1d94 100644
+--- a/src/cluster/DotNext.Net.Cluster/Net/Cluster/Consensus/Raft/CandidateState.cs
++++ b/src/cluster/DotNext.Net.Cluster/Net/Cluster/Consensus/Raft/CandidateState.cs
+@@ -30,14 +30,19 @@ internal sealed class CandidateState<TMember> : RaftState<TMember>
+         var lastIndex = auditTrail.LastEntryIndex;
+         var lastTerm = await auditTrail.GetTermAsync(lastIndex, votingCancellationToken).ConfigureAwait(false);
+ 
++        // TLA+ trace: compute local NID for RequestVote events
++        var tlaLocalNid = Tracing.TlaTrace.IsEnabled
++            ? Tracing.TlaTrace.MapServer(Members.FirstOrDefault(m => !m.IsRemote)?.EndPoint)
++            : "";
++
+         // start voting in parallel
+-        var voters = StartVoting(Members, Term, lastIndex, lastTerm, votingCancellationToken);
++        var voters = StartVoting(Members, Term, lastIndex, lastTerm, votingCancellationToken, tlaLocalNid);
+         votingCancellation.CancelAfter(timeout);
+ 
+         // finish voting
+         await EndVoting(voters.Consume(), votingCancellation.Token).ConfigureAwait(false);
+ 
+-        static TaskCompletionPipe<Task<(TMember, long, bool?)>> StartVoting(IReadOnlyCollection<TMember> members, long currentTerm, long lastIndex, long lastTerm, CancellationToken token)
++        static TaskCompletionPipe<Task<(TMember, long, bool?)>> StartVoting(IReadOnlyCollection<TMember> members, long currentTerm, long lastIndex, long lastTerm, CancellationToken token, string tlaLocalNid)
+         {
+             var voters = new TaskCompletionPipe<Task<(TMember, long, bool?)>>();
+ 
+@@ -46,6 +51,14 @@ internal sealed class CandidateState<TMember> : RaftState<TMember>
+             {
+                 while (enumerator.MoveNext() && !token.IsCancellationRequested)
+                 {
++                    // TLA+ trace: RequestVote
++                    if (Tracing.TlaTrace.IsEnabled && enumerator.Current.IsRemote)
++                    {
++                        Tracing.TlaTrace.EmitWeak("RequestVote", tlaLocalNid, currentTerm, "Candidate",
++                            new Dictionary<string, object> { ["from"] = tlaLocalNid,
++                                ["to"] = Tracing.TlaTrace.MapServer(enumerator.Current.EndPoint),
++                                ["term"] = currentTerm, ["lastLogIndex"] = lastIndex, ["lastLogTerm"] = lastTerm });
++                    }
+                     voters.Add(VoteAsync(enumerator.Current, currentTerm, lastIndex, lastTerm, token));
+                 }
+             }
+@@ -78,6 +91,9 @@ internal sealed class CandidateState<TMember> : RaftState<TMember>
+     {
+         var votes = 0;
+         var localMember = default(TMember);
++        var tlaLocalNid = Tracing.TlaTrace.IsEnabled
++            ? Tracing.TlaTrace.MapServer(Members.FirstOrDefault(m => !m.IsRemote)?.EndPoint)
++            : "";
+ 
+         var enumerator = voters.GetAsyncEnumerator(token);
+         try
+@@ -92,6 +108,13 @@ internal sealed class CandidateState<TMember> : RaftState<TMember>
+                 // current node is outdated
+                 if (term > Term)
+                 {
++                    // TLA+ trace: HandleRequestVoteResponse (higher term → step down)
++                    if (Tracing.TlaTrace.IsEnabled)
++                    {
++                        Tracing.TlaTrace.EmitWeak("HandleRequestVoteResponse", tlaLocalNid, term, "Follower",
++                            new Dictionary<string, object> { ["from"] = Tracing.TlaTrace.MapServer(member.EndPoint),
++                                ["to"] = tlaLocalNid, ["term"] = term, ["voteGranted"] = false });
++                    }
+                     MoveToFollowerState(randomizeTimeout: false, term);
+                     return;
+                 }
+@@ -112,6 +135,14 @@ internal sealed class CandidateState<TMember> : RaftState<TMember>
+                         break;
+                 }
+ 
++                // TLA+ trace: HandleRequestVoteResponse
++                if (Tracing.TlaTrace.IsEnabled)
++                {
++                    Tracing.TlaTrace.EmitWeak("HandleRequestVoteResponse", tlaLocalNid, Term, "Candidate",
++                        new Dictionary<string, object> { ["from"] = Tracing.TlaTrace.MapServer(member.EndPoint),
++                            ["to"] = tlaLocalNid, ["term"] = term, ["voteGranted"] = result == true });
++                }
++
+                 if (!member.IsRemote)
+                     localMember = member;
+             }
+diff --git a/src/cluster/DotNext.Net.Cluster/Net/Cluster/Consensus/Raft/LeaderState.cs b/src/cluster/DotNext.Net.Cluster/Net/Cluster/Consensus/Raft/LeaderState.cs
+index acf5168dc..1f06f3ef1 100644
+--- a/src/cluster/DotNext.Net.Cluster/Net/Cluster/Consensus/Raft/LeaderState.cs
++++ b/src/cluster/DotNext.Net.Cluster/Net/Cluster/Consensus/Raft/LeaderState.cs
+@@ -56,6 +56,18 @@ internal sealed partial class LeaderState<TMember> : ConsensusState<TMember>
+             {
+                 var precedingIndex = member.State.PrecedingIndex;
+ 
++                // TLA+ trace: AppendEntries
++                if (Tracing.TlaTrace.IsEnabled)
++                {
++                    var _aeNid = Tracing.TlaTrace.MapServer(Members.FirstOrDefault(m => !m.IsRemote)?.EndPoint);
++                    var _aeTo = Tracing.TlaTrace.MapServer(member.EndPoint);
++                    Tracing.TlaTrace.EmitWeak("AppendEntries", _aeNid, currentTerm, "Leader",
++                        new Dictionary<string, object> { ["from"] = _aeNid, ["to"] = _aeTo, ["term"] = currentTerm,
++                            ["prevLogIndex"] = precedingIndex,
++                            ["commitIndex"] = commitIndex,
++                            ["entriesCount"] = Math.Max(0L, currentIndex - precedingIndex) });
++                }
++
+                 // fork replication procedure
+                 replicator = context.GetOrCreate(member, replicatorFactory, Token);
+                 replicator.Initialize(activeConfig, proposedConfig, commitIndex, currentTerm, precedingIndex);
+@@ -160,6 +172,15 @@ internal sealed partial class LeaderState<TMember> : ConsensusState<TMember>
+                                 case MemberResponse.Exception:
+                                     continue;
+                                 case MemberResponse.HigherTermDetected:
++                                    // TLA+ trace: HandleAppendEntriesResponse (higher term)
++                                    if (Tracing.TlaTrace.IsEnabled)
++                                    {
++                                        var _hrNid = Tracing.TlaTrace.MapServer(Members.FirstOrDefault(m => !m.IsRemote)?.EndPoint);
++                                        var _hrFrom = Tracing.TlaTrace.MapServer(Unsafe.As<Replicator>(replicator).Member.EndPoint);
++                                        Tracing.TlaTrace.EmitWeak("HandleAppendEntriesResponse", _hrNid, result.Term, "Follower",
++                                            new Dictionary<string, object> { ["from"] = _hrFrom, ["to"] = _hrNid, ["term"] = result.Term,
++                                                ["success"] = false, ["matchIndex"] = 0 });
++                                    }
+                                     MoveToFollowerState(randomizeTimeout: false, result.Term);
+                                     goto case MemberResponse.Canceled;
+                                 case MemberResponse.Canceled:
+@@ -169,6 +190,15 @@ internal sealed partial class LeaderState<TMember> : ConsensusState<TMember>
+                                     UpdateLeaderStickiness();
+                                     goto default;
+                                 default:
++                                    // TLA+ trace: HandleAppendEntriesResponse (normal)
++                                    if (Tracing.TlaTrace.IsEnabled)
++                                    {
++                                        var _hnNid = Tracing.TlaTrace.MapServer(Members.FirstOrDefault(m => !m.IsRemote)?.EndPoint);
++                                        var _hnFrom = Tracing.TlaTrace.MapServer(Unsafe.As<Replicator>(replicator).Member.EndPoint);
++                                        Tracing.TlaTrace.EmitWeak("HandleAppendEntriesResponse", _hnNid, currentTerm, "Leader",
++                                            new Dictionary<string, object> { ["from"] = _hnFrom, ["to"] = _hnNid, ["term"] = result.Term,
++                                                ["success"] = result.Value, ["matchIndex"] = 0 });
++                                    }
+                                     commitQuorum += Unsafe.BitCast<bool, byte>(result.Value);
+                                     continue;
+                             }
+@@ -180,6 +210,14 @@ internal sealed partial class LeaderState<TMember> : ConsensusState<TMember>
+                         // majority of nodes accept entries with at least one entry from the current term
+                         var count = await auditTrail.CommitAsync(currentIndex, Token).ConfigureAwait(false); // commit all entries starting from the first uncommitted index to the end
+                         Logger.CommitSuccessful(currentIndex, count);
++
++                        // TLA+ trace: AdvanceCommitIndex
++                        if (Tracing.TlaTrace.IsEnabled)
++                        {
++                            var _acNid = Tracing.TlaTrace.MapServer(Members.FirstOrDefault(m => !m.IsRemote)?.EndPoint);
++                            Tracing.TlaTrace.EmitCommit("AdvanceCommitIndex", _acNid, currentTerm, "Leader",
++                                auditTrail.LastCommittedEntryIndex);
++                        }
+                     }
+                     else
+                     {
+diff --git a/src/cluster/DotNext.Net.Cluster/Net/Cluster/Consensus/Raft/RaftCluster.cs b/src/cluster/DotNext.Net.Cluster/Net/Cluster/Consensus/Raft/RaftCluster.cs
+index 25ab3b641..94c661fbc 100644
+--- a/src/cluster/DotNext.Net.Cluster/Net/Cluster/Consensus/Raft/RaftCluster.cs
++++ b/src/cluster/DotNext.Net.Cluster/Net/Cluster/Consensus/Raft/RaftCluster.cs
+@@ -665,6 +665,22 @@ public abstract partial class RaftCluster<TMember> : Disposable, IUnresponsiveCl
+                                 configurationReplicated = false;
+                                 break;
+                         }
++
++                        // TLA+ trace: HandleAppendEntries (success)
++                        if (Tracing.TlaTrace.IsEnabled)
++                        {
++                            var _haNid = Tracing.TlaTrace.MapServer(TryGetLocalMember()?.EndPoint);
++                            var _haFrom = Tracing.TlaTrace.MapServer(senderMember?.EndPoint);
++                            if (_haNid is { Length: > 0 } && _haFrom is { Length: > 0 })
++                            {
++                                var _haLastIdx = auditTrail.LastEntryIndex;
++                                var _haLastTrm = await auditTrail.GetTermAsync(_haLastIdx, tokenSource.Token).ConfigureAwait(false);
++                                Tracing.TlaTrace.EmitFull("HandleAppendEntries", _haNid, Term, "Follower", "",
++                                    auditTrail.LastCommittedEntryIndex, _haLastIdx, _haLastTrm,
++                                    new Dictionary<string, object> { ["from"] = _haFrom, ["to"] = _haNid, ["term"] = senderTerm,
++                                        ["prevLogIndex"] = prevLogIndex, ["success"] = true });
++                            }
++                        }
+                     }
+ 
+                     // This node is in sync with the leader and no entries arrived
+@@ -850,6 +866,25 @@ public abstract partial class RaftCluster<TMember> : Disposable, IUnresponsiveCl
+         }
+ 
+     exit:
++        // TLA+ trace: HandleRequestVote
++        if (Tracing.TlaTrace.IsEnabled)
++        {
++            var _hvNid = Tracing.TlaTrace.MapServer(TryGetLocalMember()?.EndPoint);
++            var _hvFrom = Tracing.TlaTrace.MapServer(TryGetMember(sender)?.EndPoint);
++            var _hvRole = state switch
++            {
++                LeaderState<TMember> => "Leader",
++                CandidateState<TMember> => "Candidate",
++                _ => "Follower",
++            };
++            var _hvLastIdx = auditTrail.LastEntryIndex;
++            var _hvLastTrm = await auditTrail.GetTermAsync(_hvLastIdx, LifecycleToken).ConfigureAwait(false);
++            Tracing.TlaTrace.EmitFull("HandleRequestVote", _hvNid, result.Term, _hvRole, "",
++                auditTrail.LastCommittedEntryIndex, _hvLastIdx, _hvLastTrm,
++                new Dictionary<string, object> { ["from"] = _hvFrom, ["to"] = _hvNid, ["term"] = senderTerm,
++                    ["lastLogIndex"] = lastLogIndex, ["lastLogTerm"] = lastLogTerm,
++                    ["voteGranted"] = result.Value });
++        }
+         return result;
+     }
+ 
+@@ -1099,6 +1134,16 @@ public abstract partial class RaftCluster<TMember> : Disposable, IUnresponsiveCl
+                     // vote for self
+                     newState.StartVoting(ElectionTimeout, auditTrail);
+                     Logger.TransitionToCandidateStateCompleted(Term);
++
++                    // TLA+ trace: Timeout
++                    if (Tracing.TlaTrace.IsEnabled)
++                    {
++                        var _tNid = Tracing.TlaTrace.MapServer(TryGetLocalMember()?.EndPoint);
++                        var _tLastIdx = auditTrail.LastEntryIndex;
++                        var _tLastTrm = await auditTrail.GetTermAsync(_tLastIdx, LifecycleToken).ConfigureAwait(false);
++                        Tracing.TlaTrace.EmitFull("Timeout", _tNid, Term, "Candidate", _tNid,
++                            auditTrail.LastCommittedEntryIndex, _tLastIdx, _tLastTrm);
++                    }
+                 }
+                 else
+                 {
+@@ -1163,6 +1208,16 @@ public abstract partial class RaftCluster<TMember> : Disposable, IUnresponsiveCl
+ 
+                 newState.StartLeading(HeartbeatTimeout, auditTrail, ConfigurationStorage);
+                 Logger.TransitionToLeaderStateCompleted(currentTerm);
++
++                // TLA+ trace: BecomeLeader
++                if (Tracing.TlaTrace.IsEnabled)
++                {
++                    var _blNid = Tracing.TlaTrace.MapServer(newLeader.EndPoint);
++                    var _blLastIdx = auditTrail.LastEntryIndex;
++                    // lastLogTerm = currentTerm because no-op entry was just appended
++                    Tracing.TlaTrace.EmitFull("BecomeLeader", _blNid, currentTerm, "Leader", "",
++                        auditTrail.LastCommittedEntryIndex, _blLastIdx, currentTerm);
++                }
+             }
+         }
+         catch (OperationCanceledException) when (lockTaken is false)

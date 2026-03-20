@@ -1,0 +1,170 @@
+diff --git a/ratis-server/src/main/java/org/apache/ratis/server/impl/LeaderElection.java b/ratis-server/src/main/java/org/apache/ratis/server/impl/LeaderElection.java
+index 385d3383..fa5b1dbb 100644
+--- a/ratis-server/src/main/java/org/apache/ratis/server/impl/LeaderElection.java
++++ b/ratis-server/src/main/java/org/apache/ratis/server/impl/LeaderElection.java
+@@ -17,6 +17,7 @@
+  */
+ package org.apache.ratis.server.impl;
+ 
++import org.apache.ratis.server.TlaTrace;
+ import org.apache.ratis.metrics.Timekeeper;
+ import org.apache.ratis.proto.RaftProtos.RequestVoteReplyProto;
+ import org.apache.ratis.proto.RaftProtos.RequestVoteRequestProto;
+@@ -451,6 +452,12 @@ final class LeaderElection implements Runnable {
+       final ConfAndTerm confAndTerm = (round == 0 && round0 != null) ? round0 : server.initElection(phase);
+       electionTerm = confAndTerm.getTerm();
+       conf = confAndTerm.getConf();
++      // TLA+ trace: election phase start
++      if (phase == Phase.ELECTION) {
++        TlaTrace.emitWeak("Timeout", server.getId().toString(), electionTerm, "CANDIDATE");
++      } else {
++        TlaTrace.emitWeak("PreVote", server.getId().toString(), electionTerm, "CANDIDATE");
++      }
+     }
+ 
+     LOG.info("{} {} round {}: submit vote requests at term {} for {}", this, phase, round, electionTerm, conf);
+@@ -472,11 +479,19 @@ final class LeaderElection implements Runnable {
+           return false;
+         case TIMEOUT:
+           return false; // should retry
+-        case REJECTED:
+-        case DISCOVERED_A_NEW_TERM:
++        case REJECTED: {
+           final long term = r.maxTerm(server.getCurrentTerm());
+           server.rejected(term, r);
+           return false;
++        }
++        case DISCOVERED_A_NEW_TERM: {
++          final long term = r.maxTerm(server.getCurrentTerm());
++          server.rejected(term, r);
++          // TLA+ trace: stepped down due to higher term
++          TlaTrace.emitWeak("HandleRequestVoteResponseHigherTerm",
++              server.getId().toString(), term, "FOLLOWER");
++          return false;
++        }
+         default: throw new IllegalArgumentException("Unable to process result " + r.result);
+       }
+     }
+diff --git a/ratis-server/src/main/java/org/apache/ratis/server/impl/RaftServerImpl.java b/ratis-server/src/main/java/org/apache/ratis/server/impl/RaftServerImpl.java
+index 0b891f65..910649db 100644
+--- a/ratis-server/src/main/java/org/apache/ratis/server/impl/RaftServerImpl.java
++++ b/ratis-server/src/main/java/org/apache/ratis/server/impl/RaftServerImpl.java
+@@ -100,6 +100,7 @@ import org.apache.ratis.statemachine.TransactionContext;
+ import org.apache.ratis.statemachine.impl.TransactionContextImpl;
+ import org.apache.ratis.thirdparty.com.google.common.annotations.VisibleForTesting;
+ import org.apache.ratis.thirdparty.com.google.protobuf.InvalidProtocolBufferException;
++import org.apache.ratis.server.TlaTrace;
+ import org.apache.ratis.trace.TraceUtils;
+ import org.apache.ratis.trace.TraceConfigKeys;
+ import org.apache.ratis.util.CodeInjectionForTesting;
+@@ -651,6 +652,9 @@ class RaftServerImpl implements RaftServer.Division,
+     final LeaderStateImpl leader = role.updateLeaderState(this);
+     state.becomeLeader();
+ 
++    // TLA+ trace: election won, became leader
++    TlaTrace.emit("HandleRequestVoteResponse", this);
++
+     // start sending AppendEntries RPC to followers
+     leader.start();
+   }
+@@ -865,6 +869,8 @@ class RaftServerImpl implements RaftServer.Division,
+       writeIndexCache.add(request.getClientId(), context.getLogIndexFuture());
+       try {
+         state.appendLog(context);
++        // TLA+ trace: client request appended to log
++        TlaTrace.emit("ClientRequest", this);
+       } catch (StateMachineException e) {
+         // the StateMachineException is thrown by the SM in the preAppend stage.
+         // Return the exception in a RaftClientReply.
+@@ -1485,6 +1491,10 @@ class RaftServerImpl implements RaftServer.Division,
+       }
+       reply = toRequestVoteReplyProto(candidateId, getMemberId(),
+           voteGranted, state.getCurrentTerm(), shouldShutdown, state.getLastEntry(), callId);
++      // TLA+ trace: vote request handled
++      TlaTrace.emit("HandleRequestVoteRequest", this,
++          "\"src\":\"" + candidateId + "\",\"voteGranted\":" + voteGranted
++          + ",\"phase\":\"" + phase + "\"");
+       if (LOG.isInfoEnabled()) {
+         LOG.info("{} replies to {} vote request: {}. Peer's state: {}",
+             getMemberId(), phase, toRequestVoteReplyString(reply), state);
+@@ -1610,6 +1620,11 @@ class RaftServerImpl implements RaftServer.Division,
+       currentTerm = state.getCurrentTerm();
+       final boolean recognized = state.recognizeLeader(Op.APPEND_ENTRIES, leaderId, leaderTerm);
+       if (!recognized) {
++        // TLA+ trace: rejected AppendEntries from unrecognized leader
++        if (!isHeartbeat) {
++          TlaTrace.emit("HandleAppendEntriesRequest", this,
++              "\"src\":\"" + leaderId + "\",\"result\":\"NOT_LEADER\"");
++        }
+         return CompletableFuture.completedFuture(toAppendEntriesReplyProto(
+             leaderId, getMemberId(), currentTerm, followerCommit, state.getNextIndex(),
+             AppendResult.NOT_LEADER, callId, RaftLog.INVALID_LOG_INDEX, isHeartbeat));
+@@ -1639,6 +1654,11 @@ class RaftServerImpl implements RaftServer.Division,
+             leaderId, getMemberId(), currentTerm, followerCommit, inconsistencyReplyNextIndex,
+             AppendResult.INCONSISTENCY, callId, RaftLog.INVALID_LOG_INDEX, isHeartbeat);
+         LOG.info("{}: appendEntries* reply {}", getMemberId(), toAppendEntriesReplyString(reply));
++        // TLA+ trace: inconsistent AppendEntries
++        if (!isHeartbeat) {
++          TlaTrace.emit("HandleAppendEntriesRequest", this,
++              "\"src\":\"" + leaderId + "\",\"result\":\"INCONSISTENCY\"");
++        }
+         followerState.ifPresent(fs -> fs.updateLastRpcTime(FollowerState.UpdateType.APPEND_COMPLETE));
+         return future.thenApply(dummy -> reply);
+       }
+@@ -1670,6 +1690,13 @@ class RaftServerImpl implements RaftServer.Division,
+       final boolean updated = state.updateCommitIndex(commitIndex, currentTerm, false);
+       if (updated) {
+         updateCommitInfoCache();
++        // TLA+ trace: follower commit index advanced
++        TlaTrace.emit("AdvanceCommitIndex", RaftServerImpl.this);
++      }
++      // TLA+ trace: AppendEntries handled successfully
++      if (!isHeartbeat) {
++        TlaTrace.emit("HandleAppendEntriesRequest", RaftServerImpl.this,
++            "\"src\":\"" + leaderId + "\",\"result\":\"SUCCESS\"");
+       }
+       final long nextIndex = isHeartbeat? state.getNextIndex(): matchIndex + 1;
+       final AppendEntriesReplyProto reply = toAppendEntriesReplyProto(leaderId, getMemberId(),
+diff --git a/ratis-server/src/main/java/org/apache/ratis/server/leader/LogAppenderDefault.java b/ratis-server/src/main/java/org/apache/ratis/server/leader/LogAppenderDefault.java
+index 9d1edd46..aa53562d 100644
+--- a/ratis-server/src/main/java/org/apache/ratis/server/leader/LogAppenderDefault.java
++++ b/ratis-server/src/main/java/org/apache/ratis/server/leader/LogAppenderDefault.java
+@@ -23,6 +23,7 @@ import org.apache.ratis.proto.RaftProtos.InstallSnapshotReplyProto;
+ import org.apache.ratis.proto.RaftProtos.InstallSnapshotRequestProto;
+ import org.apache.ratis.rpc.CallId;
+ import org.apache.ratis.server.RaftServer;
++import org.apache.ratis.server.TlaTrace;
+ import org.apache.ratis.server.raftlog.RaftLog;
+ import org.apache.ratis.server.raftlog.RaftLogIOException;
+ import org.apache.ratis.server.util.ServerStringUtils;
+@@ -79,6 +80,15 @@ class LogAppenderDefault extends LogAppenderBase {
+         final Timestamp sendTime = Timestamp.currentTime();
+         getFollower().updateLastRpcSendTime(request.getEntriesCount() == 0);
+         final AppendEntriesRequestProto proto = request;
++        // TLA+ trace: sending AppendEntries/Heartbeat to follower
++        if (TlaTrace.isEnabled()) {
++          String dst = getFollowerId().toString();
++          if (proto.getEntriesCount() == 0) {
++            TlaTrace.emit("Heartbeat", getServer(), "\"dst\":\"" + dst + "\"");
++          } else {
++            TlaTrace.emit("AppendEntries", getServer(), "\"dst\":\"" + dst + "\"");
++          }
++        }
+         final AppendEntriesReplyProto reply = getServerRpc().appendEntries(proto);
+         final long first = proto.getEntriesCount() > 0 ? proto.getEntries(0).getIndex() : RaftLog.INVALID_LOG_INDEX;
+         requestFirstIndex.set(first);
+@@ -205,6 +215,14 @@ class LogAppenderDefault extends LogAppenderBase {
+         default: throw new IllegalArgumentException("Unable to process result " + reply.getResult());
+       }
+       getLeaderState().onAppendEntriesReply(this, reply);
++      // TLA+ trace: AppendEntries response handled
++      if (TlaTrace.isEnabled()) {
++        String src = getFollowerId().toString();
++        TlaTrace.emit("HandleAppendEntriesResponse", getServer(),
++            "\"src\":\"" + src + "\",\"result\":\"" + reply.getResult().name() + "\""
++            + ",\"matchIndex\":" + getFollower().getMatchIndex()
++            + ",\"nextIndex\":" + getFollower().getNextIndex());
++      }
+     }
+   }
+ 

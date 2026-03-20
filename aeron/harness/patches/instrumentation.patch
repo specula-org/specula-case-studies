@@ -1,0 +1,164 @@
+diff --git a/aeron-cluster/src/main/java/io/aeron/cluster/ConsensusModuleAgent.java b/aeron-cluster/src/main/java/io/aeron/cluster/ConsensusModuleAgent.java
+index b39074c1f8..66ddce4312 100644
+--- a/aeron-cluster/src/main/java/io/aeron/cluster/ConsensusModuleAgent.java
++++ b/aeron-cluster/src/main/java/io/aeron/cluster/ConsensusModuleAgent.java
+@@ -1078,6 +1078,10 @@ final class ConsensusModuleAgent
+             if (leaderMember.id() == leaderMemberId && Cluster.Role.FOLLOWER == role)
+             {
+                 notifiedCommitPosition = max(notifiedCommitPosition, logPosition);
++                TlaTrace.emitCommitPositionEvent("FollowerReceiveCommitPosition",
++                    leaderMemberId, memberId,
++                    logPosition, notifiedCommitPosition,
++                    this.commitPosition.getPlain(), 0, "FOLLOWER_READY");
+                 timeOfLastLogUpdateNs = nowNs;
+             }
+         }
+@@ -2836,6 +2840,12 @@ final class ConsensusModuleAgent
+ 
+             publishCommitPosition(quorumPosition, leadershipTermId);
+ 
++            if (quorumPosition > leaderCommitPosition)
++            {
++                TlaTrace.emitNodeEvent("LeaderAdvanceCommitPosition", memberId,
++                    0, leadershipTermId, "LEADER_READY",
++                    appendPosition, quorumPosition, 0, 0);
++            }
+             commitPosition.proposeMaxRelease(quorumPosition);
+             timeOfLastLogUpdateNs = nowNs;
+ 
+@@ -2972,6 +2982,8 @@ final class ConsensusModuleAgent
+             throw new IllegalStateException("election in progress");
+         }
+ 
++        TlaTrace.emitSimpleEvent("Timeout", memberId,
++            null != election ? "INIT" : (Cluster.Role.LEADER == role ? "LEADER_READY" : "FOLLOWER_READY"));
+         role(Cluster.Role.FOLLOWER);
+ 
+         final long leadershipTermId = this.leadershipTermId;
+diff --git a/aeron-cluster/src/main/java/io/aeron/cluster/Election.java b/aeron-cluster/src/main/java/io/aeron/cluster/Election.java
+index 80ce3b8450..bc6c84fe59 100644
+--- a/aeron-cluster/src/main/java/io/aeron/cluster/Election.java
++++ b/aeron-cluster/src/main/java/io/aeron/cluster/Election.java
+@@ -308,6 +308,10 @@ class Election
+         if (null != follower && thisMember.id() != followerMemberId)
+         {
+             consensusModuleAgent.updateMemberLogPosition(follower, logLeadershipTermId, logPosition);
++            TlaTrace.emitMsgEvent("HandleCanvassPosition",
++                followerMemberId, thisMember.id(),
++                candidateTermId, this.leadershipTermId, state.name(),
++                appendPosition, 0, notifiedCommitPosition, 0);
+ 
+             if (logLeadershipTermId < this.leadershipTermId)
+             {
+@@ -357,6 +361,9 @@ class Election
+         if (candidateTermId <= this.candidateTermId)
+         {
+             placeVote(candidateTermId, candidateId, false);
++            TlaTrace.emitVoteEvent("HandleRequestVote",
++                candidateId, thisMember.id(),
++                this.candidateTermId, leadershipTermId, state.name(), false);
+         }
+         else if (compareLog(this.logLeadershipTermId, appendPosition, logLeadershipTermId, logPosition) > 0)
+         {
+@@ -364,6 +371,9 @@ class Election
+                 candidateTermId, logPosition, ctx.epochClock().time());
+ 
+             placeVote(candidateTermId, candidateId, false);
++            TlaTrace.emitVoteEvent("HandleRequestVote",
++                candidateId, thisMember.id(),
++                this.candidateTermId, leadershipTermId, state.name(), false);
+ 
+             final ClusterMember candidateMember = clusterMemberByIdMap.get(candidateId);
+             if (null != candidateMember && Cluster.Role.LEADER == consensusModuleAgent.role())
+@@ -383,6 +393,9 @@ class Election
+                 candidateTermId, logPosition, TimeUnit.MILLISECONDS.convert(nowNs, TimeUnit.NANOSECONDS));
+             placeVote(candidateTermId, candidateId, true);
+             state(FOLLOWER_BALLOT, nowNs, "");
++            TlaTrace.emitVoteEvent("HandleRequestVote",
++                candidateId, thisMember.id(),
++                this.candidateTermId, leadershipTermId, state.name(), true);
+         }
+     }
+ 
+@@ -410,6 +423,9 @@ class Election
+                     .candidateTermId(candidateTermId)
+                     .vote(vote ? Boolean.TRUE : Boolean.FALSE);
+                 consensusModuleAgent.updateMemberLogPosition(follower, logLeadershipTermId, logPosition);
++                TlaTrace.emitVoteEvent("HandleRequestVoteResponse",
++                    voterId, thisMember.id(),
++                    candidateTermId, leadershipTermId, state.name(), vote);
+             }
+         }
+     }
+@@ -474,6 +490,10 @@ class Election
+                 this.leaderRecordingId = leaderRecordingId;
+                 this.catchupJoinPosition = appendPosition < logPosition ? logPosition : NULL_POSITION;
+                 notifiedCommitPosition = max(notifiedCommitPosition, commitPosition);
++                TlaTrace.emitMsgEvent("HandleNewLeadershipTerm",
++                    leaderMemberId, thisMember.id(),
++                    this.candidateTermId, this.leadershipTermId, state.name(),
++                    this.appendPosition, 0, notifiedCommitPosition, 0);
+ 
+                 if (this.appendPosition < termBaseLogPosition)
+                 {
+@@ -574,6 +594,9 @@ class Election
+         if (null != leaderMember && leaderMember.id() == leaderMemberId)
+         {
+             notifiedCommitPosition = max(notifiedCommitPosition, logPosition);
++            TlaTrace.emitCommitPositionEvent("ElectionReceiveCommitPosition",
++                leaderMemberId, thisMember.id(),
++                logPosition, notifiedCommitPosition, 0, 0, state.name());
+             if (FOLLOWER_LOG_REPLICATION == state)
+             {
+                 replicationDeadlineNs = nowNs(ctx) + ctx.leaderHeartbeatTimeoutNs();
+@@ -686,6 +709,9 @@ class Election
+         else
+         {
+             state(CANVASS, nowNs, "");
++            TlaTrace.emitNodeEvent("EnterCanvass", thisMember.id(),
++                candidateTermId, leadershipTermId, state.name(),
++                appendPosition, 0, notifiedCommitPosition, 0);
+         }
+ 
+         return 1;
+@@ -731,6 +757,9 @@ class Election
+                 candidateTermId + 1, logPosition, ctx.epochClock().time());
+             ClusterMember.becomeCandidate(clusterMembers, candidateTermId, thisMember.id());
+             state(CANDIDATE_BALLOT, nowNs, "");
++            TlaTrace.emitNodeEvent("Nominate", thisMember.id(),
++                candidateTermId, leadershipTermId, state.name(),
++                appendPosition, 0, notifiedCommitPosition, 0);
+ 
+             return 1;
+         }
+@@ -754,6 +783,9 @@ class Election
+             leaderMember = thisMember;
+             leadershipTermId = candidateTermId;
+             state(LEADER_LOG_REPLICATION, nowNs, "unanimous leader");
++            TlaTrace.emitNodeEvent("BecomeLeader", thisMember.id(),
++                candidateTermId, leadershipTermId, state.name(),
++                appendPosition, 0, notifiedCommitPosition, 0);
+             workCount++;
+         }
+         else if (nowNs >= (timeOfLastStateChangeNs + ctx.electionTimeoutNs()))
+@@ -763,6 +795,9 @@ class Election
+                 leaderMember = thisMember;
+                 leadershipTermId = candidateTermId;
+                 state(LEADER_LOG_REPLICATION, nowNs, "quorum leader");
++                TlaTrace.emitNodeEvent("BecomeLeader", thisMember.id(),
++                    candidateTermId, leadershipTermId, state.name(),
++                    appendPosition, 0, notifiedCommitPosition, 0);
+             }
+             else
+             {
+@@ -1240,6 +1275,10 @@ class Election
+ 
+                 consensusPublisher.canvassPosition(
+                     member.publication(), logLeadershipTermId, appendPosition, leadershipTermId, thisMember.id());
++                TlaTrace.emitMsgEventWithFields("SendCanvassPosition",
++                    thisMember.id(), member.id(),
++                    candidateTermId, leadershipTermId, state.name(),
++                    logLeadershipTermId, appendPosition, leadershipTermId);
+             }
+         }
+     }

@@ -1,0 +1,373 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index e9d9fb8..1c9be68 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -11,6 +11,7 @@ option(USE_PTHREAD_EXIT "Call pthread_exit on server threads" OFF)
+ option(ADDRESS_SANITIZER "Enable address sanitizer" OFF)
+ option(THREAD_SANITIZER "Enable thread sanitizer" OFF)
+ option(BUILD_EXAMPLES "Build examples" ON)
++option(NURAFT_TLA_TRACE "Enable TLA+ trace instrumentation" OFF)
+ 
+ if(NOT CMAKE_CXX_STANDARD)
+     set(CMAKE_CXX_STANDARD 11)
+@@ -254,6 +255,11 @@ if(THREAD_SANITIZER)
+     message(STATUS "---- THREAD SANITIZER IS ON ----")
+ endif()
+ 
++if(NURAFT_TLA_TRACE)
++    add_compile_definitions(NURAFT_TLA_TRACE)
++    message(STATUS "---- TLA+ TRACE INSTRUMENTATION IS ON ----")
++endif()
++
+ if(CODE_COVERAGE)
+     APPEND_COVERAGE_COMPILER_FLAGS()
+     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fno-inline")
+diff --git a/src/handle_append_entries.cxx b/src/handle_append_entries.cxx
+index eb4b268..644ea2c 100644
+--- a/src/handle_append_entries.cxx
++++ b/src/handle_append_entries.cxx
+@@ -38,6 +38,10 @@ limitations under the License.
+ #include <cassert>
+ #include <sstream>
+ 
++#ifdef NURAFT_TLA_TRACE
++#include "tla_trace.hxx"
++#endif
++
+ namespace nuraft {
+ 
+ /**
+@@ -647,6 +651,21 @@ ptr<req_msg> raft_server::create_append_entries_req(ptr<peer>& pp ,
+     }
+     p.set_last_sent_idx(last_log_idx + 1);
+ 
++#ifdef NURAFT_TLA_TRACE
++    tla_trace::EventBuilder("AppendEntries", TLA_TRACE_NID)
++        .state(term, static_cast<int>(role_.load()),
++               commit_idx, sm_commit_index_.load(),
++               precommit_index_.load(),
++               cur_nxt_idx - 1,
++               term_for_log(cur_nxt_idx - 1))
++        .field_str("to", tla_trace::server_name(p.get_id()))
++        .field_int("prevLogIndex", (int64_t)last_log_idx)
++        .field_int("prevLogTerm", (int64_t)last_log_term)
++        .field_int("numEntries", (int64_t)(log_entries ? log_entries->size() : 0))
++        .field_int("commitIdx", (int64_t)commit_idx)
++        .emit();
++#endif
++
+     if (params->use_full_consensus_among_healthy_members_) {
+         // Full consensus mode: set flag indicating the member is excluded.
+         uint64_t last_resp_time_ms = p.get_resp_timer_us() / 1000;
+@@ -834,6 +853,15 @@ ptr<resp_msg> raft_server::handle_append_entries(req_msg& req)
+         }
+         resp->set_next_batch_size_hint_in_bytes(
+             state_machine_->get_next_batch_size_hint_in_bytes());
++#ifdef NURAFT_TLA_TRACE
++        tla_trace::EventBuilder("HandleAppendEntries", TLA_TRACE_NID)
++            .state(TLA_TRACE_STATE_ARGS)
++            .field_str("from", tla_trace::server_name(req.get_src()))
++            .field_int("msgTerm", (int64_t)req.get_term())
++            .field_bool("accepted", false)
++            .field_int("numEntries", (int64_t)req.log_entries().size())
++            .emit();
++#endif
+         return resp;
+     }
+ 
+@@ -1140,6 +1168,16 @@ ptr<resp_msg> raft_server::handle_append_entries(req_msg& req)
+ 
+     out_of_log_range_ = false;
+ 
++#ifdef NURAFT_TLA_TRACE
++    tla_trace::EventBuilder("HandleAppendEntries", TLA_TRACE_NID)
++        .state(TLA_TRACE_STATE_ARGS)
++        .field_str("from", tla_trace::server_name(req.get_src()))
++        .field_int("msgTerm", (int64_t)req.get_term())
++        .field_bool("accepted", true)
++        .field_int("numEntries", (int64_t)req.log_entries().size())
++        .emit();
++#endif
++
+     return resp;
+ }
+ 
+@@ -1227,6 +1265,16 @@ void raft_server::handle_append_entries_resp(resp_msg& resp) {
+             p->set_last_accepted_log_idx(new_matched_idx);
+         }
+ 
++#ifdef NURAFT_TLA_TRACE
++        tla_trace::EventBuilder("HandleAppendEntriesResponse", TLA_TRACE_NID)
++            .state(TLA_TRACE_STATE_ARGS)
++            .field_str("from", tla_trace::server_name(resp.get_src()))
++            .field_int("msgTerm", (int64_t)resp.get_term())
++            .field_bool("accepted", true)
++            .field_int("matchIndex", (int64_t)new_matched_idx)
++            .emit();
++#endif
++
+         bool sm_committed_idx_updated = false;
+         if (resp.get_ctx() &&
+             ctx_->get_params()->track_peers_sm_commit_idx_) {
+@@ -1301,7 +1349,18 @@ void raft_server::handle_append_entries_resp(resp_msg& resp) {
+         //   However, such decreased `committed_index` should not
+         //   cause any problem, as it will be gracefully handled in
+         //   `commit()` function below.
++#ifdef NURAFT_TLA_TRACE
++        ulong _ci_before = quick_commit_index_.load();
++#endif
+         commit( committed_index );
++#ifdef NURAFT_TLA_TRACE
++        if (quick_commit_index_.load() > _ci_before) {
++            tla_trace::EventBuilder("AdvanceCommitIndex", TLA_TRACE_NID)
++                .state(TLA_TRACE_STATE_ARGS)
++                .field_int("newCommitIndex", (int64_t)quick_commit_index_.load())
++                .emit();
++        }
++#endif
+ 
+         // As commit might send requests, so refresh streamed log idx here
+         last_streamed_log_idx = p->get_last_streamed_log_idx();
+diff --git a/src/handle_client_request.cxx b/src/handle_client_request.cxx
+index a4815be..51fb863 100644
+--- a/src/handle_client_request.cxx
++++ b/src/handle_client_request.cxx
+@@ -33,6 +33,10 @@ limitations under the License.
+ #include <chrono>
+ #include <sstream>
+ 
++#ifdef NURAFT_TLA_TRACE
++#include "tla_trace.hxx"
++#endif
++
+ namespace nuraft {
+ 
+ ptr<resp_msg> raft_server::handle_cli_req_prelock(req_msg& req,
+@@ -140,6 +144,12 @@ ptr<resp_msg> raft_server::handle_cli_req(req_msg& req,
+         log_store_->end_of_append_batch(last_idx - num_entries + 1, num_entries);
+     }
+     try_update_precommit_index(last_idx);
++#ifdef NURAFT_TLA_TRACE
++    tla_trace::EventBuilder("ClientRequest", TLA_TRACE_NID)
++        .state(TLA_TRACE_STATE_ARGS)
++        .field_int("logIndex", (int64_t)last_idx)
++        .emit();
++#endif
+     resp_idx = log_store_->next_slot();
+ 
+     // Finished appending logs and pre_commit of itself.
+diff --git a/src/handle_commit.cxx b/src/handle_commit.cxx
+index 2d87b5d..6de9b38 100644
+--- a/src/handle_commit.cxx
++++ b/src/handle_commit.cxx
+@@ -37,6 +37,10 @@ limitations under the License.
+ #include <sstream>
+ #include <random>
+ 
++#ifdef NURAFT_TLA_TRACE
++#include "tla_trace.hxx"
++#endif
++
+ namespace nuraft {
+ 
+ void raft_server::commit(ulong target_idx) {
+@@ -276,6 +280,14 @@ bool raft_server::commit_in_bg_exec(size_t timeout_ms) {
+ 
+         ulong exp_idx = index_to_commit - 1;
+         if (sm_commit_index_.compare_exchange_strong(exp_idx, index_to_commit)) {
++#ifdef NURAFT_TLA_TRACE
++            tla_trace::EventBuilder("CommitEntry", TLA_TRACE_NID)
++                .state(TLA_TRACE_STATE_ARGS)
++                .field_int("smCommitIndex", (int64_t)index_to_commit)
++                .field_str("entryType",
++                    (le->get_val_type() == log_val_type::app_log) ? "app" : "conf")
++                .emit();
++#endif
+             snapshot_and_compact(sm_commit_index_);
+ 
+             cb_func::Param param(id_, leader_);
+diff --git a/src/handle_vote.cxx b/src/handle_vote.cxx
+index 5052658..c954f03 100644
+--- a/src/handle_vote.cxx
++++ b/src/handle_vote.cxx
+@@ -31,6 +31,10 @@ limitations under the License.
+ #include <cassert>
+ #include <sstream>
+ 
++#ifdef NURAFT_TLA_TRACE
++#include "tla_trace.hxx"
++#endif
++
+ namespace nuraft {
+ 
+ bool raft_server::check_cond_for_zp_election() {
+@@ -131,6 +135,12 @@ void raft_server::request_prevote() {
+     // Count for myself.
+     pre_vote_.dead_++;
+ 
++#ifdef NURAFT_TLA_TRACE
++    tla_trace::EventBuilder("Timeout", TLA_TRACE_NID)
++        .state(TLA_TRACE_STATE_ARGS)
++        .emit();
++#endif
++
+     if ( my_priority_ < target_priority_ ) {
+         if ( check_cond_for_zp_election() ) {
+             p_in("[PRIORITY] temporarily allow election for zero-priority member");
+@@ -261,6 +271,16 @@ void raft_server::request_vote(bool force_vote) {
+     ctx_->state_mgr_->save_state(*state_);
+     votes_granted_ += 1;
+     votes_responded_ += 1;
++#ifdef NURAFT_TLA_TRACE
++    tla_trace::EventBuilder("InitiateVote", TLA_TRACE_NID)
++        .state(TLA_TRACE_STATE_ARGS)
++        .emit();
++    tla_trace::EventBuilder("PersistState", TLA_TRACE_NID)
++        .state(TLA_TRACE_STATE_ARGS)
++        .field_int("persistedTerm", (int64_t)state_->get_term())
++        .field_int("persistedVotedFor", (int64_t)state_->get_voted_for())
++        .emit();
++#endif
+     p_in("[VOTE INIT] my id %d, my role %s, term %" PRIu64 ", log idx %" PRIu64 ", "
+          "log term %" PRIu64 ", priority (target %d / mine %d)\n",
+          id_, srv_role_to_string(role_).c_str(),
+@@ -384,6 +404,17 @@ ptr<resp_msg> raft_server::handle_vote_req(req_msg& req) {
+         p_in("decision: X (deny), term %" PRIu64, resp->get_term());
+     }
+ 
++#ifdef NURAFT_TLA_TRACE
++    tla_trace::EventBuilder("HandleVoteRequest", TLA_TRACE_NID)
++        .state(TLA_TRACE_STATE_ARGS)
++        .field_str("from", tla_trace::server_name(req.get_src()))
++        .field_int("msgTerm", (int64_t)req.get_term())
++        .field_bool("granted", resp->get_accepted())
++        .field_int("lastLogIdx", (int64_t)req.get_last_log_idx())
++        .field_int("lastLogTerm", (int64_t)req.get_last_log_term())
++        .emit();
++#endif
++
+     return resp;
+ }
+ 
+@@ -410,6 +441,15 @@ void raft_server::handle_vote_resp(resp_msg& resp) {
+         election_completed_ = true;
+     }
+ 
++#ifdef NURAFT_TLA_TRACE
++    tla_trace::EventBuilder("HandleVoteResponse", TLA_TRACE_NID)
++        .state(TLA_TRACE_STATE_ARGS)
++        .field_str("from", tla_trace::server_name(resp.get_src()))
++        .field_int("msgTerm", (int64_t)resp.get_term())
++        .field_bool("accepted", resp.get_accepted())
++        .emit();
++#endif
++
+     int32 election_quorum_size = get_quorum_for_election() + 1;
+ 
+     p_in("[VOTE RESP] peer %d (%s), resp term %" PRIu64 ", my role %s, "
+@@ -475,6 +515,15 @@ ptr<resp_msg> raft_server::handle_prevote_req(req_msg& req) {
+         }
+     }
+ 
++#ifdef NURAFT_TLA_TRACE
++    tla_trace::EventBuilder("HandlePreVoteRequest", TLA_TRACE_NID)
++        .state(TLA_TRACE_STATE_ARGS)
++        .field_str("from", tla_trace::server_name(req.get_src()))
++        .field_int("msgTerm", (int64_t)req.get_term())
++        .field_bool("granted", resp->get_accepted())
++        .emit();
++#endif
++
+     return resp;
+ }
+ 
+@@ -503,6 +552,15 @@ void raft_server::handle_prevote_resp(resp_msg& resp) {
+         }
+     }
+ 
++#ifdef NURAFT_TLA_TRACE
++    tla_trace::EventBuilder("HandlePreVoteResponse", TLA_TRACE_NID)
++        .state(TLA_TRACE_STATE_ARGS)
++        .field_str("from", tla_trace::server_name(resp.get_src()))
++        .field_int("msgTerm", (int64_t)resp.get_term())
++        .field_bool("accepted", resp.get_accepted())
++        .emit();
++#endif
++
+     int32 election_quorum_size = get_quorum_for_election() + 1;
+ 
+     p_in("[PRE-VOTE RESP] peer %d (%s), term %" PRIu64 ", resp term %" PRIu64 ", "
+diff --git a/src/raft_server.cxx b/src/raft_server.cxx
+index 9af2775..62306df 100644
+--- a/src/raft_server.cxx
++++ b/src/raft_server.cxx
+@@ -42,6 +42,10 @@ limitations under the License.
+ #include <sstream>
+ #include <thread>
+ 
++#ifdef NURAFT_TLA_TRACE
++#include "tla_trace.hxx"
++#endif
++
+ namespace nuraft {
+ 
+ const int raft_server::default_snapshot_sync_block_size = 4 * 1024;
+@@ -163,6 +167,10 @@ raft_server::raft_server(context* ctx, const init_options& opt)
+     }
+     vote_init_timer_term_ = state_->get_term();
+ 
++#ifdef NURAFT_TLA_TRACE
++    tla_trace::TraceWriter::instance().init();
++#endif
++
+     ptr<cluster_config> c_conf = get_config();
+     std::stringstream init_msg;
+     init_msg << "   === INIT RAFT SERVER ===\n"
+@@ -1194,6 +1202,12 @@ void raft_server::become_leader() {
+         p_in("[BECOME LEADER] appended new config at %" PRIu64,
+              index_at_becoming_leader_.load());
+         config_changing_ = true;
++
++#ifdef NURAFT_TLA_TRACE
++        tla_trace::EventBuilder("BecomeLeader", TLA_TRACE_NID)
++            .state(TLA_TRACE_STATE_ARGS)
++            .emit();
++#endif
+     }
+ 
+     cb_func::Param param(id_, leader_);
+@@ -1578,6 +1592,13 @@ bool raft_server::update_term(ulong term) {
+         votes_granted_ = 0;
+         votes_responded_ = 0;
+         ctx_->state_mgr_->save_state(*state_);
++#ifdef NURAFT_TLA_TRACE
++        tla_trace::EventBuilder("PersistState", TLA_TRACE_NID)
++            .state(TLA_TRACE_STATE_ARGS)
++            .field_int("persistedTerm", (int64_t)state_->get_term())
++            .field_int("persistedVotedFor", (int64_t)state_->get_voted_for())
++            .emit();
++#endif
+         become_follower();
+         return true;
+     }
+diff --git a/tests/CMakeLists.txt b/tests/CMakeLists.txt
+index 7d6c8cc..3f94c4e 100644
+--- a/tests/CMakeLists.txt
++++ b/tests/CMakeLists.txt
+@@ -60,6 +60,16 @@ unit_test(NAME failure_test
+     ${EXAMPLES_SRC}/logger.cc
+     ${EXAMPLES_SRC}/in_memory_log_store.cxx)
+ 
++# === TLA+ Trace test ===
++unit_test(NAME trace_test
++    SOURCES
++    unit/test_trace.cxx
++    unit/fake_network.cxx
++    ${EXAMPLES_SRC}/logger.cc
++    ${EXAMPLES_SRC}/in_memory_log_store.cxx
++    SKIP
++)
++
+ # === ASIO network stuff test, only when ASIO is enabled ===
+ if(NOT DISABLE_ASIO)
+     unit_test(NAME asio_service_test

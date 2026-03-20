@@ -1,0 +1,361 @@
+diff --git a/hazelcast/src/main/java/com/hazelcast/cp/internal/raft/impl/RaftNodeImpl.java b/hazelcast/src/main/java/com/hazelcast/cp/internal/raft/impl/RaftNodeImpl.java
+index 1b965decd5..c037ef3633 100644
+--- a/hazelcast/src/main/java/com/hazelcast/cp/internal/raft/impl/RaftNodeImpl.java
++++ b/hazelcast/src/main/java/com/hazelcast/cp/internal/raft/impl/RaftNodeImpl.java
+@@ -748,6 +748,8 @@ public final class RaftNodeImpl implements RaftNode {
+         }
+ 
+         raftIntegration.send(request, follower);
++        TlaTraceLogger.emitMsg("AppendEntries", state.localEndpoint(), state.localEndpoint(), follower, state,
++            "\"prevLogIndex\":" + prevEntryIndex + ",\"prevLogTerm\":" + prevEntryTerm + ",\"entryCount\":" + entries.length + ",\"leaderCommitIndex\":" + state.commitIndex());
+ 
+         if (entries.length > 0 && entries[entries.length - 1].index() > leaderState.flushedLogIndex()) {
+             // if I am sending any non-flushed entry to the follower, I should trigger the flush task.
+@@ -1285,6 +1287,7 @@ public final class RaftNodeImpl implements RaftNode {
+             LogEntry entry = raftLog.getLogEntry(quorumMatchIndex);
+             if (entry.term() == state.term()) {
+                 commitEntries(quorumMatchIndex);
++                TlaTraceLogger.emit("AdvanceCommitIndex", state.localEndpoint(), state, "\"oldCommitIndex\":" + commitIndex + ",\"newCommitIndex\":" + quorumMatchIndex);
+                 return true;
+             } else if (logger.isFineEnabled()) {
+                 logger.fine("Cannot commit " + entry + " since an entry from the current term: " + state.term() + " is needed.");
+@@ -1332,6 +1335,7 @@ public final class RaftNodeImpl implements RaftNode {
+             runQuery(t.element1, t.element2);
+         }
+ 
++        TlaTraceLogger.emit("RunQueries", state.localEndpoint(), state, "\"queryCount\":" + operations.size() + ",\"queryRound\":" + queryState.queryRound());
+         queryState.reset();
+         return false;
+     }
+@@ -1374,6 +1378,7 @@ public final class RaftNodeImpl implements RaftNode {
+                 if (isHeartbeatTimedOut(state.leaderState().majorityAppendRequestAckTimestamp(state.majority()))) {
+                     logger.warning("Demoting to " + FOLLOWER + " since not received acks from majority recently...");
+                     toFollower(state.term());
++                    TlaTraceLogger.emit("LeaderCheckLease", state.localEndpoint(), state, null);
+                     invalidateFuturesUntil(state.log().lastLogOrSnapshotIndex(), new StaleAppendRequestException(null));
+                     return;
+                 }
+diff --git a/hazelcast/src/main/java/com/hazelcast/cp/internal/raft/impl/handler/AppendFailureResponseHandlerTask.java b/hazelcast/src/main/java/com/hazelcast/cp/internal/raft/impl/handler/AppendFailureResponseHandlerTask.java
+index fc74f60424..9822bdec6f 100644
+--- a/hazelcast/src/main/java/com/hazelcast/cp/internal/raft/impl/handler/AppendFailureResponseHandlerTask.java
++++ b/hazelcast/src/main/java/com/hazelcast/cp/internal/raft/impl/handler/AppendFailureResponseHandlerTask.java
+@@ -18,6 +18,7 @@ package com.hazelcast.cp.internal.raft.impl.handler;
+ 
+ import com.hazelcast.cp.internal.raft.impl.RaftEndpoint;
+ import com.hazelcast.cp.internal.raft.impl.RaftNodeImpl;
++import com.hazelcast.cp.internal.raft.impl.TlaTraceLogger;
+ import com.hazelcast.cp.internal.raft.impl.dto.AppendFailureResponse;
+ import com.hazelcast.cp.internal.raft.impl.dto.AppendRequest;
+ import com.hazelcast.cp.internal.raft.impl.dto.AppendSuccessResponse;
+@@ -64,6 +65,7 @@ public class AppendFailureResponseHandlerTask extends AbstractResponseHandlerTas
+             // If RPC request or response contains term T > currentTerm: set currentTerm = T, convert to follower (§5.1)
+             logger.info("Demoting to FOLLOWER after " + resp + " from current term: " + state.term());
+             raftNode.toFollower(resp.term());
++            TlaTraceLogger.emitMsg("HandleAppendFailureResponse", state.localEndpoint(), resp.follower(), state.localEndpoint(), state, null);
+             return;
+         }
+ 
+@@ -74,6 +76,7 @@ public class AppendFailureResponseHandlerTask extends AbstractResponseHandlerTas
+         if (updateNextIndex(state)) {
+             raftNode.sendAppendRequest(resp.follower());
+         }
++        TlaTraceLogger.emitMsg("HandleAppendFailureResponse", state.localEndpoint(), resp.follower(), state.localEndpoint(), state, null);
+     }
+ 
+     private boolean updateNextIndex(RaftState state) {
+diff --git a/hazelcast/src/main/java/com/hazelcast/cp/internal/raft/impl/handler/AppendRequestHandlerTask.java b/hazelcast/src/main/java/com/hazelcast/cp/internal/raft/impl/handler/AppendRequestHandlerTask.java
+index 7f0f4779c6..31ac94a257 100644
+--- a/hazelcast/src/main/java/com/hazelcast/cp/internal/raft/impl/handler/AppendRequestHandlerTask.java
++++ b/hazelcast/src/main/java/com/hazelcast/cp/internal/raft/impl/handler/AppendRequestHandlerTask.java
+@@ -27,6 +27,7 @@ import com.hazelcast.cp.internal.raft.impl.dto.AppendSuccessResponse;
+ import com.hazelcast.cp.internal.raft.impl.log.LogEntry;
+ import com.hazelcast.cp.internal.raft.impl.log.RaftLog;
+ import com.hazelcast.cp.internal.raft.impl.state.RaftState;
++import com.hazelcast.cp.internal.raft.impl.TlaTraceLogger;
+ import com.hazelcast.cp.internal.raft.impl.task.RaftNodeStatusAwareTask;
+ 
+ import java.util.ArrayList;
+@@ -74,6 +75,7 @@ public class AppendRequestHandlerTask extends RaftNodeStatusAwareTask implements
+                 logger.warning("Stale " + req + " received in current term: " + state.term());
+             }
+ 
++            TlaTraceLogger.emitMsg("HandleAppendRequest", localMember(), req.leader(), localMember(), state, "\"success\":false");
+             raftNode.send(createFailureResponse(state.term()), req.leader());
+             return;
+         }
+@@ -109,6 +111,7 @@ public class AppendRequestHandlerTask extends RaftNodeStatusAwareTask implements
+                         logger.warning("Failed to get previous log index for " + req + ", last log index: " + lastLogIndex);
+                     }
+ 
++                    TlaTraceLogger.emitMsg("HandleAppendRequest", localMember(), req.leader(), localMember(), state, "\"success\":false");
+                     raftNode.send(createFailureResponse(req.term()), req.leader());
+                     return;
+                 }
+@@ -120,6 +123,7 @@ public class AppendRequestHandlerTask extends RaftNodeStatusAwareTask implements
+                     logger.warning("Previous log term of " + req + " is different than ours: " + prevLogTerm);
+                 }
+ 
++                TlaTraceLogger.emitMsg("HandleAppendRequest", localMember(), req.leader(), localMember(), state, "\"success\":false");
+                 raftNode.send(createFailureResponse(req.term()), req.leader());
+                 return;
+             }
+@@ -207,6 +211,7 @@ public class AppendRequestHandlerTask extends RaftNodeStatusAwareTask implements
+             AppendSuccessResponse resp = new AppendSuccessResponse(localMember(), state.term(), lastLogIndex,
+                     req.queryRound(), req.flowControlSequenceNumber());
+             raftNode.send(resp, req.leader());
++            TlaTraceLogger.emitMsg("HandleAppendRequest", localMember(), req.leader(), localMember(), state, "\"success\":true");
+         } finally {
+             if (state.commitIndex() > oldCommitIndex) {
+                 raftNode.applyLogEntries();
+diff --git a/hazelcast/src/main/java/com/hazelcast/cp/internal/raft/impl/handler/AppendSuccessResponseHandlerTask.java b/hazelcast/src/main/java/com/hazelcast/cp/internal/raft/impl/handler/AppendSuccessResponseHandlerTask.java
+index 2b31d596b8..b681d600d3 100644
+--- a/hazelcast/src/main/java/com/hazelcast/cp/internal/raft/impl/handler/AppendSuccessResponseHandlerTask.java
++++ b/hazelcast/src/main/java/com/hazelcast/cp/internal/raft/impl/handler/AppendSuccessResponseHandlerTask.java
+@@ -18,6 +18,7 @@ package com.hazelcast.cp.internal.raft.impl.handler;
+ 
+ import com.hazelcast.cp.internal.raft.impl.RaftEndpoint;
+ import com.hazelcast.cp.internal.raft.impl.RaftNodeImpl;
++import com.hazelcast.cp.internal.raft.impl.TlaTraceLogger;
+ import com.hazelcast.cp.internal.raft.impl.dto.AppendFailureResponse;
+ import com.hazelcast.cp.internal.raft.impl.dto.AppendRequest;
+ import com.hazelcast.cp.internal.raft.impl.dto.AppendSuccessResponse;
+@@ -76,6 +77,7 @@ public class AppendSuccessResponseHandlerTask extends AbstractResponseHandlerTas
+         }
+ 
+         checkIfQueryAckNeeded(state);
++        TlaTraceLogger.emitMsg("HandleAppendSuccessResponse", state.localEndpoint(), resp.follower(), state.localEndpoint(), state, "\"matchIndex\":" + state.leaderState().getFollowerState(resp.follower()).matchIndex());
+     }
+ 
+     private boolean updateFollowerIndices(RaftState state) {
+diff --git a/hazelcast/src/main/java/com/hazelcast/cp/internal/raft/impl/handler/PreVoteRequestHandlerTask.java b/hazelcast/src/main/java/com/hazelcast/cp/internal/raft/impl/handler/PreVoteRequestHandlerTask.java
+index 3d22af77a7..65a904e33c 100644
+--- a/hazelcast/src/main/java/com/hazelcast/cp/internal/raft/impl/handler/PreVoteRequestHandlerTask.java
++++ b/hazelcast/src/main/java/com/hazelcast/cp/internal/raft/impl/handler/PreVoteRequestHandlerTask.java
+@@ -23,6 +23,7 @@ import com.hazelcast.cp.internal.raft.impl.dto.PreVoteResponse;
+ import com.hazelcast.cp.internal.raft.impl.log.RaftLog;
+ import com.hazelcast.cp.internal.raft.impl.state.RaftState;
+ import com.hazelcast.cp.internal.raft.impl.task.PreVoteTask;
++import com.hazelcast.cp.internal.raft.impl.TlaTraceLogger;
+ import com.hazelcast.cp.internal.raft.impl.task.RaftNodeStatusAwareTask;
+ 
+ /**
+@@ -55,6 +56,7 @@ public class PreVoteRequestHandlerTask extends RaftNodeStatusAwareTask implement
+         // Reply false if term < currentTerm (§5.1)
+         if (state.term() > req.nextTerm()) {
+             logger.info("Rejecting " + req + " since current term: " + state.term() + " is bigger");
++            TlaTraceLogger.emitMsg("HandlePreVoteRequest", localEndpoint, req.candidate(), localEndpoint, state, "\"granted\":false");
+             raftNode.send(new PreVoteResponse(localEndpoint, state.term(), false), req.candidate());
+             return;
+         }
+@@ -62,6 +64,7 @@ public class PreVoteRequestHandlerTask extends RaftNodeStatusAwareTask implement
+         // Reply false if the leader is available (leader stickiness)
+         if (raftNode.isLeaderAvailable()) {
+             logger.info("Rejecting " + req + " since received append entries recently.");
++            TlaTraceLogger.emitMsg("HandlePreVoteRequest", localEndpoint, req.candidate(), localEndpoint, state, "\"granted\":false");
+             raftNode.send(new PreVoteResponse(localEndpoint, state.term(), false), req.candidate());
+             return;
+         }
+@@ -69,17 +72,20 @@ public class PreVoteRequestHandlerTask extends RaftNodeStatusAwareTask implement
+         RaftLog raftLog = state.log();
+         if (raftLog.lastLogOrSnapshotTerm() > req.lastLogTerm()) {
+             logger.info("Rejecting " + req + " since our last log term: " + raftLog.lastLogOrSnapshotTerm() + " is greater");
++            TlaTraceLogger.emitMsg("HandlePreVoteRequest", localEndpoint, req.candidate(), localEndpoint, state, "\"granted\":false");
+             raftNode.send(new PreVoteResponse(localEndpoint, req.nextTerm(), false), req.candidate());
+             return;
+         }
+ 
+         if (raftLog.lastLogOrSnapshotTerm() == req.lastLogTerm() && raftLog.lastLogOrSnapshotIndex() > req.lastLogIndex()) {
+             logger.info("Rejecting " + req + " since our last log index: " + raftLog.lastLogOrSnapshotIndex() + " is greater");
++            TlaTraceLogger.emitMsg("HandlePreVoteRequest", localEndpoint, req.candidate(), localEndpoint, state, "\"granted\":false");
+             raftNode.send(new PreVoteResponse(localEndpoint, req.nextTerm(), false), req.candidate());
+             return;
+         }
+ 
+         logger.info("Granted pre-vote for " + req);
++        TlaTraceLogger.emitMsg("HandlePreVoteRequest", localEndpoint, req.candidate(), localEndpoint, state, "\"granted\":true");
+         raftNode.send(new PreVoteResponse(localEndpoint, req.nextTerm(), true), req.candidate());
+     }
+ }
+diff --git a/hazelcast/src/main/java/com/hazelcast/cp/internal/raft/impl/handler/PreVoteResponseHandlerTask.java b/hazelcast/src/main/java/com/hazelcast/cp/internal/raft/impl/handler/PreVoteResponseHandlerTask.java
+index 5b2fb0413d..42e083412f 100644
+--- a/hazelcast/src/main/java/com/hazelcast/cp/internal/raft/impl/handler/PreVoteResponseHandlerTask.java
++++ b/hazelcast/src/main/java/com/hazelcast/cp/internal/raft/impl/handler/PreVoteResponseHandlerTask.java
+@@ -21,6 +21,7 @@ import com.hazelcast.cp.internal.raft.impl.RaftNodeImpl;
+ import com.hazelcast.cp.internal.raft.impl.dto.PreVoteResponse;
+ import com.hazelcast.cp.internal.raft.impl.state.CandidateState;
+ import com.hazelcast.cp.internal.raft.impl.state.RaftState;
++import com.hazelcast.cp.internal.raft.impl.TlaTraceLogger;
+ import com.hazelcast.cp.internal.raft.impl.task.LeaderElectionTask;
+ 
+ import static com.hazelcast.cp.internal.raft.impl.RaftRole.FOLLOWER;
+@@ -71,6 +72,9 @@ public class PreVoteResponseHandlerTask extends AbstractResponseHandlerTask {
+         if (preCandidateState.isMajorityGranted()) {
+             logger.info("We have the majority during pre-vote phase. Let's start real election!");
+             new LeaderElectionTask(raftNode, false).run();
++            TlaTraceLogger.emitMsg("HandlePreVoteResponse", localMember(), resp.voter(), localMember(), state, "\"elected\":true");
++        } else {
++            TlaTraceLogger.emitMsg("HandlePreVoteResponse", localMember(), resp.voter(), localMember(), state, "\"elected\":false");
+         }
+     }
+ 
+diff --git a/hazelcast/src/main/java/com/hazelcast/cp/internal/raft/impl/handler/VoteRequestHandlerTask.java b/hazelcast/src/main/java/com/hazelcast/cp/internal/raft/impl/handler/VoteRequestHandlerTask.java
+index 8f506b8f56..e9bc4d8949 100644
+--- a/hazelcast/src/main/java/com/hazelcast/cp/internal/raft/impl/handler/VoteRequestHandlerTask.java
++++ b/hazelcast/src/main/java/com/hazelcast/cp/internal/raft/impl/handler/VoteRequestHandlerTask.java
+@@ -23,6 +23,7 @@ import com.hazelcast.cp.internal.raft.impl.dto.VoteResponse;
+ import com.hazelcast.cp.internal.raft.impl.log.RaftLog;
+ import com.hazelcast.cp.internal.raft.impl.state.RaftState;
+ import com.hazelcast.cp.internal.raft.impl.task.LeaderElectionTask;
++import com.hazelcast.cp.internal.raft.impl.TlaTraceLogger;
+ import com.hazelcast.cp.internal.raft.impl.task.RaftNodeStatusAwareTask;
+ 
+ import static com.hazelcast.cp.internal.raft.impl.RaftRole.FOLLOWER;
+@@ -63,6 +64,7 @@ public class VoteRequestHandlerTask extends RaftNodeStatusAwareTask implements R
+         // Since current leader may have restarted by recovering its persistent state.
+         if (!req.isDisruptive() && raftNode.isLeaderAvailable() && !req.candidate().equals(state.leader())) {
+             logger.info("Rejecting " + req + " since received append entries recently.");
++            TlaTraceLogger.emitMsg("HandleVoteRequest", localMember, req.candidate(), localMember, state, "\"granted\":false");
+             raftNode.send(new VoteResponse(localMember, state.term(), false), req.candidate());
+             return;
+         }
+@@ -70,6 +72,7 @@ public class VoteRequestHandlerTask extends RaftNodeStatusAwareTask implements R
+         // Reply false if term < currentTerm (§5.1)
+         if (state.term() > req.term()) {
+             logger.info("Rejecting " + req + " since current term: " + state.term() + " is bigger");
++            TlaTraceLogger.emitMsg("HandleVoteRequest", localMember, req.candidate(), localMember, state, "\"granted\":false");
+             raftNode.send(new VoteResponse(localMember, state.term(), false), req.candidate());
+             return;
+         }
+@@ -87,6 +90,7 @@ public class VoteRequestHandlerTask extends RaftNodeStatusAwareTask implements R
+ 
+         if (state.leader() != null && !req.candidate().equals(state.leader())) {
+             logger.warning("Rejecting " + req + " since we have a leader: " + state.leader());
++            TlaTraceLogger.emitMsg("HandleVoteRequest", localMember, req.candidate(), localMember, state, "\"granted\":false");
+             raftNode.send(new VoteResponse(localMember, req.term(), false), req.candidate());
+             return;
+         }
+@@ -98,6 +102,7 @@ public class VoteRequestHandlerTask extends RaftNodeStatusAwareTask implements R
+             } else {
+                 logger.info("Duplicate " + req + ". currently voted-for: " + state.votedFor());
+             }
++            TlaTraceLogger.emitMsg("HandleVoteRequest", localMember, req.candidate(), localMember, state, "\"granted\":" + granted);
+             raftNode.send(new VoteResponse(localMember, req.term(), granted), req.candidate());
+             return;
+         }
+@@ -105,12 +110,14 @@ public class VoteRequestHandlerTask extends RaftNodeStatusAwareTask implements R
+         RaftLog raftLog = state.log();
+         if (raftLog.lastLogOrSnapshotTerm() > req.lastLogTerm()) {
+             logger.info("Rejecting " + req + " since our last log term: " + raftLog.lastLogOrSnapshotTerm() + " is greater");
++            TlaTraceLogger.emitMsg("HandleVoteRequest", localMember, req.candidate(), localMember, state, "\"granted\":false");
+             raftNode.send(new VoteResponse(localMember, req.term(), false), req.candidate());
+             return;
+         }
+ 
+         if (raftLog.lastLogOrSnapshotTerm() == req.lastLogTerm() && raftLog.lastLogOrSnapshotIndex() > req.lastLogIndex()) {
+             logger.info("Rejecting " + req + " since our last log index: " + raftLog.lastLogOrSnapshotIndex() + " is greater");
++            TlaTraceLogger.emitMsg("HandleVoteRequest", localMember, req.candidate(), localMember, state, "\"granted\":false");
+             raftNode.send(new VoteResponse(localMember, req.term(), false), req.candidate());
+             return;
+         }
+@@ -118,6 +125,7 @@ public class VoteRequestHandlerTask extends RaftNodeStatusAwareTask implements R
+         logger.info("Granted vote for " + req);
+         state.persistVote(req.term(), req.candidate());
+ 
++        TlaTraceLogger.emitMsg("HandleVoteRequest", localMember, req.candidate(), localMember, state, "\"granted\":true");
+         raftNode.send(new VoteResponse(localMember, req.term(), true), req.candidate());
+     }
+ }
+diff --git a/hazelcast/src/main/java/com/hazelcast/cp/internal/raft/impl/handler/VoteResponseHandlerTask.java b/hazelcast/src/main/java/com/hazelcast/cp/internal/raft/impl/handler/VoteResponseHandlerTask.java
+index d9fe8b941b..8c1c2ed93b 100644
+--- a/hazelcast/src/main/java/com/hazelcast/cp/internal/raft/impl/handler/VoteResponseHandlerTask.java
++++ b/hazelcast/src/main/java/com/hazelcast/cp/internal/raft/impl/handler/VoteResponseHandlerTask.java
+@@ -22,6 +22,7 @@ import com.hazelcast.cp.internal.raft.impl.RaftNodeImpl;
+ import com.hazelcast.cp.internal.raft.impl.RaftRole;
+ import com.hazelcast.cp.internal.raft.impl.dto.VoteRequest;
+ import com.hazelcast.cp.internal.raft.impl.dto.VoteResponse;
++import com.hazelcast.cp.internal.raft.impl.TlaTraceLogger;
+ import com.hazelcast.cp.internal.raft.impl.state.CandidateState;
+ import com.hazelcast.cp.internal.raft.impl.state.RaftState;
+ 
+@@ -64,6 +65,7 @@ public class VoteResponseHandlerTask extends AbstractResponseHandlerTask {
+             logger.info("Demoting to FOLLOWER from current term: " + state.term() + " to new term: " + resp.term()
+                     + " after " + resp);
+             raftNode.toFollower(resp.term());
++            TlaTraceLogger.emitMsg("HandleVoteResponse", localMember(), resp.voter(), localMember(), state, "\"becameLeader\":false");
+             return;
+         }
+ 
+@@ -81,6 +83,9 @@ public class VoteResponseHandlerTask extends AbstractResponseHandlerTask {
+         if (candidateState.isMajorityGranted()) {
+             logger.info("We are the LEADER!");
+             raftNode.toLeader();
++            TlaTraceLogger.emitMsg("HandleVoteResponse", localMember(), resp.voter(), localMember(), state, "\"becameLeader\":true");
++        } else {
++            TlaTraceLogger.emitMsg("HandleVoteResponse", localMember(), resp.voter(), localMember(), state, "\"becameLeader\":false");
+         }
+     }
+ 
+diff --git a/hazelcast/src/main/java/com/hazelcast/cp/internal/raft/impl/task/PreVoteTask.java b/hazelcast/src/main/java/com/hazelcast/cp/internal/raft/impl/task/PreVoteTask.java
+index b485e228dd..0402273cb1 100644
+--- a/hazelcast/src/main/java/com/hazelcast/cp/internal/raft/impl/task/PreVoteTask.java
++++ b/hazelcast/src/main/java/com/hazelcast/cp/internal/raft/impl/task/PreVoteTask.java
+@@ -18,6 +18,7 @@ package com.hazelcast.cp.internal.raft.impl.task;
+ 
+ import com.hazelcast.cp.internal.raft.impl.RaftEndpoint;
+ import com.hazelcast.cp.internal.raft.impl.RaftNodeImpl;
++import com.hazelcast.cp.internal.raft.impl.TlaTraceLogger;
+ import com.hazelcast.cp.internal.raft.impl.dto.PreVoteRequest;
+ import com.hazelcast.cp.internal.raft.impl.log.RaftLog;
+ import com.hazelcast.cp.internal.raft.impl.state.RaftState;
+@@ -61,6 +62,7 @@ public class PreVoteTask extends RaftNodeStatusAwareTask implements Runnable {
+         }
+ 
+         state.initPreCandidateState();
++        TlaTraceLogger.emit("Timeout", localMember(), state, null);
+         int nextTerm = state.term() + 1;
+         RaftLog log = state.log();
+         PreVoteRequest request = new PreVoteRequest(localMember(), nextTerm, log.lastLogOrSnapshotTerm(),
+diff --git a/hazelcast/src/main/java/com/hazelcast/cp/internal/raft/impl/task/QueryTask.java b/hazelcast/src/main/java/com/hazelcast/cp/internal/raft/impl/task/QueryTask.java
+index 4d202850dd..c53419252e 100644
+--- a/hazelcast/src/main/java/com/hazelcast/cp/internal/raft/impl/task/QueryTask.java
++++ b/hazelcast/src/main/java/com/hazelcast/cp/internal/raft/impl/task/QueryTask.java
+@@ -23,6 +23,7 @@ import com.hazelcast.cp.internal.raft.QueryPolicy;
+ import com.hazelcast.cp.internal.raft.command.RaftGroupCmd;
+ import com.hazelcast.cp.internal.raft.impl.RaftEndpoint;
+ import com.hazelcast.cp.internal.raft.impl.RaftNodeImpl;
++import com.hazelcast.cp.internal.raft.impl.TlaTraceLogger;
+ import com.hazelcast.cp.internal.raft.impl.state.QueryState;
+ import com.hazelcast.cp.internal.raft.impl.state.RaftState;
+ import com.hazelcast.logging.ILogger;
+@@ -137,6 +138,8 @@ public class QueryTask implements Runnable {
+         if (queryState.addQuery(commitIndex, operation, resultFuture) == 1) {
+             raftNode.broadcastAppendRequest();
+         }
++        TlaTraceLogger.emit("SubmitLinearizableRead", raftNode.getLocalMember(), state,
++                "\"queryRound\":" + queryState.queryRound() + ",\"queryCommitIndex\":" + commitIndex);
+     }
+ 
+     private boolean verifyOperation() {
+diff --git a/hazelcast/src/main/java/com/hazelcast/cp/internal/raft/impl/task/ReplicateTask.java b/hazelcast/src/main/java/com/hazelcast/cp/internal/raft/impl/task/ReplicateTask.java
+index 4edd837564..bdf9db31ce 100644
+--- a/hazelcast/src/main/java/com/hazelcast/cp/internal/raft/impl/task/ReplicateTask.java
++++ b/hazelcast/src/main/java/com/hazelcast/cp/internal/raft/impl/task/ReplicateTask.java
+@@ -23,6 +23,7 @@ import com.hazelcast.cp.internal.raft.command.DestroyRaftGroupCmd;
+ import com.hazelcast.cp.internal.raft.impl.RaftEndpoint;
+ import com.hazelcast.cp.internal.raft.impl.RaftNodeImpl;
+ import com.hazelcast.cp.internal.raft.impl.RaftNodeStatus;
++import com.hazelcast.cp.internal.raft.impl.TlaTraceLogger;
+ import com.hazelcast.cp.internal.raft.impl.command.UpdateRaftGroupMembersCmd;
+ import com.hazelcast.cp.internal.raft.impl.log.LogEntry;
+ import com.hazelcast.cp.internal.raft.impl.log.RaftLog;
+@@ -95,6 +96,10 @@ public class ReplicateTask implements Runnable {
+             raftNode.registerFuture(newEntryLogIndex, resultFuture);
+             log.appendEntries(new LogEntry(state.term(), newEntryLogIndex, operation));
+ 
++            if (!(operation instanceof UpdateRaftGroupMembersCmd)) {
++                TlaTraceLogger.emit("ClientRequest", raftNode.getLocalMember(), state, null);
++            }
++
+             preApplyRaftGroupCmd(newEntryLogIndex, operation);
+ 
+             raftNode.broadcastAppendRequest();

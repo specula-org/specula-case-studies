@@ -1,0 +1,86 @@
+diff --git a/tests/unit/test_trace.cxx b/tests/unit/test_trace.cxx
+new file mode 100644
+index 0000000..1783220
+--- /dev/null
++++ b/tests/unit/test_trace.cxx
+@@ -0,0 +1,80 @@
++/************************************************************************
++ * TLA+ Trace Validation Test
++ *
++ * Runs a basic 3-node Raft scenario with NURAFT_TRACE_FILE set,
++ * producing an NDJSON trace for TLA+ validation.
++ ************************************************************************/
++
++#include "fake_network.hxx"
++#include "raft_package_fake.hxx"
++#include "fake_executer.hxx"
++
++#include "raft_params.hxx"
++#include "test_common.h"
++
++#include <cstdio>
++#include <cstdlib>
++
++using namespace nuraft;
++using namespace raft_functional_common;
++
++using raft_result = cmd_result< ptr<buffer> >;
++
++namespace trace_test {
++
++int basic_trace_test() {
++    reset_log_files();
++    ptr<FakeNetworkBase> f_base = cs_new<FakeNetworkBase>();
++
++    std::string s1_addr = "S1";
++    std::string s2_addr = "S2";
++    std::string s3_addr = "S3";
++
++    RaftPkg s1(f_base, 1, s1_addr);
++    RaftPkg s2(f_base, 2, s2_addr);
++    RaftPkg s3(f_base, 3, s3_addr);
++    std::vector<RaftPkg*> pkgs = {&s1, &s2, &s3};
++
++    // 1. Launch servers and form group (S1 becomes leader).
++    CHK_Z( launch_servers( pkgs ) );
++    CHK_Z( make_group( pkgs ) );
++
++    // S1 should be leader now.
++    CHK_TRUE( s1.raftServer->is_leader() );
++
++    // 2. Append client entries using the executer thread pattern.
++    ExecArgs exec_args(&s1);
++    TestSuite::ThreadHolder hh(&exec_args, fake_executer, fake_executer_killer);
++
++    for (int i = 0; i < 3; i++) {
++        std::string test_msg = "msg" + std::to_string(i);
++        ptr<buffer> msg = buffer::alloc(test_msg.size() + 1);
++        msg->put(test_msg);
++
++        {   std::lock_guard<std::mutex> l(exec_args.msgToWriteLock);
++            exec_args.msgToWrite = msg;
++        }
++        exec_args.eaExecuter.invoke();
++        TestSuite::sleep_ms(EXECUTOR_WAIT_MS, "wait for executor");
++
++        // Replicate: pre-commit and commit packets.
++        s1.fNet->execReqResp();
++        s1.fNet->execReqResp();
++        CHK_Z( wait_for_sm_exec(pkgs, COMMIT_TIMEOUT_SEC) );
++    }
++
++    // 3. Verify all state machines are in sync.
++    CHK_TRUE( s1.getTestSm()->isSame(*s2.getTestSm()) );
++    CHK_TRUE( s1.getTestSm()->isSame(*s3.getTestSm()) );
++
++    return 0;
++}
++
++}  // namespace trace_test
++
++int main(int argc, char** argv) {
++    TestSuite ts(argc, argv);
++    ts.options.printTestMessage = true;
++    ts.doTest("basic trace test", trace_test::basic_trace_test);
++    return 0;
++}
