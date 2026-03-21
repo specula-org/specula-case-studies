@@ -1,0 +1,393 @@
+diff --git a/Core/StringUtil.cc b/Core/StringUtil.cc
+index f99a1ab..bab90d0 100644
+--- a/Core/StringUtil.cc
++++ b/Core/StringUtil.cc
+@@ -22,6 +22,7 @@
+ #include <cassert>
+ #include <cctype>
+ #include <cstdarg>
++#include <cstdint>
+ #include <cstring>
+ #include <functional>
+ #include <locale>
+diff --git a/SConstruct b/SConstruct
+index b2f35e2..26e1b75 100644
+--- a/SConstruct
++++ b/SConstruct
+@@ -1,4 +1,7 @@
+-from distutils.version import LooseVersion as Version
++try:
++    from distutils.version import LooseVersion as Version
++except ImportError:
++    from packaging.version import Version
+ import re
+ import sys
+ import os
+@@ -92,13 +95,13 @@ def detect_compiler():
+ if env['CXX_FAMILY'].lower() == 'auto':
+     try:
+         detect_compiler()
+-        print 'Detected compiler %s %s' % (env['CXX_FAMILY'],
+-                                           env['CXX_VERSION'])
++        print('Detected compiler %s %s' % (env['CXX_FAMILY'],
++                                           env['CXX_VERSION']))
+     except BaseException as e:
+-        print 'Could not detect compiler: %s' % e
++        print('Could not detect compiler: %s' % e)
+         pass
+ 
+-CXX_STANDARD = 'c++11'
++CXX_STANDARD = 'c++17'
+ 
+ if (env['CXX_FAMILY'] == 'gcc' and
+     Version(env['CXX_VERSION']) < Version('4.7')):
+@@ -183,7 +186,7 @@ if env["BUILDTYPE"] == "DEBUG":
+ elif env["BUILDTYPE"] == "RELEASE":
+     env.Append(CPPFLAGS = [ "-DNDEBUG", "-O2" ])
+ else:
+-    print "Error BUILDTYPE must be RELEASE or DEBUG"
++    print("Error BUILDTYPE must be RELEASE or DEBUG")
+     sys.exit(-1)
+ 
+ if env["VERBOSE"] == "0":
+@@ -213,13 +216,13 @@ env.AddMethod(Protobuf)
+ def GetNumCPUs():
+     if env["NUMCPUS"] != "0":
+         return int(env["NUMCPUS"])
+-    if os.sysconf_names.has_key("SC_NPROCESSORS_ONLN"):
++    if "SC_NPROCESSORS_ONLN" in os.sysconf_names:
+         cpus = os.sysconf("SC_NPROCESSORS_ONLN")
+         if isinstance(cpus, int) and cpus > 0:
+             return 2*cpus
+         else:
+             return 2
+-    return 2*int(os.popen2("sysctl -n hw.ncpu")[1].read())
++    return 2*int(subprocess.check_output(["sysctl", "-n", "hw.ncpu"]).decode())
+ 
+ env.SetOption('num_jobs', GetNumCPUs())
+ 
+@@ -414,7 +417,7 @@ def remove_sources(env, target, source):
+             garbage.update(g.sources)
+     for g in garbage:
+         if env['VERBOSE'] == '1':
+-            print 'rm %s' % g
++            print('rm %s' % g)
+         try:
+             os.remove(str(g))
+         except OSError:
+@@ -423,7 +426,7 @@ def remove_sources(env, target, source):
+ # Rename PACKAGEROOT directory and subdirectories (should be empty)
+ def remove_packageroot(env, target, source):
+     if env['VERBOSE'] == '1':
+-        print 'rm -r %s' % PACKAGEROOT
++        print('rm -r %s' % PACKAGEROOT)
+     import shutil
+     shutil.rmtree(str(PACKAGEROOT))
+ 
+diff --git a/Server/RaftConsensus.cc b/Server/RaftConsensus.cc
+index 232298e..2e23af3 100644
+--- a/Server/RaftConsensus.cc
++++ b/Server/RaftConsensus.cc
+@@ -40,6 +40,9 @@
+ #include "Server/RaftConsensus.h"
+ #include "Server/Globals.h"
+ #include "Storage/LogFactory.h"
++#ifdef LOGCABIN_TLA_TRACE
++#include "Server/tla_trace.h"
++#endif
+ 
+ namespace LogCabin {
+ namespace Server {
+@@ -1124,6 +1127,13 @@ RaftConsensus::exit()
+     exiting = true;
+     if (configuration)
+         configuration->forEach(&Server::exit);
++#ifdef LOGCABIN_TLA_TRACE
++    if (TlaTrace::isEnabled()) {
++        TlaTrace::Event("Timeout", serverId)
++            .state(TLA_STATE())
++            .emit();
++    }
++#endif
+     interruptAll();
+ }
+ 
+@@ -1424,6 +1434,16 @@ RaftConsensus::handleAppendEntries(
+     // long disk writes
+     setElectionTimer();
+     withholdVotesUntil = Clock::now() + ELECTION_TIMEOUT;
++#ifdef LOGCABIN_TLA_TRACE
++    if (TlaTrace::isEnabled()) {
++        TlaTrace::Event("HandleAppendEntries", serverId)
++            .state(TLA_STATE())
++            .field("from", TlaTrace::nid(request.server_id()))
++            .field("success", response.success())
++            .field("lastLogIndex", static_cast<uint64_t>(response.last_log_index()))
++            .emit();
++    }
++#endif
+ }
+ 
+ void
+@@ -1519,6 +1539,15 @@ RaftConsensus::handleInstallSnapshot(
+         snapshotWriter.reset();
+         readSnapshot();
+         stateChanged.notify_all();
++#ifdef LOGCABIN_TLA_TRACE
++        if (TlaTrace::isEnabled()) {
++            TlaTrace::Event("HandleInstallSnapshot", serverId)
++                .state(TLA_STATE())
++                .field("from", TlaTrace::nid(request.server_id()))
++                .field("lastSnapshotIndex", lastSnapshotIndex)
++                .emit();
++        }
++#endif
+     }
+ }
+ 
+@@ -1579,6 +1608,15 @@ RaftConsensus::handleRequestVote(
+     response.set_granted(request.term() == currentTerm &&
+                          votedFor == request.server_id());
+     response.set_log_ok(logIsOk);
++#ifdef LOGCABIN_TLA_TRACE
++    if (TlaTrace::isEnabled()) {
++        TlaTrace::Event("HandleRequestVote", serverId)
++            .state(TLA_STATE())
++            .field("from", TlaTrace::nid(request.server_id()))
++            .field("granted", response.granted())
++            .emit();
++    }
++#endif
+ }
+ 
+ std::pair<RaftConsensus::ClientResult, uint64_t>
+@@ -1838,6 +1876,15 @@ RaftConsensus::snapshotDone(
+     const Log::Entry& lastEntry = log->getEntry(lastIncludedIndex);
+     lastSnapshotTerm = lastEntry.term();
+     lastSnapshotClusterTime = lastEntry.cluster_time();
++#ifdef LOGCABIN_TLA_TRACE
++    if (TlaTrace::isEnabled()) {
++        TlaTrace::Event("TakeSnapshot", serverId)
++            .state(TLA_STATE())
++            .field("lastSnapshotIndex", lastSnapshotIndex)
++            .field("lastSnapshotTerm", lastSnapshotTerm)
++            .emit();
++    }
++#endif
+ 
+     // It's easier to grab this configuration out of the manager again than to
+     // carry it around after writing the header.
+@@ -2044,6 +2091,15 @@ RaftConsensus::leaderDiskThreadMain()
+             }
+             if (state == State::LEADER && currentTerm == term) {
+                 configuration->localServer->lastSyncedIndex = sync->lastIndex;
++#ifdef LOGCABIN_TLA_TRACE
++                if (TlaTrace::isEnabled()) {
++                    TlaTrace::Event("LeaderDiskSync", serverId)
++                        .state(TLA_STATE())
++                        .field("lastSyncedIndex",
++                               configuration->localServer->lastSyncedIndex)
++                        .emit();
++                }
++#endif
+                 advanceCommitIndex();
+             }
+             log->syncComplete(std::move(sync));
+@@ -2196,6 +2252,14 @@ RaftConsensus::advanceCommitIndex()
+     VERBOSE("New commitIndex: %lu", commitIndex);
+     assert(commitIndex <= log->getLastLogIndex());
+     stateChanged.notify_all();
++#ifdef LOGCABIN_TLA_TRACE
++    if (TlaTrace::isEnabled()) {
++        TlaTrace::Event("AdvanceCommitIndex", serverId)
++            .state(TLA_STATE())
++            .field("newCommitIndex", commitIndex)
++            .emit();
++    }
++#endif
+ 
+     if (state == State::LEADER && commitIndex >= configuration->id) {
+         // Upon committing a configuration that excludes itself, the leader
+@@ -2288,6 +2352,17 @@ RaftConsensus::appendEntries(std::unique_lock<Mutex>& lockGuard,
+     Protocol::Raft::AppendEntries::Response response;
+     TimePoint start = Clock::now();
+     uint64_t epoch = currentEpoch;
++#ifdef LOGCABIN_TLA_TRACE
++    if (TlaTrace::isEnabled()) {
++        TlaTrace::Event("AppendEntries", serverId)
++            .state(TLA_STATE())
++            .field("from", TlaTrace::nid(serverId))
++            .field("to", TlaTrace::nid(peer.serverId))
++            .field("prevLogIndex", prevLogIndex)
++            .field("numEntries", numEntries)
++            .emit();
++    }
++#endif
+     Peer::CallStatus status = peer.callRPC(
+                 Protocol::Raft::OpCode::APPEND_ENTRIES,
+                 request, response,
+@@ -2336,6 +2411,16 @@ RaftConsensus::appendEntries(std::unique_lock<Mutex>& lockGuard,
+             }
+             peer.nextIndex = peer.matchIndex + 1;
+             peer.suppressBulkData = false;
++#ifdef LOGCABIN_TLA_TRACE
++            if (TlaTrace::isEnabled()) {
++                TlaTrace::Event("HandleAppendEntriesResponse", serverId)
++                    .state(TLA_STATE())
++                    .field("from", TlaTrace::nid(peer.serverId))
++                    .field("success", true)
++                    .field("matchIndex", peer.matchIndex)
++                    .emit();
++            }
++#endif
+ 
+             if (!peer.isCaughtUp_ &&
+                 peer.thisCatchUpIterationGoalId <= peer.matchIndex) {
+@@ -2356,6 +2441,16 @@ RaftConsensus::appendEntries(std::unique_lock<Mutex>& lockGuard,
+                 }
+             }
+         } else {
++#ifdef LOGCABIN_TLA_TRACE
++            if (TlaTrace::isEnabled()) {
++                TlaTrace::Event("HandleAppendEntriesResponse", serverId)
++                    .state(TLA_STATE())
++                    .field("from", TlaTrace::nid(peer.serverId))
++                    .field("success", false)
++                    .field("matchIndex", peer.matchIndex)
++                    .emit();
++            }
++#endif
+             if (peer.nextIndex > 1)
+                 --peer.nextIndex;
+             // A server that hasn't been around for a while might have a much
+@@ -2427,6 +2522,17 @@ RaftConsensus::installSnapshot(std::unique_lock<Mutex>& lockGuard,
+     Protocol::Raft::InstallSnapshot::Response response;
+     TimePoint start = Clock::now();
+     uint64_t epoch = currentEpoch;
++#ifdef LOGCABIN_TLA_TRACE
++    if (TlaTrace::isEnabled() && request.byte_offset() == 0) {
++        TlaTrace::Event("InstallSnapshot", serverId)
++            .state(TLA_STATE())
++            .field("from", TlaTrace::nid(serverId))
++            .field("to", TlaTrace::nid(peer.serverId))
++            .field("lastSnapshotIndex",
++                   static_cast<uint64_t>(request.last_snapshot_index()))
++            .emit();
++    }
++#endif
+     Peer::CallStatus status = peer.callRPC(
+                 Protocol::Raft::OpCode::INSTALL_SNAPSHOT,
+                 request, response,
+@@ -2484,6 +2590,15 @@ RaftConsensus::installSnapshot(std::unique_lock<Mutex>& lockGuard,
+             advanceCommitIndex();
+             peer.snapshotFile.reset();
+             peer.snapshotFileOffset = 0;
++#ifdef LOGCABIN_TLA_TRACE
++            if (TlaTrace::isEnabled()) {
++                TlaTrace::Event("HandleInstallSnapshotResponse", serverId)
++                    .state(TLA_STATE())
++                    .field("from", TlaTrace::nid(peer.serverId))
++                    .field("matchIndex", peer.matchIndex)
++                    .emit();
++            }
++#endif
+             peer.lastSnapshotIndex = 0;
+         }
+     }
+@@ -2525,6 +2640,13 @@ RaftConsensus::becomeLeader()
+ 
+     // Outstanding RequestVote RPCs are no longer needed.
+     interruptAll();
++#ifdef LOGCABIN_TLA_TRACE
++    if (TlaTrace::isEnabled()) {
++        TlaTrace::Event("BecomeLeader", serverId)
++            .state(TLA_STATE())
++            .emit();
++    }
++#endif
+ }
+ 
+ void
+@@ -2747,6 +2869,14 @@ RaftConsensus::replicateEntry(Log::Entry& entry,
+         entry.set_cluster_time(clusterClock.leaderStamp());
+         append({&entry});
+         uint64_t index = log->getLastLogIndex();
++#ifdef LOGCABIN_TLA_TRACE
++        if (TlaTrace::isEnabled() &&
++            entry.type() == Protocol::Raft::EntryType::DATA) {
++            TlaTrace::Event("ClientRequest", serverId)
++                .state(TLA_STATE())
++                .emit();
++        }
++#endif
+         while (!exiting && currentTerm == entry.term()) {
+             if (commitIndex >= index) {
+                 VERBOSE("replicate succeeded");
+@@ -2809,11 +2939,29 @@ RaftConsensus::requestVote(std::unique_lock<Mutex>& lockGuard, Peer& peer)
+             peer.haveVote_ = true;
+             NOTICE("Got vote from server %lu for term %lu",
+                    peer.serverId, currentTerm);
++#ifdef LOGCABIN_TLA_TRACE
++            if (TlaTrace::isEnabled()) {
++                TlaTrace::Event("HandleRequestVoteResponse", serverId)
++                    .state(TLA_STATE())
++                    .field("from", TlaTrace::nid(peer.serverId))
++                    .field("granted", true)
++                    .emit();
++            }
++#endif
+             if (configuration->quorumAll(&Server::haveVote))
+                 becomeLeader();
+         } else {
+             NOTICE("Vote denied by server %lu for term %lu",
+                    peer.serverId, currentTerm);
++#ifdef LOGCABIN_TLA_TRACE
++            if (TlaTrace::isEnabled()) {
++                TlaTrace::Event("HandleRequestVoteResponse", serverId)
++                    .state(TLA_STATE())
++                    .field("from", TlaTrace::nid(peer.serverId))
++                    .field("granted", false)
++                    .emit();
++            }
++#endif
+         }
+     }
+ }
+@@ -2896,6 +3044,13 @@ RaftConsensus::startNewElection()
+         snapshotWriter.reset();
+     }
+     updateLogMetadata();
++#ifdef LOGCABIN_TLA_TRACE
++    if (TlaTrace::isEnabled()) {
++        TlaTrace::Event("Timeout", serverId)
++            .state(TLA_STATE())
++            .emit();
++    }
++#endif
+     interruptAll();
+ 
+     // if we're the only server, this election is already done
+diff --git a/Server/SConscript b/Server/SConscript
+index c7a9364..2d05928 100644
+--- a/Server/SConscript
++++ b/Server/SConscript
+@@ -9,6 +9,7 @@ src = [
+     "RaftService.cc",
+     "ServerStats.cc",
+     "StateMachine.cc",
++    "tla_trace.cc",
+ ]
+ object_files['Server'] = (env.StaticObject(src) +
+                           env.Protobuf("SnapshotMetadata.proto") +
+diff --git a/include/LogCabin/Client.h b/include/LogCabin/Client.h
+index 15a7b44..a24eae2 100644
+--- a/include/LogCabin/Client.h
++++ b/include/LogCabin/Client.h
+@@ -23,6 +23,7 @@
+ #include <memory>
+ #include <map>
+ #include <mutex>
++#include <stdexcept>
+ #include <string>
+ #include <vector>
+ 
