@@ -1,8 +1,6 @@
 # Additional Potential Issues in Autobahn BFT
 
-Following our earlier exchange regarding the QC proposal binding issue and the view change winning-view selection issue, we continued studying the Autobahn codebase and identified several additional observations that we wanted to share. We describe them below in detail so that you can evaluate whether they are relevant to your implementation.
-
-All line references are to the `autobahn-artifact` repository as published.
+Following our earlier exchange regarding the QC proposal binding issue and the view change winning-view selection issue, we continued studying the Autobahn codebase and identified several additional observations that we wanted to share. We describe them below in detail so that you can evaluate whether they are relevant to your implementation and current threat model.
 
 ---
 
@@ -31,7 +29,7 @@ ConsensusMessage::Commit { slot: _, view: _, qc: _, proposals } => {
 
 The `proposals` field is defined as `HashMap<PublicKey, Proposal>` in the `ConsensusMessage` enum (`messages.rs`, lines 101, 107, 113). Each entry represents one validator's "lane" — a chain of headers to deliver. The iteration order determines which validator's headers appear first in the output.
 
-Since `HashMap` iteration order depends on internal hash state and can differ across process instances, two replicas receiving the same `Commit` message may iterate the proposals in different orders and produce different output sequences.
+In practice this may not lead to an issue if lanes are considered parallel, but `main.rs` (line 177) implies the list of certificates should be ordered.
 
 ### Possible Scenario
 
@@ -68,11 +66,11 @@ Replacing `HashMap<PublicKey, Proposal>` with `BTreeMap<PublicKey, Proposal>` in
 
 ### Summary
 
-We noticed that `Timeout::digest()` creates a SHA-512 hash but does not feed any of the timeout's fields (slot, view, high_qc, high_prop) into the hasher. As a result, all Timeout messages appear to produce the same digest regardless of their content. If our reading is correct, this would mean that timeout signatures do not bind to the timeout's actual slot, view, or QC evidence, and a signed timeout could be replayed across different slots and views.
+We noticed that `Timeout::digest()` creates a SHA-512 hash but does not feed any of the timeout's fields into the hasher. As a result, all Timeout messages appear to produce the same digest regardless of their content. If our reading is correct, this would mean a signed timeout could be replayed across different slots and views.
 
 ### Observation
 
-In `messages.rs`, lines 1349–1358, the `Hash` implementation for `Timeout`:
+In `messages.rs`, lines 1349–1358, `Sha512::new().finalize()` thus always produces the same hash.
 
 ```rust
 // messages.rs:1349-1358
@@ -89,16 +87,14 @@ impl Hash for Timeout {
 }
 ```
 
-All meaningful fields are commented out. The hasher receives no input, so `Sha512::new().finalize()` always produces the same hash. This digest is used for signature creation in `Timeout::new_from_key()` (line 1384):
+### Consequence
+
+This digest is used for signature creation in `Timeout::new_from_key()` (line 1384):
 
 ```rust
 // messages.rs:1384
 let signature = Signature::new(&timeout.digest(), &secret);
 ```
-
-Since the digest is constant, a valid timeout signature from any (slot, view) context can be attached to a timeout message with a completely different (slot, view).
-
-### Consequence
 
 A timeout signed for (slot=1, view=2) would have the same digest — and therefore the same valid signature — as a timeout for (slot=5, view=10). If an attacker collects one valid signed timeout from a given validator, that signature could be reused to construct timeout messages for arbitrary slots and views under that validator's identity.
 
@@ -145,7 +141,7 @@ pub fn verify(&self, committee: &Committee) -> ConsensusResult<()> {
 }
 ```
 
-Since `Self::genesis(committee) == *self` is always true (because `PartialEq::eq` always returns `true`), the function returns `Ok(())` immediately. The quorum threshold check (line 1535) and the per-timeout signature verification loop (lines 1541–1544) are effectively dead code.
+The quorum threshold check (line 1535) and the per-timeout signature verification loop (lines 1541–1544) are thus effectively dead code.
 
 ### Consequence
 
@@ -178,7 +174,7 @@ This means the QC genesis check in `QC::verify()` never short-circuits, so QC ve
 
 ### Possible Fix
 
-Restoring the commented-out comparison logic in `TC::PartialEq` (comparing hash and view fields) would allow the genesis check to function correctly, letting non-genesis TCs proceed to the quorum and signature verification code that is already implemented.
+Restoring the commented-out comparison logic in `TC::PartialEq` would allow the genesis check to function correctly.
 
 ---
 
@@ -212,13 +208,9 @@ if qc.votes.len() == committee.size() {  // Fast path (3f+1 Prepare votes)
 }
 ```
 
-The fast path (line 137–138) returns `false` on ID mismatch, allowing the caller to reject the message gracefully. The slow path (line 158–159) panics instead, terminating the entire process.
-
 ### Consequence
 
-A Byzantine node could construct a Commit message with a QC that has fewer than `committee.size()` votes (taking the slow path) and a deliberately mismatched QC ID. When an honest node processes this Commit via `is_valid()` (`core.rs`, line 1249: `verify_commit(consensus_message, &self.committee)`), the panic would crash the node.
-
-Since `verify_commit` is called before any authentication check on the Commit message itself, a single malformed message from any network participant could crash honest nodes.
+A Byzantine node could construct a Commit message with a QC that has fewer than `committee.size()` votes (taking the slow path) and a deliberately mismatched QC ID. Since `verify_commit` is called before any authentication check on the Commit message itself, a single malformed message from any network participant could crash honest nodes.
 
 ### Possible Fix
 
@@ -259,11 +251,11 @@ impl Hash for Header {
 }
 ```
 
-The `consensus_messages` field (`HashMap<Digest, ConsensusMessage>`, line 432) carries Prepare, Confirm, and Commit messages embedded in the DAG header. The code for including these in the digest is commented out with a `TODO` annotation.
+The code for including `consensus_messages` in the digest is commented out with a `TODO` annotation.
 
 ### Consequence
 
-A Byzantine proposer could create two headers with identical (author, height, payload, parent) but different `consensus_messages` — for example, one carrying `Prepare(v1)` and another carrying `Prepare(v2)`. Both headers would have the same digest, and therefore the same valid signature. The proposer could then send different versions to different peers, equivocating at the dissemination layer while passing all signature checks.
+A Byzantine proposer could create two headers with identical (author, height, payload, parent) but different `consensus_messages` — for example, one carrying `Prepare(v1)` and another carrying `Prepare(v2)`. Both headers would have the same digest, and therefore the same valid signature. The proposer could then send different versions to different peers, leading them to persist different bytes for the same header and cause votes to diverge.
 
 ### Possible Fix
 
@@ -276,18 +268,6 @@ Uncommenting the `consensus_messages` hashing loop would bind the header digest 
 ### Summary
 
 We noticed that when an honest node receives a Prepare message, `is_valid()` does not appear to check whether the sender is the legitimate leader for that (slot, view). If our reading is correct, any node — including a Byzantine one — could send a Prepare message for any slot and view, and honest nodes would accept it and vote.
-
-### Observation
-
-In `core.rs`, lines 1170–1229, `is_valid()` for a Prepare message performs the following checks:
-
-1. **TC validity** (lines 1182–1194): if a TC is provided, verify it and check that proposals match the TC's winning proposals
-2. **QC ticket validity** (lines 1196–1217): if no TC (view 1), check the slot-bounding QC ticket
-3. **View constraint** (line 1218): `ticket_valid = ticket_valid && *view == 1` — for the no-TC case, only view 1 is accepted
-4. **Duplicate vote prevention** (line 1229): `!self.last_voted_consensus.contains(&(*slot, *view))`
-5. **View match** (line 1229): `self.views.get(slot).unwrap() == view`
-
-Notably absent is a check like `leader(slot, view) == sender`. The function validates the message content (TC, ticket, view) but not whether the sender is authorized to propose for that (slot, view).
 
 ### Consequence
 
@@ -340,8 +320,6 @@ ConsensusMessage::Confirm { slot, view, qc, proposals: _ } => {
 }
 ```
 
-There is no `last_voted_consensus.contains` check, and `process_confirm_message()` (`core.rs`, lines 1541–1576) does not record the (slot, view) pair in any duplicate-prevention set.
-
 ### Consequence
 
 If a node receives a second Confirm for the same (slot, view) — whether a legitimate retransmission or a conflicting one — it would sign and emit a second Confirm vote. Under normal circumstances this may be harmless, but in the presence of other issues (e.g., Issue 1 from our first report, where the QC does not bind to the proposal value), an attacker could potentially collect Confirm votes for two different values in the same (slot, view).
@@ -393,7 +371,7 @@ Adding a check like `if self.committed_slots.contains_key(&sl) { return Ok(()); 
 
 ### Summary
 
-We noticed that the retain predicates in `clean_slot_periods()` use `&&` (logical AND) to combine two conditions, which appears to cause entries for future slots to be unconditionally deleted. If our reading is correct, when K > 1 (multiple concurrent slots), committing one slot would destroy in-progress consensus state for other active slots.
+We noticed that the retain predicates in `clean_slot_periods()` cause entries for future slots to be unconditionally deleted. If our reading is correct, with multiple concurrent slots, committing one slot would destroy in-progress consensus state for other active slots.
 
 ### Observation
 
@@ -414,6 +392,7 @@ async fn clean_slot_periods(&mut self, slot: Slot) -> DagResult<()> {
 ```
 
 The retain predicate keeps entries where **both** conditions hold:
+
 1. `s % k != slot_period` — the entry is in a different period
 2. `s <= &slot` — the entry is not in the future
 
@@ -423,14 +402,14 @@ For entries with `s > slot` (future slots), condition (2) is `false`, so the ent
 
 With K=3 and committing slot 3 (`slot_period = 0`):
 
-| Entry slot | `s % 3 != 0` | `s <= 3` | Retained? | Expected? |
-|-----------|-------------|---------|-----------|-----------|
-| slot 1    | false       | true    | No        | No (same period, past) |
-| slot 2    | true        | true    | Yes       | Yes (different period) |
-| slot 3    | false       | true    | No        | No (same period, current) |
-| slot 4    | true        | false   | **No**    | **Yes (active, different period)** |
-| slot 5    | true        | false   | **No**    | **Yes (active, different period)** |
-| slot 6    | false       | false   | No        | No (same period, future) |
+| Entry slot | `s % 3 != 0` | `s <= 3` | Retained? | Expected?                          |
+| ---------- | ------------ | -------- | --------- | ---------------------------------- |
+| slot 1     | false        | true     | No        | No (same period, past)             |
+| slot 2     | true         | true     | Yes       | Yes (different period)             |
+| slot 3     | false        | true     | No        | No (same period, current)          |
+| slot 4     | true         | false    | **No**    | **Yes (active, different period)** |
+| slot 5     | true         | false    | **No**    | **Yes (active, different period)** |
+| slot 6     | false        | false    | No        | No (same period, future)           |
 
 Slots 4 and 5 are in different periods and should be retained (they may have active consensus in progress), but they are deleted because `s <= &slot` is false.
 
@@ -481,11 +460,9 @@ fn enough_coverage(
 }
 ```
 
-The function iterates over `current_proposals` (which contains entries for all validators in the committee) and looks up each key in `prepare_proposals` (from the received message). If `prepare_proposals` does not contain an entry for a given `pk`, `.unwrap()` panics.
-
 ### Consequence
 
-A Byzantine leader could construct a Prepare message with a proposals map that is missing one or more validators' keys. When the next slot's leader evaluates `enough_coverage()` on this message (`core.rs`, line 1110), the unwrap would crash the node.
+A Byzantine leader could construct a Prepare message with a proposals map that is missing one or more validators' keys. An incomplete map can also occur in a non-Byzantine scenario (e.g. Prepare message derived from a TC). When the next slot's leader evaluates `enough_coverage()` on this message (`core.rs`, line 1110), the unwrap would crash the node.
 
 This crash occurs after the Prepare has already passed `is_valid()`, since `is_valid()` does not check that the proposals map contains all expected keys.
 
@@ -513,7 +490,7 @@ This checks for duplicate voting and view consistency, but does not check `self.
 
 ### Consequence
 
-In isolation, this is primarily a defense-in-depth concern: unnecessary consensus messages waste resources but do not independently cause a safety violation (assuming the TC verification and winning-proposals checks are working correctly). However, if a Byzantine node can trigger voting on already-committed slots, it could accumulate QCs for conflicting values in later views, which combined with other issues could be leveraged to violate agreement safety.
+In isolation, this is primarily a defense-in-depth concern. However, if a Byzantine node can trigger voting on already-committed slots, it could accumulate QCs for conflicting values in later views, which combined with other issues could be leveraged to violate agreement safety.
 
 ### Possible Fix
 
@@ -559,6 +536,8 @@ The node that assembles the TC (by collecting 2f+1 timeout votes locally) correc
 
 ### Consequence
 
+We see that TC broadcast is currently disabled, but wanted to mention this for completeness.
+
 After a view change, only the node that assembled the TC (and the new leader, via `generate_prepare_from_tc`) would be in the new view. All other honest nodes would remain in the old view. When the new leader sends a Prepare for the new view, those nodes would reject it (since their local view does not match), potentially stalling consensus.
 
 Additionally, `handle_tc()` does not call `tc.verify()`. While TC verification is currently bypassed due to Issue 3, once that is fixed, the lack of verification here would mean `handle_tc()` accepts any TC without checking quorum or signatures.
@@ -592,7 +571,7 @@ if !self.synchronizer.get_proposals(&commit_message, &header).await.unwrap().is_
 }
 ```
 
-If the proposals are not locally available, `get_proposals` triggers an asynchronous sync and the Commit message is expected to be redelivered via the `rx_header_waiter_instances` loopback channel (`core.rs`, line 2266). However, the original Commit message is not saved to any persistent storage — it exists only in the current call's stack frame.
+If the proposals are not locally available, `get_proposals` triggers an asynchronous sync and the Commit message is expected to be redelivered via the `rx_header_waiter_instances` loopback channel (`core.rs`, line 2266). However, the original Commit message is not saved to any persistent storage.
 
 ### Consequence
 
@@ -629,11 +608,11 @@ let result = tokio::select! {
 };
 ```
 
-While `tokio::select!` (without the `biased;` modifier) selects randomly among ready branches, under sustained flooding the network channel (`rx_primaries`) would be ready on nearly every iteration. With 7 branches, each branch has roughly equal probability of being selected, but a continuously-full network channel means the event loop would mostly be processing network messages, with timers only being checked on approximately 1-in-7 iterations.
+With 7 branches, each branch has roughly equal probability of being selected, but a continuously-full network channel means the event loop would mostly be processing network messages, with timers only being checked on approximately 1-in-7 iterations.
 
 ### Consequence
 
-If a Byzantine leader floods honest nodes with messages (which do not need to be valid — they just need to enter the channel), the effective timeout duration could be extended by a factor proportional to the message processing rate. This would delay view changes, allowing the Byzantine leader to maintain control of the view for longer than the configured timeout period.
+If a Byzantine leader floods honest nodes with messages (which do not need to be valid — they just need to enter the channel), the effective timeout duration could be extended by a factor proportional to the message processing rate. This would allow the Byzantine leader to maintain control of the view for longer than the configured timeout period.
 
 We note that this is a common challenge in event-loop-based BFT implementations and may be acceptable given the protocol's threat model. We wanted to flag it for completeness.
 
