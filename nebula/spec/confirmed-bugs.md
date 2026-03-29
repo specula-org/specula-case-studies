@@ -3,7 +3,7 @@
 ## Summary
 
 - Total findings reviewed: 11 (3 MC-confirmed bugs + 6 code-review bug families + 5 code-review-only items - overlaps)
-- Confirmed: 7 (1 reproduced, 6 code-audit only)
+- Confirmed: 7 (2 reproduced, 5 code-audit only)
 - False positives: 0
 - Inconclusive: 0
 - Out of scope: 4 (defensive coding / style / liveness concerns, not safety bugs)
@@ -16,7 +16,7 @@
 | NB-2 | LeaderCompleteness violation (non-persisted vote) | MC + Code Review | REPRODUCED | Critical |
 | NB-3 | Pre-vote causes leader step-down | MC + Code Review | CONFIRMED (code audit + MC) | High |
 | NB-4 | Heartbeat doesn't advance follower commitIndex | Code Review | CONFIRMED (code audit) | Medium |
-| NB-5 | Snapshot promise never fulfilled (Host wedged) | Code Review | CONFIRMED (code audit) | High |
+| NB-5 | Snapshot promise never fulfilled (Host wedged) | Code Review | REPRODUCED | High |
 | NB-6 | processAppendLogResponses missing onLostLeadership | Code Review | CONFIRMED (code audit) | Medium |
 | NB-7 | removeListenerSpace never erases from map | Code Review | CONFIRMED (code audit) | Low |
 
@@ -204,7 +204,7 @@ Advance follower's `committedLogId_` in the heartbeat handler, similar to how `p
 ## Bug NB-5: Snapshot Promise Never Fulfilled — Host Permanently Wedged
 
 - **Source**: Code Review (Family 3)
-- **Status**: CONFIRMED (code audit)
+- **Status**: REPRODUCED
 - **Severity**: High
 - **Location**: `SnapshotManager.cpp:42-46` (leadership check failure path), `Host.cpp:376-407` (snapshot callback), `Host.h:85-96` (reset)
 
@@ -234,7 +234,22 @@ Additionally, the snapshot callback at Host.cpp:378-382 updates `lastLogIdSent_`
 
 ### Reproduction
 
-Code audit only. The unfulfilled promise is clearly visible in the code — the `return` at line 45 exits the lambda without calling `p.setValue()` or `p.setException()`.
+**REPRODUCED** via standalone C++ test (`repro/nb5_snapshot_promise_wedge.cpp`).
+
+The test recreates the exact promise/future lifecycle from SnapshotManager and Host using `std::promise`/`std::future` (same broken-promise semantics as folly). Four scenarios:
+
+1. **Normal path**: Leadership retained, promise fulfilled, `sendingSnapshot_` cleared -- PASS
+2. **Leadership change (the bug)**: Promise destroyed unfulfilled, `std::future_error: Broken promise` caught, `sendingSnapshot_` remains true permanently -- BUG CONFIRMED
+3. **Stale state update**: Snapshot callback updates Host state with old-term values after leadership change -- BUG CONFIRMED
+4. **Host::reset() race**: Demonstrates the incomplete workaround (force-clear without waiting for snapshot thread)
+
+```
+$ g++ -std=c++17 -pthread -o nb5_snapshot_promise_wedge nb5_snapshot_promise_wedge.cpp
+$ ./nb5_snapshot_promise_wedge
+BUG CONFIRMED: sendingSnapshot_ is still TRUE — Host is permanently wedged!
+```
+
+**Patch**: `repro/patches/nb5-fulfill-promise-on-leadership-change.patch`
 
 ### Recommendation
 
@@ -359,8 +374,9 @@ Each finding was traced through the source code:
 ### Phase 2: Reproduction
 For the highest-confidence bugs (MC-confirmed with counterexamples):
 - **NB-2**: Successfully reproduced via unit test simulating real crash-restart (new object + same WAL)
+- **NB-5**: Successfully reproduced via standalone C++ test (repro/nb5_snapshot_promise_wedge.cpp) demonstrating broken-promise wedge
 - **NB-1, NB-3**: Confirmed by code audit + MC counterexamples; unit test reproduction not feasible because the test framework lacks network partition simulation
-- **NB-4 through NB-7**: Confirmed by code audit; the bugs are in clearly identifiable code paths
+- **NB-4, NB-6, NB-7**: Confirmed by code audit; the bugs are in clearly identifiable code paths
 
 ### Test Artifacts
 - Test source: `src/kvstore/raftex/test/BugReproTest.cpp`

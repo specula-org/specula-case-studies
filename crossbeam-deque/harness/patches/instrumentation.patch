@@ -1,0 +1,261 @@
+diff --git a/crossbeam-deque/src/deque.rs b/crossbeam-deque/src/deque.rs
+index ba9dbc3..1bbc45e 100644
+--- a/crossbeam-deque/src/deque.rs
++++ b/crossbeam-deque/src/deque.rs
+@@ -304,6 +304,9 @@ impl<T> Worker<T> {
+ 
+         let guard = &epoch::pin();
+ 
++        // --- TRACE: ResizeGrow timebox start ---
++        let _tla_ts = if crate::tla_trace::is_active() { crate::tla_trace::rdtsc() } else { 0 };
++
+         // Replace the old buffer with the new one.
+         self.buffer.replace(new);
+         let old =
+@@ -311,6 +314,12 @@ impl<T> Worker<T> {
+                 .buffer
+                 .swap(Owned::new(new).into_shared(guard), Ordering::Release, guard);
+ 
++        // --- TRACE: ResizeGrow event (between swap and defer) ---
++        if crate::tla_trace::is_active() {
++            let _tla_te = crate::tla_trace::rdtsc();
++            crate::tla_trace::emit_resize_grow(_tla_ts, _tla_te, f, b);
++        }
++
+         // Destroy the old buffer later.
+         unsafe { guard.defer_unchecked(move || old.into_owned().into_box().dealloc()) }
+ 
+@@ -419,6 +428,9 @@ impl<T> Worker<T> {
+             buffer.write(b, MaybeUninit::new(task));
+         }
+ 
++        // --- TRACE: Push timebox start ---
++        let _tla_ts = if crate::tla_trace::is_active() { crate::tla_trace::rdtsc() } else { 0 };
++
+         // ThreadSanitizer does not understand fences, so we omit fence and do store with Release ordering.
+         #[cfg(not(crossbeam_sanitize_thread))]
+         atomic::fence(Ordering::Release);
+@@ -430,6 +442,13 @@ impl<T> Worker<T> {
+ 
+         // Increment the back index.
+         self.inner.back.store(b.wrapping_add(1), store_order);
++
++        // --- TRACE: Push event ---
++        if crate::tla_trace::is_active() {
++            let _tla_te = crate::tla_trace::rdtsc();
++            let _tla_f = self.inner.front.load(Ordering::SeqCst);
++            crate::tla_trace::emit_push(_tla_ts, _tla_te, _tla_f, b.wrapping_add(1));
++        }
+     }
+ 
+     /// Pops a task from the queue.
+@@ -463,12 +482,27 @@ impl<T> Worker<T> {
+         match self.flavor {
+             // Pop from the front of the queue.
+             Flavor::Fifo => {
++                // --- TRACE: FIFOPopAttempt timebox start ---
++                let _tla_ts = if crate::tla_trace::is_active() { crate::tla_trace::rdtsc() } else { 0 };
++
+                 // Try incrementing the front index to pop the task.
+                 let f = self.inner.front.fetch_add(1, Ordering::SeqCst);
+                 let new_f = f.wrapping_add(1);
+ 
+                 if b.wrapping_sub(new_f) < 0 {
++                    // --- TRACE: FIFOPopAttempt rollback_needed ---
++                    if crate::tla_trace::is_active() {
++                        let _tla_te = crate::tla_trace::rdtsc();
++                        crate::tla_trace::emit_fifo_pop_attempt(_tla_ts, _tla_te, new_f, b, "rollback_needed");
++                    }
++
++                    let _tla_ts2 = if crate::tla_trace::is_active() { crate::tla_trace::rdtsc() } else { 0 };
+                     self.inner.front.store(f, Ordering::Relaxed);
++                    // --- TRACE: FIFOPopRollback ---
++                    if crate::tla_trace::is_active() {
++                        let _tla_te = crate::tla_trace::rdtsc();
++                        crate::tla_trace::emit_fifo_pop_rollback(_tla_ts2, _tla_te, f, b);
++                    }
+                     return None;
+                 }
+ 
+@@ -482,12 +516,21 @@ impl<T> Worker<T> {
+                         self.resize(buffer.cap / 2);
+                     }
+ 
++                    // --- TRACE: FIFOPopAttempt success ---
++                    if crate::tla_trace::is_active() {
++                        let _tla_te = crate::tla_trace::rdtsc();
++                        crate::tla_trace::emit_fifo_pop_attempt(_tla_ts, _tla_te, new_f, b, "success");
++                    }
++
+                     Some(task)
+                 }
+             }
+ 
+             // Pop from the back of the queue.
+             Flavor::Lifo => {
++                // --- TRACE: LIFOPop timebox start ---
++                let _tla_ts = if crate::tla_trace::is_active() { crate::tla_trace::rdtsc() } else { 0 };
++
+                 // Decrement the back index.
+                 let b = b.wrapping_sub(1);
+                 self.inner.back.store(b, Ordering::Relaxed);
+@@ -503,6 +546,11 @@ impl<T> Worker<T> {
+                 if len < 0 {
+                     // The queue is empty. Restore the back index to the original task.
+                     self.inner.back.store(b.wrapping_add(1), Ordering::Relaxed);
++                    // --- TRACE: LIFOPop empty ---
++                    if crate::tla_trace::is_active() {
++                        let _tla_te = crate::tla_trace::rdtsc();
++                        crate::tla_trace::emit_lifo_pop(_tla_ts, _tla_te, f, b.wrapping_add(1), "empty");
++                    }
+                     None
+                 } else {
+                     // Read the task to be popped.
+@@ -512,7 +560,7 @@ impl<T> Worker<T> {
+                     // Are we popping the last task from the queue?
+                     if len == 0 {
+                         // Try incrementing the front index.
+-                        if self
++                        let _tla_cas_ok = self
+                             .inner
+                             .front
+                             .compare_exchange(
+@@ -521,14 +569,22 @@ impl<T> Worker<T> {
+                                 Ordering::SeqCst,
+                                 Ordering::Relaxed,
+                             )
+-                            .is_err()
+-                        {
++                            .is_ok();
++                        if !_tla_cas_ok {
+                             // Failed. We didn't pop anything. Reset to `None`.
+                             task.take();
+                         }
+ 
+                         // Restore the back index to the original task.
+                         self.inner.back.store(b.wrapping_add(1), Ordering::Relaxed);
++
++                        // --- TRACE: LIFOPop (last element: success or contention_lost) ---
++                        if crate::tla_trace::is_active() {
++                            let _tla_te = crate::tla_trace::rdtsc();
++                            let _tla_nf = self.inner.front.load(Ordering::SeqCst);
++                            let _tla_res = if _tla_cas_ok { "success" } else { "contention_lost" };
++                            crate::tla_trace::emit_lifo_pop(_tla_ts, _tla_te, _tla_nf, b.wrapping_add(1), _tla_res);
++                        }
+                     } else {
+                         // Shrink the buffer if `len` is less than one fourth of the capacity.
+                         if buffer.cap > MIN_CAP && len < buffer.cap as isize / 4 {
+@@ -536,6 +592,13 @@ impl<T> Worker<T> {
+                                 self.resize(buffer.cap / 2);
+                             }
+                         }
++
++                        // --- TRACE: LIFOPop success (normal) ---
++                        if crate::tla_trace::is_active() {
++                            let _tla_te = crate::tla_trace::rdtsc();
++                            let _tla_f = self.inner.front.load(Ordering::SeqCst);
++                            crate::tla_trace::emit_lifo_pop(_tla_ts, _tla_te, _tla_f, b, "success");
++                        }
+                     }
+ 
+                     task.map(|t| unsafe { t.assume_init() })
+@@ -639,6 +702,9 @@ impl<T> Stealer<T> {
+     /// assert_eq!(s.steal(), Steal::Success(2));
+     /// ```
+     pub fn steal(&self) -> Steal<T> {
++        // --- TRACE: StealBegin timebox start ---
++        let _tla_ts_begin = if crate::tla_trace::is_active() { crate::tla_trace::rdtsc() } else { 0 };
++
+         // Load the front index.
+         let f = self.inner.front.load(Ordering::Acquire);
+ 
+@@ -658,26 +724,68 @@ impl<T> Stealer<T> {
+ 
+         // Is the queue empty?
+         if b.wrapping_sub(f) <= 0 {
++            // --- TRACE: StealBegin empty ---
++            if crate::tla_trace::is_active() {
++                let _tla_te = crate::tla_trace::rdtsc();
++                crate::tla_trace::emit_steal_begin(_tla_ts_begin, _tla_te, f, b, "empty");
++            }
+             return Steal::Empty;
+         }
+ 
+         // Load the buffer and read the task at the front.
+         let buffer = self.inner.buffer.load(Ordering::Acquire, guard);
++
++        // --- TRACE: StealBegin proceed ---
++        if crate::tla_trace::is_active() {
++            let _tla_te = crate::tla_trace::rdtsc();
++            crate::tla_trace::emit_steal_begin(_tla_ts_begin, _tla_te, f, b, "proceed");
++        }
++
++        // --- TRACE: StealReadTask timebox ---
++        let _tla_ts_read = if crate::tla_trace::is_active() { crate::tla_trace::rdtsc() } else { 0 };
+         let task = unsafe { buffer.deref().read(f) };
++        if crate::tla_trace::is_active() {
++            let _tla_te = crate::tla_trace::rdtsc();
++            crate::tla_trace::emit_steal_read_task(_tla_ts_read, _tla_te);
++        }
++
++        // --- TRACE: StealCommit timebox start ---
++        let _tla_ts_cas = if crate::tla_trace::is_active() { crate::tla_trace::rdtsc() } else { 0 };
+ 
+         // Try incrementing the front index to steal the task.
+         // If the buffer has been swapped or the increment fails, we retry.
+-        if self.inner.buffer.load(Ordering::Acquire, guard) != buffer
+-            || self
+-                .inner
+-                .front
+-                .compare_exchange(f, f.wrapping_add(1), Ordering::SeqCst, Ordering::Relaxed)
+-                .is_err()
++        // Split the check to emit distinct trace events.
++        let _tla_buf_changed = self.inner.buffer.load(Ordering::Acquire, guard) != buffer;
++        if _tla_buf_changed {
++            // --- TRACE: StealCommit fail_recheck ---
++            if crate::tla_trace::is_active() {
++                let _tla_te = crate::tla_trace::rdtsc();
++                let _tla_cf = self.inner.front.load(Ordering::SeqCst);
++                crate::tla_trace::emit_steal_commit(_tla_ts_cas, _tla_te, _tla_cf, "single", "fail_recheck", 1);
++            }
++            return Steal::Retry;
++        }
++        if self
++            .inner
++            .front
++            .compare_exchange(f, f.wrapping_add(1), Ordering::SeqCst, Ordering::Relaxed)
++            .is_err()
+         {
+-            // We didn't steal this task, forget it.
++            // --- TRACE: StealCommit fail_cas ---
++            if crate::tla_trace::is_active() {
++                let _tla_te = crate::tla_trace::rdtsc();
++                let _tla_cf = self.inner.front.load(Ordering::SeqCst);
++                crate::tla_trace::emit_steal_commit(_tla_ts_cas, _tla_te, _tla_cf, "single", "fail_cas", 1);
++            }
+             return Steal::Retry;
+         }
+ 
++        // --- TRACE: StealCommit success ---
++        if crate::tla_trace::is_active() {
++            let _tla_te = crate::tla_trace::rdtsc();
++            crate::tla_trace::emit_steal_commit(_tla_ts_cas, _tla_te, f.wrapping_add(1), "single", "success", 1);
++        }
++
+         // Return the stolen task.
+         Steal::Success(unsafe { task.assume_init() })
+     }
+diff --git a/crossbeam-deque/src/lib.rs b/crossbeam-deque/src/lib.rs
+index 0585ca3..eeb964d 100644
+--- a/crossbeam-deque/src/lib.rs
++++ b/crossbeam-deque/src/lib.rs
+@@ -103,6 +103,9 @@ extern crate std;
+ #[cfg(feature = "std")]
+ mod alloc_helper;
+ 
++#[cfg(feature = "std")]
++pub mod tla_trace;
++
+ #[cfg(feature = "std")]
+ mod deque;
+ #[cfg(feature = "std")]

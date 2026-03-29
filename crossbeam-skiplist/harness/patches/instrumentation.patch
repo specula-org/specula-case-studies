@@ -1,0 +1,365 @@
+diff --git a/crossbeam-skiplist/Cargo.toml b/crossbeam-skiplist/Cargo.toml
+index 1c5fbc0..d8455e7 100644
+--- a/crossbeam-skiplist/Cargo.toml
++++ b/crossbeam-skiplist/Cargo.toml
+@@ -37,6 +37,9 @@ std = ["alloc", "crossbeam-epoch/std", "crossbeam-utils/std"]
+ # NOTE: Disabling both `std` *and* `alloc` features is not supported yet.
+ alloc = ["crossbeam-epoch/alloc"]
+ 
++# TLA+ trace instrumentation (Category B timebox)
++tla-trace = ["std"]
++
+ [dependencies]
+ crossbeam-epoch = { version = "0.9.17", path = "../crossbeam-epoch", default-features = false }
+ crossbeam-utils = { version = "0.8.18", path = "../crossbeam-utils", default-features = false }
+diff --git a/crossbeam-skiplist/src/base.rs b/crossbeam-skiplist/src/base.rs
+index afa2df7..de67e73 100644
+--- a/crossbeam-skiplist/src/base.rs
++++ b/crossbeam-skiplist/src/base.rs
+@@ -13,6 +13,9 @@ use core::{
+ };
+ 
+ use crossbeam_epoch::{self as epoch, Atomic, Collector, Guard, Shared};
++
++#[cfg(feature = "tla-trace")]
++use crate::tla_trace;
+ use crossbeam_utils::CachePadded;
+ 
+ use crate::{
+@@ -521,6 +524,12 @@ impl<K, V, C> SkipList<K, V, C> {
+         if len > isize::MAX as usize { 0 } else { len }
+     }
+ 
++    /// Returns the raw pointer address of the head sentinel (for TLA+ trace node ID mapping).
++    #[cfg(feature = "tla-trace")]
++    pub fn inner_head_ptr(&self) -> usize {
++        &self.head as *const Head<K, V> as usize
++    }
++
+     /// Ensures that all `Guard`s used with the skip list come from the same
+     /// `Collector`.
+     fn check_guard(&self, guard: &Guard) {
+@@ -572,16 +581,36 @@ where
+         Q: ?Sized,
+     {
+         self.check_guard(guard);
+-        let n = self.search_bound(Bound::Included(key), false, guard)?;
+-        if !self.comparator.equivalent(&n.key, key) {
+-            return None;
+-        }
+ 
+-        Some(Entry {
+-            parent: self,
+-            node: n,
+-            guard,
+-        })
++        #[cfg(feature = "tla-trace")]
++        let _tla_get_start = if tla_trace::is_active() { tla_trace::rdtsc() } else { 0 };
++
++        let n = self.search_bound(Bound::Included(key), false, guard);
++
++        let result = match n {
++            Some(n) if self.comparator.equivalent(&n.key, key) => {
++                // TRACE: Get — found
++                #[cfg(feature = "tla-trace")]
++                if tla_trace::is_active() {
++                    let t_end = tla_trace::rdtsc();
++                    let tla_key = tla_trace::key_to_i64(&n.key);
++                    tla_trace::emit_get(_tla_get_start, t_end, tla_key, true);
++                }
++
++                Some(Entry {
++                    parent: self,
++                    node: n,
++                    guard,
++                })
++            }
++            _ => {
++                // Not found: skip trace (Get is a no-op in the spec, and we
++                // cannot reliably convert Q to i64 when Q: ?Sized)
++                None
++            }
++        };
++
++        result
+     }
+ 
+     /// Returns an `Entry` pointing to the lowest element whose key is above
+@@ -1064,6 +1093,22 @@ where
+                 )
+             };
+ 
++            // TRACE: InsertBegin — after node allocation, before CAS loop
++            #[cfg(feature = "tla-trace")]
++            let _tla_insert_begin_done = {
++                if tla_trace::is_active() {
++                    let t_start = tla_trace::rdtsc();
++                    let t_end = tla_trace::rdtsc();
++                    let tla_key = tla_trace::key_to_i64(&n.as_ref().key);
++                    let found_ptr = search.found.map(|f| f.ptr.as_ptr() as usize);
++                    tla_trace::emit_insert_begin(
++                        t_start, t_end, tla_key,
++                        n.ptr.as_ptr() as usize, height, found_ptr,
++                    );
++                }
++                true
++            };
++
+             // Optimistically increment `len`.
+             self.hot_data.len.fetch_add(1, Ordering::Relaxed);
+ 
+@@ -1073,7 +1118,10 @@ where
+ 
+                 // Try installing the new node into the skip list (at level 0).
+                 // TODO(Amanieu): can we use release ordering here?
+-                if search.left[0]
++                #[cfg(feature = "tla-trace")]
++                let _tla_cas_start = if tla_trace::is_active() { tla_trace::rdtsc() } else { 0 };
++
++                let cas_ok = search.left[0]
+                     .get_level(0)
+                     .compare_exchange(
+                         search.right[0],
+@@ -1082,7 +1130,9 @@ where
+                         Ordering::SeqCst,
+                         guard,
+                     )
+-                    .is_ok()
++                    .is_ok();
++
++                if cas_ok
+                 {
+                     // This node has been abandoned
+                     if let Some(r) = search.found {
+@@ -1090,6 +1140,20 @@ where
+                             self.hot_data.len.fetch_sub(1, Ordering::Relaxed);
+                         }
+                     }
++
++                    // TRACE: InsertCAS success
++                    #[cfg(feature = "tla-trace")]
++                    if tla_trace::is_active() {
++                        let t_end = tla_trace::rdtsc();
++                        let tla_key = tla_trace::key_to_i64(&n.as_ref().key);
++                        let old_node = search.found.map(|f| f.ptr.as_ptr() as usize);
++                        let list_size = self.hot_data.len.load(Ordering::Relaxed);
++                        tla_trace::emit_insert_cas(
++                            _tla_cas_start, t_end, tla_key,
++                            n.ptr.as_ptr() as usize, true, old_node, list_size,
++                        );
++                    }
++
+                     break;
+                 }
+ 
+@@ -1194,11 +1258,28 @@ where
+ 
+                     // Try installing the new node at the current level.
+                     // TODO(Amanieu): can we use release ordering here?
++                    #[cfg(feature = "tla-trace")]
++                    let _tla_build_start = if tla_trace::is_active() { tla_trace::rdtsc() } else { 0 };
++
+                     if pred
+                         .get_level(level)
+                         .compare_exchange(succ, node, Ordering::SeqCst, Ordering::SeqCst, guard)
+                         .is_ok()
+                     {
++                        // TRACE: InsertBuildLevel — CAS succeeded at this level
++                        #[cfg(feature = "tla-trace")]
++                        if tla_trace::is_active() {
++                            let t_end = tla_trace::rdtsc();
++                            let tla_key = tla_trace::key_to_i64(&n.as_ref().key);
++                            let rc = tla_trace::extract_ref_count(
++                                n.refs_and_height.load(Ordering::Relaxed)
++                            );
++                            tla_trace::emit_insert_build_level(
++                                _tla_build_start, t_end, tla_key,
++                                n.ptr.as_ptr() as usize, level, rc,
++                            );
++                        }
++
+                         // Success! Continue on the next level.
+                         break;
+                     }
+@@ -1288,19 +1369,56 @@ where
+ 
+                 // First try incrementing the reference count because we have to return the node as
+                 // an entry. If this fails, repeat the search.
++                #[cfg(feature = "tla-trace")]
++                let _tla_remove_begin_start = if tla_trace::is_active() { tla_trace::rdtsc() } else { 0 };
++
+                 let entry = match RefEntry::try_acquire(self, n) {
+                     Some(e) => e,
+                     None => continue,
+                 };
+ 
++                // TRACE: RemoveBegin — after successful try_acquire
++                #[cfg(feature = "tla-trace")]
++                if tla_trace::is_active() {
++                    let t_end = tla_trace::rdtsc();
++                    let tla_key = tla_trace::key_to_i64(&n.as_ref().key);
++                    let rc = tla_trace::extract_ref_count(
++                        n.refs_and_height.load(Ordering::Relaxed)
++                    );
++                    tla_trace::emit_remove_begin(
++                        _tla_remove_begin_start, t_end, tla_key,
++                        n.ptr.as_ptr() as usize, rc,
++                    );
++                }
++
+                 // Try removing the node by marking its tower.
++                #[cfg(feature = "tla-trace")]
++                let _tla_mark_start = if tla_trace::is_active() { tla_trace::rdtsc() } else { 0 };
++
+                 if n.mark_tower() {
++                    // TRACE: RemoveMarkTower — won=true
++                    #[cfg(feature = "tla-trace")]
++                    if tla_trace::is_active() {
++                        let t_end = tla_trace::rdtsc();
++                        let tla_key = tla_trace::key_to_i64(&n.as_ref().key);
++                        let removed = n.is_removed();
++                        tla_trace::emit_remove_mark_tower(
++                            _tla_mark_start, t_end, tla_key,
++                            n.ptr.as_ptr() as usize, true, removed,
++                        );
++                    }
++
+                     // Success! Decrement `len`.
+                     self.hot_data.len.fetch_sub(1, Ordering::Relaxed);
+ 
+                     // Unlink the node at each level of the skip list. We could do this by simply
+                     // repeating the search, but it's usually faster to unlink it manually using
+                     // the `left` and `right` lists.
++                    #[cfg(feature = "tla-trace")]
++                    let _tla_unlink_start = if tla_trace::is_active() { tla_trace::rdtsc() } else { 0 };
++                    #[cfg(feature = "tla-trace")]
++                    let mut _tla_unlinked_levels: usize = 0;
++
+                     for level in (0..n.height()).rev() {
+                         // TODO(Amanieu): can we use relaxed ordering here?
+                         let succ = n.get_level(level).load(Ordering::SeqCst, guard).with_tag(0);
+@@ -1320,14 +1438,42 @@ where
+                         {
+                             // Success! Decrement the reference count.
+                             n.decrement(guard);
++                            #[cfg(feature = "tla-trace")]
++                            { _tla_unlinked_levels += 1; }
+                         } else {
+                             // Failed! Just repeat the search to completely unlink the node.
+                             self.search_bound(Bound::Included(key), false, guard);
+                             break;
+                         }
+                     }
++
++                    // TRACE: RemoveUnlink — after unlink loop
++                    #[cfg(feature = "tla-trace")]
++                    if tla_trace::is_active() {
++                        let t_end = tla_trace::rdtsc();
++                        let tla_key = tla_trace::key_to_i64(&n.as_ref().key);
++                        let rc = tla_trace::extract_ref_count(
++                            n.refs_and_height.load(Ordering::Relaxed)
++                        );
++                        tla_trace::emit_remove_unlink(
++                            _tla_unlink_start, t_end, tla_key,
++                            n.ptr.as_ptr() as usize, _tla_unlinked_levels, rc,
++                        );
++                    }
++
+                     return Some(entry);
+                 } else {
++                    // TRACE: RemoveMarkTower — won=false (already marked)
++                    #[cfg(feature = "tla-trace")]
++                    if tla_trace::is_active() {
++                        let t_end = tla_trace::rdtsc();
++                        let tla_key = tla_trace::key_to_i64(&n.as_ref().key);
++                        tla_trace::emit_remove_mark_tower(
++                            _tla_mark_start, t_end, tla_key,
++                            n.ptr.as_ptr() as usize, false, true,
++                        );
++                    }
++
+                     // The node has already been marked.
+                     n.decrement(guard);
+                     return None;
+@@ -1653,7 +1799,26 @@ impl<'a, K: 'a, V: 'a, C: 'a> RefEntry<'a, K, V, C> {
+     /// Releases the reference on the entry.
+     pub fn release(self, guard: &Guard) {
+         self.parent.check_guard(guard);
++
++        // TRACE: ReleaseEntry
++        #[cfg(feature = "tla-trace")]
++        let (_tla_start, _tla_node_ptr) = if tla_trace::is_active() {
++            (tla_trace::rdtsc(), self.node.ptr.as_ptr() as usize)
++        } else {
++            (0, 0)
++        };
++
+         unsafe { self.node.decrement(guard) }
++
++        #[cfg(feature = "tla-trace")]
++        if tla_trace::is_active() {
++            let t_end = tla_trace::rdtsc();
++            // After decrement, refcount may have changed. Read it.
++            let rc = tla_trace::extract_ref_count(
++                unsafe { (*(_tla_node_ptr as *const Node<K, V>)).refs_and_height.load(Ordering::Relaxed) }
++            );
++            tla_trace::emit_release_entry(_tla_start, t_end, _tla_node_ptr, rc);
++        }
+     }
+ 
+     /// Releases the reference of the entry, pinning the thread only when
+@@ -1662,7 +1827,24 @@ impl<'a, K: 'a, V: 'a, C: 'a> RefEntry<'a, K, V, C> {
+     where
+         F: FnOnce() -> Guard,
+     {
++        // TRACE: ReleaseEntry (via release_with_pin)
++        #[cfg(feature = "tla-trace")]
++        let (_tla_start, _tla_node_ptr) = if tla_trace::is_active() {
++            (tla_trace::rdtsc(), self.node.ptr.as_ptr() as usize)
++        } else {
++            (0, 0)
++        };
++
+         unsafe { self.node.decrement_with_pin(self.parent, pin) }
++
++        #[cfg(feature = "tla-trace")]
++        if tla_trace::is_active() {
++            let t_end = tla_trace::rdtsc();
++            let rc = tla_trace::extract_ref_count(
++                unsafe { (*(_tla_node_ptr as *const Node<K, V>)).refs_and_height.load(Ordering::Relaxed) }
++            );
++            tla_trace::emit_release_entry(_tla_start, t_end, _tla_node_ptr, rc);
++        }
+     }
+ 
+     /// Tries to create a new `RefEntry` by incrementing the reference count of
+diff --git a/crossbeam-skiplist/src/lib.rs b/crossbeam-skiplist/src/lib.rs
+index 5337e3d..674dc1e 100644
+--- a/crossbeam-skiplist/src/lib.rs
++++ b/crossbeam-skiplist/src/lib.rs
+@@ -265,5 +265,8 @@ pub mod set;
+ #[doc(inline)]
+ pub use crate::{map::SkipMap, set::SkipSet};
+ 
++#[cfg(feature = "tla-trace")]
++pub mod tla_trace;
++
+ pub mod comparator;
+ pub mod equivalent;
+diff --git a/crossbeam-skiplist/src/map.rs b/crossbeam-skiplist/src/map.rs
+index 92e888e..f8c3933 100644
+--- a/crossbeam-skiplist/src/map.rs
++++ b/crossbeam-skiplist/src/map.rs
+@@ -62,6 +62,12 @@ impl<K, V, C> SkipMap<K, V, C> {
+         }
+     }
+ 
++    /// Returns the raw pointer address of the head sentinel (for TLA+ trace node ID mapping).
++    #[cfg(feature = "tla-trace")]
++    pub fn inner_head_ptr(&self) -> usize {
++        self.inner.inner_head_ptr()
++    }
++
+     /// Returns `true` if the map is empty.
+     ///
+     /// # Example

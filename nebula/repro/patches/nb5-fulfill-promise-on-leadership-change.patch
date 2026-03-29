@@ -1,0 +1,49 @@
+From: Specula <noreply@specula.dev>
+Subject: [PATCH] Fix NB-5: fulfill snapshot promise on leadership change
+
+SnapshotManager::sendSnapshot() creates a promise at line 33, but the
+leadership check at lines 42-46 returns early without fulfilling it.
+This destroys the promise, causing a BrokenPromise exception on the
+future side.  The Host's thenValue callback never fires, leaving
+sendingSnapshot_=true permanently — the Host can never send logs or
+snapshots to this peer again.
+
+Fix: call p.setValue(Status::Error(...)) before the early return.
+
+Also add .thenError() in Host::startSendSnapshot() as defense-in-depth,
+so sendingSnapshot_ is always cleared regardless of exception type.
+
+Bug: vesoft-inc/nebula#63
+---
+ src/kvstore/raftex/Host.cpp            | 5 +++++
+ src/kvstore/raftex/SnapshotManager.cpp | 1 +
+ 2 files changed, 6 insertions(+)
+
+diff --git a/src/kvstore/raftex/SnapshotManager.cpp b/src/kvstore/raftex/SnapshotManager.cpp
+index abcdef1..1234567 100644
+--- a/src/kvstore/raftex/SnapshotManager.cpp
++++ b/src/kvstore/raftex/SnapshotManager.cpp
+@@ -42,6 +42,7 @@ folly::Future<StatusOr<std::pair<LogID, TermID>>> SnapshotManager::sendSnapshot(
+     if (tr.second != RaftPart::Role::LEADER) {
+       VLOG(1) << part->idStr_ << "leader changed, term " << tr.first
+               << ", do not send snapshot to " << dst;
++      p.setValue(Status::Error("Leadership changed"));
+       return;
+     }
+     auto termId = tr.first;
+diff --git a/src/kvstore/raftex/Host.cpp b/src/kvstore/raftex/Host.cpp
+index abcdef2..1234568 100644
+--- a/src/kvstore/raftex/Host.cpp
++++ b/src/kvstore/raftex/Host.cpp
+@@ -371,6 +371,11 @@ nebula::cpp2::ErrorCode Host::startSendSnapshot() {
+           self->sendingSnapshot_ = false;
+           self->noMoreRequestCV_.notify_all();
++        })
++        .thenError(folly::tag_t<std::exception>{}, [self = shared_from_this()](std::exception&& e) {
++          LOG(ERROR) << self->idStr_ << "Snapshot future error: " << e.what();
++          std::lock_guard<std::mutex> g(self->lock_);
++          self->sendingSnapshot_ = false;
++          self->noMoreRequestCV_.notify_all();
+         });
+   } else {
+     VLOG_EVERY_N(2, 1000) << idStr_ << "The snapshot req is in queue, please wait for a moment";

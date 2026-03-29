@@ -1,0 +1,379 @@
+diff --git a/Cargo.toml b/Cargo.toml
+index 00266f6..fbcc94d 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -30,6 +30,7 @@ serde_json = "1"
+ [features]
+ default = []
+ serde = ["dep:serde"]
++tla-trace = []
+ 
+ [profile.test]
+ inherits = "release"
+@@ -39,6 +40,7 @@ debug-assertions = true
+ unexpected_cfgs = { level = "warn", check-cfg = [
+     'cfg(papaya_stress)',
+     'cfg(papaya_asan)',
++    'cfg(feature, values("tla-trace"))',
+ ] }
+ 
+ [[bench]]
+diff --git a/src/lib.rs b/src/lib.rs
+index 51998bd..7cc1569 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -231,6 +231,10 @@ mod map;
+ mod raw;
+ mod set;
+ 
++#[cfg(feature = "tla-trace")]
++#[allow(missing_docs, dead_code)]
++pub mod tla_trace;
++
+ #[cfg(feature = "serde")]
+ mod serde_impls;
+ 
+diff --git a/src/raw/mod.rs b/src/raw/mod.rs
+index 722ee20..5bae84d 100644
+--- a/src/raw/mod.rs
++++ b/src/raw/mod.rs
+@@ -238,6 +238,17 @@ impl<K, V, S> HashMap<K, V, S> {
+         let mut table = Table::alloc(probe::entries_for(capacity));
+         *table.state_mut().status.get_mut() = State::PROMOTED;
+ 
++        #[cfg(feature = "tla-trace")]
++        {
++            let _tla_start = crate::tla_trace::rdtsc();
++            let _tla_end = crate::tla_trace::rdtsc();
++            crate::tla_trace::emit_init_table(
++                table.raw as *mut u8,
++                probe::entries_for(capacity),
++                _tla_start, _tla_end,
++            );
++        }
++
+         HashMap {
+             hasher,
+             resize,
+@@ -891,6 +902,8 @@ where
+         let meta_entry = unsafe { table.meta(i) };
+ 
+         // Try to claim the empty entry.
++        #[cfg(feature = "tla-trace")]
++        let _tla_start = crate::tla_trace::rdtsc();
+         let found = match guard.compare_exchange(
+             entry,
+             ptr::null_mut(),
+@@ -900,8 +913,27 @@ where
+         ) {
+             // Successfully claimed the entry.
+             Ok(_) => {
++                #[cfg(feature = "tla-trace")]
++                {
++                    let _tla_end = crate::tla_trace::rdtsc();
++                    crate::tla_trace::emit_insert_cas(
++                        unsafe { &(*new_entry).key },
++                        unsafe { &(*new_entry).value },
++                        table.raw as *mut u8, i, _tla_start, _tla_end,
++                    );
++                }
++
+                 // Update the metadata table.
++                #[cfg(feature = "tla-trace")]
++                let _tla_meta_start = crate::tla_trace::rdtsc();
+                 meta_entry.store(meta, Ordering::Release);
++                #[cfg(feature = "tla-trace")]
++                {
++                    let _tla_meta_end = crate::tla_trace::rdtsc();
++                    crate::tla_trace::emit_insert_meta(
++                        table.raw as *mut u8, i, _tla_meta_start, _tla_meta_end,
++                    );
++                }
+ 
+                 // Return the value we inserted.
+                 return InsertStatus::Inserted;
+@@ -961,6 +993,8 @@ where
+         let entry = unsafe { table.entry(i) };
+ 
+         // Try to perform the update.
++        #[cfg(feature = "tla-trace")]
++        let _tla_start = crate::tla_trace::rdtsc();
+         let found = match guard.compare_exchange_weak(
+             entry,
+             current.raw,
+@@ -970,6 +1004,23 @@ where
+         ) {
+             // Successfully updated.
+             Ok(_) => unsafe {
++                #[cfg(feature = "tla-trace")]
++                {
++                    let _tla_end = crate::tla_trace::rdtsc();
++                    let is_remove = new_entry == Entry::<K, V>::TOMBSTONE;
++                    if is_remove {
++                        crate::tla_trace::emit_remove(
++                            &(*current.ptr).key, table.raw as *mut u8, i,
++                            _tla_start, _tla_end,
++                        );
++                    } else {
++                        crate::tla_trace::emit_insert_update(
++                            &(*new_entry).key, &(*new_entry).value,
++                            table.raw as *mut u8, i, _tla_start, _tla_end,
++                        );
++                    }
++                }
++
+                 // Safety: The caller guarantees that `current` is a valid non-null entry that was
+                 // inserted into the map. Additionally, it is now unreachable from this table due
+                 // to the CAS above.
+@@ -1864,6 +1915,8 @@ where
+         *new.state_mut().status.get_mut() = State::PROMOTED;
+ 
+         // Race to write the initial table.
++        #[cfg(feature = "tla-trace")]
++        let _tla_start = crate::tla_trace::rdtsc();
+         match self.table.compare_exchange(
+             ptr::null_mut(),
+             new.raw,
+@@ -1871,7 +1924,18 @@ where
+             Ordering::Acquire,
+         ) {
+             // Successfully initialized the table.
+-            Ok(_) => new,
++            Ok(_) => {
++                #[cfg(feature = "tla-trace")]
++                {
++                    let _tla_end = crate::tla_trace::rdtsc();
++                    crate::tla_trace::emit_init_table(
++                        new.raw as *mut u8,
++                        capacity.unwrap_or(CAPACITY),
++                        _tla_start, _tla_end,
++                    );
++                }
++                new
++            }
+ 
+             // Someone beat us, deallocate our table and use the table that was written.
+             Err(found) => {
+@@ -1977,8 +2041,20 @@ where
+         );
+ 
+         // Allocate the new table while holding the lock.
++        #[cfg(feature = "tla-trace")]
++        let _tla_start = crate::tla_trace::rdtsc();
+         let next = Table::alloc(next_capacity);
+         state.next.store(next.raw, Ordering::Release);
++        #[cfg(feature = "tla-trace")]
++        {
++            let _tla_end = crate::tla_trace::rdtsc();
++            crate::tla_trace::emit_alloc_next(
++                table.raw as *mut u8,
++                next.raw as *mut u8,
++                next_capacity,
++                _tla_start, _tla_end,
++            );
++        }
+         drop(_allocating);
+ 
+         next
+@@ -2064,7 +2140,18 @@ where
+                         //
+                         // Note that the `SeqCst` is necessary to make the store visible
+                         // to threads that are unparked.
++                        #[cfg(feature = "tla-trace")]
++                        let _tla_abort_start = crate::tla_trace::rdtsc();
+                         next.state().status.store(State::ABORTED, Ordering::SeqCst);
++                        #[cfg(feature = "tla-trace")]
++                        {
++                            let _tla_abort_end = crate::tla_trace::rdtsc();
++                            crate::tla_trace::emit_abort_resize(
++                                table.raw as *mut u8,
++                                next.raw as *mut u8,
++                                _tla_abort_start, _tla_abort_end,
++                            );
++                        }
+ 
+                         // Allocate the next table.
+                         let allocated = self.get_or_alloc_next(None, next);
+@@ -2131,9 +2218,18 @@ where
+                 }
+ 
+                 // Park until the table is promoted.
++                #[cfg(feature = "tla-trace")]
++                let _tla_park_start = crate::tla_trace::rdtsc();
+                 state
+                     .parker
+                     .park(&state.status, |status| status == State::PENDING);
++                #[cfg(feature = "tla-trace")]
++                {
++                    let _tla_park_end = crate::tla_trace::rdtsc();
++                    crate::tla_trace::emit_park(
++                        next.raw as *mut u8, _tla_park_start, _tla_park_end,
++                    );
++                }
+             }
+         }
+     }
+@@ -2159,9 +2255,13 @@ where
+         // Note that we don't need to protect the returned entry here, because
+         // no one is allowed to retire the entry once we put the `COPYING` bit
+         // down until it is inserted into the new table.
++        #[cfg(feature = "tla-trace")]
++        let _tla_start = crate::tla_trace::rdtsc();
+         let entry = unsafe { table.entry(i) }
+             .fetch_or(Entry::COPYING, Ordering::AcqRel)
+             .unpack();
++        #[cfg(feature = "tla-trace")]
++        let _tla_end = crate::tla_trace::rdtsc();
+ 
+         // The entry is a tombstone.
+         if entry.raw == Entry::TOMBSTONE {
+@@ -2177,16 +2277,35 @@ where
+             return true;
+         }
+ 
++        // Emit copy_mark_copying only if entry was not already COPYING
++        #[cfg(feature = "tla-trace")]
++        if entry.tag() & Entry::COPYING == 0 {
++            crate::tla_trace::emit_copy_mark_copying(
++                table.raw as *mut u8, i, _tla_start, _tla_end,
++            );
++        }
++
+         // Copy the value to the new table.
+         //
+         // Safety: We marked the entry as `COPYING`, ensuring that any updates
+         // or removals wait until we complete the copy, and allowing us to get
+         // away without a protected load. Additionally, we verified that the
+         // entry is non-null, meaning that it is valid for reads.
+-        unsafe {
++        #[cfg(feature = "tla-trace")]
++        let _tla_copy_start = crate::tla_trace::rdtsc();
++        let _copy_result = unsafe {
+             self.insert_copy(entry.ptr.unpack(), false, next_table, guard)
+-                .is_some()
++        };
++        #[cfg(feature = "tla-trace")]
++        if let Some((_dst_table, _dst_slot)) = _copy_result {
++            let _tla_copy_end = crate::tla_trace::rdtsc();
++            crate::tla_trace::emit_copy_insert(
++                table.raw as *mut u8, i,
++                _dst_table.raw as *mut u8, _dst_slot,
++                _tla_copy_start, _tla_copy_end,
++            );
+         }
++        _copy_result.is_some()
+     }
+ 
+     /// Help along an in-progress resize incrementally by copying a chunk of entries.
+@@ -2285,9 +2404,18 @@ where
+                 }
+ 
+                 // Park until the table is promoted.
++                #[cfg(feature = "tla-trace")]
++                let _tla_park_start = crate::tla_trace::rdtsc();
+                 state
+                     .parker
+                     .park(&state.status, |status| status == State::PENDING);
++                #[cfg(feature = "tla-trace")]
++                {
++                    let _tla_park_end = crate::tla_trace::rdtsc();
++                    crate::tla_trace::emit_park(
++                        next.raw as *mut u8, _tla_park_start, _tla_park_end,
++                    );
++                }
+             }
+         }
+     }
+@@ -2308,7 +2436,11 @@ where
+         let entry = unsafe { table.entry(i) };
+ 
+         // Mark the entry as copying.
++        #[cfg(feature = "tla-trace")]
++        let _tla_start = crate::tla_trace::rdtsc();
+         let found = entry.fetch_or(Entry::COPYING, Ordering::AcqRel).unpack();
++        #[cfg(feature = "tla-trace")]
++        let _tla_end = crate::tla_trace::rdtsc();
+ 
+         // The entry is a tombstone.
+         if found.raw == Entry::TOMBSTONE {
+@@ -2324,6 +2456,14 @@ where
+             return;
+         }
+ 
++        // Emit copy_mark_copying only if entry was not already COPYING
++        #[cfg(feature = "tla-trace")]
++        if found.tag() & Entry::COPYING == 0 {
++            crate::tla_trace::emit_copy_mark_copying(
++                table.raw as *mut u8, i, _tla_start, _tla_end,
++            );
++        }
++
+         // Mark the entry as borrowed so writers in the new table know it was copied.
+         let new_entry = found.map_tag(|addr| addr | Entry::BORROWED);
+ 
+@@ -2333,10 +2473,21 @@ where
+         // or removals wait until we complete the copy, and allowing us to get
+         // away without a protected load. Additionally, we verified that the
+         // entry is non-null, meaning that it is valid for reads.
+-        unsafe {
++        #[cfg(feature = "tla-trace")]
++        let _tla_icopy_start = crate::tla_trace::rdtsc();
++        let _icopy_result = unsafe {
+             self.insert_copy(new_entry, true, next_table, guard)
+-                .unwrap();
++        };
++        #[cfg(feature = "tla-trace")]
++        if let Some((_dst_table, _dst_slot)) = _icopy_result {
++            let _tla_icopy_end = crate::tla_trace::rdtsc();
++            crate::tla_trace::emit_copy_insert(
++                table.raw as *mut u8, i,
++                _dst_table.raw as *mut u8, _dst_slot,
++                _tla_icopy_start, _tla_icopy_end,
++            );
+         }
++        _icopy_result.unwrap();
+ 
+         // Mark the entry as copied.
+         let copied = found
+@@ -2348,7 +2499,16 @@ where
+         //
+         // Note that the `SeqCst` is necessary to make the store visible to threads
+         // that are unparked.
++        #[cfg(feature = "tla-trace")]
++        let _tla_copied_start = crate::tla_trace::rdtsc();
+         entry.store(copied, Ordering::SeqCst);
++        #[cfg(feature = "tla-trace")]
++        {
++            let _tla_copied_end = crate::tla_trace::rdtsc();
++            crate::tla_trace::emit_copy_mark_copied(
++                table.raw as *mut u8, i, _tla_copied_start, _tla_copied_end,
++            );
++        }
+ 
+         // Notify any writers that the copy has completed.
+         table.state().parker.unpark(entry);
+@@ -2472,11 +2632,24 @@ where
+             // it may not contain all the entries in the table.
+             if table.raw == root {
+                 // Try to update the root.
++                #[cfg(feature = "tla-trace")]
++                let _tla_start = crate::tla_trace::rdtsc();
+                 if self
+                     .table
+                     .compare_exchange(table.raw, next.raw, Ordering::Release, Ordering::Acquire)
+                     .is_ok()
+                 {
++                    #[cfg(feature = "tla-trace")]
++                    {
++                        let _tla_end = crate::tla_trace::rdtsc();
++                        crate::tla_trace::emit_try_promote(
++                            table.raw as *mut u8,
++                            next.raw as *mut u8,
++                            copied,
++                            _tla_start, _tla_end,
++                        );
++                    }
++
+                     // Successfully promoted the table.
+                     //
+                     // Note that the `SeqCst` is necessary to make the store visible to threads

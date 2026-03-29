@@ -143,7 +143,7 @@ Note: The model found this violation on the cancel barrier path (`BAR_CANCEL_INC
 - **Severity**: Critical (deterministic deadlock in production builds)
 - **Affects**: All GCC versions since 11 (commit d656bfda, Feb 2021). Unfixed in GCC trunk as of March 2026.
 - **Affects all barrier implementations**: centralized (Linux), flat (NVIDIA patch), POSIX — all use identical BAR_TASK_PENDING gating
-- **Status**: Not yet reported upstream
+- **Status**: Reported upstream — https://gcc.gnu.org/bugzilla/show_bug.cgi?id=124620
 - **Root cause**: `omp_fulfill_event` from unshackled thread wakes a barrier thread without setting BAR_TASK_PENDING
 
 ### Root Cause

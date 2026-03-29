@@ -1,0 +1,343 @@
+diff --git a/src/internal.rs b/src/internal.rs
+index 9d72c81..632ab2e 100644
+--- a/src/internal.rs
++++ b/src/internal.rs
+@@ -1,6 +1,7 @@
+ #[cfg(not(feature = "std-mutex"))]
+ use crate::mutex::{Mutex, MutexGuard};
+ use crate::signal::DynamicSignal;
++use crate::tla_trace;
+ extern crate alloc;
+ use alloc::collections::VecDeque;
+ use branches::unlikely;
+@@ -64,7 +65,16 @@ impl<T> Internal<T> {
+ 
+     #[inline(always)]
+     pub(crate) fn clone_recv(&self) -> Internal<T> {
+-        acquire_internal(self).inc_ref_count(false);
++        let _tla_start = tla_trace::ts_start();
++        let mut internal = acquire_internal(self);
++        internal.inc_ref_count(false);
++        if tla_trace::is_active() {
++            tla_trace::emit_channel_event_counts(
++                "clone_receiver", _tla_start,
++                internal.send_count, internal.recv_count, None,
++            );
++        }
++        drop(internal);
+         Internal {
+             _guard: CacheGuard::new(()),
+             internal: self.internal,
+@@ -73,7 +83,15 @@ impl<T> Internal<T> {
+ 
+     #[inline(always)]
+     pub(crate) fn drop_recv(&mut self) {
++        let _tla_start = tla_trace::ts_start();
+         let mut internal = acquire_internal(self);
++        if tla_trace::is_active() {
++            let new_recv = internal.recv_count.saturating_sub(1);
++            tla_trace::emit_refcount_event(
++                "drop_receiver", _tla_start,
++                internal.send_count, new_recv,
++            );
++        }
+         if unlikely(internal.dec_ref_count(false)) {
+             drop(internal);
+             unsafe { self.drop() }
+@@ -82,7 +100,16 @@ impl<T> Internal<T> {
+ 
+     #[inline(always)]
+     pub(crate) fn clone_send(&self) -> Internal<T> {
+-        acquire_internal(self).inc_ref_count(true);
++        let _tla_start = tla_trace::ts_start();
++        let mut internal = acquire_internal(self);
++        internal.inc_ref_count(true);
++        if tla_trace::is_active() {
++            tla_trace::emit_channel_event_counts(
++                "clone_sender", _tla_start,
++                internal.send_count, internal.recv_count, None,
++            );
++        }
++        drop(internal);
+         Internal {
+             _guard: CacheGuard::new(()),
+             internal: self.internal,
+@@ -91,7 +118,15 @@ impl<T> Internal<T> {
+ 
+     #[inline(always)]
+     pub(crate) fn drop_send(&mut self) {
++        let _tla_start = tla_trace::ts_start();
+         let mut internal = acquire_internal(self);
++        if tla_trace::is_active() {
++            let new_send = internal.send_count.saturating_sub(1);
++            tla_trace::emit_refcount_event(
++                "drop_sender", _tla_start,
++                new_send, internal.recv_count,
++            );
++        }
+         if unlikely(internal.dec_ref_count(true)) {
+             drop(internal);
+             unsafe { self.drop() }
+diff --git a/src/lib.rs b/src/lib.rs
+index ab14f64..e372a20 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -12,6 +12,9 @@ mod error;
+ mod future;
+ mod signal;
+ 
++/// TLA+ trace emission module for trace validation.
++pub mod tla_trace;
++
+ pub use error::*;
+ #[cfg(feature = "async")]
+ pub use future::*;
+@@ -235,6 +238,7 @@ macro_rules! shared_impl {
+         /// assert_eq!(s.is_closed(),true);
+         /// ```
+         pub fn close(&self) -> Result<(), CloseError> {
++            let _tla_start = tla_trace::ts_start();
+             let mut internal = acquire_internal(&self.internal);
+             if unlikely(internal.recv_count == 0 && internal.send_count == 0) {
+                 return Err(CloseError());
+@@ -243,6 +247,12 @@ macro_rules! shared_impl {
+             internal.send_count = 0;
+             internal.terminate_signals();
+             internal.queue.clear();
++            if tla_trace::is_active() {
++                tla_trace::emit_channel_event_counts(
++                    "close", _tla_start,
++                    internal.send_count, internal.recv_count, None,
++                );
++            }
+             Ok(())
+         }
+         /// Returns whether the channel is closed on both side of send and
+@@ -605,13 +615,30 @@ impl<T> Sender<T> {
+     /// ```
+     #[inline(always)]
+     pub fn send(&self, data: T) -> Result<(), SendError<T>> {
++        let _tla_start = tla_trace::ts_start();
+         let cap = self.internal.capacity();
+         let mut internal = acquire_internal(&self.internal);
+         if unlikely(internal.recv_count == 0) {
++            if tla_trace::is_active() {
++                tla_trace::emit_channel_event_counts(
++                    "send_closed", _tla_start,
++                    internal.send_count, internal.recv_count, None,
++                );
++            }
+             drop(internal);
+             return Err(SendError(data));
+         }
+         if let Some(first) = internal.next_recv() {
++            if tla_trace::is_active() {
++                let st = tla_trace::ChannelState {
++                    queue_len: internal.queue.len(),
++                    send_count: internal.send_count,
++                    recv_count: internal.recv_count,
++                    wait_list_len: internal.wait_list.len(),
++                    recv_blocking: internal.recv_blocking,
++                };
++                tla_trace::emit_channel_event("send_direct_handoff", _tla_start, &st, None);
++            }
+             drop(internal);
+             // SAFETY: it's safe to send to owned signal once
+             unsafe { first.send(data) }
+@@ -620,12 +647,32 @@ impl<T> Sender<T> {
+         if cap > 0 && internal.queue.len() < cap {
+             // SAFETY: MaybeUninit is acting like a ManuallyDrop
+             internal.queue.push_back(data);
++            if tla_trace::is_active() {
++                let st = tla_trace::ChannelState {
++                    queue_len: internal.queue.len(),
++                    send_count: internal.send_count,
++                    recv_count: internal.recv_count,
++                    wait_list_len: internal.wait_list.len(),
++                    recv_blocking: internal.recv_blocking,
++                };
++                tla_trace::emit_channel_event("send_to_queue", _tla_start, &st, None);
++            }
+             return Ok(());
+         }
+         let mut data = MaybeUninit::new(data);
+         // send directly to the waitlist
+         let sig = pin!(SyncSignal::new(KanalPtr::new_from(data.as_mut_ptr())));
+         internal.push_signal(sig.dynamic_ptr());
++        if tla_trace::is_active() {
++            let st = tla_trace::ChannelState {
++                queue_len: internal.queue.len(),
++                send_count: internal.send_count,
++                recv_count: internal.recv_count,
++                wait_list_len: internal.wait_list.len(),
++                recv_blocking: internal.recv_blocking,
++            };
++            tla_trace::emit_channel_event("send_block", _tla_start, &st, None);
++        }
+         drop(internal);
+         if unlikely(!sig.wait()) {
+             // SAFETY: data failed to move, sender should drop it if it
+@@ -1059,9 +1106,16 @@ impl<T> Receiver<T> {
+     /// Receives data from the channel
+     #[inline(always)]
+     pub fn recv(&self) -> Result<T, ReceiveError> {
++        let _tla_start = tla_trace::ts_start();
+         let cap = self.internal.capacity();
+         let mut internal = acquire_internal(&self.internal);
+         if unlikely(internal.recv_count == 0) {
++            if tla_trace::is_active() {
++                tla_trace::emit_channel_event_counts(
++                    "recv_closed", _tla_start,
++                    internal.send_count, internal.recv_count, None,
++                );
++            }
+             return Err(ReceiveError());
+         }
+         if cap > 0 {
+@@ -1071,15 +1125,41 @@ impl<T> Receiver<T> {
+                     // SAFETY: it's safe to receive from owned signal once
+                     unsafe { internal.queue.push_back(p.recv()) }
+                 }
++                if tla_trace::is_active() {
++                    let st = tla_trace::ChannelState {
++                        queue_len: internal.queue.len(),
++                        send_count: internal.send_count,
++                        recv_count: internal.recv_count,
++                        wait_list_len: internal.wait_list.len(),
++                        recv_blocking: internal.recv_blocking,
++                    };
++                    tla_trace::emit_channel_event("recv_from_queue", _tla_start, &st, None);
++                }
+                 return Ok(v);
+             }
+         }
+         if let Some(p) = internal.next_send() {
++            if tla_trace::is_active() {
++                let st = tla_trace::ChannelState {
++                    queue_len: internal.queue.len(),
++                    send_count: internal.send_count,
++                    recv_count: internal.recv_count,
++                    wait_list_len: internal.wait_list.len(),
++                    recv_blocking: internal.recv_blocking,
++                };
++                tla_trace::emit_channel_event("recv_direct_handoff", _tla_start, &st, None);
++            }
+             drop(internal);
+             // SAFETY: it's safe to receive from owned signal once
+             return unsafe { Ok(p.recv()) };
+         }
+         if unlikely(internal.send_count == 0) {
++            if tla_trace::is_active() {
++                tla_trace::emit_channel_event_counts(
++                    "recv_closed", _tla_start,
++                    internal.send_count, internal.recv_count, None,
++                );
++            }
+             return Err(ReceiveError());
+         }
+         // no active waiter so push to the queue
+@@ -1088,6 +1168,16 @@ impl<T> Receiver<T> {
+             ret.as_mut_ptr()
+         )));
+         internal.push_signal(sig.dynamic_ptr());
++        if tla_trace::is_active() {
++            let st = tla_trace::ChannelState {
++                queue_len: internal.queue.len(),
++                send_count: internal.send_count,
++                recv_count: internal.recv_count,
++                wait_list_len: internal.wait_list.len(),
++                recv_blocking: internal.recv_blocking,
++            };
++            tla_trace::emit_channel_event("recv_block", _tla_start, &st, None);
++        }
+         drop(internal);
+ 
+         if unlikely(!sig.wait()) {
+diff --git a/src/signal.rs b/src/signal.rs
+index 07c5fa4..f4c698e 100644
+--- a/src/signal.rs
++++ b/src/signal.rs
+@@ -1,4 +1,4 @@
+-use crate::{backoff, pointer::KanalPtr};
++use crate::{backoff, pointer::KanalPtr, tla_trace};
+ use core::{
+     cell::UnsafeCell,
+     fmt::Debug,
+@@ -159,19 +159,29 @@ impl<T> SyncSignal<T> {
+     }
+     #[inline(always)]
+     pub(crate) unsafe fn write_data(this: *const Self, data: T) {
++        let _tla_start = tla_trace::ts_start();
+         let thread = ManuallyDrop::take(&mut *(*this).thread.get());
+         unsafe {
+             (*this).ptr.write(data);
+         }
+-        if unlikely((*this).state.swap(UNLOCKED, Ordering::AcqRel) == LOCKED_STARVATION) {
++        let prev = (*this).state.swap(UNLOCKED, Ordering::AcqRel);
++        if tla_trace::is_active() {
++            tla_trace::emit_signal_event("signal_write_data", _tla_start, "UNLOCKED");
++        }
++        if unlikely(prev == LOCKED_STARVATION) {
+             thread.unpark();
+         }
+     }
+     #[inline(always)]
+     pub(crate) unsafe fn read_data(this: *const Self) -> T {
++        let _tla_start = tla_trace::ts_start();
+         let thread = ManuallyDrop::take(&mut *(*this).thread.get());
+         let r = (*this).ptr.read();
+-        if unlikely((*this).state.swap(UNLOCKED, Ordering::AcqRel) == LOCKED_STARVATION) {
++        let prev = (*this).state.swap(UNLOCKED, Ordering::AcqRel);
++        if tla_trace::is_active() {
++            tla_trace::emit_signal_event("signal_write_data", _tla_start, "UNLOCKED");
++        }
++        if unlikely(prev == LOCKED_STARVATION) {
+             thread.unpark();
+         }
+         r
+@@ -183,8 +193,13 @@ impl<T> SyncSignal<T> {
+         self.ptr.read()
+     }
+     pub(crate) unsafe fn terminate(this: *const Self) {
++        let _tla_start = tla_trace::ts_start();
+         let thread = ManuallyDrop::take(&mut *(*this).thread.get());
+-        if unlikely((*this).state.swap(TERMINATED, Ordering::AcqRel) == LOCKED_STARVATION) {
++        let prev = (*this).state.swap(TERMINATED, Ordering::AcqRel);
++        if tla_trace::is_active() {
++            tla_trace::emit_signal_event("signal_terminated", _tla_start, "TERMINATED");
++        }
++        if unlikely(prev == LOCKED_STARVATION) {
+             thread.unpark();
+         }
+     }
+@@ -214,18 +229,24 @@ impl<T> SyncSignal<T> {
+                 break;
+             }
+         }
++        let _tla_cas_start = tla_trace::ts_start();
+         match self.state.compare_exchange(
+             LOCKED,
+             LOCKED_STARVATION,
+             Ordering::Release,
+             Ordering::Acquire,
+         ) {
+-            Ok(_) => loop {
+-                std::thread::park();
+-                let v = self.state.load(Ordering::Relaxed);
+-                if likely(v > LOCKED_STARVATION) {
+-                    fence(Ordering::Acquire);
+-                    return v == UNLOCKED;
++            Ok(_) => {
++                if tla_trace::is_active() {
++                    tla_trace::emit_simple_event("wait_timeout", _tla_cas_start);
++                }
++                loop {
++                    std::thread::park();
++                    let v = self.state.load(Ordering::Relaxed);
++                    if likely(v > LOCKED_STARVATION) {
++                        fence(Ordering::Acquire);
++                        return v == UNLOCKED;
++                    }
+                 }
+             },
+             Err(v) => v == UNLOCKED,

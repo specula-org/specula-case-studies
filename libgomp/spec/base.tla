@@ -600,10 +600,10 @@ PrimaryHandleTask ==
     /\ pc[Primary] = "primary_handle_task"
     \* task.c:1583: &team->barrier != bar check (Family 4)
     /\ threadTeamId[Primary] = teamId  \* No ABA — still on correct team
-    /\ IF taskPending /\ taskCount > 0
-       THEN \* Tasks available — execute one
+    /\ IF taskPending /\ taskCount > taskDetachCount
+       THEN \* Runnable (non-detached) tasks available — execute one
             /\ taskCount' = taskCount - 1
-            /\ taskPending' = IF taskCount - 1 > 0 THEN TRUE ELSE FALSE
+            /\ taskPending' = IF taskCount - 1 > taskDetachCount THEN TRUE ELSE FALSE
        ELSE \* TOCTOU: taskPending was TRUE in PrimaryCheckThread/PrimaryCheckCancelThread
             \* but a secondary consumed the last task before we got here.
             \* task.c:1637-1724: gomp_barrier_handle_tasks finds empty queue, returns.
@@ -619,10 +619,10 @@ PrimaryHandleTask ==
  *)
 PrimaryHandleTaskLast ==
     /\ pc[Primary] = "primary_handle_task_last"
-    /\ IF taskCount > 0 /\ taskPending
-       THEN \* Execute a task
+    /\ IF taskCount > taskDetachCount /\ taskPending
+       THEN \* Execute a runnable (non-detached) task
             /\ taskCount' = taskCount - 1
-            /\ taskPending' = IF taskCount - 1 > 0 THEN TRUE ELSE FALSE
+            /\ taskPending' = IF taskCount - 1 > taskDetachCount THEN TRUE ELSE FALSE
             /\ UNCHANGED <<generation, waitingForTask, cancelled,
                            secondaryArrived, holding, pc,
                            threadGenVars, detachVars>>
@@ -679,9 +679,9 @@ SecondaryHandleTask(t) ==
     /\ ~holding  \* If holding, gomp_barrier_has_completed bails out (bar.h:414)
     \* task.c:1583: team barrier pointer check (Family 4)
     /\ threadTeamId[t] = teamId
-    /\ taskCount > 0
+    /\ taskCount > taskDetachCount  \* Only runnable (non-detached) tasks
     /\ taskCount' = taskCount - 1
-    /\ taskPending' = IF taskCount - 1 > 0 THEN TRUE ELSE FALSE
+    /\ taskPending' = IF taskCount - 1 > taskDetachCount THEN TRUE ELSE FALSE
     \* task.c:1608: secondaries call with wait_on_was_last=FALSE (bar.c:457)
     \* They execute tasks but CANNOT complete the barrier (goto no_task).
     \* Only the primary (wait_on_was_last=TRUE) can complete the barrier.

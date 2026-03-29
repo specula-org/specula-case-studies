@@ -1,0 +1,328 @@
+diff --git a/tokio/src/sync/broadcast.rs b/tokio/src/sync/broadcast.rs
+index 3ab9a2ca..1d857244 100644
+--- a/tokio/src/sync/broadcast.rs
++++ b/tokio/src/sync/broadcast.rs
+@@ -123,6 +123,8 @@ use crate::task::coop::cooperative;
+ use crate::util::linked_list::{self, GuardedLinkedList, LinkedList};
+ use crate::util::WakeList;
+ 
++use super::tla_trace;
++
+ use std::fmt;
+ use std::future::Future;
+ use std::marker::PhantomPinned;
+@@ -242,6 +244,12 @@ pub struct Receiver<T> {
+ 
+     /// Next position to read from
+     next: u64,
++
++    /// Trace ID for TLA+ trace validation (e.g. 1 -> "r1")
++    trace_id: u64,
++
++    /// Suppress trace emission (during drop cleanup loop)
++    trace_suppress: bool,
+ }
+ 
+ pub mod error {
+@@ -508,10 +516,20 @@ const MAX_RECEIVERS: usize = usize::MAX >> 2;
+ pub fn channel<T: Clone>(capacity: usize) -> (Sender<T>, Receiver<T>) {
+     // SAFETY: In the line below we are creating one extra receiver, so there will be 1 in total.
+     let tx = unsafe { Sender::new_with_receiver_count(1, capacity) };
++    let trace_id = tla_trace::NEXT_RECEIVER_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+     let rx = Receiver {
+         shared: tx.shared.clone(),
+         next: 0,
++        trace_id,
++        trace_suppress: false,
+     };
++
++    // TLA+ trace: emit Subscribe for the initial receiver created by channel()
++    if tla_trace::is_active() {
++        let ts = tla_trace::now_ns();
++        tla_trace::emit_subscribe(ts, ts, &format!("r{}", trace_id), 0, 1);
++    }
++
+     (tx, rx)
+ }
+ 
+@@ -629,6 +647,8 @@ impl<T> Sender<T> {
+     /// # }
+     /// ```
+     pub fn send(&self, value: T) -> Result<usize, SendError<T>> {
++        let _trace_start = if tla_trace::is_active() { tla_trace::now_ns() } else { 0 };
++
+         let mut tail = self.shared.tail.lock();
+ 
+         if tail.rx_cnt == 0 {
+@@ -655,6 +675,10 @@ impl<T> Sender<T> {
+         // Write the value
+         slot.val = Some(value);
+ 
++        // TLA+ trace: capture state under locks
++        let _trace_tail_pos = tail.pos;
++        let _trace_rx_cnt = rem;
++
+         // Release the slot lock before notifying the receivers.
+         drop(slot);
+ 
+@@ -663,6 +687,17 @@ impl<T> Sender<T> {
+         // thread is in the critical section.
+         self.shared.notify_rx(tail);
+ 
++        // TLA+ trace: emit Send event after lock release
++        if tla_trace::is_active() {
++            let trace_end = tla_trace::now_ns();
++            let vid = tla_trace::NEXT_VALUE_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
++            tla_trace::emit_send(
++                _trace_start, trace_end,
++                &format!("v{}", (vid % 2) + 1),
++                _trace_tail_pos, _trace_rx_cnt,
++            );
++        }
++
+         Ok(rem)
+     }
+ 
+@@ -903,10 +938,21 @@ impl<T> Sender<T> {
+     }
+ 
+     fn close_channel(&self) {
++        let _trace_start = if tla_trace::is_active() { tla_trace::now_ns() } else { 0 };
++
+         let mut tail = self.shared.tail.lock();
+         tail.closed = true;
+ 
++        // TLA+ trace: capture state under tail lock
++        let _trace_closed = tail.closed;
++
+         self.shared.notify_rx(tail);
++
++        // TLA+ trace: CloseChannel event after lock release
++        if tla_trace::is_active() {
++            let trace_end = tla_trace::now_ns();
++            tla_trace::emit_close_channel(_trace_start, trace_end, _trace_closed);
++        }
+     }
+ 
+     /// Returns the number of [`Sender`] handles.
+@@ -922,6 +968,8 @@ impl<T> Sender<T> {
+ 
+ /// Create a new `Receiver` which reads starting from the tail.
+ fn new_receiver<T>(shared: Arc<Shared<T>>) -> Receiver<T> {
++    let _trace_start = if tla_trace::is_active() { tla_trace::now_ns() } else { 0 };
++
+     let mut tail = shared.tail.lock();
+ 
+     assert!(tail.rx_cnt != MAX_RECEIVERS, "max receivers");
+@@ -936,9 +984,23 @@ fn new_receiver<T>(shared: Arc<Shared<T>>) -> Receiver<T> {
+     tail.rx_cnt = tail.rx_cnt.checked_add(1).expect("overflow");
+     let next = tail.pos;
+ 
++    // TLA+ trace: capture state under tail lock
++    let _trace_rx_cnt = tail.rx_cnt;
++    let trace_id = tla_trace::NEXT_RECEIVER_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
++
+     drop(tail);
+ 
+-    Receiver { shared, next }
++    // TLA+ trace: emit Subscribe event after lock release
++    if tla_trace::is_active() {
++        let trace_end = tla_trace::now_ns();
++        tla_trace::emit_subscribe(
++            _trace_start, trace_end,
++            &format!("r{}", trace_id),
++            next, _trace_rx_cnt,
++        );
++    }
++
++    Receiver { shared, next, trace_id, trace_suppress: false }
+ }
+ 
+ /// List used in `Shared::notify_rx`. It wraps a guarded linked list
+@@ -1057,16 +1119,34 @@ impl<T> Shared<T> {
+ 
+ impl<T> Clone for Sender<T> {
+     fn clone(&self) -> Sender<T> {
++        let _trace_start = if tla_trace::is_active() { tla_trace::now_ns() } else { 0 };
++
+         let shared = self.shared.clone();
+         shared.num_tx.fetch_add(1, Relaxed);
+ 
++        // TLA+ trace: SenderClone
++        if tla_trace::is_active() {
++            let trace_end = tla_trace::now_ns();
++            tla_trace::emit_sender_clone(_trace_start, trace_end);
++        }
++
+         Sender { shared }
+     }
+ }
+ 
+ impl<T> Drop for Sender<T> {
+     fn drop(&mut self) {
+-        if 1 == self.shared.num_tx.fetch_sub(1, AcqRel) {
++        let _trace_start = if tla_trace::is_active() { tla_trace::now_ns() } else { 0 };
++
++        let prev = self.shared.num_tx.fetch_sub(1, AcqRel);
++
++        // TLA+ trace: SenderDrop (emit BEFORE close_channel)
++        if tla_trace::is_active() {
++            let trace_end = tla_trace::now_ns();
++            tla_trace::emit_sender_drop(_trace_start, trace_end, prev - 1);
++        }
++
++        if prev == 1 {
+             self.close_channel();
+         }
+     }
+@@ -1129,6 +1209,10 @@ impl<T> Drop for WeakSender<T> {
+ }
+ 
+ impl<T> Receiver<T> {
++    fn trace_id_str(&self) -> String {
++        format!("r{}", self.trace_id)
++    }
++
+     /// Returns the number of messages that were sent into the channel and that
+     /// this [`Receiver`] has yet to receive.
+     ///
+@@ -1224,6 +1308,8 @@ impl<T> Receiver<T> {
+         &mut self,
+         waiter: Option<(&UnsafeCell<Waiter>, &Waker)>,
+     ) -> Result<RecvGuard<'_, T>, TryRecvError> {
++        let _trace_start = if tla_trace::is_active() && !self.trace_suppress { tla_trace::now_ns() } else { 0 };
++
+         let idx = (self.next & self.shared.mask as u64) as usize;
+ 
+         // The slot holding the next value to read
+@@ -1257,6 +1343,11 @@ impl<T> Receiver<T> {
+                     // it's been closed, then that's what we return, otherwise we
+                     // set a waker and return empty.
+                     if tail.closed {
++                        // TLA+ trace: RecvClosed
++                        if tla_trace::is_active() && !self.trace_suppress {
++                            let trace_end = tla_trace::now_ns();
++                            tla_trace::emit_recv_closed(_trace_start, trace_end, &self.trace_id_str());
++                        }
+                         return Err(TryRecvError::Closed);
+                     }
+ 
+@@ -1295,6 +1386,12 @@ impl<T> Receiver<T> {
+                     drop(tail);
+                     drop(old_waker);
+ 
++                    // TLA+ trace: RecvEmpty
++                    if tla_trace::is_active() && !self.trace_suppress {
++                        let trace_end = tla_trace::now_ns();
++                        tla_trace::emit_recv_empty(_trace_start, trace_end, &self.trace_id_str());
++                    }
++
+                     return Err(TryRecvError::Empty);
+                 }
+ 
+@@ -1313,17 +1410,35 @@ impl<T> Receiver<T> {
+                 if missed == 0 {
+                     self.next = self.next.wrapping_add(1);
+ 
++                    // TLA+ trace: RecvSuccess (slow path, missed==0)
++                    if tla_trace::is_active() && !self.trace_suppress {
++                        let trace_end = tla_trace::now_ns();
++                        tla_trace::emit_recv_success(_trace_start, trace_end, &self.trace_id_str(), self.next);
++                    }
++
+                     return Ok(RecvGuard { slot });
+                 }
+ 
+                 self.next = next;
+ 
++                // TLA+ trace: RecvLagged
++                if tla_trace::is_active() && !self.trace_suppress {
++                    let trace_end = tla_trace::now_ns();
++                    tla_trace::emit_recv_lagged(_trace_start, trace_end, &self.trace_id_str(), self.next);
++                }
++
+                 return Err(TryRecvError::Lagged(missed));
+             }
+         }
+ 
+         self.next = self.next.wrapping_add(1);
+ 
++        // TLA+ trace: RecvSuccess (fast path)
++        if tla_trace::is_active() && !self.trace_suppress {
++            let trace_end = tla_trace::now_ns();
++            tla_trace::emit_recv_success(_trace_start, trace_end, &self.trace_id_str(), self.next);
++        }
++
+         Ok(RecvGuard { slot })
+     }
+ 
+@@ -1547,6 +1662,8 @@ impl<T: Clone> Receiver<T> {
+ 
+ impl<T> Drop for Receiver<T> {
+     fn drop(&mut self) {
++        let _trace_start = if tla_trace::is_active() { tla_trace::now_ns() } else { 0 };
++
+         let mut tail = self.shared.tail.lock();
+ 
+         tail.rx_cnt -= 1;
+@@ -1558,8 +1675,20 @@ impl<T> Drop for Receiver<T> {
+             tail.closed = true;
+         }
+ 
++        // TLA+ trace: ReceiverDrop — capture state under tail lock
++        let _trace_rx_cnt = tail.rx_cnt;
++
+         drop(tail);
+ 
++        // TLA+ trace: emit ReceiverDrop before cleanup loop
++        if tla_trace::is_active() {
++            let trace_end = tla_trace::now_ns();
++            tla_trace::emit_receiver_drop(_trace_start, trace_end, &self.trace_id_str(), _trace_rx_cnt);
++        }
++
++        // Suppress recv_ref trace events during cleanup loop
++        self.trace_suppress = true;
++
+         while self.next < until {
+             match self.recv_ref(None) {
+                 Ok(_) => {}
+@@ -1636,6 +1765,8 @@ impl<'a, T> Drop for Recv<'a, T> {
+         // If not, no further synchronization is required, since the waiter
+         // is not in the list and, as such, is not shared with any other threads.
+         if queued {
++            let _trace_start = if tla_trace::is_active() { tla_trace::now_ns() } else { 0 };
++
+             // Acquire the tail lock. This is required for safety before accessing
+             // the waiter node.
+             let mut tail = self.receiver.shared.tail.lock();
+@@ -1657,6 +1788,16 @@ impl<'a, T> Drop for Recv<'a, T> {
+                         tail.waiters.remove((&mut *ptr).into());
+                     });
+                 }
++
++                // TLA+ trace: DeregisterWaiter
++                if tla_trace::is_active() {
++                    drop(tail);
++                    let trace_end = tla_trace::now_ns();
++                    tla_trace::emit_deregister_waiter(
++                        _trace_start, trace_end,
++                        &self.receiver.trace_id_str(),
++                    );
++                }
+             }
+         }
+     }
+diff --git a/tokio/src/sync/mod.rs b/tokio/src/sync/mod.rs
+index 52bf6509..8a4396ef 100644
+--- a/tokio/src/sync/mod.rs
++++ b/tokio/src/sync/mod.rs
+@@ -458,6 +458,9 @@ cfg_sync! {
+     mod barrier;
+     pub use barrier::{Barrier, BarrierWaitResult};
+ 
++    #[doc(hidden)]
++    pub mod tla_trace;
++
+     pub mod broadcast;
+ 
+     pub mod mpsc;
