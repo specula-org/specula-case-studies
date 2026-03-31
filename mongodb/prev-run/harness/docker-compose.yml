@@ -1,0 +1,67 @@
+# MongoDB sharded cluster for TLA+ trace collection.
+# 2 shards (1-member replsets), 1 config server, 1 mongos.
+
+services:
+  configsvr:
+    image: mongo:8.0
+    container_name: mongo-configsvr
+    command: >
+      mongod --configsvr --replSet configRS --port 27017 --bind_ip_all
+      --setParameter logComponentVerbosity='{transaction: {verbosity: 4}}'
+      --logpath /var/log/mongodb/mongod.log --logappend
+    volumes:
+      - configsvr-logs:/var/log/mongodb
+    networks:
+      - mongo-net
+
+  shard1:
+    image: mongo:8.0
+    container_name: mongo-shard1
+    command: >
+      mongod --shardsvr --replSet shard1RS --port 27017 --bind_ip_all
+      --setParameter logComponentVerbosity='{transaction: {verbosity: 4}}'
+      --logpath /var/log/mongodb/mongod.log --logappend
+    volumes:
+      - shard1-logs:/var/log/mongodb
+    networks:
+      - mongo-net
+
+  shard2:
+    image: mongo:8.0
+    container_name: mongo-shard2
+    command: >
+      mongod --shardsvr --replSet shard2RS --port 27017 --bind_ip_all
+      --setParameter logComponentVerbosity='{transaction: {verbosity: 4}}'
+      --logpath /var/log/mongodb/mongod.log --logappend
+    networks:
+      - mongo-net
+    volumes:
+      - shard2-logs:/var/log/mongodb
+
+  mongos:
+    image: mongo:8.0
+    container_name: mongo-mongos
+    command: >
+      mongos --configdb configRS/configsvr:27017 --port 27017 --bind_ip_all
+      --setParameter logComponentVerbosity='{transaction: {verbosity: 4}}'
+      --logpath /var/log/mongodb/mongos.log --logappend
+    ports:
+      - "27017:27017"
+    depends_on:
+      - configsvr
+      - shard1
+      - shard2
+    volumes:
+      - mongos-logs:/var/log/mongodb
+    networks:
+      - mongo-net
+
+volumes:
+  configsvr-logs:
+  shard1-logs:
+  shard2-logs:
+  mongos-logs:
+
+networks:
+  mongo-net:
+    driver: bridge

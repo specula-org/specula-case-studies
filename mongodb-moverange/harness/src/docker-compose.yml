@@ -1,0 +1,82 @@
+version: "3.8"
+
+# Minimal sharded MongoDB cluster for MoveRange commit protocol trace capture.
+# Topology: 1 config server RS + 2 single-node shard RSs + 1 mongos router.
+
+services:
+  configsvr:
+    image: mongo:8
+    container_name: mr-configsvr
+    hostname: configsvr
+    command: >
+      mongod --configsvr --replSet configrs --port 27019
+      --setParameter enableTestCommands=1
+      --setParameter logComponentVerbosity='{sharding: {migration: {verbosity: 3}, rangeDeleter: {verbosity: 2}}}'
+      --bind_ip_all
+    ports:
+      - "27319:27019"
+    volumes:
+      - configsvr-data:/data/db
+    networks:
+      - mr-net
+
+  shard0:
+    image: mongo:8
+    container_name: mr-shard0
+    hostname: shard0
+    command: >
+      mongod --shardsvr --replSet shard0rs --port 27018
+      --setParameter enableTestCommands=1
+      --setParameter logComponentVerbosity='{sharding: {migration: {verbosity: 3}, rangeDeleter: {verbosity: 2}}, replication: {verbosity: 1}}'
+      --setParameter orphanCleanupDelaySecs=0
+      --bind_ip_all
+    ports:
+      - "27318:27018"
+    volumes:
+      - shard0-data:/data/db
+    networks:
+      - mr-net
+
+  shard1:
+    image: mongo:8
+    container_name: mr-shard1
+    hostname: shard1
+    command: >
+      mongod --shardsvr --replSet shard1rs --port 27018
+      --setParameter enableTestCommands=1
+      --setParameter logComponentVerbosity='{sharding: {migration: {verbosity: 3}, rangeDeleter: {verbosity: 2}}, replication: {verbosity: 1}}'
+      --setParameter orphanCleanupDelaySecs=0
+      --bind_ip_all
+    ports:
+      - "27418:27018"
+    volumes:
+      - shard1-data:/data/db
+    networks:
+      - mr-net
+
+  mongos:
+    image: mongo:8
+    container_name: mr-mongos
+    hostname: mongos
+    command: >
+      mongos --configdb configrs/configsvr:27019 --port 27017
+      --setParameter enableTestCommands=1
+      --setParameter logComponentVerbosity='{sharding: {migration: {verbosity: 3}}}'
+      --bind_ip_all
+    ports:
+      - "27417:27017"
+    depends_on:
+      - configsvr
+      - shard0
+      - shard1
+    networks:
+      - mr-net
+
+volumes:
+  configsvr-data:
+  shard0-data:
+  shard1-data:
+
+networks:
+  mr-net:
+    driver: bridge

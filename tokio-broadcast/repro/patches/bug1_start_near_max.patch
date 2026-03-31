@@ -1,0 +1,34 @@
+diff --git a/tokio/src/sync/broadcast.rs b/tokio/src/sync/broadcast.rs
+index abcdef1..1234567 100644
+--- a/tokio/src/sync/broadcast.rs
++++ b/tokio/src/sync/broadcast.rs
+@@ -559,13 +559,18 @@ impl<T> Sender<T> {
+         // Round to a power of two
+         capacity = capacity.next_power_of_two();
+
++        // BUG REPRODUCTION: Start position near u64::MAX to trigger wraparound.
++        // In a real system this state would exist after ~584 years of continuous
++        // operation at 1 billion messages/second.
++        const START_POS: u64 = u64::MAX - 5;
++
+         let mut buffer = Vec::with_capacity(capacity);
+
+         for i in 0..capacity {
+             buffer.push(Mutex::new(Slot {
+                 rem: AtomicUsize::new(0),
+-                pos: (i as u64).wrapping_sub(capacity as u64),
++                pos: START_POS.wrapping_add(i as u64).wrapping_sub(capacity as u64),
+                 val: None,
+             }));
+         }
+@@ -573,7 +578,7 @@ impl<T> Sender<T> {
+         let shared = Arc::new(Shared {
+             buffer: buffer.into_boxed_slice(),
+             mask: capacity - 1,
+-            tail: Mutex::new(Tail {
++             tail: Mutex::new(Tail {
+-                pos: 0,
++                pos: START_POS,
+                 rx_cnt: receiver_count,
+                 closed: receiver_count == 0,
+                 waiters: LinkedList::new(),

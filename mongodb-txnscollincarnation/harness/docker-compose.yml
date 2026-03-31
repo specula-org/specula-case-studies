@@ -1,0 +1,73 @@
+# MongoDB sharded cluster for TxnsCollectionIncarnation trace collection.
+# 2 shards (1-member replsets named shard0000/shard0001 to match Trace.tla defaults),
+# 1 config server, 1 mongos.
+# Port 27217 for mongos to avoid conflicts with other running clusters.
+
+services:
+  configsvr:
+    image: mongo:8
+    container_name: tci-configsvr
+    command: >
+      mongod --configsvr --replSet configRS --port 27017 --bind_ip_all
+      --setParameter enableTestCommands=1
+      --setParameter logComponentVerbosity='{sharding: {verbosity: 3}, transaction: {verbosity: 3}}'
+      --logpath /var/log/mongodb/mongod.log --logappend
+    volumes:
+      - configsvr-logs:/var/log/mongodb
+    networks:
+      - tci-net
+
+  shard0:
+    image: mongo:8
+    container_name: tci-shard0
+    command: >
+      mongod --shardsvr --replSet shard0000 --port 27017 --bind_ip_all
+      --setParameter enableTestCommands=1
+      --setParameter logComponentVerbosity='{sharding: {verbosity: 3}, transaction: {verbosity: 3}}'
+      --logpath /var/log/mongodb/mongod.log --logappend
+    volumes:
+      - shard0-logs:/var/log/mongodb
+    networks:
+      - tci-net
+
+  shard1:
+    image: mongo:8
+    container_name: tci-shard1
+    command: >
+      mongod --shardsvr --replSet shard0001 --port 27017 --bind_ip_all
+      --setParameter enableTestCommands=1
+      --setParameter logComponentVerbosity='{sharding: {verbosity: 3}, transaction: {verbosity: 3}}'
+      --logpath /var/log/mongodb/mongod.log --logappend
+    volumes:
+      - shard1-logs:/var/log/mongodb
+    networks:
+      - tci-net
+
+  mongos:
+    image: mongo:8
+    container_name: tci-mongos
+    command: >
+      mongos --configdb configRS/configsvr:27017 --port 27017 --bind_ip_all
+      --setParameter enableTestCommands=1
+      --setParameter logComponentVerbosity='{sharding: {verbosity: 3}, transaction: {verbosity: 3}}'
+      --logpath /var/log/mongodb/mongos.log --logappend
+    ports:
+      - "27217:27017"
+    depends_on:
+      - configsvr
+      - shard0
+      - shard1
+    volumes:
+      - mongos-logs:/var/log/mongodb
+    networks:
+      - tci-net
+
+volumes:
+  configsvr-logs:
+  shard0-logs:
+  shard1-logs:
+  mongos-logs:
+
+networks:
+  tci-net:
+    driver: bridge

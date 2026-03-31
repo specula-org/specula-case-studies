@@ -1,0 +1,81 @@
+version: '3.8'
+# 3-node shard1 RS (for w:1 rollback), 1-node shard2 RS, 1 configsvr, 1 mongos
+# MongoDB 8.2.6 (latest)
+
+services:
+  configsvr:
+    image: mongo:latest
+    container_name: repro-configsvr
+    command: >
+      mongod --configsvr --replSet configRS --port 27017
+      --setParameter enableTestCommands=1
+      --bind_ip_all
+    networks:
+      - mongo-net
+
+  # Shard1: 3-node RS so w:1 delete can roll back on primary crash
+  shard1a:
+    image: mongo:latest
+    container_name: repro-shard1a
+    command: >
+      mongod --shardsvr --replSet shard1RS --port 27017
+      --setParameter enableTestCommands=1
+      --setParameter logComponentVerbosity='{transaction: {verbosity: 3}}'
+      --bind_ip_all
+      --logpath /var/log/mongodb/mongod.log --logappend
+    volumes:
+      - shard1a-logs:/var/log/mongodb
+    networks:
+      - mongo-net
+
+  shard1b:
+    image: mongo:latest
+    container_name: repro-shard1b
+    command: >
+      mongod --shardsvr --replSet shard1RS --port 27017
+      --setParameter enableTestCommands=1
+      --bind_ip_all
+    networks:
+      - mongo-net
+
+  shard1c:
+    image: mongo:latest
+    container_name: repro-shard1c
+    command: >
+      mongod --shardsvr --replSet shard1RS --port 27017
+      --setParameter enableTestCommands=1
+      --bind_ip_all
+    networks:
+      - mongo-net
+
+  # Shard2: 1-node RS (participant, will be "removed")
+  shard2:
+    image: mongo:latest
+    container_name: repro-shard2
+    command: >
+      mongod --shardsvr --replSet shard2RS --port 27017
+      --setParameter enableTestCommands=1
+      --bind_ip_all
+    networks:
+      - mongo-net
+
+  mongos:
+    image: mongo:latest
+    container_name: repro-mongos
+    command: >
+      mongos --configdb configRS/configsvr:27017
+      --setParameter enableTestCommands=1
+      --bind_ip_all --port 27017
+    depends_on:
+      - configsvr
+    ports:
+      - "27117:27017"
+    networks:
+      - mongo-net
+
+volumes:
+  shard1a-logs:
+
+networks:
+  mongo-net:
+    driver: bridge

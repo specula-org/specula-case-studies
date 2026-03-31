@@ -1,0 +1,85 @@
+# MongoDB 8.0.12 sharded cluster for bug reproduction.
+# Bug 1 (SERVER-105751): Fixed in 8.0.13 — 8.0.12 is vulnerable.
+# Bug 4 (SERVER-106075): Fixed in 8.0.16 — 8.0.12 is vulnerable.
+#
+# 2 shards (1-member replsets), 1 config server, 1 mongos.
+
+services:
+  configsvr:
+    image: mongo:8.0.12
+    container_name: repro-configsvr
+    command: >
+      mongod --configsvr --replSet configRS --port 27017 --bind_ip_all
+      --setParameter logComponentVerbosity='{transaction: {verbosity: 4}, replication: {verbosity: 2}}'
+      --setParameter enableTestCommands=1
+      --setParameter logicalSessionRefreshMillis=5000
+      --logpath /var/log/mongodb/mongod.log --logappend
+    volumes:
+      - configsvr-data:/data/db
+      - configsvr-logs:/var/log/mongodb
+    networks:
+      - mongo-net
+
+  shard1:
+    image: mongo:8.0.12
+    container_name: repro-shard1
+    command: >
+      mongod --shardsvr --replSet shard1RS --port 27017 --bind_ip_all
+      --setParameter logComponentVerbosity='{transaction: {verbosity: 4}, replication: {verbosity: 2}}'
+      --setParameter enableTestCommands=1
+      --setParameter logicalSessionRefreshMillis=5000
+      --setParameter TransactionRecordMinimumLifetimeMinutes=0
+      --logpath /var/log/mongodb/mongod.log --logappend
+    volumes:
+      - shard1-data:/data/db
+      - shard1-logs:/var/log/mongodb
+    networks:
+      - mongo-net
+
+  shard2:
+    image: mongo:8.0.12
+    container_name: repro-shard2
+    command: >
+      mongod --shardsvr --replSet shard2RS --port 27017 --bind_ip_all
+      --setParameter logComponentVerbosity='{transaction: {verbosity: 4}, replication: {verbosity: 2}}'
+      --setParameter enableTestCommands=1
+      --setParameter logicalSessionRefreshMillis=5000
+      --setParameter TransactionRecordMinimumLifetimeMinutes=0
+      --logpath /var/log/mongodb/mongod.log --logappend
+    volumes:
+      - shard2-data:/data/db
+      - shard2-logs:/var/log/mongodb
+    networks:
+      - mongo-net
+
+  mongos:
+    image: mongo:8.0.12
+    container_name: repro-mongos
+    command: >
+      mongos --configdb configRS/configsvr:27017 --port 27017 --bind_ip_all
+      --setParameter logComponentVerbosity='{transaction: {verbosity: 4}}'
+      --setParameter enableTestCommands=1
+      --logpath /var/log/mongodb/mongos.log --logappend
+    ports:
+      - "27117:27017"
+    depends_on:
+      - configsvr
+      - shard1
+      - shard2
+    volumes:
+      - mongos-logs:/var/log/mongodb
+    networks:
+      - mongo-net
+
+volumes:
+  configsvr-data:
+  configsvr-logs:
+  shard1-data:
+  shard1-logs:
+  shard2-data:
+  shard2-logs:
+  mongos-logs:
+
+networks:
+  mongo-net:
+    driver: bridge

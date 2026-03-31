@@ -1,0 +1,78 @@
+version: "3.8"
+
+# Minimal sharded MongoDB cluster for range deletion trace capture.
+# Topology: 1 config server RS + 2 single-node shard RSs + 1 mongos router.
+
+services:
+  configsvr:
+    image: mongo:8
+    container_name: rd-configsvr
+    hostname: configsvr
+    command: >
+      mongod --configsvr --replSet configrs --port 27019
+      --setParameter logComponentVerbosity='{sharding: {rangeDeleter: {verbosity: 2}, migration: {verbosity: 2}}}'
+      --bind_ip_all
+    ports:
+      - "27119:27019"
+    volumes:
+      - configsvr-data:/data/db
+    networks:
+      - rd-net
+
+  shard0:
+    image: mongo:8
+    container_name: rd-shard0
+    hostname: shard0
+    command: >
+      mongod --shardsvr --replSet shard0rs --port 27018
+      --setParameter logComponentVerbosity='{sharding: {rangeDeleter: {verbosity: 2}, migration: {verbosity: 2}}}'
+      --setParameter orphanCleanupDelaySecs=0
+      --bind_ip_all
+    ports:
+      - "27118:27018"
+    volumes:
+      - shard0-data:/data/db
+    networks:
+      - rd-net
+
+  shard1:
+    image: mongo:8
+    container_name: rd-shard1
+    hostname: shard1
+    command: >
+      mongod --shardsvr --replSet shard1rs --port 27018
+      --setParameter logComponentVerbosity='{sharding: {rangeDeleter: {verbosity: 2}, migration: {verbosity: 2}}}'
+      --setParameter orphanCleanupDelaySecs=0
+      --bind_ip_all
+    ports:
+      - "27218:27018"
+    volumes:
+      - shard1-data:/data/db
+    networks:
+      - rd-net
+
+  mongos:
+    image: mongo:8
+    container_name: rd-mongos
+    hostname: mongos
+    command: >
+      mongos --configdb configrs/configsvr:27019 --port 27017
+      --setParameter logComponentVerbosity='{sharding: {rangeDeleter: {verbosity: 2}, migration: {verbosity: 2}}}'
+      --bind_ip_all
+    ports:
+      - "27017:27017"
+    depends_on:
+      - configsvr
+      - shard0
+      - shard1
+    networks:
+      - rd-net
+
+volumes:
+  configsvr-data:
+  shard0-data:
+  shard1-data:
+
+networks:
+  rd-net:
+    driver: bridge

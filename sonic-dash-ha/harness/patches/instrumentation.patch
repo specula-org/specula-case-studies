@@ -1,0 +1,89 @@
+diff --git a/crates/hamgrd/src/actors/ha_scope.rs b/crates/hamgrd/src/actors/ha_scope.rs
+index 3830781..44cb7bb 100644
+--- a/crates/hamgrd/src/actors/ha_scope.rs
++++ b/crates/hamgrd/src/actors/ha_scope.rs
+@@ -487,6 +487,11 @@ impl HaScopeActor {
+         let kfv: KeyOpFieldValues = incoming.get_or_fail(key)?.deserialize_data()?;
+ 
+         if kfv.operation == KeyOperation::Del {
++            // --- TLA+ TRACE: config deletion → go_to_dead ---
++            if crate::tla_trace::is_active() {
++                crate::tla_trace::on_config_del(&self.vdpu_id);
++            }
++
+             // cleanup resources before stopping
+             if let Err(e) = self.do_cleanup(state) {
+                 error!("Failed to cleanup HaScopeActor resources: {}", e);
+@@ -500,6 +505,13 @@ impl HaScopeActor {
+         // Update internal config
+         self.dash_ha_scope_config = Some(dash_ha_scope_config);
+ 
++        // --- TLA+ TRACE: config received → receive_config + change_desired_state ---
++        if crate::tla_trace::is_active() {
++            let desired = self.dash_ha_scope_config.as_ref().unwrap().desired_ha_state;
++            let ha_set_id = self.get_haset_id().unwrap_or_default();
++            crate::tla_trace::on_config_set(&self.vdpu_id, desired, &ha_set_id);
++        }
++
+         if first_time {
+             // Subscribe to the vDPU Actor for state updates.
+             self.register_to_vdpu_actor(outgoing, true)?;
+@@ -548,6 +560,8 @@ impl HaScopeActor {
+             return Ok(());
+         }
+ 
++        let tla_first_managed = self.bridges.is_empty();
++
+         // create an internal entry for npu STATE_DB/DASH_HA_SCOPE_STATE, which will be the
+         // notification channel to SDN controller
+         let swss_key = format!(
+@@ -575,6 +589,15 @@ impl HaScopeActor {
+             );
+         }
+         // ha_scope_table in dpu has no info derived from vDPU but it won't be programed until we receive vDPU which confirms the vDPU is managed
++
++        // --- TLA+ TRACE: vDPU state → dpu_health_change + receive_vdpu_state [+ start_connecting] ---
++        if crate::tla_trace::is_active() {
++            crate::tla_trace::on_vdpu_state(&self.vdpu_id, vdpu.up);
++            if tla_first_managed {
++                crate::tla_trace::on_start_connecting(&self.vdpu_id);
++            }
++        }
++
+         self.update_dpu_ha_scope_table(state)?;
+         self.update_npu_ha_scope_state_base(state)?;
+         Ok(())
+@@ -589,6 +612,11 @@ impl HaScopeActor {
+             return Ok(());
+         }
+ 
++        // --- TLA+ TRACE: HA set state received → receive_haset_state ---
++        if crate::tla_trace::is_active() {
++            crate::tla_trace::on_haset_state(&self.vdpu_id);
++        }
++
+         // ha_scope vip_v4 and vip_v6 are derived from ha_set
+         self.update_dpu_ha_scope_table(state)?;
+         self.update_npu_ha_scope_state_base(state)?;
+@@ -639,6 +667,9 @@ impl HaScopeActor {
+ impl Actor for HaScopeActor {
+     #[instrument(name="handle_message", level="info", skip_all, fields(actor=format!("ha-scope/{}", self.id), key=key))]
+     async fn handle_message(&mut self, state: &mut State, key: &str, context: &mut Context) -> Result<()> {
++        // Initialize TLA+ tracing (no-op if HA_TRACE_FILE not set or already initialized)
++        crate::tla_trace::try_init();
++
+         if key == Self::table_name() {
+             if let Err(e) = self.handle_dash_ha_scope_config_table_message(state, key, context) {
+                 error!("handle_dash_ha_scope_config_table_message failed: {e}");
+diff --git a/crates/hamgrd/src/main.rs b/crates/hamgrd/src/main.rs
+index c9aea26..4d8a358 100644
+--- a/crates/hamgrd/src/main.rs
++++ b/crates/hamgrd/src/main.rs
+@@ -19,6 +19,7 @@ use swss_common_bridge::consumer::ConsumerBridge;
+ use tokio::{signal, task::JoinHandle, time::timeout};
+ use tracing::error;
+ mod actors;
++mod tla_trace;
+ mod db_structs;
+ mod ha_actor_messages;
+ use actors::{dpu::DpuActor, ha_scope::HaScopeActor, ha_set::HaSetActor, vdpu::VDpuActor, DbBasedActor};
