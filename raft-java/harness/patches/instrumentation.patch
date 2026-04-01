@@ -1,26 +1,8 @@
-diff --git a/raft-java-admin/pom.xml b/raft-java-admin/pom.xml
-index bab8b4b..2fc32e0 100644
---- a/raft-java-admin/pom.xml
-+++ b/raft-java-admin/pom.xml
-@@ -20,10 +20,10 @@
-             <plugin>
-                 <groupId>org.apache.maven.plugins</groupId>
-                 <artifactId>maven-compiler-plugin</artifactId>
--                <version>3.6.1</version>
-+                <version>3.11.0</version>
-                 <configuration>
--                    <source>1.7</source>
--                    <target>1.7</target>
-+                    <source>1.8</source>
-+                    <target>1.8</target>
-                     <encoding>UTF-8</encoding>
-                 </configuration>
-             </plugin>
 diff --git a/raft-java-core/pom.xml b/raft-java-core/pom.xml
-index aba5258..78a3672 100644
+index aba5258..4ccc1d8 100644
 --- a/raft-java-core/pom.xml
 +++ b/raft-java-core/pom.xml
-@@ -103,13 +103,29 @@
+@@ -103,10 +103,10 @@
              <plugin>
                  <groupId>org.apache.maven.plugins</groupId>
                  <artifactId>maven-compiler-plugin</artifactId>
@@ -34,26 +16,7 @@ index aba5258..78a3672 100644
                      <encoding>UTF-8</encoding>
                  </configuration>
              </plugin>
-+            <plugin>
-+                <groupId>org.apache.maven.plugins</groupId>
-+                <artifactId>maven-surefire-plugin</artifactId>
-+                <version>3.1.2</version>
-+                <configuration>
-+                    <argLine>
-+                        --add-opens java.base/java.lang=ALL-UNNAMED
-+                        --add-opens java.base/java.lang.reflect=ALL-UNNAMED
-+                        --add-opens java.base/java.util=ALL-UNNAMED
-+                        --add-opens java.base/java.io=ALL-UNNAMED
-+                        --add-opens java.base/java.net=ALL-UNNAMED
-+                        --add-opens java.base/sun.nio.ch=ALL-UNNAMED
-+                        --add-opens java.base/java.nio=ALL-UNNAMED
-+                    </argLine>
-+                </configuration>
-+            </plugin>
-         </plugins>
-     </build>
- 
-@@ -132,7 +148,7 @@
+@@ -132,7 +132,7 @@
          <dependency>
              <groupId>org.projectlombok</groupId>
              <artifactId>lombok</artifactId>
@@ -62,248 +25,220 @@ index aba5258..78a3672 100644
          </dependency>
          <dependency>
              <groupId>com.google.guava</groupId>
-diff --git a/raft-java-core/src/main/java/com/github/wenweihu86/raft/RaftNode.java b/raft-java-core/src/main/java/com/github/wenweihu86/raft/RaftNode.java
-index a48feeb..e2a8276 100644
---- a/raft-java-core/src/main/java/com/github/wenweihu86/raft/RaftNode.java
-+++ b/raft-java-core/src/main/java/com/github/wenweihu86/raft/RaftNode.java
-@@ -157,6 +157,9 @@ public class RaftNode {
-             entries.add(logEntry);
-             newLastLogIndex = raftLog.append(entries);
- //            raftLog.updateMetaData(currentTerm, null, raftLog.getFirstLogIndex());
-+            if (entryType == RaftProto.EntryType.ENTRY_TYPE_DATA) {
-+                TlaTrace.emitClientRequest(this);
-+            }
- 
-             for (RaftProto.Server server : configuration.getServersList()) {
-                 final Peer peer = peerMap.get(server.getServerId());
-@@ -245,6 +248,7 @@ public class RaftNode {
-             requestBuilder.setPrevLogIndex(prevLogIndex);
-             numEntries = packEntries(peer.getNextIndex(), requestBuilder);
-             requestBuilder.setCommitIndex(Math.min(commitIndex, prevLogIndex + numEntries));
-+            TlaTrace.emitAppendEntries(this, peer.getServer().getServerId());
-         } finally {
-             lock.unlock();
-         }
-@@ -275,6 +279,8 @@ public class RaftNode {
-                 if (response.getResCode() == RaftProto.ResCode.RES_CODE_SUCCESS) {
-                     peer.setMatchIndex(prevLogIndex + numEntries);
-                     peer.setNextIndex(peer.getMatchIndex() + 1);
-+                    // Emit BEFORE advanceCommitIndex so trace order matches spec
-+                    TlaTrace.emitHandleAppendEntriesResponse(this, peer.getServer().getServerId());
-                     if (ConfigurationUtils.containsServer(configuration, peer.getServer().getServerId())) {
-                         advanceCommitIndex();
-                     } else {
-@@ -287,6 +293,7 @@ public class RaftNode {
-                     }
-                 } else {
-                     peer.setNextIndex(response.getLastLogIndex() + 1);
-+                    TlaTrace.emitHandleAppendEntriesResponse(this, peer.getServer().getServerId());
-                 }
-             }
-         } finally {
-@@ -384,6 +391,7 @@ public class RaftNode {
-                 // discard old log entries
-                 lock.lock();
-                 try {
-+                    TlaTrace.emitTakeSnapshot(this);
-                     if (lastSnapshotIndex > 0 && raftLog.getFirstLogIndex() <= lastSnapshotIndex) {
-                         raftLog.truncatePrefix(lastSnapshotIndex + 1);
-                     }
-@@ -465,6 +473,7 @@ public class RaftNode {
-             }
-             LOG.info("Running pre-vote in term {}", currentTerm);
-             state = NodeState.STATE_PRE_CANDIDATE;
-+            TlaTrace.emitStartPreVote(this);
-         } finally {
-             lock.unlock();
-         }
-@@ -499,6 +508,7 @@ public class RaftNode {
-             state = NodeState.STATE_CANDIDATE;
-             leaderId = 0;
-             votedFor = localServer.getServerId();
-+            TlaTrace.emitStartVote(this);
-         } finally {
-             lock.unlock();
-         }
-@@ -606,13 +616,17 @@ public class RaftNode {
-                         if (voteGrantedNum > configuration.getServersCount() / 2) {
-                             LOG.info("get majority pre vote, serverId={} when pre vote, start vote",
-                                     localServer.getServerId());
-+                            // Emit BEFORE startVote so trace order matches spec
-+                            TlaTrace.emitHandlePreVoteResponse(RaftNode.this, peer.getServer().getServerId());
-                             startVote();
-+                            return; // already emitted
-                         }
-                     } else {
-                         LOG.info("pre vote denied by server {} with term {}, my term is {}",
-                                 peer.getServer().getServerId(), response.getTerm(), currentTerm);
-                     }
-                 }
-+                TlaTrace.emitHandlePreVoteResponse(RaftNode.this, peer.getServer().getServerId());
-             } finally {
-                 lock.unlock();
-             }
-@@ -672,13 +686,17 @@ public class RaftNode {
-                         LOG.info("voteGrantedNum={}", voteGrantedNum);
-                         if (voteGrantedNum > configuration.getServersCount() / 2) {
-                             LOG.info("Got majority vote, serverId={} become leader", localServer.getServerId());
-+                            // Emit BEFORE becomeLeader so trace order matches spec
-+                            TlaTrace.emitHandleRequestVoteResponse(RaftNode.this, peer.getServer().getServerId());
-                             becomeLeader();
-+                            return; // already emitted
-                         }
-                     } else {
-                         LOG.info("Vote denied by server {} with term {}, my term is {}",
-                                 peer.getServer().getServerId(), response.getTerm(), currentTerm);
-                     }
-                 }
-+                TlaTrace.emitHandleRequestVoteResponse(RaftNode.this, peer.getServer().getServerId());
-             } finally {
-                 lock.unlock();
-             }
-@@ -697,6 +715,7 @@ public class RaftNode {
-     private void becomeLeader() {
-         state = NodeState.STATE_LEADER;
-         leaderId = localServer.getServerId();
-+        TlaTrace.emitBecomeLeader(this);
-         // stop vote timer
-         if (electionScheduledFuture != null && !electionScheduledFuture.isDone()) {
-             electionScheduledFuture.cancel(true);
-@@ -761,6 +780,7 @@ public class RaftNode {
-         long oldCommitIndex = commitIndex;
-         commitIndex = newCommitIndex;
-         raftLog.updateMetaData(currentTerm, null, raftLog.getFirstLogIndex(), commitIndex);
-+        TlaTrace.emitAdvanceCommitIndex(this);
-         // 同步到状态机
-         for (long index = oldCommitIndex + 1; index <= newCommitIndex; index++) {
-             RaftProto.LogEntry entry = raftLog.getEntry(index);
-@@ -822,6 +842,14 @@ public class RaftNode {
-                 RaftProto.InstallSnapshotResponse response
-                         = peer.getRaftConsensusServiceAsync().installSnapshot(request);
-                 if (response != null && response.getResCode() == RaftProto.ResCode.RES_CODE_SUCCESS) {
-+                    if (request.getIsFirst()) {
-+                        lock.lock();
-+                        try {
-+                            TlaTrace.emitSendInstallSnapshot(this, peer.getServer().getServerId());
-+                        } finally {
-+                            lock.unlock();
-+                        }
-+                    }
-                     lastFileName = request.getFileName();
-                     lastOffset = request.getOffset();
-                     lastLength = request.getData().size();
-@@ -843,6 +871,7 @@ public class RaftNode {
-                 lock.lock();
-                 try {
-                     peer.setNextIndex(lastIncludedIndexInSnapshot + 1);
-+                    TlaTrace.emitHandleInstallSnapshotResponse(this, peer.getServer().getServerId());
-                 } finally {
-                     lock.unlock();
-                 }
-diff --git a/raft-java-core/src/main/java/com/github/wenweihu86/raft/service/impl/RaftConsensusServiceImpl.java b/raft-java-core/src/main/java/com/github/wenweihu86/raft/service/impl/RaftConsensusServiceImpl.java
-index 4eb69c1..8be0ac0 100644
---- a/raft-java-core/src/main/java/com/github/wenweihu86/raft/service/impl/RaftConsensusServiceImpl.java
-+++ b/raft-java-core/src/main/java/com/github/wenweihu86/raft/service/impl/RaftConsensusServiceImpl.java
-@@ -1,6 +1,7 @@
- package com.github.wenweihu86.raft.service.impl;
- 
- import com.github.wenweihu86.raft.RaftNode;
-+import com.github.wenweihu86.raft.TlaTrace;
- import com.github.wenweihu86.raft.proto.RaftProto;
- import com.github.wenweihu86.raft.service.RaftConsensusService;
- import com.github.wenweihu86.raft.util.ConfigurationUtils;
-@@ -56,6 +57,7 @@ public class RaftConsensusServiceImpl implements RaftConsensusService {
-                             "in term {} (my term is {}), granted={}",
-                     request.getServerId(), request.getTerm(),
-                     raftNode.getCurrentTerm(), responseBuilder.getGranted());
-+            TlaTrace.emitHandlePreVoteRequest(raftNode, request.getServerId());
-             return responseBuilder.build();
-         } finally {
-             raftNode.getLock().unlock();
-@@ -92,6 +94,7 @@ public class RaftConsensusServiceImpl implements RaftConsensusService {
-                             "in term {} (my term is {}), granted={}",
-                     request.getServerId(), request.getTerm(),
-                     raftNode.getCurrentTerm(), responseBuilder.getGranted());
-+            TlaTrace.emitHandleRequestVoteRequest(raftNode, request.getServerId());
-             return responseBuilder.build();
-         } finally {
-             raftNode.getLock().unlock();
-@@ -108,6 +111,7 @@ public class RaftConsensusServiceImpl implements RaftConsensusService {
-             responseBuilder.setResCode(RaftProto.ResCode.RES_CODE_FAIL);
-             responseBuilder.setLastLogIndex(raftNode.getRaftLog().getLastLogIndex());
-             if (request.getTerm() < raftNode.getCurrentTerm()) {
-+                TlaTrace.emitHandleAppendEntriesRequest(raftNode, request.getServerId());
-                 return responseBuilder.build();
-             }
-             raftNode.stepDown(request.getTerm());
-@@ -124,6 +128,7 @@ public class RaftConsensusServiceImpl implements RaftConsensusService {
-                 raftNode.stepDown(request.getTerm() + 1);
-                 responseBuilder.setResCode(RaftProto.ResCode.RES_CODE_FAIL);
-                 responseBuilder.setTerm(request.getTerm() + 1);
-+                TlaTrace.emitHandleAppendEntriesRequest(raftNode, request.getServerId());
-                 return responseBuilder.build();
-             }
- 
-@@ -131,6 +136,7 @@ public class RaftConsensusServiceImpl implements RaftConsensusService {
-                 LOG.info("Rejecting AppendEntries RPC would leave gap, " +
-                         "request prevLogIndex={}, my lastLogIndex={}",
-                         request.getPrevLogIndex(), raftNode.getRaftLog().getLastLogIndex());
-+                TlaTrace.emitHandleAppendEntriesRequest(raftNode, request.getServerId());
-                 return responseBuilder.build();
-             }
-             if (request.getPrevLogIndex() >= raftNode.getRaftLog().getFirstLogIndex()
-@@ -142,6 +148,7 @@ public class RaftConsensusServiceImpl implements RaftConsensusService {
-                         raftNode.getRaftLog().getEntryTerm(request.getPrevLogIndex()));
-                 Validate.isTrue(request.getPrevLogIndex() > 0);
-                 responseBuilder.setLastLogIndex(request.getPrevLogIndex() - 1);
-+                TlaTrace.emitHandleAppendEntriesRequest(raftNode, request.getServerId());
-                 return responseBuilder.build();
-             }
- 
-@@ -152,6 +159,7 @@ public class RaftConsensusServiceImpl implements RaftConsensusService {
-                 responseBuilder.setTerm(raftNode.getCurrentTerm());
-                 responseBuilder.setLastLogIndex(raftNode.getRaftLog().getLastLogIndex());
-                 advanceCommitIndex(request);
-+                TlaTrace.emitHandleAppendEntriesRequest(raftNode, request.getServerId());
-                 return responseBuilder.build();
-             }
- 
-@@ -183,6 +191,7 @@ public class RaftConsensusServiceImpl implements RaftConsensusService {
-                             "in term {} (my term is {}), entryCount={} resCode={}",
-                     request.getServerId(), request.getTerm(), raftNode.getCurrentTerm(),
-                     request.getEntriesCount(), responseBuilder.getResCode());
-+            TlaTrace.emitHandleAppendEntriesRequest(raftNode, request.getServerId());
-             return responseBuilder.build();
-         } finally {
-             raftNode.getLock().unlock();
-@@ -299,6 +308,12 @@ public class RaftConsensusServiceImpl implements RaftConsensusService {
-                 raftNode.getLock().unlock();
-             }
-             LOG.info("end accept install snapshot request from serverId={}", request.getServerId());
-+            raftNode.getLock().lock();
-+            try {
-+                TlaTrace.emitHandleInstallSnapshotRequest(raftNode, request.getServerId());
-+            } finally {
-+                raftNode.getLock().unlock();
-+            }
-         }
- 
-         if (request.getIsLast()) {
-diff --git a/raft-java-example/pom.xml b/raft-java-example/pom.xml
-index 9094e53..e485642 100644
---- a/raft-java-example/pom.xml
-+++ b/raft-java-example/pom.xml
-@@ -63,10 +63,10 @@
-             <plugin>
-                 <groupId>org.apache.maven.plugins</groupId>
-                 <artifactId>maven-compiler-plugin</artifactId>
--                <version>3.6.1</version>
-+                <version>3.11.0</version>
-                 <configuration>
--                    <source>1.7</source>
--                    <target>1.7</target>
-+                    <source>1.8</source>
-+                    <target>1.8</target>
-                     <encoding>UTF-8</encoding>
-                 </configuration>
-             </plugin>
+diff --git a/raft-java-core/src/test/java/com/github/wenweihu86/raft/service/impl/InstallSnapshotBugTest.java b/raft-java-core/src/test/java/com/github/wenweihu86/raft/service/impl/InstallSnapshotBugTest.java
+new file mode 100644
+index 0000000..df0ca23
+--- /dev/null
++++ b/raft-java-core/src/test/java/com/github/wenweihu86/raft/service/impl/InstallSnapshotBugTest.java
+@@ -0,0 +1,211 @@
++package com.github.wenweihu86.raft.service.impl;
++
++import com.github.wenweihu86.raft.RaftNode;
++import com.github.wenweihu86.raft.RaftOptions;
++import com.github.wenweihu86.raft.StateMachine;
++import com.github.wenweihu86.raft.proto.RaftProto;
++import com.google.protobuf.ByteString;
++import org.apache.commons.io.FileUtils;
++import org.junit.After;
++import org.junit.Assert;
++import org.junit.Before;
++import org.junit.Test;
++
++import java.io.File;
++import java.io.IOException;
++import java.lang.reflect.Field;
++import java.util.ArrayList;
++import java.util.List;
++import java.util.concurrent.Executors;
++import java.util.concurrent.ScheduledExecutorService;
++
++/**
++ * Reproduction test for raft-java bug #75:
++ *
++ * After installSnapshot completes (final chunk), the handler applies the
++ * state machine from the snapshot and truncates the log, but FAILS to
++ * update commitIndex, lastAppliedIndex, or configuration to match the
++ * snapshot's lastIncludedIndex and included configuration.
++ *
++ * Compare with the constructor (RaftNode lines 88-112) which correctly
++ * sets commitIndex = max(snapshot.lastIncludedIndex, log.commitIndex),
++ * lastAppliedIndex = commitIndex, and configuration = snapshot config.
++ *
++ * The buggy code is in RaftConsensusServiceImpl.installSnapshot(),
++ * lines 279-301, where after the final chunk:
++ *   - stateMachine.readSnapshot() is called (OK)
++ *   - snapshot.reload() is called (OK)
++ *   - raftLog.truncatePrefix() is called (OK)
++ *   - commitIndex is NOT updated (BUG)
++ *   - lastAppliedIndex is NOT updated (BUG)
++ *   - configuration is NOT updated (BUG)
++ */
++public class InstallSnapshotBugTest {
++
++    private static final String TEST_DATA_DIR = "/tmp/raft-java-bug75-test";
++
++    private RaftNode raftNode;
++    private RaftConsensusServiceImpl service;
++    private NoOpStateMachine stateMachine;
++    private ScheduledExecutorService scheduler;
++
++    /** Minimal state machine that does nothing -- sufficient for this test. */
++    static class NoOpStateMachine implements StateMachine {
++        boolean readSnapshotCalled = false;
++        @Override public void writeSnapshot(String snapshotDir) {}
++        @Override public void readSnapshot(String snapshotDir) {
++            readSnapshotCalled = true;
++        }
++        @Override public void apply(byte[] dataBytes) {}
++    }
++
++    @Before
++    public void setUp() throws Exception {
++        // Clean up any previous test data
++        FileUtils.deleteDirectory(new File(TEST_DATA_DIR));
++
++        // Build initial configuration: 3 servers (server IDs 1, 2, 3)
++        List<RaftProto.Server> initialServers = new ArrayList<>();
++        for (int i = 1; i <= 3; i++) {
++            initialServers.add(RaftProto.Server.newBuilder()
++                    .setServerId(i)
++                    .setEndpoint(RaftProto.Endpoint.newBuilder()
++                            .setHost("127.0.0.1")
++                            .setPort(8000 + i)
++                            .build())
++                    .build());
++        }
++
++        RaftOptions options = new RaftOptions();
++        options.setDataDir(TEST_DATA_DIR);
++        // Use large election timeout to avoid interference
++        options.setElectionTimeoutMilliseconds(60000);
++        options.setSnapshotPeriodSeconds(3600);
++
++        stateMachine = new NoOpStateMachine();
++
++        // localServer is server 1
++        raftNode = new RaftNode(options, initialServers, initialServers.get(0), stateMachine);
++
++        // Instead of calling init() (which tries to create BRPC peer connections),
++        // inject a ScheduledExecutorService via reflection so that stepDown() ->
++        // resetElectionTimer() does not NPE.
++        scheduler = Executors.newScheduledThreadPool(2);
++        Field schedulerField = RaftNode.class.getDeclaredField("scheduledExecutorService");
++        schedulerField.setAccessible(true);
++        schedulerField.set(raftNode, scheduler);
++
++        // Simulate some prior progress: commitIndex=5, lastAppliedIndex=5
++        raftNode.setCommitIndex(5);
++        raftNode.setLastAppliedIndex(5);
++
++        service = new RaftConsensusServiceImpl(raftNode);
++    }
++
++    @After
++    public void tearDown() throws Exception {
++        if (scheduler != null) {
++            scheduler.shutdownNow();
++        }
++        FileUtils.deleteDirectory(new File(TEST_DATA_DIR));
++    }
++
++    @Test
++    public void testInstallSnapshotDoesNotUpdateCommitIndexOrConfiguration() throws IOException {
++        // --- Arrange ---
++
++        // Build a snapshot configuration with 4 servers (different from initial 3)
++        RaftProto.Configuration.Builder snapshotConfBuilder = RaftProto.Configuration.newBuilder();
++        for (int i = 1; i <= 4; i++) {
++            snapshotConfBuilder.addServers(RaftProto.Server.newBuilder()
++                    .setServerId(i)
++                    .setEndpoint(RaftProto.Endpoint.newBuilder()
++                            .setHost("127.0.0.1")
++                            .setPort(9000 + i)
++                            .build())
++                    .build());
++        }
++        RaftProto.Configuration snapshotConf = snapshotConfBuilder.build();
++
++        // Build snapshot metadata: lastIncludedIndex=100, lastIncludedTerm=10
++        RaftProto.SnapshotMetaData snapshotMeta = RaftProto.SnapshotMetaData.newBuilder()
++                .setLastIncludedIndex(100)
++                .setLastIncludedTerm(10)
++                .setConfiguration(snapshotConf)
++                .build();
++
++        // The installSnapshot request: single chunk (isFirst=true, isLast=true)
++        // term must be >= currentTerm to pass the term check
++        RaftProto.InstallSnapshotRequest request = RaftProto.InstallSnapshotRequest.newBuilder()
++                .setServerId(2)         // leader is server 2
++                .setTerm(10)            // high enough term
++                .setSnapshotMetaData(snapshotMeta)
++                .setFileName("state.dat")
++                .setOffset(0)
++                .setData(ByteString.copyFromUtf8("snapshot-data"))
++                .setIsFirst(true)
++                .setIsLast(true)
++                .build();
++
++        // Record pre-install state
++        long preCommitIndex = raftNode.getCommitIndex();
++        long preLastApplied = raftNode.getLastAppliedIndex();
++        int preConfigSize = raftNode.getConfiguration().getServersCount();
++
++        Assert.assertEquals("Pre-condition: commitIndex should be 5", 5, preCommitIndex);
++        Assert.assertEquals("Pre-condition: lastAppliedIndex should be 5", 5, preLastApplied);
++        Assert.assertEquals("Pre-condition: configuration should have 3 servers", 3, preConfigSize);
++
++        // --- Act ---
++        RaftProto.InstallSnapshotResponse response = service.installSnapshot(request);
++
++        // --- Assert ---
++        Assert.assertEquals("installSnapshot should succeed",
++                RaftProto.ResCode.RES_CODE_SUCCESS, response.getResCode());
++
++        // Verify the state machine WAS applied (this part works correctly)
++        Assert.assertTrue("State machine readSnapshot should have been called",
++                stateMachine.readSnapshotCalled);
++
++        // Verify the snapshot metadata was reloaded (this part works correctly)
++        long snapshotLastIndex = raftNode.getSnapshot().getMetaData().getLastIncludedIndex();
++        Assert.assertEquals("Snapshot metadata should reflect lastIncludedIndex=100",
++                100, snapshotLastIndex);
++
++        // === BUG DEMONSTRATION ===
++        // After installSnapshot, commitIndex SHOULD be updated to at least
++        // lastIncludedIndex (100), just as the constructor does on startup.
++        // But the buggy code leaves it at the old value.
++        long postCommitIndex = raftNode.getCommitIndex();
++        long postLastApplied = raftNode.getLastAppliedIndex();
++        int postConfigSize = raftNode.getConfiguration().getServersCount();
++
++        // These assertions demonstrate the bug: values are STILL at old levels
++        System.out.println("=== Bug #75 Demonstration ===");
++        System.out.println("Snapshot lastIncludedIndex: 100");
++        System.out.println("commitIndex after install:  " + postCommitIndex + " (expected: 100)");
++        System.out.println("lastAppliedIndex after install: " + postLastApplied + " (expected: 100)");
++        System.out.println("configuration servers after install: " + postConfigSize + " (expected: 4)");
++
++        // BUG: commitIndex is still 5 instead of 100
++        Assert.assertEquals(
++                "BUG: commitIndex was not updated after installSnapshot "
++                + "(should be 100, still " + postCommitIndex + ")",
++                5, postCommitIndex);
++
++        // BUG: lastAppliedIndex is still 5 instead of 100
++        Assert.assertEquals(
++                "BUG: lastAppliedIndex was not updated after installSnapshot "
++                + "(should be 100, still " + postLastApplied + ")",
++                5, postLastApplied);
++
++        // BUG: configuration still has 3 servers instead of 4
++        Assert.assertEquals(
++                "BUG: configuration was not updated after installSnapshot "
++                + "(should be 4 servers, still " + postConfigSize + ")",
++                3, postConfigSize);
++
++        System.out.println("\nAll assertions passed: bug #75 is confirmed.");
++        System.out.println("commitIndex, lastAppliedIndex, and configuration are NOT updated.");
++    }
++}

@@ -1,304 +1,242 @@
-diff --git a/openraft/Cargo.toml b/openraft/Cargo.toml
-index ceb388c4..30ec0710 100644
---- a/openraft/Cargo.toml
-+++ b/openraft/Cargo.toml
-@@ -50,6 +50,9 @@ default = ["tokio-rt"]
- # Enable the default Tokio runtime
- tokio-rt = ["dep:openraft-rt-tokio"]
+diff --git a/tests/tests/elect/main.rs b/tests/tests/elect/main.rs
+index 80f7a33a..f5c39194 100644
+--- a/tests/tests/elect/main.rs
++++ b/tests/tests/elect/main.rs
+@@ -9,3 +9,4 @@ mod fixtures;
  
-+# Enable TLA+ trace emission for formal verification
-+tla-trace = ["dep:serde_json"]
+ mod t10_elect_compare_last_log;
+ mod t11_elect_seize_leadership;
++mod t12_bug5_update_vote_debug_assert;
+diff --git a/tests/tests/elect/t12_bug5_update_vote_debug_assert.rs b/tests/tests/elect/t12_bug5_update_vote_debug_assert.rs
+new file mode 100644
+index 00000000..378b4090
+--- /dev/null
++++ b/tests/tests/elect/t12_bug5_update_vote_debug_assert.rs
+@@ -0,0 +1,227 @@
++use std::sync::atomic::AtomicBool;
++use std::sync::atomic::Ordering;
++use std::sync::Arc;
++use std::time::Duration;
 +
- # Enables benchmarks in unittest.
- #
- # Benchmark in openraft depends on the unstable feature `test` thus it cannot be used with stable rust.
-diff --git a/openraft/src/engine/engine_impl.rs b/openraft/src/engine/engine_impl.rs
-index 9aaa403c..1a5a384f 100644
---- a/openraft/src/engine/engine_impl.rs
-+++ b/openraft/src/engine/engine_impl.rs
-@@ -212,6 +212,9 @@ where C: RaftTypeConfig
-         // Safe unwrap(): it won't reject itself ˙–˙
-         self.vote_handler().update_vote(&new_vote).unwrap();
- 
-+        #[cfg(feature = "tla-trace")]
-+        crate::tla_trace::emit_strong("Elect", &self.config.id, &*self.state);
++use anyhow::Result;
++use maplit::btreeset;
++use openraft::base::BoxFuture;
++use openraft::Config;
++use openraft::RPCTypes;
++use openraft::ServerState;
++use openraft::Vote;
++use openraft::raft::AppendEntriesRequest;
++use openraft::type_config::TypeConfigExt;
++use openraft_memstore::TypeConfig;
 +
-         self.output.push_command(Command::SendVote {
-             vote_req: VoteRequest::new(new_vote, last_log_id),
-         });
-@@ -282,6 +285,9 @@ where C: RaftTypeConfig
- 
-         let res = self.vote_handler().update_vote(&req.vote);
- 
-+        #[cfg(feature = "tla-trace")]
-+        crate::tla_trace::emit_msg_weak("HandleVoteRequest", &self.config.id, req.vote.leader_id().node_id(), &*self.state);
++use crate::fixtures::RaftRouter;
++use crate::fixtures::log_id;
++use crate::fixtures::ut_harness;
 +
-         tracing::info!("handle vote request result: req: {}, result: {:?}", req, res);
- 
-         // Return the updated vote, this way the candidate knows which vote is granted, in case
-@@ -313,6 +319,10 @@ where C: RaftTypeConfig
-                 tracing::info!("a quorum granted my vote");
-                 self.establish_leader();
-             }
-+
-+            #[cfg(feature = "tla-trace")]
-+            crate::tla_trace::emit_msg_weak("HandleVoteResponse", &self.config.id, &target, &*self.state);
-+
-             return;
-         }
- 
-@@ -349,6 +359,9 @@ where C: RaftTypeConfig
- 
-         // Update if resp.vote is greater.
-         self.vote_handler().update_vote(&vote).ok();
-+
-+        #[cfg(feature = "tla-trace")]
-+        crate::tla_trace::emit_msg_weak("HandleVoteResponse", &self.config.id, &target, &*self.state);
-     }
- 
-     /// Append entries to follower/learner.
-@@ -367,6 +380,9 @@ where C: RaftTypeConfig
- 
-         let stream_result: StreamAppendResult<C> = self.append_entries(vote, segment).map_err(Into::into);
- 
-+        #[cfg(feature = "tla-trace")]
-+        crate::tla_trace::emit_msg_weak("HandleAppendEntries", &self.config.id, vote.leader_id().node_id(), &*self.state);
-+
-         let condition = if stream_result.is_ok() {
-             Some(Condition::IOFlushed {
-                 io_id: self.state.accepted_log_io().unwrap().clone(),
-@@ -422,6 +438,10 @@ where C: RaftTypeConfig
-         // The condition to satisfy before running other command that depends on the snapshot.
-         // In this case, the response can only be sent when the snapshot is installed.
-         let cond = fh.install_full_snapshot(snapshot);
-+
-+        #[cfg(feature = "tla-trace")]
-+        crate::tla_trace::emit_msg_weak("HandleInstallSnapshot", &self.config.id, vote.leader_id().node_id(), &*self.state);
-+
-         let res = SnapshotResponse {
-             vote: self.state.vote_ref().clone(),
-         };
-@@ -459,7 +479,15 @@ where C: RaftTypeConfig
- 
-         #[allow(clippy::collapsible_if)]
-         if em.log_id().as_ref() <= self.state.committed() {
-+            #[cfg(feature = "tla-trace")]
-+            let _tla_was_leader = self.state.server_state == ServerState::Leader;
-+
-             self.vote_handler().update_internal_server_state();
-+
-+            #[cfg(feature = "tla-trace")]
-+            if _tla_was_leader && self.state.server_state != ServerState::Leader {
-+                crate::tla_trace::emit_weak("LeaderStepDown", &self.config.id, &*self.state);
-+            }
-         }
-     }
- 
-@@ -669,6 +697,9 @@ where C: RaftTypeConfig
-         // IO progress is updated by the new blank log
- 
-         self.try_leader_handler().unwrap().leader_append_entries([EntryPayload::Blank]);
-+
-+        #[cfg(feature = "tla-trace")]
-+        crate::tla_trace::emit_strong("EstablishLeader", &self.config.id, &*self.state);
-     }
- 
-     /// Check if a raft node is in a state that allows to initialize.
-@@ -750,6 +781,7 @@ where C: RaftTypeConfig
- 
-     pub(crate) fn snapshot_handler(&mut self) -> SnapshotHandler<'_, '_, C, SM> {
-         SnapshotHandler {
-+            config: &self.config,
-             state: &mut self.state,
-             output: &mut self.output,
-         }
-diff --git a/openraft/src/engine/handler/following_handler/mod.rs b/openraft/src/engine/handler/following_handler/mod.rs
-index e2f8690b..e72efc68 100644
---- a/openraft/src/engine/handler/following_handler/mod.rs
-+++ b/openraft/src/engine/handler/following_handler/mod.rs
-@@ -328,6 +328,7 @@ where C: RaftTypeConfig
- 
-     fn snapshot_handler(&mut self) -> SnapshotHandler<'_, '_, C, SM> {
-         SnapshotHandler {
-+            config: self.config,
-             state: self.state,
-             output: self.output,
-         }
-diff --git a/openraft/src/engine/handler/leader_handler/mod.rs b/openraft/src/engine/handler/leader_handler/mod.rs
-index 565e0957..2f04cba8 100644
---- a/openraft/src/engine/handler/leader_handler/mod.rs
-+++ b/openraft/src/engine/handler/leader_handler/mod.rs
-@@ -57,6 +57,9 @@ where C: RaftTypeConfig
-     where I: IntoIterator<Item = EntryPayloadOf<C>, IntoIter: ExactSizeIterator> {
-         let payloads = payloads.into_iter();
- 
-+        #[cfg(feature = "tla-trace")]
-+        let mut _tla_has_value_entry = false;
-+
-         let log_ids = self.leader.assign_log_ids(payloads.len())?;
- 
-         self.state.extend_log_ids_from_same_leader(log_ids.clone());
-@@ -64,6 +67,10 @@ where C: RaftTypeConfig
-         let mut membership_entry = None;
-         let entries = Batch::from_iter(payloads.zip(log_ids.clone()).map(|(payload, log_id)| {
-             tracing::debug!("assign log id: {}", log_id);
-+            #[cfg(feature = "tla-trace")]
-+            if matches!(&payload, crate::entry::payload::EntryPayload::Normal(_)) {
-+                _tla_has_value_entry = true;
-+            }
-             let entry = C::Entry::new(log_id, payload);
-             if let Some(m) = entry.get_membership() {
-                 debug_assert!(
-@@ -98,6 +105,11 @@ where C: RaftTypeConfig
- 
-         rh.initiate_replication();
- 
-+        #[cfg(feature = "tla-trace")]
-+        if _tla_has_value_entry {
-+            crate::tla_trace::emit_strong("ClientRequest", &self.config.id, self.state);
++/// Bug #5: establish_leader() update_vote failure silently swallowed by debug_assert.
++///
++/// This test reproduces a bug where `establish_leader()` calls `update_vote()` with the
++/// candidate's committed vote, but the return value is only checked by `debug_assert!`.
++/// When `update_vote` fails (because `state.vote` was bumped to a higher term by a
++/// rejected vote response), the failure is silently swallowed in release builds.
++///
++/// Scenario (state reversion — within openraft's design scope):
++/// 1. 3-node cluster. Node 1 becomes leader so node 0 is a follower (no leader struct).
++/// 2. We inject Vote(T7, 0, committed) into node 1 via a fabricated heartbeat,
++///    simulating state from before a reversion.
++/// 3. Node 0 starts election (at some term < T7).
++/// 4. Node 1 rejects (has Vote(T7, 0, committed)). The rejection is processed first
++///    via timing control. handle_vote_resp applies to_non_committed() -> Vote(T7, 0, uncommitted).
++///    state.vote is bumped to T7. Candidate survives (same node_id).
++/// 5. Node 2 grants -> quorum -> establish_leader() calls update_vote(committed at low term).
++///    But state.vote = Vote(T7, uncommitted) > committed at low term -> update_vote FAILS.
++///    debug_assert! panics in debug; silently swallowed in release.
++#[tracing::instrument]
++#[test_harness::test(harness = ut_harness)]
++async fn bug5_update_vote_debug_assert() -> Result<()> {
++    let config = Arc::new(
++        Config {
++            enable_heartbeat: false,
++            enable_elect: false,
++            // election_timeout_min is used as the TTL for vote RPCs.
++            // It needs to be large enough for our timing control (~500ms gate + 100ms delay).
++            // But the leader lease is based on election_timeout_max, so keep it reasonable.
++            heartbeat_interval: 100,
++            election_timeout_min: 5_000,
++            election_timeout_max: 5_001,
++            ..Default::default()
 +        }
++        .validate()?,
++    );
 +
-         Some(log_ids)
-     }
- 
-@@ -107,6 +119,9 @@ where C: RaftTypeConfig
-         let session_id = ReplicationSessionId::new(self.leader.committed_vote.clone(), membership_log_id.clone());
- 
-         self.output.push_command(Command::BroadcastHeartbeat { session_id });
++    let mut router = RaftRouter::new(config.clone());
++    router.network_send_delay(0);
 +
-+        #[cfg(feature = "tla-trace")]
-+        crate::tla_trace::emit_term("SendHeartbeat", &self.config.id, self.state);
-     }
- 
-     /// Get the log id for a linearizable read.
-diff --git a/openraft/src/engine/handler/log_handler/mod.rs b/openraft/src/engine/handler/log_handler/mod.rs
-index de06ccb5..0b7e50ad 100644
---- a/openraft/src/engine/handler/log_handler/mod.rs
-+++ b/openraft/src/engine/handler/log_handler/mod.rs
-@@ -46,6 +46,9 @@ where C: RaftTypeConfig
- 
-         st.purge_log(&upto);
-         self.output.push_command(Command::PurgeLog { upto });
++    tracing::info!("--- create 3-node cluster, node 0 is initial leader at term 1");
++    let log_index = router.new_cluster(btreeset! {0, 1, 2}, btreeset! {}).await?;
 +
-+        #[cfg(feature = "tla-trace")]
-+        crate::tla_trace::emit_term("PurgeLog", &self.config.id, self.state);
-     }
- 
-     /// Update the next log id to purge up to, if more logs can be purged, according to the
-diff --git a/openraft/src/engine/handler/replication_handler/mod.rs b/openraft/src/engine/handler/replication_handler/mod.rs
-index 0d86d4ed..b933d45f 100644
---- a/openraft/src/engine/handler/replication_handler/mod.rs
-+++ b/openraft/src/engine/handler/replication_handler/mod.rs
-@@ -195,6 +195,9 @@ where C: RaftTypeConfig
-         );
- 
-         self.try_commit_quorum_accepted(quorum_accepted);
++    let n0 = router.get_raft_handle(&0)?;
++    n0.wait(timeout()).state(ServerState::Leader, "node 0 is leader").await?;
 +
-+        #[cfg(feature = "tla-trace")]
-+        crate::tla_trace::emit_msg_weak("HandleAppendEntriesResponse", &self.config.id, &node_id, self.state);
-     }
- 
-     /// Commit the log id that is granted(accepted) by a quorum of voters.
-@@ -216,6 +219,9 @@ where C: RaftTypeConfig
-             self.output.push_command(Command::ReplicateCommitted {
-                 committed: self.state.committed().cloned(),
-             });
++    tracing::info!(log_index, "--- let leadership expire, then have node 1 become leader");
++    // Wait for the leader lease to expire on all nodes (election_timeout_max = 5001ms).
++    // This makes node 0 step down to Follower/Learner, clearing its leader struct.
++    // This is critical: we need node 0 to NOT have an active leader struct when it
++    // starts its election, otherwise a different debug_assert fires first.
++    TypeConfig::sleep(Duration::from_millis(6000)).await;
 +
-+            #[cfg(feature = "tla-trace")]
-+            crate::tla_trace::emit_strong("AdvanceCommitIndex", &self.config.id, self.state);
-         }
-     }
- 
-@@ -240,6 +246,9 @@ where C: RaftTypeConfig
-         let mut updater = progress::entry::update::Updater::new(self.config, prog_entry);
- 
-         updater.update_conflicting(conflict.index(), inflight_id);
++    let n1 = router.get_raft_handle(&1)?;
++    n1.trigger().elect().await?;
++    n1.wait(timeout()).state(ServerState::Leader, "node 1 is leader").await?;
 +
-+        #[cfg(feature = "tla-trace")]
-+        crate::tla_trace::emit_msg_weak("HandleAppendEntriesResponse", &self.config.id, &target, self.state);
-     }
- 
-     /// Enable one-time replication reset for a specific node upon log reversion detection.
-@@ -359,6 +368,16 @@ where C: RaftTypeConfig
- 
-             match t {
-                 Ok(inflight) => {
-+                    #[cfg(feature = "tla-trace")]
-+                    {
-+                        let event_name = if matches!(inflight, Inflight::Snapshot { .. }) {
-+                            "SendInstallSnapshot"
-+                        } else {
-+                            "ReplicateEntries"
-+                        };
-+                        crate::tla_trace::emit_target_term(event_name, &self.config.id, &item.id, self.state);
++    // Node 0 should have stepped down
++    n0.wait(timeout())
++        .state(ServerState::Follower, "node 0 stepped down to follower")
++        .await?;
++
++    let m0 = router.get_metrics(&0)?;
++    let m1 = router.get_metrics(&1)?;
++    tracing::info!("node 0: term={}, vote={}", m0.current_term, m0.vote);
++    tracing::info!("node 1: term={}, vote={}, state={:?}", m1.current_term, m1.vote, m1.state);
++    let current_term = m0.current_term;
++
++    tracing::info!(log_index, "--- inject Vote(T7, 0, committed) into node 1");
++    // Send a fabricated AppendEntries heartbeat from "node 0 at term 7".
++    // This causes node 1 to accept Vote(T7, 0, committed), overriding its current vote.
++    // This simulates node 1 having previously seen node 0 as leader at a very high term.
++    {
++        let high_term_vote = Vote::new_committed(7, 0);
++        // Use the current last_log_id for prev_log_id
++        let m1 = router.get_metrics(&1)?;
++        let last_log_idx = m1.last_log_index.unwrap_or(log_index);
++        let last_log = log_id(current_term, 1, last_log_idx);
++
++        let req = AppendEntriesRequest::<TypeConfig> {
++            vote: high_term_vote.clone(),
++            prev_log_id: Some(last_log.clone()),
++            entries: vec![],
++            leader_commit: Some(last_log),
++        };
++
++        let resp = n1.append_entries(req).await?;
++        tracing::info!("inject response: {:?}", resp);
++
++        n1.wait(timeout())
++            .vote(high_term_vote, "node 1 accepts Vote(T7, 0, committed)")
++            .await?;
++
++        let m1 = router.get_metrics(&1)?;
++        tracing::info!("node 1 after inject: vote={}, term={}", m1.vote, m1.current_term);
++        assert_eq!(m1.current_term, 7, "node 1 should be at term 7");
++    }
++
++    tracing::info!(log_index, "--- set up Vote pre-hook for timing control");
++    let gate_open = Arc::new(AtomicBool::new(false));
++    let gate_for_pre = gate_open.clone();
++
++    router
++        .set_rpc_pre_hook(RPCTypes::Vote, move |_router, _req, _from, target| {
++            let gate = gate_for_pre.clone();
++            let fu: BoxFuture<_> = if target == 2 {
++                Box::pin(async move {
++                    for _ in 0..500 {
++                        if gate.load(Ordering::Acquire) {
++                            TypeConfig::sleep(Duration::from_millis(100)).await;
++                            return Ok(());
++                        }
++                        TypeConfig::sleep(Duration::from_millis(10)).await;
 +                    }
++                    tracing::warn!("gate timed out");
++                    Ok(())
++                })
++            } else {
++                Box::pin(futures::future::ready(Ok(())))
++            };
++            fu
++        })
++        .await;
 +
-                     let leader_vote = self.leader.committed_vote.clone();
-                     Self::send_to_target(self.output, leader_vote, &item.id, inflight);
-                 }
-diff --git a/openraft/src/engine/handler/snapshot_handler/mod.rs b/openraft/src/engine/handler/snapshot_handler/mod.rs
-index c426fd9a..9a03a0bf 100644
---- a/openraft/src/engine/handler/snapshot_handler/mod.rs
-+++ b/openraft/src/engine/handler/snapshot_handler/mod.rs
-@@ -6,6 +6,7 @@ use crate::core::sm;
- use crate::display_ext::DisplayOptionExt;
- use crate::engine::Command;
- use crate::engine::EngineOutput;
-+use crate::engine::engine_config::EngineConfig;
- use crate::raft_state::LogStateReader;
- use crate::type_config::alias::SnapshotMetaOf;
- 
-@@ -18,6 +19,7 @@ mod update_snapshot_test;
- pub(crate) struct SnapshotHandler<'st, 'out, C, SM = ()>
- where C: RaftTypeConfig
- {
-+    pub(crate) config: &'st EngineConfig<C>,
-     pub(crate) state: &'st mut RaftState<C>,
-     pub(crate) output: &'out mut EngineOutput<C, SM>,
- }
-@@ -40,6 +42,10 @@ where C: RaftTypeConfig
-         self.state.io_state.set_building_snapshot(true);
- 
-         self.output.push_command(Command::from(sm::Command::build_snapshot()));
++    let gate_for_post = gate_open.clone();
++    router
++        .set_rpc_post_hook(RPCTypes::Vote, move |_router, _req, _resp, _from, target| {
++            if target == 1 {
++                tracing::info!("post-hook: node 1 responded, opening gate for node 2");
++                gate_for_post.store(true, Ordering::Release);
++            }
++            let fu: BoxFuture<_> = Box::pin(futures::future::ready(Ok(())));
++            fu
++        })
++        .await;
 +
-+        #[cfg(feature = "tla-trace")]
-+        crate::tla_trace::emit_term("TriggerSnapshot", &self.config.id, self.state);
++    tracing::info!(log_index, "--- wait for all leases to expire before election");
++    // Node 2 holds a committed vote for node 1 (with leader lease from T2).
++    // The lease duration is election_timeout_max = 5001ms.
++    // We must wait for this lease to expire so node 2 will accept node 0's VoteRequest.
++    TypeConfig::sleep(Duration::from_millis(6000)).await;
 +
-         true
-     }
- 
-diff --git a/openraft/src/lib.rs b/openraft/src/lib.rs
-index 8bbfeff0..a7f9a5ef 100644
---- a/openraft/src/lib.rs
-+++ b/openraft/src/lib.rs
-@@ -35,6 +35,9 @@ pub extern crate openraft_macros;
- pub extern crate openraft_macros as macros;
- pub extern crate openraft_rt as rt;
- 
-+#[cfg(feature = "tla-trace")]
-+pub mod tla_trace;
++    tracing::info!(log_index, "--- trigger election on node 0");
++    let m0_before = router.get_metrics(&0)?;
++    let election_term = m0_before.current_term + 1;
++    tracing::info!(
++        "node 0 at term {}, will elect at term {}",
++        m0_before.current_term,
++        election_term
++    );
 +
- mod change_members;
- mod config;
- mod core;
-diff --git a/tests/Cargo.toml b/tests/Cargo.toml
-index 92e9ada9..9799f6d0 100644
---- a/tests/Cargo.toml
-+++ b/tests/Cargo.toml
-@@ -18,7 +18,7 @@ repository    = { workspace = true }
- [dependencies]
- 
- [dev-dependencies]
--openraft           = { path = "../openraft", version = "0.10.0-alpha.17", features = ["type-alias"] }
-+openraft = { path = "../openraft", version = "0.10.0-alpha.17", features = ["type-alias", "tla-trace"] }
- openraft-memstore  = { path = "../stores/memstore" }
- openraft-legacy = { path = "../legacy" }
- 
-@@ -40,3 +40,7 @@ tracing-subscriber = { workspace = true }
- 
- bt = ["openraft/bt"]
- single-term-leader = ["openraft-memstore/single-term-leader"]
++    // Node 0 triggers election at election_term (current_term + 1).
++    // election_term < 7, so:
++    //   - Node 1 (at T7) rejects -> to_non_committed -> Vote(T7, 0, uncommitted) bumps state.vote
++    //   - Node 2 grants -> quorum -> establish_leader -> update_vote(election_term, committed) FAILS
++    n0.trigger().elect().await?;
 +
-+[[test]]
-+name = "tla_trace"
-+path = "tests/tla_trace/main.rs"
++    TypeConfig::sleep(Duration::from_millis(1500)).await;
++
++    router.rpc_pre_hook(RPCTypes::Vote, None).await;
++    router.rpc_post_hook(RPCTypes::Vote, None).await;
++
++    tracing::info!("--- verify the bug");
++    let m0 = router.get_metrics(&0)?;
++    tracing::info!(
++        "node 0 after election: running_state={:?}, state={:?}, vote={}, term={}",
++        m0.running_state,
++        m0.state,
++        m0.vote,
++        m0.current_term,
++    );
++
++    // The bug manifests as:
++    // - Debug builds: debug_assert panic kills the Raft core -> fatal or term >= 7
++    // - Release builds: state.vote = Vote(T7, 0, uncommitted) silently diverged
++    let bug_triggered = m0.current_term >= 7 || m0.running_state.is_err();
++
++    if bug_triggered {
++        tracing::info!("CONFIRMED: Bug #5 reproduced.");
++        if m0.running_state.is_err() {
++            tracing::info!(
++                "  Debug build: Raft core panicked from debug_assert: {:?}",
++                m0.running_state
++            );
++        } else {
++            tracing::info!(
++                "  Release build: state.vote = {} (committed={}). Expected Vote(T{}, committed=true).",
++                m0.vote,
++                m0.vote.is_committed(),
++                election_term,
++            );
++        }
++    }
++
++    assert!(
++        bug_triggered,
++        "Bug #5 should be triggered: expected term >= 7 or fatal state, \
++         got term={}, running_state={:?}",
++        m0.current_term,
++        m0.running_state,
++    );
++
++    Ok(())
++}
++
++fn timeout() -> Option<Duration> {
++    Some(Duration::from_millis(5_000))
++}

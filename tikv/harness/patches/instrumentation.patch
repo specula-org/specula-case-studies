@@ -1,0 +1,889 @@
+diff --git a/harness/Cargo.toml b/harness/Cargo.toml
+index 5010d76..42ff629 100644
+--- a/harness/Cargo.toml
++++ b/harness/Cargo.toml
+@@ -32,3 +32,7 @@ fxhash = "0.2.1"
+ lazy_static = "1"
+ protobuf = "2"
+ regex = "1"
++
++[[test]]
++name = "tla_trace_test"
++path = "tests/tla_trace_test.rs"
+diff --git a/harness/tests/integration_cases/test_raft.rs b/harness/tests/integration_cases/test_raft.rs
+index 59a9cda..07b9a37 100644
+--- a/harness/tests/integration_cases/test_raft.rs
++++ b/harness/tests/integration_cases/test_raft.rs
+@@ -5908,3 +5908,370 @@ fn test_log_replication_with_reordered_message() {
+     // r1 shall re-send MsgApp from match index even if resp2's reject hint is less than matching index.
+     assert_eq!(r1.prs().get(2).unwrap().matched, m.index)
+ }
++
++// Bug reproduction: raft-rs #511
++// PreVote + priority at term=0 causes fatal panic when a high-priority node
++// rejects a PreVote from a lower-priority node. The rejection response carries
++// term=self.term=0, but send() asserts that vote/prevote messages must have
++// non-zero term (raft.rs:631-648).
++//
++// Trigger: 3 fresh nodes (term=0), pre_vote=true, different priorities.
++// Low-priority node starts PreVote election. High-priority node rejects.
++// Rejection response has term=0 -> fatal! panic in send().
++#[test]
++fn test_bug_prevote_priority_panic_at_term_zero() {
++    let l = default_logger();
++
++    // Create 3 nodes with pre_vote=true. Do NOT call become_follower to keep term=0.
++    let mut n1 = new_test_raft_with_prevote(1, vec![1, 2, 3], 10, 1, new_storage(), true, &l);
++    let mut n2 = new_test_raft_with_prevote(2, vec![1, 2, 3], 10, 1, new_storage(), true, &l);
++    let mut n3 = new_test_raft_with_prevote(3, vec![1, 2, 3], 10, 1, new_storage(), true, &l);
++
++    // Node 1: low priority (will campaign). Nodes 2,3: high priority (will reject).
++    n1.set_priority(1);
++    n2.set_priority(5);
++    n3.set_priority(5);
++
++    // Verify all nodes are at term=0 (fresh initialization).
++    assert_eq!(n1.term, 0, "node 1 should start at term 0");
++    assert_eq!(n2.term, 0, "node 2 should start at term 0");
++    assert_eq!(n3.term, 0, "node 3 should start at term 0");
++
++    let mut network = Network::new(vec![Some(n1), Some(n2), Some(n3)], &l);
++
++    // Node 1 (low priority) triggers PreVote election.
++    // Node 2/3 (high priority, term=0) will reject -> send PreVoteResponse with term=0.
++    // The send() function fatally panics on term=0 vote messages.
++    let result = panic::catch_unwind(AssertUnwindSafe(|| {
++        network.send(vec![new_message(1, 1, MessageType::MsgHup, 0)]);
++    }));
++
++    // Bug #511: this SHOULD succeed without panic, but currently panics.
++    assert!(
++        result.is_err(),
++        "BUG CONFIRMED: PreVote rejection at term=0 should have caused a panic (raft-rs #511)"
++    );
++
++    // Verify the panic message mentions the term=0 assertion.
++    if let Err(panic_info) = &result {
++        let msg = if let Some(s) = panic_info.downcast_ref::<String>() {
++            s.clone()
++        } else if let Some(s) = panic_info.downcast_ref::<&str>() {
++            s.to_string()
++        } else {
++            "unknown panic".to_string()
++        };
++        assert!(
++            msg.contains("term should be set when sending"),
++            "Panic message should be about term=0 in vote message, got: {msg}"
++        );
++    }
++}
++
++// Bug reproduction: Priority blocks CAMPAIGN_TRANSFER votes.
++// When the leader transfers leadership to a low-priority node, high-priority
++// voters reject the transfer election even though CAMPAIGN_TRANSFER bypasses
++// the lease check. The priority check at raft.rs:1499 is NOT bypassed for
++// transfer elections, causing the transfer to fail.
++//
++// Scenario: 3-node cluster where all other voters have higher priority than
++// the transfer target. The target cannot get a majority because both voters
++// reject based on priority, even though the transfer was explicitly requested.
++#[test]
++fn test_bug_priority_blocks_leader_transfer() {
++    let l = default_logger();
++
++    // 3-node cluster. Node 1 will be leader and transfer target is node 2.
++    // Node 2: low priority (transfer target). Nodes 1,3: high priority (voters).
++    let mut n1 = new_test_raft_with_prevote(1, vec![1, 2, 3], 10, 1, new_storage(), true, &l);
++    let mut n2 = new_test_raft_with_prevote(2, vec![1, 2, 3], 10, 1, new_storage(), true, &l);
++    let mut n3 = new_test_raft_with_prevote(3, vec![1, 2, 3], 10, 1, new_storage(), true, &l);
++
++    n1.set_priority(10);
++    n2.set_priority(1); // Transfer target: lowest priority
++    n3.set_priority(10);
++
++    // Initialize to term=1 to avoid the term=0 panic (bug #511).
++    n1.become_follower(1, INVALID_ID);
++    n2.become_follower(1, INVALID_ID);
++    n3.become_follower(1, INVALID_ID);
++
++    let mut network = Network::new(vec![Some(n1), Some(n2), Some(n3)], &l);
++
++    // Elect node 1 as leader (highest priority tied with node 3, but node 1 campaigns first).
++    network.send(vec![new_message(1, 1, MessageType::MsgHup, 0)]);
++    assert_eq!(
++        network.peers[&1].state,
++        StateRole::Leader,
++        "node 1 should become leader"
++    );
++
++    // Replicate an entry so all logs are synchronized.
++    network.send(vec![new_message(1, 1, MessageType::MsgPropose, 1)]);
++
++    // Transfer leadership from node 1 (priority=10) to node 2 (priority=1).
++    // Node 2's log is up to date. Leader sends MsgTimeoutNow to node 2.
++    // Node 2 campaigns with CAMPAIGN_TRANSFER (which bypasses lease check but NOT priority).
++    let transfer_msg = new_message(2, 1, MessageType::MsgTransferLeader, 0);
++    network.send(vec![transfer_msg]);
++
++    // Analysis of the vote:
++    // - Node 2 votes for itself: 1 vote
++    // - Node 1 (priority=10) receives vote request from node 2 (priority=1):
++    //   m.index == node1.last_index (equal logs) -> falls to priority check
++    //   node1.priority(10) <= node2.priority(1) -> FALSE -> REJECTED
++    // - Node 3 (priority=10) receives vote request from node 2 (priority=1):
++    //   m.index == node3.last_index (equal logs) -> falls to priority check
++    //   node3.priority(10) <= node2.priority(1) -> FALSE -> REJECTED
++    // - Node 2 gets 1/3 votes -> election fails
++    //
++    // The transfer should succeed, but priority blocks it.
++    let node2_is_leader = network.peers[&2].state == StateRole::Leader;
++
++    // This assertion documents the bug: transfer fails when it should succeed.
++    assert!(
++        !node2_is_leader,
++        "BUG CONFIRMED: transfer to low-priority node 2 is blocked by priority check"
++    );
++
++    // Verify node 1 stepped down (it received a higher-term vote request).
++    assert_ne!(
++        network.peers[&1].state,
++        StateRole::Leader,
++        "old leader (node 1) should have stepped down"
++    );
++
++    // No node is leader — the cluster is leaderless until a new election.
++    // This is a liveness regression: the explicitly requested transfer failed,
++    // AND the original leader stepped down, leaving the cluster without a leader.
++    let any_leader = (1..=3).any(|id| network.peers[&id].state == StateRole::Leader);
++    assert!(
++        !any_leader,
++        "BUG: no node is leader after failed transfer — cluster is stuck until election timeout"
++    );
++}
++
++// Bug reproduction: Leader removed from config does not step down.
++// When a configuration change removes the current leader from the voter set,
++// post_conf_change() at raft.rs:2747-2757 detects the removal but does NOT
++// step down. It just sets promotable=false and returns early. Two explicit
++// TODOs from the etcd/raft authors acknowledge this.
++//
++// Impact: The removed leader continues sending heartbeats, suppressing
++// elections on remaining voters. Without check_quorum, the cluster is
++// blocked indefinitely — no new leader can be elected.
++#[test]
++fn test_bug_removed_leader_does_not_step_down() {
++    let l = default_logger();
++    let mut nt = Network::new(vec![None, None, None], &l);
++
++    // Elect node 1 as leader.
++    nt.send(vec![new_message(1, 1, MessageType::MsgHup, 0)]);
++    assert_eq!(nt.peers[&1].state, StateRole::Leader);
++
++    // Replicate an entry so all logs are synchronized.
++    nt.send(vec![new_message(1, 1, MessageType::MsgPropose, 1)]);
++
++    // Apply committed entries on the leader so we can apply the conf change.
++    let committed = nt.peers[&1].raft_log.committed;
++    nt.peers.get_mut(&1).unwrap().commit_apply(committed);
++
++    // Remove the leader (node 1) from the voter set.
++    let cs = nt.peers.get_mut(&1).unwrap().apply_conf_change(&remove_node(1)).unwrap();
++
++    // Verify node 1 was removed from the voter set.
++    assert!(
++        !cs.voters.contains(&1),
++        "node 1 should no longer be a voter"
++    );
++
++    // BUG: node 1 is still the leader even though it's no longer a voter!
++    assert_eq!(
++        nt.peers[&1].state,
++        StateRole::Leader,
++        "BUG CONFIRMED: removed leader does not step down (raft.rs:2747-2757 TODO)"
++    );
++
++    // Verify it's no longer promotable (the partial fix that exists).
++    assert!(
++        !nt.peers[&1].promotable(),
++        "removed leader should not be promotable"
++    );
++
++    // Now demonstrate the liveness impact: the removed leader's heartbeats
++    // suppress elections on remaining voters.
++    //
++    // Tick node 1 enough to trigger heartbeat sending.
++    let heartbeat_timeout = nt.peers[&1].heartbeat_timeout();
++    for _ in 0..heartbeat_timeout {
++        nt.peers.get_mut(&1).unwrap().tick();
++    }
++
++    // Collect heartbeat messages from the removed leader.
++    let msgs = nt.peers.get_mut(&1).unwrap().read_messages();
++    let heartbeats: Vec<_> = msgs
++        .iter()
++        .filter(|m| m.get_msg_type() == MessageType::MsgHeartbeat)
++        .collect();
++
++    // BUG IMPACT: removed leader still sends heartbeats to remaining voters.
++    assert!(
++        !heartbeats.is_empty(),
++        "BUG IMPACT: removed leader still sends heartbeats, suppressing elections"
++    );
++
++    // Deliver these heartbeats to node 2 and collect responses.
++    for hb in &heartbeats {
++        if hb.to == 2 {
++            let _ = nt.peers.get_mut(&2).unwrap().step((**hb).clone());
++        }
++    }
++
++    // Node 2 should still be a follower with node 1 as leader.
++    assert_eq!(
++        nt.peers[&2].state,
++        StateRole::Follower,
++        "node 2 should still be a follower — heartbeats from removed leader suppress elections"
++    );
++    assert_eq!(
++        nt.peers[&2].leader_id, 1,
++        "node 2 still thinks the removed node 1 is leader"
++    );
++}
++
++// Bug reproduction: Auto-leave joint consensus stalls on leader change.
++// The auto-leave mechanism at raft.rs:987-1007 only triggers when
++// self.state == StateRole::Leader. If a follower applies the enter-joint
++// entry, the auto_leave check is skipped.
++//
++// This test demonstrates two consequences:
++// 1. A follower applying the enter-joint entry does NOT trigger auto_leave
++//    (the state != Leader guard prevents it).
++// 2. If the joint config adds nodes that don't yet exist in the cluster,
++//    the cluster gets stuck: no new leader can be elected (joint consensus
++//    requires quorum from both old and new configs), and auto_leave cannot
++//    fire because there is no leader.
++#[test]
++fn test_bug_auto_leave_joint_stalls_on_leader_crash() {
++    let l = default_logger();
++    let mut nt = Network::new(vec![None, None, None], &l);
++
++    // Elect node 1 as leader.
++    nt.send(vec![new_message(1, 1, MessageType::MsgHup, 0)]);
++    assert_eq!(nt.peers[&1].state, StateRole::Leader);
++
++    // Replicate an entry so logs are synchronized.
++    nt.send(vec![new_message(1, 1, MessageType::MsgPropose, 1)]);
++
++    // Apply all committed entries on all nodes.
++    for id in 1..=3 {
++        let committed = nt.peers[&id].raft_log.committed;
++        nt.peers.get_mut(&id).unwrap().commit_apply(committed);
++    }
++
++    // Propose a joint config change: add node 4 + add node 5 (multi-change
++    // triggers joint consensus with auto_leave=true via ConfChangeTransition::Auto).
++    let mut cc = ConfChangeV2::default();
++    cc.set_changes(
++        vec![
++            new_conf_change_single(4, ConfChangeType::AddNode),
++            new_conf_change_single(5, ConfChangeType::AddNode),
++        ]
++        .into(),
++    );
++    let mut e = Entry::default();
++    e.set_entry_type(EntryType::EntryConfChangeV2);
++    e.set_data(cc.write_to_bytes().unwrap().into());
++    let m = new_message_with_entries(1, 1, MessageType::MsgPropose, vec![e]);
++    nt.send(vec![m]);
++
++    // The enter-joint entry should be committed (nodes 1, 2, 3 form quorum).
++    let enter_joint_index = nt.peers[&1].raft_log.committed;
++
++    // Crash the leader BEFORE it applies the enter-joint entry.
++    nt.isolate(1);
++
++    // ---- Part 1: Follower applies enter-joint, auto_leave does NOT trigger ----
++
++    // Node 2 applies the enter-joint entry as a FOLLOWER.
++    let committed_2 = nt.peers[&2].raft_log.committed;
++    let cs_2 = nt.peers
++        .get_mut(&2)
++        .unwrap()
++        .apply_conf_change(&cc)
++        .unwrap();
++
++    // Verify we're in joint consensus with auto_leave.
++    assert!(cs_2.auto_leave, "config should have auto_leave=true");
++    assert!(
++        !cs_2.voters_outgoing.is_empty(),
++        "should be in joint consensus (voters_outgoing non-empty)"
++    );
++
++    // commit_apply on the follower — auto_leave check is skipped (state != Leader).
++    nt.peers.get_mut(&2).unwrap().commit_apply(committed_2);
++
++    // BUG: no leave-joint entry was proposed because the auto_leave check
++    // at raft.rs:991 requires self.state == StateRole::Leader.
++    let last_index_2 = nt.peers[&2].raft_log.last_index();
++    assert_eq!(
++        last_index_2, enter_joint_index,
++        "BUG CONFIRMED: follower's commit_apply skips auto_leave (raft.rs:991 state != Leader). \
++         No leave-joint entry proposed — cluster stuck in joint consensus."
++    );
++
++    // ---- Part 2: Cluster cannot elect a new leader ----
++
++    // Node 3 also applies the conf change.
++    let committed_3 = nt.peers[&3].raft_log.committed;
++    nt.peers
++        .get_mut(&3)
++        .unwrap()
++        .apply_conf_change(&cc)
++        .unwrap();
++    nt.peers.get_mut(&3).unwrap().commit_apply(committed_3);
++
++    // Try to elect node 2 as the new leader.
++    let election_timeout = nt.peers[&2].election_timeout();
++    for _ in 0..2 * election_timeout {
++        nt.peers.get_mut(&2).unwrap().tick();
++    }
++
++    // Exchange vote messages between nodes 2 and 3.
++    let msgs = nt.peers.get_mut(&2).unwrap().read_messages();
++    for m in msgs {
++        if m.to == 3 {
++            let _ = nt.peers.get_mut(&3).unwrap().step(m);
++        }
++    }
++    let msgs = nt.peers.get_mut(&3).unwrap().read_messages();
++    for m in msgs {
++        if m.to == 2 {
++            let _ = nt.peers.get_mut(&2).unwrap().step(m);
++        }
++    }
++
++    // Joint consensus requires quorum from BOTH configs:
++    //   Incoming (new): {1,2,3,4,5} → quorum = 3. Nodes 2,3 = 2 votes. NOT enough.
++    //   Outgoing (old): {1,2,3}     → quorum = 2. Nodes 2,3 = 2 votes. Enough.
++    // Node 2 cannot become leader because it can't get quorum from the new config.
++    assert_ne!(
++        nt.peers[&2].state,
++        StateRole::Leader,
++        "BUG IMPACT: node 2 cannot become leader — joint consensus requires quorum \
++         from {{1,2,3,4,5}} but nodes 1,4,5 are unreachable. Cluster is stuck."
++    );
++
++    // The live cluster (nodes 2, 3) is now completely stuck:
++    // - Old leader (node 1) is isolated/crashed
++    // - No new leader can be elected (joint consensus quorum unreachable)
++    // - Still in joint consensus (auto_leave never triggered on any live node)
++    // - The only recovery is manual intervention to force a config change
++    let any_live_leader = (2..=3).any(|id| nt.peers[&id].state == StateRole::Leader);
++    assert!(
++        !any_live_leader,
++        "BUG CONFIRMED: no live leader — stuck in joint consensus indefinitely. \
++         Auto-leave at raft.rs:987 requires Leader state, but no leader can be elected \
++         because the joint config includes unreachable nodes."
++    );
++}
+diff --git a/harness/tests/tla_trace_test.rs b/harness/tests/tla_trace_test.rs
+new file mode 100644
+index 0000000..8f38507
+--- /dev/null
++++ b/harness/tests/tla_trace_test.rs
+@@ -0,0 +1,161 @@
++/// TLA+ trace validation test scenarios for raft-rs.
++///
++/// Each test exercises a specific protocol path and emits NDJSON traces
++/// for validation against the TLA+ specification.
++///
++/// Run with: RAFT_TRACE_FILE=<path> cargo test -p harness --test tla_trace_test -- --nocapture
++use harness::{Interface, Network};
++use raft::eraftpb::*;
++use raft::prelude::*;
++use raft::{default_logger, tla_trace, StateRole, INVALID_ID};
++
++fn new_message(from: u64, to: u64, msg_type: MessageType, n: usize) -> Message {
++    let mut m = Message::default();
++    m.from = from;
++    m.to = to;
++    m.set_msg_type(msg_type);
++    if n > 0 {
++        let entries: Vec<Entry> = (0..n)
++            .map(|_| {
++                let mut e = Entry::default();
++                e.data = b"testdata".to_vec().into();
++                e
++            })
++            .collect();
++        m.set_entries(entries.into());
++    }
++    m
++}
++
++/// Scenario 1: Basic consensus — election + log replication + heartbeat.
++///
++/// Exercises: Timeout, HandleRequestVoteRequest, HandleRequestVoteResponse,
++///            BecomeLeader, ClientRequest, HandleAppendEntriesRequest,
++///            HandleAppendEntriesResponse, SendHeartbeat, HandleHeartbeatRequest,
++///            HandleHeartbeatResponse, PersistEntries, AdvanceCommitIndex.
++#[test]
++fn tla_basic_consensus() {
++    tla_trace::init_from_env();
++    let l = default_logger();
++    // pre_vote=true to match TLA+ spec (Timeout always goes through PreVote first)
++    let mut config = Network::default_config();
++    config.pre_vote = true;
++    let mut nt = Network::new_with_config(vec![None, None, None], &config, &l);
++
++    // --- Phase 1: Election ---
++    // Node 1 triggers election via MsgHup.
++    // Network.send delivers vote requests/responses and persist calls.
++    nt.send(vec![new_message(1, 1, MessageType::MsgHup, 0)]);
++    assert_eq!(
++        nt.peers[&1].state,
++        StateRole::Leader,
++        "node 1 should be leader"
++    );
++    assert_eq!(nt.peers[&2].state, StateRole::Follower);
++    assert_eq!(nt.peers[&3].state, StateRole::Follower);
++    let leader_term = nt.peers[&1].term;
++
++    // --- Phase 2: Log replication ---
++    // Leader proposes an entry. Network.send replicates it and commits.
++    nt.send(vec![new_message(1, 1, MessageType::MsgPropose, 1)]);
++    // After full round-trip, entry should be committed on majority.
++    assert!(
++        nt.peers[&1].raft_log.committed >= 2,
++        "leader should have committed >= 2 (noop + proposal)"
++    );
++
++    // --- Phase 3: Heartbeat ---
++    // Leader sends heartbeat to all followers.
++    nt.send(vec![new_message(1, 1, MessageType::MsgBeat, 0)]);
++
++    // --- Phase 4: Another proposal ---
++    nt.send(vec![new_message(1, 1, MessageType::MsgPropose, 1)]);
++    assert!(
++        nt.peers[&1].raft_log.committed >= 3,
++        "leader should have committed >= 3"
++    );
++
++    // Verify all nodes agree on term
++    assert_eq!(nt.peers[&2].term, leader_term);
++    assert_eq!(nt.peers[&3].term, leader_term);
++
++    println!(
++        "basic_consensus: term={}, committed={}",
++        leader_term,
++        nt.peers[&1].raft_log.committed
++    );
++}
++
++/// Scenario 2: Pre-vote election — exercises the PreVote protocol.
++///
++/// Exercises: Timeout (PreCandidate), HandleRequestPreVoteRequest,
++///            HandleRequestPreVoteResponse, then real vote cycle.
++#[test]
++fn tla_prevote_election() {
++    tla_trace::init_from_env();
++    let l = default_logger();
++    let mut config = Network::default_config();
++    config.pre_vote = true;
++    let mut nt = Network::new_with_config(vec![None, None, None], &config, &l);
++
++    // Trigger election on node 1 (with pre-vote enabled).
++    // This will first do a PreVote round, then a real Vote round.
++    nt.send(vec![new_message(1, 1, MessageType::MsgHup, 0)]);
++    assert_eq!(
++        nt.peers[&1].state,
++        StateRole::Leader,
++        "node 1 should be leader after pre-vote + vote"
++    );
++
++    // Propose an entry to verify the leader works
++    nt.send(vec![new_message(1, 1, MessageType::MsgPropose, 1)]);
++    assert!(
++        nt.peers[&1].raft_log.committed >= 2,
++        "leader should have committed >= 2"
++    );
++
++    println!(
++        "prevote_election: term={}, committed={}",
++        nt.peers[&1].term,
++        nt.peers[&1].raft_log.committed
++    );
++}
++
++/// Scenario 3: Leader transfer — exercises leadership handover.
++///
++/// Exercises: TransferLeadership, HandleTimeoutNowRequest, then new election.
++#[test]
++fn tla_leader_transfer() {
++    tla_trace::init_from_env();
++    let l = default_logger();
++    // pre_vote=true to match TLA+ spec
++    let mut config = Network::default_config();
++    config.pre_vote = true;
++    let mut nt = Network::new_with_config(vec![None, None, None], &config, &l);
++
++    // Elect node 1 as leader
++    nt.send(vec![new_message(1, 1, MessageType::MsgHup, 0)]);
++    assert_eq!(nt.peers[&1].state, StateRole::Leader);
++
++    // Propose entry to make logs up-to-date
++    nt.send(vec![new_message(1, 1, MessageType::MsgPropose, 1)]);
++
++    // Transfer leadership from 1 to 3
++    let mut transfer_msg = Message::default();
++    transfer_msg.set_msg_type(MessageType::MsgTransferLeader);
++    transfer_msg.from = 3;
++    transfer_msg.to = 1;
++    nt.send(vec![transfer_msg]);
++
++    // After transfer, node 3 should be the new leader
++    assert_eq!(
++        nt.peers[&3].state,
++        StateRole::Leader,
++        "node 3 should be leader after transfer"
++    );
++
++    println!(
++        "leader_transfer: new_leader=3, term={}",
++        nt.peers[&3].term,
++    );
++}
+diff --git a/src/lib.rs b/src/lib.rs
+index ff149c4..a7f15a5 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -508,6 +508,7 @@ mod config;
+ mod errors;
+ mod log_unstable;
+ mod quorum;
++pub mod tla_trace;
+ mod raft;
+ mod raft_log;
+ pub mod raw_node;
+diff --git a/src/raft.rs b/src/raft.rs
+index f744238..4729fd8 100644
+--- a/src/raft.rs
++++ b/src/raft.rs
+@@ -41,6 +41,7 @@ use crate::quorum::VoteResult;
+ use crate::util;
+ use crate::util::NO_LIMIT;
+ use crate::{confchange, Progress, ProgressState, ProgressTracker};
++use crate::tla_trace_event;
+ 
+ // CAMPAIGN_PRE_ELECTION represents the first phase of a normal election when
+ // Config.pre_vote is true.
+@@ -874,6 +875,7 @@ impl<T: Storage> RaftCore<T> {
+             m.context = context.into();
+         }
+         self.send(m, msgs);
++        tla_trace_event!("SendHeartbeat", self, &format!(r#","from":{},"to":{}"#, self.id, to));
+     }
+ }
+ 
+@@ -944,6 +946,7 @@ impl<T: Storage> Raft<T> {
+                 .get_mut(self_id)
+                 .unwrap()
+                 .update_committed(committed);
++            tla_trace_event!("AdvanceCommitIndex", self);
+             return true;
+         }
+         false
+@@ -1059,6 +1062,7 @@ impl<T: Storage> Raft<T> {
+     /// Notifies that these raft logs have been persisted.
+     pub fn on_persist_entries(&mut self, index: u64, term: u64) {
+         let update = self.raft_log.maybe_persist(index, term);
++        if update { tla_trace_event!("PersistEntries", self); }
+         if update && self.state == StateRole::Leader {
+             // Actually, if it is a leader and persisted index is updated, this term
+             // must be equal to self.term because the persisted index must be equal to
+@@ -1481,7 +1485,7 @@ impl<T: Storage> Raft<T> {
+         fail_point!("before_step");
+ 
+         match m.get_msg_type() {
+-            MessageType::MsgHup => self.hup(false),
++            MessageType::MsgHup => { self.hup(false); tla_trace_event!("Timeout", self); }
+             MessageType::MsgRequestVote | MessageType::MsgRequestPreVote => {
+                 // We can vote if this is a repeat of a vote we've already cast...
+                 let can_vote = (self.vote == m.from) ||
+@@ -1514,6 +1518,10 @@ impl<T: Storage> Raft<T> {
+                         self.election_elapsed = 0;
+                         self.vote = m.from;
+                     }
++                    {
++                        let ename = if m.get_msg_type() == MessageType::MsgRequestVote { "HandleRequestVoteRequest" } else { "HandleRequestPreVoteRequest" };
++                        tla_trace_event!(ename, self, &format!(r#","from":{},"granted":true"#, m.from));
++                    }
+                 } else {
+                     self.log_vote_reject(&m);
+                     let mut to_send =
+@@ -1525,6 +1533,10 @@ impl<T: Storage> Raft<T> {
+                     to_send.commit_term = commit_term;
+                     self.r.send(to_send, &mut self.msgs);
+                     self.maybe_commit_by_vote(&m);
++                    {
++                        let ename = if m.get_msg_type() == MessageType::MsgRequestVote { "HandleRequestVoteRequest" } else { "HandleRequestPreVoteRequest" };
++                        tla_trace_event!(ename, self, &format!(r#","from":{},"granted":false"#, m.from));
++                    }
+                 }
+             }
+             _ => match self.state {
+@@ -1808,6 +1820,7 @@ impl<T: Storage> Raft<T> {
+                 }
+                 self.send_append(m.from);
+             }
++            tla_trace_event!("HandleAppendEntriesResponse", self, &format!(r#","from":{},"accepted":false"#, m.from));
+             return;
+         }
+ 
+@@ -1831,6 +1844,7 @@ impl<T: Storage> Raft<T> {
+             }
+             ProgressState::Replicate => pr.ins.free_to(m.get_index()),
+         }
++        tla_trace_event!("HandleAppendEntriesResponse", self, &format!(r#","from":{},"accepted":true"#, m.from));
+ 
+         if self.maybe_commit() {
+             if self.should_bcast_commit() {
+@@ -1890,6 +1904,7 @@ impl<T: Storage> Raft<T> {
+         {
+             self.r.send_append(m.from, pr, &mut self.msgs);
+         }
++        tla_trace_event!("HandleHeartbeatResponse", self, &format!(r#","from":{}"#, m.from));
+ 
+         if self.read_only.option != ReadOnlyOption::Safe || m.context.is_empty() {
+             return;
+@@ -1964,6 +1979,7 @@ impl<T: Storage> Raft<T> {
+         // so reset r.electionElapsed.
+         self.election_elapsed = 0;
+         self.lead_transferee = Some(lead_transferee);
++        tla_trace_event!("TransferLeadership", self, &format!(r#","target":{}"#, lead_transferee));
+         let pr = self.prs.get_mut(from).unwrap();
+         if pr.matched == self.r.raft_log.last_index() {
+             self.send_timeout_now(lead_transferee);
+@@ -2058,6 +2074,7 @@ impl<T: Storage> Raft<T> {
+                     let term = self.term;
+                     self.become_follower(term, INVALID_ID);
+                 }
++                tla_trace_event!("CheckQuorum", self);
+                 return Ok(());
+             }
+             MessageType::MsgPropose => {
+@@ -2140,6 +2157,7 @@ impl<T: Storage> Raft<T> {
+                     return Err(Error::ProposalDropped);
+                 }
+                 self.bcast_append();
++                tla_trace_event!("ClientRequest", self);
+                 return Ok(());
+             }
+             MessageType::MsgReadIndex => {
+@@ -2327,6 +2345,10 @@ impl<T: Storage> Raft<T> {
+ 
+                 self.poll(m.from, m.get_msg_type(), !m.reject);
+                 self.maybe_commit_by_vote(&m);
++                {
++                    let ename = if m.get_msg_type() == MessageType::MsgRequestVoteResponse { "HandleRequestVoteResponse" } else { "HandleRequestPreVoteResponse" };
++                    tla_trace_event!(ename, self, &format!(r#","from":{},"granted":{}"#, m.from, !m.reject));
++                }
+             }
+             MessageType::MsgTimeoutNow => debug!(
+                 self.logger,
+@@ -2408,6 +2430,7 @@ impl<T: Storage> Raft<T> {
+                     // know we are not recovering from a partition so there is no need for the
+                     // extra round trip.
+                     self.hup(true);
++                    tla_trace_event!("HandleTimeoutNowRequest", self, &format!(r#","from":{}"#, m.from));
+                 } else {
+                     info!(
+                         self.logger,
+@@ -2553,8 +2576,10 @@ impl<T: Storage> Raft<T> {
+             to_send.reject_hint = hint_index;
+             to_send.log_term = hint_term.unwrap();
+         }
++        let _tla_accepted = !to_send.reject;
+         to_send.set_commit(self.raft_log.committed);
+         self.r.send(to_send, &mut self.msgs);
++        tla_trace_event!("HandleAppendEntriesRequest", self, &format!(r#","from":{}"#, m.from));
+     }
+ 
+     // TODO: revoke pub when there is a better way to test.
+@@ -2571,6 +2596,7 @@ impl<T: Storage> Raft<T> {
+         to_send.context = m.take_context();
+         to_send.commit = self.raft_log.committed;
+         self.r.send(to_send, &mut self.msgs);
++        tla_trace_event!("HandleHeartbeatRequest", self, &format!(r#","from":{}"#, m.from));
+     }
+ 
+     fn handle_snapshot(&mut self, mut m: Message) {
+diff --git a/src/tla_trace.rs b/src/tla_trace.rs
+new file mode 100644
+index 0000000..be96002
+--- /dev/null
++++ b/src/tla_trace.rs
+@@ -0,0 +1,164 @@
++//! TLA+ trace emission for raft-rs.
++//!
++//! Writes NDJSON trace lines to a file specified by `RAFT_TRACE_FILE` env var.
++//! If the env var is not set, all emit calls are no-ops.
++//!
++//! Thread-safe via `OnceLock<Mutex<...>>`.
++
++use std::fs::OpenOptions;
++use std::io::{BufWriter, Write};
++use std::sync::{Mutex, OnceLock};
++use std::time::{SystemTime, UNIX_EPOCH};
++
++use crate::StateRole;
++
++static WRITER: OnceLock<Mutex<BufWriter<std::fs::File>>> = OnceLock::new();
++
++/// Initialize trace writer from `RAFT_TRACE_FILE` environment variable.
++/// If the env var is not set, tracing remains disabled (all emit calls are no-ops).
++pub fn init_from_env() {
++    if let Ok(path) = std::env::var("RAFT_TRACE_FILE") {
++        init(&path);
++    }
++}
++
++/// Initialize trace writer with an explicit file path.
++pub fn init(path: &str) {
++    let file = OpenOptions::new()
++        .create(true)
++        .truncate(true)
++        .write(true)
++        .open(path)
++        .unwrap_or_else(|e| panic!("Failed to create trace file {}: {}", path, e));
++    WRITER.set(Mutex::new(BufWriter::new(file))).ok();
++}
++
++/// Returns true if tracing is active.
++#[inline]
++pub fn is_active() -> bool {
++    WRITER.get().is_some()
++}
++
++fn role_str(role: StateRole) -> &'static str {
++    match role {
++        StateRole::Follower => "Follower",
++        StateRole::Candidate => "Candidate",
++        StateRole::Leader => "Leader",
++        StateRole::PreCandidate => "PreCandidate",
++    }
++}
++
++fn now_nanos() -> u64 {
++    SystemTime::now()
++        .duration_since(UNIX_EPOCH)
++        .unwrap_or_default()
++        .as_nanos() as u64
++}
++
++fn write_line(line: &str) {
++    if let Some(writer) = WRITER.get() {
++        if let Ok(mut w) = writer.lock() {
++            let _ = writeln!(w, "{}", line);
++            let _ = w.flush();
++        }
++    }
++}
++
++/// Emit a trace event with full state snapshot and optional extra JSON fields.
++///
++/// `extra` should be a pre-formatted JSON fragment starting with a comma,
++/// e.g. `r#","from":2,"accepted":true"#`. Pass `""` for no extra fields.
++pub fn emit_state(
++    event: &str,
++    node: u64,
++    term: u64,
++    role: StateRole,
++    commit: u64,
++    last_index: u64,
++    last_term: u64,
++    persisted: u64,
++    vote: u64,
++    leader_id: u64,
++    extra: &str,
++) {
++    if !is_active() {
++        return;
++    }
++    // Use 0 for "no value" — TLA+ JSON parser doesn't support null.
++    // INVALID_ID = 0 in raft-rs, Nil in spec. Trace.tla doesn't validate these fields.
++    let voted_for = vote;
++    let leader = leader_id;
++    let line = format!(
++        r#"{{"tag":"trace","event":"{}","node":{},"state":{{"term":{},"role":"{}","commit":{},"lastLogIndex":{},"lastLogTerm":{},"persisted":{},"votedFor":{},"leaderId":{}}},"ts":{}{}}}"#,
++        event,
++        node,
++        term,
++        role_str(role),
++        commit,
++        last_index,
++        last_term,
++        persisted,
++        voted_for,
++        leader,
++        now_nanos(),
++        extra
++    );
++    write_line(&line);
++}
++
++/// Emit a minimal event with no state (e.g., Crash).
++pub fn emit_minimal(event: &str, node: u64) {
++    if !is_active() {
++        return;
++    }
++    let line = format!(
++        r#"{{"tag":"trace","event":"{}","node":{},"ts":{}}}"#,
++        event,
++        node,
++        now_nanos()
++    );
++    write_line(&line);
++}
++
++/// Convenience macro for emitting trace events from within raft.rs.
++///
++/// Usage:
++///   `tla_trace_event!("EventName", self);`                         — state only
++///   `tla_trace_event!("EventName", self, &format!(...));`          — state + extra fields
++#[macro_export]
++macro_rules! tla_trace_event {
++    ($event:expr, $raft:expr) => {
++        if $crate::tla_trace::is_active() {
++            $crate::tla_trace::emit_state(
++                $event,
++                $raft.id,
++                $raft.term,
++                $raft.state,
++                $raft.raft_log.committed,
++                $raft.raft_log.last_index(),
++                $raft.raft_log.last_term(),
++                $raft.raft_log.persisted,
++                $raft.vote,
++                $raft.leader_id,
++                "",
++            );
++        }
++    };
++    ($event:expr, $raft:expr, $extra:expr) => {
++        if $crate::tla_trace::is_active() {
++            $crate::tla_trace::emit_state(
++                $event,
++                $raft.id,
++                $raft.term,
++                $raft.state,
++                $raft.raft_log.committed,
++                $raft.raft_log.last_index(),
++                $raft.raft_log.last_term(),
++                $raft.raft_log.persisted,
++                $raft.vote,
++                $raft.leader_id,
++                $extra,
++            );
++        }
++    };
++}
