@@ -211,7 +211,7 @@ callback creates a crash-recovery equivocation path for honest nodes.
 
 ---
 
-## MC-4: Non-Atomic Finalization Writes (Case C — Acknowledged Design Flaw)
+## MC-4: Non-Atomic Finalization Writes (Likely False Positive — Model/Impl Mismatch)
 
 ### Hypothesis
 
@@ -267,8 +267,18 @@ information, potentially preventing it from participating in future finalization
 
 **Note**: The `PersistedStateConsistency` invariant may be partially Case A (too strong)
 for some scenarios: the in-memory divergence between s1 and s2 could also arise from
-normal asynchronous standard change application timing. The core finding (crash between
-sub-steps creates persistent inconsistency) is Case C.
+normal asynchronous standard change application timing.
+
+**Post-review update**: Code audit found that `apply_finality()` and
+`update_authority_set()` both buffer writes via `apply_aux(import_op, ...)` into the
+same `BlockImportOperation`. The actual disk commit happens in a single
+`db.commit(transaction)` call (`lib.rs:1734` in `try_commit_operation`), making the
+two writes **atomic in the RocksDB backend**. Additionally, `insert_aux()` always
+returns `Ok(())`, so the `warn!("potentially inconsistent state")` error branch at
+`environment.rs:1604` can never trigger. The TLA+ model (`MC_mc4.tla`) incorrectly
+splits this into two independent actions (`WriteFinalizationToDisk` +
+`WriteAuthSetToDisk`), creating a crash window that does not exist in the real
+implementation. **Reclassified as likely false positive (model-implementation mismatch).**
 
 ---
 

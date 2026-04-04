@@ -1,67 +1,86 @@
-//! Trace generation test scenarios for papaya TLA+ trace validation.
-//!
-//! Each test exercises specific protocol paths and writes per-thread
-//! NDJSON traces to the directory specified by PAPAYA_TRACE_DIR.
-//!
-//! Test scenarios:
-//!   1. basic_insert:           Single-thread inserts → init_table + insert_cas + insert_meta
-//!   2. concurrent_insert_resize: Multi-thread inserts → triggers resize (alloc_next, copy, promote)
-//!   3. concurrent_insert_remove: Multi-thread insert+remove → exercises update_at for both paths
+// TLA+ trace test scenarios for papaya lock-free hash map.
+// These tests exercise the protocol code paths to generate trace events
+// for trace validation against the TLA+ spec.
 
 use papaya::{HashMap, ResizeMode};
 use std::sync::{Arc, Barrier};
 use std::thread;
 
-/// Scenario 1: Basic single-thread inserts.
-/// Exercises: init_table, insert_cas, insert_meta.
-/// Expected events: 1 init_table + N insert_cas + N insert_meta.
-#[test]
-fn basic_insert() {
-    let map: HashMap<i32, i32> = HashMap::builder()
-        .capacity(32)
-        .resize_mode(ResizeMode::Blocking)
-        .build();
-    let guard = map.guard();
-    for i in 0..8 {
-        map.insert(i, i * 10, &guard);
-    }
-    // Verify all keys are present
-    for i in 0..8 {
-        assert_eq!(map.get(&i, &guard), Some(&(i * 10)));
-    }
-    drop(guard);
-    papaya::tla_trace::flush();
+fn trace_dir() -> String {
+    std::env::var("TLA_TRACE_DIR").unwrap_or_else(|_| "traces".to_string())
 }
 
-/// Scenario 2: Concurrent inserts that trigger resize.
-/// Uses small capacity (4) + incremental(1) to force resize quickly.
-/// Exercises: init_table, insert_cas, insert_meta, alloc_next,
-///            copy_mark_copying, copy_insert, copy_mark_copied, try_promote.
-#[test]
-fn concurrent_insert_resize() {
-    let map: Arc<HashMap<i32, i32>> = Arc::new(
-        HashMap::builder()
-            .capacity(4)
-            .resize_mode(ResizeMode::Incremental(1))
-            .build(),
-    );
-    let num_threads = 4;
-    let keys_per_thread = 8;
-    let barrier = Arc::new(Barrier::new(num_threads));
+/// Helper: insert with trace context
+fn traced_insert(map: &HashMap<String, String>, k: &str, v: &str, guard: &impl papaya::Guard) {
+    papaya::tla_trace::set_pending_key(k);
+    papaya::tla_trace::set_pending_val(v);
+    map.insert(k.to_string(), v.to_string(), guard);
+    papaya::tla_trace::clear_pending();
+}
 
-    let handles: Vec<_> = (0..num_threads)
-        .map(|t| {
-            let map = Arc::clone(&map);
-            let barrier = Arc::clone(&barrier);
+/// Helper: remove with trace context
+fn traced_remove(map: &HashMap<String, String>, k: &str, guard: &impl papaya::Guard) {
+    papaya::tla_trace::set_pending_key(k);
+    let _ = map.remove(&k.to_string(), guard);
+    papaya::tla_trace::clear_pending();
+}
+
+/// Helper: get with trace context (gets emit trace events directly, no pending context needed)
+fn traced_get(map: &HashMap<String, String>, k: &str, guard: &impl papaya::Guard) {
+    let _ = map.get(&k.to_string(), guard);
+}
+
+// ================================================================
+// Scenario 1: Basic Insert/Remove (2 threads)
+// Exercises: InsertBegin, InsertProbe, InsertCAS, StoreMeta,
+//            RemoveBegin, RemoveProbe, RemoveCAS, RemoveStoreMeta,
+//            InsertUpdate
+// ================================================================
+#[test]
+fn trace_insert_remove() {
+    let dir = trace_dir();
+    std::fs::create_dir_all(&dir).ok();
+
+    papaya::tla_trace::init(&dir, "insert_remove");
+
+    let map: HashMap<String, String> = HashMap::builder()
+        .capacity(8)
+        .resize_mode(ResizeMode::Blocking)
+        .build();
+
+    let map = Arc::new(map);
+    let barrier = Arc::new(Barrier::new(2));
+
+    let handles: Vec<_> = (0..2)
+        .map(|i| {
+            let map = map.clone();
+            let barrier = barrier.clone();
             thread::spawn(move || {
-                let guard = map.guard();
+                papaya::tla_trace::thread_init();
                 barrier.wait();
-                let base = t as i32 * keys_per_thread;
-                for i in 0..keys_per_thread {
-                    map.insert(base + i, (base + i) * 100, &guard);
+
+                let guard = map.guard();
+
+                if i == 0 {
+                    // Thread 0: insert k1=v1, k2=v2, get, remove k1, insert k1=v2, get
+                    traced_insert(&map, "k1", "v1", &guard);
+                    traced_insert(&map, "k2", "v2", &guard);
+                    traced_get(&map, "k1", &guard);
+                    traced_get(&map, "k2", &guard);
+                    traced_remove(&map, "k1", &guard);
+                    traced_insert(&map, "k1", "v2", &guard);
+                    traced_get(&map, "k1", &guard);
+                } else {
+                    // Thread 1: insert k1=v2 (races with thread 0), get, remove k2
+                    traced_insert(&map, "k1", "v2", &guard);
+                    traced_get(&map, "k1", &guard);
+                    traced_remove(&map, "k2", &guard);
+                    traced_insert(&map, "k2", "v1", &guard);
+                    traced_get(&map, "k2", &guard);
+                    traced_get(&map, "k3", &guard); // get of non-existent key
                 }
-                drop(guard);
-                papaya::tla_trace::flush();
+
+                papaya::tla_trace::thread_shutdown();
             })
         })
         .collect();
@@ -70,83 +89,172 @@ fn concurrent_insert_resize() {
         h.join().unwrap();
     }
 
-    // Verify all keys present
-    let guard = map.guard();
-    for t in 0..num_threads {
-        let base = t as i32 * keys_per_thread;
-        for i in 0..keys_per_thread {
-            assert_eq!(map.get(&(base + i), &guard), Some(&((base + i) * 100)));
-        }
-    }
-    drop(guard);
-    papaya::tla_trace::flush();
+    papaya::tla_trace::shutdown();
 }
 
-/// Scenario 3: Concurrent inserts and removes.
-/// Exercises: insert_cas, insert_meta, remove (via update_at), insert_update.
+// ================================================================
+// Scenario 2: Resize (blocking mode, 4 threads)
+// Exercises: AllocNextTable, MarkCopying, MarkCopyingEmpty,
+//            CopyEntry, TryPromote, ParkThread, UnparkThread
+// ================================================================
 #[test]
-fn concurrent_insert_remove() {
-    let map: Arc<HashMap<i32, i32>> = Arc::new(
-        HashMap::builder()
-            .capacity(16)
-            .resize_mode(ResizeMode::Blocking)
-            .build(),
-    );
+fn trace_resize_blocking() {
+    let dir = trace_dir();
+    std::fs::create_dir_all(&dir).ok();
+
+    papaya::tla_trace::init(&dir, "resize_blocking");
+
+    // Small initial capacity to force early resize
+    let map: HashMap<String, String> = HashMap::builder()
+        .capacity(4)
+        .resize_mode(ResizeMode::Blocking)
+        .build();
+
+    let map = Arc::new(map);
+    let barrier = Arc::new(Barrier::new(4));
+
+    let handles: Vec<_> = (0..4)
+        .map(|i| {
+            let map = map.clone();
+            let barrier = barrier.clone();
+            thread::spawn(move || {
+                papaya::tla_trace::thread_init();
+                barrier.wait();
+
+                let guard = map.guard();
+
+                // Each thread inserts unique keys to fill and force resize
+                for j in 0..4 {
+                    let k = format!("k{}_{}", i, j);
+                    let v = format!("v{}_{}", i, j);
+                    traced_insert(&map, &k, &v, &guard);
+                }
+
+                // Also do some removes
+                for j in 0..2 {
+                    let k = format!("k{}_{}", i, j);
+                    traced_remove(&map, &k, &guard);
+                }
+
+                papaya::tla_trace::thread_shutdown();
+            })
+        })
+        .collect();
+
+    for h in handles {
+        h.join().unwrap();
+    }
+
+    papaya::tla_trace::shutdown();
+}
+
+// ================================================================
+// Scenario 3: Concurrent Insert/Remove Race (Family 2)
+// Exercises the two-step insert visibility window where
+// StoreMeta can race with RemoveStoreMeta.
+// ================================================================
+#[test]
+fn trace_concurrent_race() {
+    let dir = trace_dir();
+    std::fs::create_dir_all(&dir).ok();
+
+    papaya::tla_trace::init(&dir, "concurrent_race");
+
+    let map: HashMap<String, String> = HashMap::builder()
+        .capacity(8)
+        .resize_mode(ResizeMode::Blocking)
+        .build();
+
+    let map = Arc::new(map);
+    let barrier = Arc::new(Barrier::new(2));
+
+    let handles: Vec<_> = (0..2)
+        .map(|i| {
+            let map = map.clone();
+            let barrier = barrier.clone();
+            thread::spawn(move || {
+                papaya::tla_trace::thread_init();
+                barrier.wait();
+
+                let guard = map.guard();
+
+                if i == 0 {
+                    // Thread 0: repeatedly insert k1 with alternating values
+                    for round in 0..8 {
+                        let v = if round % 2 == 0 { "v1" } else { "v2" };
+                        traced_insert(&map, "k1", v, &guard);
+                    }
+                } else {
+                    // Thread 1: repeatedly remove k1
+                    for _ in 0..8 {
+                        traced_remove(&map, "k1", &guard);
+                        // Re-insert to keep the race going
+                        traced_insert(&map, "k1", "v1", &guard);
+                    }
+                }
+
+                papaya::tla_trace::thread_shutdown();
+            })
+        })
+        .collect();
+
+    for h in handles {
+        h.join().unwrap();
+    }
+
+    papaya::tla_trace::shutdown();
+}
+
+// ================================================================
+// Scenario 4: Incremental resize mode
+// Exercises: MarkCopied, BORROWED entry handling
+// ================================================================
+#[test]
+fn trace_resize_incremental() {
+    let dir = trace_dir();
+    std::fs::create_dir_all(&dir).ok();
+
+    papaya::tla_trace::init(&dir, "resize_incremental");
+
+    let map: HashMap<String, String> = HashMap::builder()
+        .capacity(4)
+        .resize_mode(ResizeMode::Incremental(1)) // Small chunk to force many copy steps
+        .build();
+
+    let map = Arc::new(map);
     let barrier = Arc::new(Barrier::new(3));
 
-    // Thread 1: inserts keys 0..16
-    let map1 = Arc::clone(&map);
-    let b1 = Arc::clone(&barrier);
-    let h1 = thread::spawn(move || {
-        let guard = map1.guard();
-        b1.wait();
-        for i in 0..16_i32 {
-            map1.insert(i, i * 10, &guard);
-        }
-        drop(guard);
-        papaya::tla_trace::flush();
-    });
+    let handles: Vec<_> = (0..3)
+        .map(|i| {
+            let map = map.clone();
+            let barrier = barrier.clone();
+            thread::spawn(move || {
+                papaya::tla_trace::thread_init();
+                barrier.wait();
 
-    // Thread 2: removes even keys 0,2,4..14 (retries until present)
-    let map2 = Arc::clone(&map);
-    let b2 = Arc::clone(&barrier);
-    let h2 = thread::spawn(move || {
-        let guard = map2.guard();
-        b2.wait();
-        for i in (0..16_i32).step_by(2) {
-            // Spin until the key exists, then remove
-            loop {
-                if map2.remove(&i, &guard).is_some() {
-                    break;
+                let guard = map.guard();
+
+                // Each thread inserts keys to force incremental resize
+                for j in 0..5 {
+                    let k = format!("k{}_{}", i, j);
+                    let v = format!("v{}_{}", i, j);
+                    traced_insert(&map, &k, &v, &guard);
                 }
-                std::hint::spin_loop();
-            }
-        }
-        drop(guard);
-        papaya::tla_trace::flush();
-    });
 
-    // Thread 3: updates odd keys 1,3,5..15 with new values (retries until present)
-    let map3 = Arc::clone(&map);
-    let b3 = Arc::clone(&barrier);
-    let h3 = thread::spawn(move || {
-        let guard = map3.guard();
-        b3.wait();
-        for i in (1..16_i32).step_by(2) {
-            loop {
-                if map3.get(&i, &guard).is_some() {
-                    map3.insert(i, i * 100, &guard);
-                    break;
+                // Do interleaved removes and inserts during/after resize
+                for j in 0..3 {
+                    let k = format!("k{}_{}", i, j);
+                    traced_remove(&map, &k, &guard);
                 }
-                std::hint::spin_loop();
-            }
-        }
-        drop(guard);
-        papaya::tla_trace::flush();
-    });
 
-    h1.join().unwrap();
-    h2.join().unwrap();
-    h3.join().unwrap();
-    papaya::tla_trace::flush();
+                papaya::tla_trace::thread_shutdown();
+            })
+        })
+        .collect();
+
+    for h in handles {
+        h.join().unwrap();
+    }
+
+    papaya::tla_trace::shutdown();
 }
