@@ -350,6 +350,72 @@ in key order (deterministic), ensuring all replicas derive the same total order.
 
 ---
 
+## Bug DA-28: View Advancement Side-Effect on Rejected Messages (HIGH)
+
+**Severity**: HIGH — Byzantine node can force honest node to skip valid views
+**Family**: 3 (Message Acceptance Guards)
+**Found by**: MC (ablation experiment: full × autobahn, MC_hunt_family3.cfg, 26-state counterexample). Reproduced via unit test.
+
+### Summary
+
+In `is_valid()`, the Prepare branch advances the node's local view
+(`views.insert(*slot, *view)`) **before** checking whether the message should
+be accepted. A rejected Prepare message (e.g., duplicate vote, invalid ticket)
+still permanently advances the node's view as a side-effect. A Byzantine node
+can send an invalid Prepare for a high view to force an honest node to skip
+all intermediate views.
+
+### Root Cause
+
+```rust
+// core.rs:1226-1229 — view advanced BEFORE validation
+let curr_view = self.views.get(slot).unwrap_or(&0);
+if curr_view < view {
+    self.views.insert(*slot, *view);   // SIDE-EFFECT: view advanced
+}
+
+// core.rs:1233 — validation happens AFTER view advance
+!self.last_voted_consensus.contains(&(*slot, *view))
+    && ticket_valid
+    && self.views.get(slot).unwrap() == view  // always true after insert (tautology)
+```
+
+The third condition (`views == view`) is always true after the insert, making
+it a dead check.
+
+### Counterexample
+
+A Byzantine node sends an invalid `Prepare(slot=1, view=3)` without a valid TC.
+The honest node correctly rejects it (no vote), but `views[1]` is advanced from
+0 to 3. A subsequent valid `Prepare(slot=1, view=1)` is then rejected because
+`views[1]=3 ≠ 1`.
+
+### Reproduction
+
+```
+test core::core_tests::bug4_view_advance_side_effect ... ok
+
+Step 1: Sent INVALID Prepare(slot=1, view=3, tc=None) — rejected.
+Step 2: VALID Prepare(slot=1, view=1) — NO vote received (2s timeout).
+=== BUG-04 CONFIRMED ===
+Invalid Prepare(view=3) advanced views[1] from 0 to 3 as side-effect.
+Valid Prepare(view=1) rejected because views[1]=3 != 1.
+```
+
+### Affected Code
+
+| File | Lines | Issue |
+|------|-------|-------|
+| `core.rs` | 1226-1229 | `is_valid()` Prepare branch: view advance before decision |
+| `core.rs` | 1233 | `last_voted_consensus` check after view already advanced |
+
+### Fix
+
+Move `views.insert(*slot, *view)` after the validation check, so it only
+executes when the message is accepted.
+
+---
+
 ## Bug DA-7: handle_tc() Is a Near-No-Op (MEDIUM)
 
 **Severity**: MEDIUM — Liveness violation, non-leader nodes stuck after view change
