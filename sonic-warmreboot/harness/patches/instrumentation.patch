@@ -1,0 +1,256 @@
+diff --git a/orchagent/orchdaemon.cpp b/orchagent/orchdaemon.cpp
+index 0000000..1111111 100644
+--- a/orchagent/orchdaemon.cpp
++++ b/orchagent/orchdaemon.cpp
+@@ -1,5 +1,6 @@
+ #include <unistd.h>
+ #include <unordered_map>
++#include "tla_trace.h"
+
+ #include "orchdaemon.h"
+ #include "logger.h"
+@@ -1010,6 +1011,11 @@ void OrchDaemon::start()
+         if (gSwitchOrch && gSwitchOrch->checkRestartReady())
+         {
+             bool ret = warmRestartCheck();
++            /* TLA_TRACE: OrchCheckReady — after warmRestartCheck() check
++             * Reference: orchdaemon.cpp:1012, instrumentation-spec.md #5 */
++            TlaTrace::emit("OrchCheckReady", {
++                {"orchState", ret ? "ReadyReplied" : "CheckingReady"},
++                {"phase", "Freeze"}});
+             if (ret)
+             {
+                 // Orchagent is ready to perform warm restart, stop processing any new db data.
+@@ -1018,6 +1024,11 @@ void OrchDaemon::start()
+                 {
+                     while (!gRingBuffer->IsEmpty() || !gRingBuffer->IsIdle())
+                     {
++                        /* TLA_TRACE: OrchDrainRingBuffer — each ring buffer drain iteration
++                         * Reference: orchdaemon.cpp:1019-1026, instrumentation-spec.md #8 */
++                        TlaTrace::emit("OrchDrainRingBuffer", {
++                            {"orchState", "Draining"},
++                            {"pendingEvents", std::to_string(gRingBuffer ? gRingBuffer->Size() : 0)}});
+                         gRingBuffer->notify();
+                         std::this_thread::sleep_for(std::chrono::milliseconds(SLEEP_MSECONDS));
+                     }
+@@ -1045,6 +1056,10 @@ void OrchDaemon::start()
+                     flush();
+
+                     SWSS_LOG_WARN("Orchagent is frozen for warm restart!");
++                    /* TLA_TRACE: OrchFreeze — after FDB aging disabled and learning disabled
++                     * Reference: orchdaemon.cpp:1029-1048, instrumentation-spec.md #9 */
++                    TlaTrace::emit("OrchFreeze", {
++                        {"orchState", "Frozen"}});
+                     freezeAndHeartBeat(UINT_MAX, heartBeatInterval);
+                 }
+             }
+@@ -1059,6 +1074,10 @@ bool OrchDaemon::warmRestoreAndSyncUp()
+
+     WarmStart::setWarmStartState("orchagent", WarmStart::INITIALIZED);
+
++    /* TLA_TRACE: OrchWarmRestore — start of 3-phase restoration
++     * Reference: orchdaemon.cpp:1059-1136, instrumentation-spec.md #28 */
++    TlaTrace::emit("OrchWarmRestore", {
++        {"orchState", "Restoring"}});
+     for (Orch *o : m_orchList)
+     {
+         o->bake();
+@@ -1121,6 +1140,10 @@ bool OrchDaemon::warmRestoreAndSyncUp()
+
+     SWSS_LOG_NOTICE("Orchagent state restore done");
+
++    /* TLA_TRACE: OrchSendApplyView — before syncd_apply_view()
++     * Reference: orchdaemon.cpp:1123, instrumentation-spec.md #29 */
++    TlaTrace::emit("OrchSendApplyView", {
++        {"orchState", "WaitApplyView"}});
+     syncd_apply_view();
+
+     for (Orch *o : m_orchList)
+@@ -1131,6 +1154,11 @@ bool OrchDaemon::warmRestoreAndSyncUp()
+      * Note. Arp sync up is handled in neighsyncd.
+      * The "RECONCILED" state of orchagent doesn't mean the state related to neighbor is up to date.
+      */
++    /* TLA_TRACE: OrchReconcileComplete — after onWarmBootEnd and RECONCILED
++     * Reference: orchdaemon.cpp:1127-1134, instrumentation-spec.md #30 */
++    TlaTrace::emit("OrchReconcileComplete", {
++        {"orchState", "Reconciling"},
++        {"componentState", "Reconciled"}});
+     WarmStart::setWarmStartState("orchagent", WarmStart::RECONCILED);
+     return true;
+ }
+@@ -1204,6 +1232,11 @@ bool OrchDaemon::warmRestartCheck()
+
+     SWSS_LOG_NOTICE("Restart check result: %s", data.c_str());
++    /* TLA_TRACE: OrchSendReadyReply — after READY reply sent
++     * Reference: orchdaemon.cpp:1207, instrumentation-spec.md #6 */
++    if (ret) {
++        TlaTrace::emit("OrchSendReadyReply", {
++            {"orchState", "ReadyReplied"},
++            {"componentState", "Quiescent"}});
++    }
+     gSwitchOrch->restartCheckReply(op,  data, values);
+     return ret;
+ }
+diff --git a/warmrestart/warmRestartAssist.cpp b/warmrestart/warmRestartAssist.cpp
+index 0000000..1111111 100644
+--- a/warmrestart/warmRestartAssist.cpp
++++ b/warmrestart/warmRestartAssist.cpp
+@@ -4,6 +4,7 @@
+ #include "schema.h"
+ #include "warm_restart.h"
+ #include "warmRestartAssist.h"
++#include "tla_trace.h"
+
+ using namespace std;
+ using namespace swss;
+@@ -160,6 +161,13 @@ void AppRestartAssist::readTablesToMap()
+         WarmStart::setWarmStartState(m_appName, WarmStart::RESTORED);
+         SWSS_LOG_NOTICE("Restored appDB table to %s internal cache map", (it->first).c_str());
+     }
++    /* TLA_TRACE: ComponentReadTable — after all entries read, state RESTORED
++     * Reference: warmRestartAssist.cpp:131-165, instrumentation-spec.md #23 */
++    TlaTrace::emit("ComponentReadTable", {
++        {"componentState", "Restored"}});
+     return;
+ }
+
+@@ -245,6 +253,14 @@ void AppRestartAssist::insertToMap(string tableName, string key, vector<FieldVal
+         setCacheEntryState(fvVector, NEW);
+         appTableCacheMap[tableName][key] = fvVector;
+     }
++    /* TLA_TRACE: ReplayEntry — after cache entry state updated
++     * Reference: warmRestartAssist.cpp:179-248, instrumentation-spec.md #24 */
++    {
++        auto state = getCacheEntryState(appTableCacheMap[tableName][key]);
++        TlaTrace::emit("ReplayEntry", {
++            {"componentState", "Restored"}},
++            {{"key", key}, {"cacheState", cacheStateMap.at(state)}});
++    }
+     return;
+ }
+
+@@ -301,6 +317,10 @@ void AppRestartAssist::reconcile()
+     appTableCacheMap.clear();
++    /* TLA_TRACE: ReconcileComponent — after reconcile complete
++     * Reference: warmRestartAssist.cpp:258-306, instrumentation-spec.md #26 */
++    TlaTrace::emit("ReconcileComponent", {
++        {"componentState", "Reconciled"}});
+     WarmStart::setWarmStartState(m_appName, WarmStart::RECONCILED);
+     m_warmStartInProgress = false;
+     return;
+@@ -316,6 +336,10 @@ void AppRestartAssist::startReconcileTimer(Select &s)
+ {
+     m_warmStartTimer.start();
+     s.addSelectable(&m_warmStartTimer);
++    /* TLA_TRACE: ComponentStartReconcileTimer — after timer started
++     * Reference: warmRestartAssist.cpp:316-320, instrumentation-spec.md #22 */
++    TlaTrace::emit("ComponentStartReconcileTimer", {
++        {"componentState", "Initialized"}});
+ }
+
+ // stop the timer, take Select class "s" to remove the timer.
+@@ -330,6 +354,10 @@ bool AppRestartAssist::checkReconcileTimer(Selectable *s)
+     if(s == &m_warmStartTimer) {
+         SWSS_LOG_INFO("warmstart timer expired");
++        /* TLA_TRACE: ReconcileTimerFire — timer expired
++         * Reference: warmRestartAssist.cpp:330-337, instrumentation-spec.md #25 */
++        TlaTrace::emit("ReconcileTimerFire", {
++            {"componentState", "Restored"}});
+         return true;
+     }
+     return false;
+diff --git a/syncd/Syncd.cpp b/syncd/Syncd.cpp
+index 0000000..1111111 100644
+--- a/syncd/Syncd.cpp
++++ b/syncd/Syncd.cpp
+@@ -1,5 +1,6 @@
+ #include "Syncd.h"
+ #include "VidManager.h"
++#include "tla_trace.h"
+
+ #include "sairediscommon.h"
+ #include "syncd.h"
+@@ -4598,6 +4599,11 @@ sai_status_t Syncd::processNotifySyncd(
+
+         m_asicInitViewMode = true;
+
++        /* TLA_TRACE: SyncdReceiveInitView — after m_asicInitViewMode = true
++         * Reference: Syncd.cpp:4591-4615, instrumentation-spec.md #14 */
++        TlaTrace::emit("SyncdReceiveInitView", {
++            {"syncdMode", "InitView"}});
++
+         clearTempView();
+
+         m_createdInInitView.clear();
+@@ -4617,6 +4623,11 @@ sai_status_t Syncd::processNotifySyncd(
+     {
+         m_asicInitViewMode = false;
+
++        /* TLA_TRACE: ApplyViewStage1 — m_asicInitViewMode = false, before applyView()
++         * Reference: Syncd.cpp:4617-4627, instrumentation-spec.md #15 */
++        TlaTrace::emit("ApplyViewStage1", {
++            {"syncdMode", "ApplyStage1"}});
++
+         // NOTE: Currently as WARN to be easier to spot, later should be NOTICE.
+
+         SWSS_LOG_WARN("syncd received APPLY VIEW, will translate");
+@@ -4889,6 +4900,12 @@ sai_status_t Syncd::applyView()
+
+         SWSS_LOG_ERROR("Exception: %s", e.what());
+
++        /* TLA_TRACE: ApplyViewStage1Fail — exception in Stage 1 (non-destructive)
++         * Reference: Syncd.cpp:4882-4891, instrumentation-spec.md #16 */
++        TlaTrace::emit("ApplyViewStage1Fail", {
++            {"syncdMode", "Normal"},
++            {"asicConsistent", "true"}});
++
+         return SAI_STATUS_FAILURE;
+     }
+
+@@ -4902,6 +4919,11 @@ sai_status_t Syncd::applyView()
+
+     for (auto& cl: cls)
+     {
++        /* TLA_TRACE: ApplyViewStage2 — destructive ASIC operations begin
++         * Reference: Syncd.cpp:4894-4907, instrumentation-spec.md #17 */
++        TlaTrace::emit("ApplyViewStage2", {
++            {"syncdMode", "ApplyStage2"}});
++
+         cl->executeOperationsOnAsic(); // can throw, if so asic will be in inconsistent state
+     }
+
+@@ -4909,6 +4931,12 @@ sai_status_t Syncd::applyView()
+
+     updateRedisDatabase(tempViews);
+
++    /* TLA_TRACE: ApplyViewComplete — both ASIC and Redis updated
++     * Reference: Syncd.cpp:4904-4909, instrumentation-spec.md #19 */
++    TlaTrace::emit("ApplyViewComplete", {
++        {"syncdMode", "Done"},
++        {"asicConsistent", "true"},
++        {"redisUpdated", "true"}});
+     for (auto& cl: cls)
+     {
+         if (m_commandLineOptions->m_enableConsistencyCheck)
+diff --git a/neighsyncd/neighsyncd.cpp b/neighsyncd/neighsyncd.cpp
+index 0000000..1111111 100644
+--- a/neighsyncd/neighsyncd.cpp
++++ b/neighsyncd/neighsyncd.cpp
+@@ -5,6 +5,7 @@
+ #include "select.h"
+ #include "netdispatcher.h"
+ #include "netlink.h"
++#include "tla_trace.h"
+ #include "neighsyncd/neighsync.h"
+
+ using namespace std;
+@@ -14,6 +15,9 @@ using namespace swss;
+ int main(int argc, char **argv)
+ {
+     Logger::linkToDbNative("neighsyncd");
++    /* TLA_TRACE: Initialize tracing for neighsyncd */
++    TlaTrace::init("neighsyncd");
++
+
+     DBConnector appDb("APPL_DB", 0);
+     RedisPipeline pipelineAppDB(&appDb);
