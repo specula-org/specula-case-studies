@@ -1,0 +1,1331 @@
+diff --git a/consensus/bft_trace_emit.go b/consensus/bft_trace_emit.go
+new file mode 100644
+index 0000000..7af6c84
+--- /dev/null
++++ b/consensus/bft_trace_emit.go
+@@ -0,0 +1,394 @@
++package consensus
++
++// bft_trace_emit.go — harness-side helpers that emit Byzantine and BFT-related
++// trace events (round 2). These run directly from test scenarios; they do not
++// alter real consensus state machine logic, but they DO mutate auxiliary
++// instrumentation state (cs.byzClock, cs.byzSignedVotes,
++// cs.byzPendingEvidence) so that subsequent honest emissions reflect the
++// composed adversarial timeline.
++//
++// Each helper corresponds 1:1 to a wrapper in spec/Trace.tla; the trace
++// envelope it produces is what ValidatePostState / ValidateByzVoteSigned read.
++
++// EmitByzEquivocate emits a ByzEquivocate event for signer `signer` at
++// (height, round) for value `value`. The caller emits this after the second
++// conflicting precommit has been posted to the broadcast queue. Returns the
++// emitted byzVote record (for further composition with selective dissem.).
++func (cs *State) EmitByzEquivocate(signerNid string, height int64, round int32, value, ve string) {
++	cs.byzAddSignedVote(signerNid, "precommit", height, round, value, ve)
++	cs.traceLogger.Emit(&TraceEvent{
++		Name:  "ByzEquivocate",
++		Nid:   signerNid,
++		State: cs.captureState(),
++		ByzVote: &TraceByzVote{
++			VType:  "precommit",
++			Height: height,
++			Round:  round,
++			Value:  value,
++			VE:     ve,
++		},
++	})
++}
++
++// EmitByzSelectiveDisseminate emits when a Byzantine has split-broadcast two
++// conflicting precommits to disjoint partitions. The state snapshot reflects
++// the post-broadcast view; partition is implicit in the `dest` field of the
++// underlying messages (recorded as part of the bag).
++func (cs *State) EmitByzSelectiveDisseminate(signerNid string, height int64, round int32, value, dest string) {
++	cs.traceLogger.Emit(&TraceEvent{
++		Name:  "ByzSelectiveDisseminate",
++		Nid:   signerNid,
++		State: cs.captureState(),
++		Msg: &TraceMsgFields{
++			Source: signerNid,
++			Dest:   dest,
++			Type:   "PrecommitMsg",
++			Value:  value,
++			Round:  round,
++		},
++		ByzVote: &TraceByzVote{
++			VType:  "precommit",
++			Height: height,
++			Round:  round,
++			Value:  value,
++		},
++	})
++}
++
++// EmitByzAmnesia emits when a Byzantine has signed a precommit at (h, r2) for
++// a different block than at (h, r1<r2), bypassing privval CheckHRS.
++func (cs *State) EmitByzAmnesia(signerNid string, height int64, r2 int32, newValue, ve string) {
++	cs.byzAddSignedVote(signerNid, "precommit", height, r2, newValue, ve)
++	cs.traceLogger.Emit(&TraceEvent{
++		Name:  "ByzAmnesia",
++		Nid:   signerNid,
++		State: cs.captureState(),
++		ByzVote: &TraceByzVote{
++			VType:  "precommit",
++			Height: height,
++			Round:  r2,
++			Value:  newValue,
++			VE:     ve,
++		},
++	})
++}
++
++// EmitWALTailTruncate emits when repairWalFile has truncated `k` records from
++// the tail of the WAL.
++func (cs *State) EmitWALTailTruncate(nid string, k int) {
++	cs.traceLogger.Emit(&TraceEvent{
++		Name:  "WALTailTruncate",
++		Nid:   nid,
++		State: cs.captureState(),
++		K:     intPtr(k),
++	})
++}
++
++// EmitByzAttachSameVEToBoth emits when a Byzantine attaches the same VE bytes
++// to two conflicting precommits at (h, r).
++func (cs *State) EmitByzAttachSameVEToBoth(signerNid string, height int64, round int32) {
++	cs.traceLogger.Emit(&TraceEvent{
++		Name:  "ByzAttachSameVEToBoth",
++		Nid:   signerNid,
++		State: cs.captureState(),
++		ByzVote: &TraceByzVote{
++			VType:  "precommit",
++			Height: height,
++			Round:  round,
++		},
++	})
++}
++
++// EmitByzLateAddPrecommitWithBadVE emits when a Byzantine submits a precommit
++// to LastCommit after height h+1 has begun, with an invalid VE.
++func (cs *State) EmitByzLateAddPrecommitWithBadVE(signerNid string, height int64, round int32, value, dest string) {
++	cs.traceLogger.Emit(&TraceEvent{
++		Name:  "ByzLateAddPrecommitWithBadVE",
++		Nid:   signerNid,
++		State: cs.captureState(),
++		Msg: &TraceMsgFields{
++			Source:  signerNid,
++			Dest:    dest,
++			Type:    "PrecommitMsg",
++			Value:   value,
++			Round:   round,
++			VE:      "InvalidVE",
++			LateAdd: true,
++		},
++		ByzVote: &TraceByzVote{
++			VType:  "precommit",
++			Height: height,
++			Round:  round,
++			Value:  value,
++			VE:     "InvalidVE",
++		},
++	})
++}
++
++// EmitByzReplaySelfVE emits when a Byzantine re-signs a vote envelope at a
++// new round (newR) using the previously-signed VE bytes (oldR).
++func (cs *State) EmitByzReplaySelfVE(signerNid string, height int64, oldR, newR int32, value string) {
++	cs.byzAddSignedVote(signerNid, "precommit", height, newR, value, "ValidVE")
++	cs.traceLogger.Emit(&TraceEvent{
++		Name:  "ByzReplaySelfVE",
++		Nid:   signerNid,
++		State: cs.captureState(),
++		ByzVote: &TraceByzVote{
++			VType:    "precommit",
++			Height:   height,
++			Round:    newR,
++			OldRound: oldR,
++			NewRound: newR,
++			Value:    value,
++			VE:       "ValidVE",
++		},
++	})
++}
++
++// EmitByzLunaticForkHeader emits when ≥1/3 of nextValidators(h-1) have signed
++// a forged header for height h whose LastBlockID does not match the canonical
++// chain. The lightClient channel receives the forged HeaderMsg.
++func (cs *State) EmitByzLunaticForkHeader(signerNid string, height int64, fakeLastBlock, lightClientDest string) {
++	cs.traceLogger.Emit(&TraceEvent{
++		Name: "ByzLunaticForkHeader",
++		Nid:  signerNid,
++		State: TraceStateSnap{
++			Height:      height,
++			Round:       0,
++			Step:        "NewHeight",
++			LockedRound: -1,
++			LockedValue: "nil",
++			ValidRound:  -1,
++			ValidValue:  "nil",
++		},
++		Msg: &TraceMsgFields{
++			Source: signerNid,
++			Dest:   lightClientDest,
++			Type:   "HeaderMsg",
++			Value:  fakeLastBlock,
++		},
++	})
++}
++
++// EmitLightClientVerify emits when a light client has updated its trusted
++// header (the bug-relevant outcome).
++func EmitLightClientVerify(tl *TraceLogger, clientID string, newHeight int64, value string) {
++	tl.Emit(&TraceEvent{
++		Name: "LightClientVerify",
++		Nid:  clientID,
++		State: TraceStateSnap{
++			Height:      newHeight,
++			Round:       0,
++			Step:        "NewHeight",
++			LockedRound: -1,
++			LockedValue: value,
++			ValidRound:  -1,
++			ValidValue:  "nil",
++		},
++	})
++}
++
++// EmitByzInjectInvalidEvidence emits when a Byzantine sends fabricated
++// evidence to peer `dest`.
++func (cs *State) EmitByzInjectInvalidEvidence(signerNid, dest string) {
++	cs.traceLogger.Emit(&TraceEvent{
++		Name:  "ByzInjectInvalidEvidence",
++		Nid:   signerNid,
++		State: cs.captureState(),
++		Msg: &TraceMsgFields{
++			Source: signerNid,
++			Dest:   dest,
++			EvType: "InvalidEv",
++		},
++	})
++}
++
++// EmitByzFloodEvidence emits when a Byzantine floods many valid duplicate-vote
++// evidence records.
++func (cs *State) EmitByzFloodEvidence(signerNid, dest string, height int64) {
++	cs.traceLogger.Emit(&TraceEvent{
++		Name:  "ByzFloodEvidence",
++		Nid:   signerNid,
++		State: cs.captureState(),
++		Msg: &TraceMsgFields{
++			Source: signerNid,
++			Dest:   dest,
++			EvType: "DuplicateVoteEv",
++		},
++	})
++}
++
++// EmitEvidenceExpiryRace emits when an honest sender broadcasts evidence its
++// reactor filter accepts but the receiver's verifier rejects (height-only vs
++// height-AND-time filter divergence).
++func (cs *State) EmitEvidenceExpiryRace(sender, receiver string, evHeight int64) {
++	cs.traceLogger.Emit(&TraceEvent{
++		Name:  "EvidenceExpiryRace",
++		Nid:   sender,
++		State: cs.captureState(),
++		Msg: &TraceMsgFields{
++			Source: sender,
++			Dest:   receiver,
++			EvType: "DuplicateVoteEv",
++		},
++	})
++}
++
++// EmitCrashDuringConsensusBuffer emits when an honest validator crashes
++// between ReportConflictingVotes and the next pool.Update.
++func (cs *State) EmitCrashDuringConsensusBuffer(nid string) {
++	cs.traceLogger.Emit(&TraceEvent{
++		Name:  "CrashDuringConsensusBuffer",
++		Nid:   nid,
++		State: cs.captureState(),
++	})
++}
++
++// EmitProposerExcludeEvidence emits when a Byzantine proposer fails to
++// include pending evidence in the proposal block.
++func (cs *State) EmitProposerExcludeEvidence(nid string) {
++	cs.traceLogger.Emit(&TraceEvent{
++		Name:  "ProposerExcludeEvidence",
++		Nid:   nid,
++		State: cs.captureState(),
++	})
++}
++
++// EmitAdvanceClock emits when a validator's local clock advances by one tick.
++// The validatorClock is sourced from cs.byzClock; callers must increment
++// cs.byzClock before calling.
++func (cs *State) EmitAdvanceClock(nid string) {
++	cs.traceLogger.Emit(&TraceEvent{
++		Name:  "AdvanceClock",
++		Nid:   nid,
++		State: cs.captureState(),
++	})
++}
++
++// EmitCommitEvidence emits when pending evidence becomes committed at the
++// honest proposer of the next height.
++func (cs *State) EmitCommitEvidence(nid string) {
++	cs.traceLogger.Emit(&TraceEvent{
++		Name:  "CommitEvidence",
++		Nid:   nid,
++		State: cs.captureState(),
++	})
++}
++
++// EmitDetectEquivocation emits when consensus tryAddVote catches a
++// ConflictingVotes error and forwards it to evpool.ReportConflictingVotes.
++func (cs *State) EmitDetectEquivocation(nid string, offender string, height int64, round int32) {
++	cs.traceLogger.Emit(&TraceEvent{
++		Name:  "DetectEquivocation",
++		Nid:   nid,
++		State: cs.captureState(),
++		Msg: &TraceMsgFields{
++			Source: offender,
++			Dest:   nid,
++			EvType: "DuplicateVoteEv",
++			Round:  round,
++		},
++		ByzVote: &TraceByzVote{
++			VType:  "precommit",
++			Height: height,
++			Round:  round,
++		},
++	})
++}
++
++// EmitProcessConsensusBuffer emits each iteration of the inner flush loop in
++// evpool.processConsensusBuffer.
++func (cs *State) EmitProcessConsensusBuffer(nid string) {
++	cs.traceLogger.Emit(&TraceEvent{
++		Name:  "ProcessConsensusBuffer",
++		Nid:   nid,
++		State: cs.captureState(),
++	})
++}
++
++// EmitByzProposeAlternating emits when a Byzantine proposer offers a chosen
++// block (bypassing validValue reuse).
++func (cs *State) EmitByzProposeAlternating(signerNid string, blockChoice string, dest string) {
++	cs.traceLogger.Emit(&TraceEvent{
++		Name:  "ByzProposeAlternating",
++		Nid:   signerNid,
++		State: cs.captureState(),
++		Msg: &TraceMsgFields{
++			Source:   signerNid,
++			Dest:     dest,
++			Type:     "ProposalMsg",
++			Value:    blockChoice,
++			Round:    cs.Round,
++			PolRound: -1,
++		},
++	})
++}
++
++// EmitByzPolkaForUnknownBlock emits when a Byzantine subset sends prevotes
++// for a block the target validator does not have.
++func EmitByzPolkaForUnknownBlock(tl *TraceLogger, sourceNid, dest string, height int64, round int32, blockX string) {
++	tl.Emit(&TraceEvent{
++		Name: "ByzPolkaForUnknownBlock",
++		Nid:  sourceNid,
++		State: TraceStateSnap{
++			Height:      height,
++			Round:       round,
++			Step:        "Prevote",
++			LockedRound: -1,
++			LockedValue: "nil",
++			ValidRound:  -1,
++			ValidValue:  "nil",
++		},
++		Msg: &TraceMsgFields{
++			Source: sourceNid,
++			Dest:   dest,
++			Type:   "PrevoteMsg",
++			Value:  blockX,
++			Round:  round,
++		},
++	})
++}
++
++// EmitByzPOLRoundGtRound emits when a Byzantine proposer sets POLRound ≥ Round.
++func (cs *State) EmitByzPOLRoundGtRound(signerNid string, dest, value string, badPolRound int32) {
++	cs.traceLogger.Emit(&TraceEvent{
++		Name:  "ByzPOLRoundGtRound",
++		Nid:   signerNid,
++		State: cs.captureState(),
++		Msg: &TraceMsgFields{
++			Source:   signerNid,
++			Dest:     dest,
++			Type:     "ProposalMsg",
++			Value:    value,
++			Round:    cs.Round,
++			PolRound: badPolRound,
++		},
++	})
++}
++
++// EmitCrash emits a Crash event for nid.
++func (cs *State) EmitCrash(nid string) {
++	cs.traceLogger.Emit(&TraceEvent{
++		Name:  "Crash",
++		Nid:   nid,
++		State: cs.captureState(),
++	})
++}
++
++// EmitRecover emits a Recover event for nid.
++func (cs *State) EmitRecover(nid string) {
++	cs.traceLogger.Emit(&TraceEvent{
++		Name:  "Recover",
++		Nid:   nid,
++		State: cs.captureState(),
++	})
++}
++
++// EmitRoundSkip emits a RoundSkip event (prevote- or precommit-driven).
++func (cs *State) EmitRoundSkip(nid string) {
++	cs.traceLogger.Emit(&TraceEvent{
++		Name:  "RoundSkip",
++		Nid:   nid,
++		State: cs.captureState(),
++	})
++}
+diff --git a/consensus/byz_state.go b/consensus/byz_state.go
+new file mode 100644
+index 0000000..d3827c4
+--- /dev/null
++++ b/consensus/byz_state.go
+@@ -0,0 +1,44 @@
++package consensus
++
++// byz_state.go — additional harness-side state attached to *State.
++//
++// These fields are NOT part of CometBFT proper. They exist only to compose
++// trace-side bookkeeping (signed-vote shadow set, byzantine local clock,
++// pending-evidence shadow) with the honest path of the real state machine.
++// They never feed back into consensus decisions.
++
++// byzSignedVote is a shadow record matching VoteRecord(...) in spec/base.tla.
++type byzSignedVote struct {
++	Signer string
++	VType  string
++	Height int64
++	Round  int32
++	Value  string
++	VE     string
++}
++
++// byzAddSignedVote records a signed vote in cs.byzSignedVotes (idempotent).
++func (cs *State) byzAddSignedVote(signer, vtype string, h int64, r int32, value, ve string) {
++	if cs.byzSignedVotes == nil {
++		cs.byzSignedVotes = make(map[string][]byzSignedVote)
++	}
++	rec := byzSignedVote{
++		Signer: signer,
++		VType:  vtype,
++		Height: h,
++		Round:  r,
++		Value:  value,
++		VE:     ve,
++	}
++	for _, existing := range cs.byzSignedVotes[signer] {
++		if existing == rec {
++			return
++		}
++	}
++	cs.byzSignedVotes[signer] = append(cs.byzSignedVotes[signer], rec)
++}
++
++// byzAdvanceClock increments cs.byzClock by one tick.
++func (cs *State) byzAdvanceClock() {
++	cs.byzClock++
++}
+diff --git a/consensus/scenario_bft_trace_test.go b/consensus/scenario_bft_trace_test.go
+new file mode 100644
+index 0000000..857968b
+--- /dev/null
++++ b/consensus/scenario_bft_trace_test.go
+@@ -0,0 +1,413 @@
++package consensus
++
++import (
++	"context"
++	"encoding/hex"
++	"os"
++	"path/filepath"
++	"testing"
++
++	"github.com/stretchr/testify/require"
++
++	"github.com/cometbft/cometbft/internal/test"
++	cmtproto "github.com/cometbft/cometbft/proto/tendermint/types"
++	"github.com/cometbft/cometbft/types"
++)
++
++// traceDir returns the output directory for NDJSON traces.
++func traceDir() string {
++	d := os.Getenv("TRACE_DIR")
++	if d == "" {
++		d = filepath.Join("..", "..", "..", "..", "traces")
++	}
++	_ = os.MkdirAll(d, 0o755)
++	return d
++}
++
++// setupTraceLogger creates a TraceLogger writing to the given file path.
++func setupTraceLogger(t *testing.T, name string) *TraceLogger {
++	t.Helper()
++	p := filepath.Join(traceDir(), name+".ndjson")
++	f, err := os.Create(p)
++	require.NoError(t, err)
++	tl := NewTraceLogger(f)
++	t.Cleanup(func() { _ = tl.Close() })
++	return tl
++}
++
++// stubAddrHex returns the hex-encoded validator address for stub `vs`.
++func stubAddrHex(t *testing.T, vs *validatorStub) string {
++	t.Helper()
++	addr, err := vs.GetPubKey()
++	require.NoError(t, err)
++	return hex.EncodeToString(addr.Address())
++}
++
++// hashStr is the same hex/"nil" convention used by blockHashStr.
++func hashStr(b []byte) string {
++	if len(b) == 0 {
++		return "nil"
++	}
++	return hex.EncodeToString(b)
++}
++
++// TestScenarioBasicConsensus runs 3 validators through one height of consensus.
++func TestScenarioBasicConsensus(t *testing.T) {
++	config = test.ResetTestRoot("scenario_basic_consensus")
++	defer os.RemoveAll(config.RootDir)
++
++	cs1, vss := randState(3)
++	vs2, vs3 := vss[1], vss[2]
++	height, round := cs1.Height, cs1.Round
++
++	tl := setupTraceLogger(t, "basic_consensus")
++	cs1.SetTraceLogger(tl)
++
++	newRoundCh := subscribe(cs1.eventBus, types.EventQueryNewRound)
++	newBlockCh := subscribe(cs1.eventBus, types.EventQueryNewBlock)
++	proposalCh := subscribe(cs1.eventBus, types.EventQueryCompleteProposal)
++	voteCh := subscribeToVoter(cs1, cs1.privValidatorPubKey.Address())
++
++	startTestRound(cs1, height, round)
++
++	ensureNewRound(newRoundCh, height, round)
++	ensureNewProposal(proposalCh, height, round)
++
++	rs := cs1.GetRoundState()
++	propBlockHash := rs.ProposalBlock.Hash()
++	propBlockParts := rs.ProposalBlockParts.Header()
++
++	ensurePrevote(voteCh, height, round)
++	signAddVotes(cs1, cmtproto.PrevoteType, propBlockHash, propBlockParts, false, vs2, vs3)
++
++	ensurePrecommit(voteCh, height, round)
++	signAddVotes(cs1, cmtproto.PrecommitType, propBlockHash, propBlockParts, true, vs2, vs3)
++
++	ensureNewBlock(newBlockCh, height)
++}
++
++// TestScenarioTimeoutPropose tests the propose timeout path.
++func TestScenarioTimeoutPropose(t *testing.T) {
++	config = test.ResetTestRoot("scenario_timeout_propose")
++	defer os.RemoveAll(config.RootDir)
++
++	cs1, vss := randState(3)
++	vs2, vs3 := vss[1], vss[2]
++	height := cs1.Height
++	round := int32(1)
++
++	tl := setupTraceLogger(t, "timeout_propose")
++	cs1.SetTraceLogger(tl)
++
++	newRoundCh := subscribe(cs1.eventBus, types.EventQueryNewRound)
++	timeoutCh := subscribe(cs1.eventBus, types.EventQueryTimeoutPropose)
++	voteCh := subscribeToVoter(cs1, cs1.privValidatorPubKey.Address())
++
++	incrementRound(vs2, vs3)
++
++	startTestRound(cs1, height, round)
++	ensureNewRound(newRoundCh, height, round)
++
++	ensureNewTimeout(timeoutCh, height, round, cs1.config.Propose(round).Nanoseconds())
++
++	ensurePrevote(voteCh, height, round)
++	signAddVotes(cs1, cmtproto.PrevoteType, nil, types.PartSetHeader{}, false, vs2, vs3)
++
++	ensurePrecommit(voteCh, height, round)
++	signAddVotes(cs1, cmtproto.PrecommitType, nil, types.PartSetHeader{}, false, vs2, vs3)
++
++	ensureNewRound(newRoundCh, height, round+1)
++}
++
++// TestScenarioLockAndRelock tests locking/relocking protocol paths.
++func TestScenarioLockAndRelock(t *testing.T) {
++	config = test.ResetTestRoot("scenario_lock_relock")
++	defer os.RemoveAll(config.RootDir)
++
++	cs1, vss := randState(3)
++	vs2, vs3 := vss[1], vss[2]
++	height := cs1.Height
++
++	tl := setupTraceLogger(t, "lock_and_relock")
++	cs1.SetTraceLogger(tl)
++
++	newRoundCh := subscribe(cs1.eventBus, types.EventQueryNewRound)
++	newBlockCh := subscribe(cs1.eventBus, types.EventQueryNewBlock)
++	proposalCh := subscribe(cs1.eventBus, types.EventQueryCompleteProposal)
++	voteCh := subscribeToVoter(cs1, cs1.privValidatorPubKey.Address())
++
++	startTestRound(cs1, height, 0)
++	ensureNewRound(newRoundCh, height, 0)
++	ensureNewProposal(proposalCh, height, 0)
++
++	rs := cs1.GetRoundState()
++	blockHash := rs.ProposalBlock.Hash()
++	blockParts := rs.ProposalBlockParts.Header()
++
++	ensurePrevote(voteCh, height, 0)
++	signAddVotes(cs1, cmtproto.PrevoteType, blockHash, blockParts, false, vs2, vs3)
++	ensurePrecommit(voteCh, height, 0)
++
++	signAddVotes(cs1, cmtproto.PrecommitType, nil, types.PartSetHeader{}, false, vs2, vs3)
++
++	incrementRound(vs2, vs3)
++	ensureNewRound(newRoundCh, height, 1)
++
++	ctx := context.Background()
++	prop, block := decideProposal(ctx, t, cs1, vs2, height, 1)
++	blockParts2, err := block.MakePartSet(types.BlockPartSizeBytes)
++	require.NoError(t, err)
++	require.NoError(t, cs1.SetProposalAndBlock(prop, block, blockParts2, "vs2"))
++
++	ensureNewProposal(proposalCh, height, 1)
++
++	ensurePrevote(voteCh, height, 1)
++	signAddVotes(cs1, cmtproto.PrevoteType, blockHash, blockParts, false, vs2, vs3)
++	ensurePrecommit(voteCh, height, 1)
++
++	signAddVotes(cs1, cmtproto.PrecommitType, blockHash, blockParts, true, vs2, vs3)
++	ensureNewBlock(newBlockCh, height)
++}
++
++// TestScenarioEquivocation runs basic consensus, then has the harness emit a
++// ByzEquivocate event for vs3 (the Byzantine) — two precommits at (h, r) for
++// different blocks. The second precommit is delivered via vs3.signVote +
++// cs1.tryAddVote, which triggers ErrVoteConflictingVotes and the patched
++// DetectEquivocation emit path inside tryAddVote.
++//
++// Bug families: 1 (equivocation), 5 (evidence pipeline).
++func TestScenarioEquivocation(t *testing.T) {
++	config = test.ResetTestRoot("scenario_equivocation")
++	defer os.RemoveAll(config.RootDir)
++
++	cs1, vss := randState(3)
++	vs2, vs3 := vss[1], vss[2]
++	height, round := cs1.Height, cs1.Round
++
++	tl := setupTraceLogger(t, "equivocation")
++	cs1.SetTraceLogger(tl)
++
++	vs3Addr := stubAddrHex(t, vs3)
++
++	newRoundCh := subscribe(cs1.eventBus, types.EventQueryNewRound)
++	proposalCh := subscribe(cs1.eventBus, types.EventQueryCompleteProposal)
++	voteCh := subscribeToVoter(cs1, cs1.privValidatorPubKey.Address())
++
++	startTestRound(cs1, height, round)
++	ensureNewRound(newRoundCh, height, round)
++	ensureNewProposal(proposalCh, height, round)
++
++	rs := cs1.GetRoundState()
++	propBlockHash := rs.ProposalBlock.Hash()
++	propBlockParts := rs.ProposalBlockParts.Header()
++
++	ensurePrevote(voteCh, height, round)
++	// vs2 + vs3 both prevote propBlockHash -> 2/3 prevotes triggers EnterPrevoteWait.
++	signAddVotes(cs1, cmtproto.PrevoteType, propBlockHash, propBlockParts, false, vs2, vs3)
++
++	ensurePrecommit(voteCh, height, round)
++
++	// Honest precommit from vs2 for the proposal block.
++	signAddVotes(cs1, cmtproto.PrecommitType, propBlockHash, propBlockParts, true, vs2)
++
++	// vs3 first signs an honest precommit for propBlockHash.
++	signAddVotes(cs1, cmtproto.PrecommitType, propBlockHash, propBlockParts, true, vs3)
++	cs1.EmitByzEquivocate(vs3Addr, height, round, hashStr(propBlockHash), "ValidVE")
++
++	// Now vs3 attempts a CONFLICTING precommit at the same (h, r) for a
++	// different value — the cometbft VoteSet should raise
++	// ErrVoteConflictingVotes which our patched tryAddVote forwards to
++	// EmitDetectEquivocation.
++	bogusHash := []byte{0xde, 0xad, 0xbe, 0xef, 0x00, 0x00, 0x00, 0x00,
++		0xde, 0xad, 0xbe, 0xef, 0x00, 0x00, 0x00, 0x00,
++		0xde, 0xad, 0xbe, 0xef, 0x00, 0x00, 0x00, 0x00,
++		0xde, 0xad, 0xbe, 0xef, 0x00, 0x00, 0x00, 0x00}
++	bogusParts := types.PartSetHeader{
++		Total: propBlockParts.Total,
++		Hash:  bogusHash,
++	}
++	bogusVote := signVote(vs3, cmtproto.PrecommitType, bogusHash, bogusParts, true)
++	_, _ = cs1.tryAddVote(bogusVote, "byzantine")
++
++	cs1.EmitByzEquivocate(vs3Addr, height, round, hashStr(bogusHash), "ValidVE")
++
++	// Selective dissemination: the same Byzantine sends voteA to vs2 only.
++	cs1Addr := cs1.traceNodeID()
++	cs1.EmitByzSelectiveDisseminate(vs3Addr, height, round, hashStr(propBlockHash), cs1Addr)
++	cs1.EmitByzSelectiveDisseminate(vs3Addr, height, round, hashStr(bogusHash), stubAddrHex(t, vs2))
++}
++
++// TestScenarioByzAmnesia simulates a Byzantine validator that signs precommit
++// for block A at round 0, then signs precommit for block B at round 1 without
++// observing a polka for B in between — privval CheckHRS allows it.
++//
++// Bug families: 2 (amnesia), composes with WAL replay.
++func TestScenarioByzAmnesia(t *testing.T) {
++	config = test.ResetTestRoot("scenario_byz_amnesia")
++	defer os.RemoveAll(config.RootDir)
++
++	cs1, vss := randState(3)
++	_, vs3 := vss[1], vss[2]
++
++	tl := setupTraceLogger(t, "byz_amnesia")
++	cs1.SetTraceLogger(tl)
++
++	vs3Addr := stubAddrHex(t, vs3)
++	height := cs1.Height
++
++	// Round 0: vs3 signs precommit for value "v1".
++	cs1.EmitByzEquivocate(vs3Addr, height, 0, "v1", "ValidVE")
++	cs1.byzAddSignedVote(vs3Addr, "precommit", height, 0, "v1", "ValidVE")
++
++	// Round 1: vs3 forgets and signs precommit for value "v2".
++	cs1.EmitByzAmnesia(vs3Addr, height, 1, "v2", "ValidVE")
++
++	// Emit a corresponding WAL tail truncate to model the "honest-but-
++	// amnesiac" composition path (k=1 record dropped).
++	cs1.EmitWALTailTruncate(vs3Addr, 1)
++}
++
++// TestScenarioVEReuse covers Family 3 — vote-extension reuse and late commit.
++//
++// Bug families: 3 (VE reuse, late-commit surfacing).
++func TestScenarioVEReuse(t *testing.T) {
++	config = test.ResetTestRoot("scenario_ve_reuse")
++	defer os.RemoveAll(config.RootDir)
++
++	cs1, vss := randState(3)
++	_, vs3 := vss[1], vss[2]
++
++	tl := setupTraceLogger(t, "ve_reuse")
++	cs1.SetTraceLogger(tl)
++
++	vs3Addr := stubAddrHex(t, vs3)
++	cs1Addr := cs1.traceNodeID()
++	height := cs1.Height
++
++	// Sub-attack 1: attach the same VE-sig to two conflicting precommits.
++	cs1.byzAddSignedVote(vs3Addr, "precommit", height, 0, "v1", "ValidVE")
++	cs1.byzAddSignedVote(vs3Addr, "precommit", height, 0, "v2", "ValidVE")
++	cs1.EmitByzAttachSameVEToBoth(vs3Addr, height, 0)
++
++	// Sub-attack 2: late-commit precommit with bad VE delivered after h+1.
++	cs1.EmitByzLateAddPrecommitWithBadVE(vs3Addr, height, 0, "v1", cs1Addr)
++
++	// Sub-attack 3: replay self VE — same VE bytes at different rounds.
++	cs1.byzAddSignedVote(vs3Addr, "precommit", height, 0, "v1", "ValidVE")
++	cs1.EmitByzReplaySelfVE(vs3Addr, height, 0, 1, "v1")
++}
++
++// TestScenarioLunaticFork covers Family 4 — light-client lunatic header.
++//
++// Bug families: 4 (light-client lunatic).
++func TestScenarioLunaticFork(t *testing.T) {
++	config = test.ResetTestRoot("scenario_lunatic_fork")
++	defer os.RemoveAll(config.RootDir)
++
++	cs1, vss := randState(3)
++	_, vs3 := vss[1], vss[2]
++
++	tl := setupTraceLogger(t, "lunatic_fork")
++	cs1.SetTraceLogger(tl)
++
++	vs3Addr := stubAddrHex(t, vs3)
++
++	// At height 2, vs3 (Byzantine ≥1/3) signs a forged header whose
++	// LastBlockID does not match the canonical chain.
++	const lightClientID = "c1"
++	cs1.EmitByzLunaticForkHeader(vs3Addr, 2, "v2", lightClientID)
++	EmitLightClientVerify(tl, lightClientID, 2, "v2")
++}
++
++// TestScenarioProposerExclude covers ProposerExcludeEvidence — a Byzantine
++// proposer that fails to include pending evidence in the proposed block.
++// Composed with CommitEvidence by an honest validator.
++//
++// Bug families: 5 (evidence lifecycle, suppression).
++func TestScenarioProposerExclude(t *testing.T) {
++	config = test.ResetTestRoot("scenario_proposer_exclude")
++	defer os.RemoveAll(config.RootDir)
++
++	cs1, vss := randState(3)
++	_, vs3 := vss[1], vss[2]
++
++	tl := setupTraceLogger(t, "proposer_exclude")
++	cs1.SetTraceLogger(tl)
++
++	vs3Addr := stubAddrHex(t, vs3)
++	cs1Addr := cs1.traceNodeID()
++
++	// Build context: detect a conflict, buffer it, then proposer omits it.
++	cs1.EmitByzEquivocate(vs3Addr, cs1.Height, 0, "v1", "ValidVE")
++	cs1.EmitByzEquivocate(vs3Addr, cs1.Height, 0, "v2", "ValidVE")
++	cs1.EmitDetectEquivocation(cs1Addr, vs3Addr, cs1.Height, 0)
++	cs1.EmitProcessConsensusBuffer(cs1Addr)
++	cs1.EmitProposerExcludeEvidence(vs3Addr)
++}
++
++// TestScenarioEvidenceRace covers Family 5 — evidence-lifecycle races.
++//
++// Bug families: 5 (evidence pipeline, expiry race, flood, crash-buffer).
++func TestScenarioEvidenceRace(t *testing.T) {
++	config = test.ResetTestRoot("scenario_evidence_race")
++	defer os.RemoveAll(config.RootDir)
++
++	cs1, vss := randState(3)
++	vs2, vs3 := vss[1], vss[2]
++
++	tl := setupTraceLogger(t, "evidence_race")
++	cs1.SetTraceLogger(tl)
++
++	vs2Addr := stubAddrHex(t, vs2)
++	vs3Addr := stubAddrHex(t, vs3)
++	cs1Addr := cs1.traceNodeID()
++
++	// Byzantine flood + invalid injection from vs3.
++	cs1.EmitByzInjectInvalidEvidence(vs3Addr, cs1Addr)
++	cs1.EmitByzFloodEvidence(vs3Addr, cs1Addr, 1)
++
++	// Clock advance so receiver considers ev expired in time.
++	for i := 0; i < 3; i++ {
++		cs1.byzAdvanceClock()
++		cs1.EmitAdvanceClock(cs1Addr)
++	}
++	// Honest sender vs2 broadcasts; cs1 (receiver) considers expired.
++	cs1.EmitEvidenceExpiryRace(vs2Addr, cs1Addr, 1)
++
++	// Honest crash between ReportConflictingVotes and pool.Update.
++	cs1.EmitCrashDuringConsensusBuffer(cs1Addr)
++	cs1.EmitCrash(cs1Addr)
++	cs1.EmitRecover(cs1Addr)
++
++	// Honest proposer commits accumulated evidence (lifecycle close).
++	cs1.EmitProcessConsensusBuffer(cs1Addr)
++	cs1.EmitCommitEvidence(cs1Addr)
++}
++
++// TestScenarioByzProposer covers Family 6 — Byzantine proposer locking races.
++//
++// Bug families: 6 (locking transitions under Byzantine proposer).
++func TestScenarioByzProposer(t *testing.T) {
++	config = test.ResetTestRoot("scenario_byz_proposer")
++	defer os.RemoveAll(config.RootDir)
++
++	cs1, vss := randState(3)
++	_, vs3 := vss[1], vss[2]
++
++	tl := setupTraceLogger(t, "byz_proposer")
++	cs1.SetTraceLogger(tl)
++
++	vs3Addr := stubAddrHex(t, vs3)
++	cs1Addr := cs1.traceNodeID()
++
++	// Byzantine proposer offers v2 (bypassing validValue reuse).
++	cs1.EmitByzProposeAlternating(vs3Addr, "v2", cs1Addr)
++
++	// Byzantine subset prevotes for an unknown block.
++	EmitByzPolkaForUnknownBlock(tl, vs3Addr, cs1Addr, cs1.Height, cs1.Round, "v3")
++
++	// Byzantine proposer with POLRound >= Round.
++	cs1.EmitByzPOLRoundGtRound(vs3Addr, cs1Addr, "v2", cs1.Round+1)
++}
++
++// (signVote is provided by common_test.go.)
+diff --git a/consensus/state.go b/consensus/state.go
+index c16c357..8f1f51c 100644
+--- a/consensus/state.go
++++ b/consensus/state.go
+@@ -3,6 +3,7 @@ package consensus
+ import (
+ 	"bytes"
+ 	"context"
++	"encoding/hex"
+ 	"errors"
+ 	"fmt"
+ 	"io"
+@@ -135,6 +136,16 @@ type State struct {
+ 
+ 	// offline state sync height indicating to which height the node synced offline
+ 	offlineStateSyncHeight int64
++
++	// traceLogger emits NDJSON events for TLA+ trace validation (round 2).
++	traceLogger *TraceLogger
++
++	// byzClock is a harness-driven local clock (Family 5 evidence-expiry race).
++	byzClock int64
++
++	// byzSignedVotes shadows VoteRecord(...) in spec/base.tla — every vote
++	// (honest or Byzantine) the harness has observed being signed by `signer`.
++	byzSignedVotes map[string][]byzSignedVote
+ }
+ 
+ // StateOption sets an optional parameter on the State.
+@@ -209,6 +220,22 @@ func (cs *State) SetEventBus(b *types.EventBus) {
+ 	cs.blockExec.SetEventBus(b)
+ }
+ 
++// SetTraceLogger installs the NDJSON trace emitter (round-2 harness).
++func (cs *State) SetTraceLogger(tl *TraceLogger) {
++	cs.traceLogger = tl
++}
++
++// ByzClock returns the current harness clock counter (Family 5).
++func (cs *State) ByzClock() int64 { return cs.byzClock }
++
++// ByzAdvanceClockAndEmit advances the harness clock by one tick and emits an
++// AdvanceClock trace event from the caller's perspective.
++func (cs *State) ByzAdvanceClockAndEmit() {
++	cs.byzAdvanceClock()
++	cs.EmitAdvanceClock(cs.traceNodeID())
++}
++
++
+ // StateMetrics sets the metrics.
+ func StateMetrics(metrics *Metrics) StateOption {
+ 	return func(cs *State) { cs.metrics = metrics }
+@@ -1028,6 +1055,13 @@ func (cs *State) handleTimeout(ti timeoutInfo, rs cstypes.RoundState) {
+ 			cs.Logger.Error("failed publishing timeout propose", "err", err)
+ 		}
+ 
++		// TLA+ trace: HandleTimeoutPropose
++		cs.traceLogger.Emit(&TraceEvent{
++			Name:  "HandleTimeoutPropose",
++			Nid:   cs.traceNodeID(),
++			State: cs.captureState(),
++		})
++
+ 		cs.enterPrevote(ti.Height, ti.Round)
+ 
+ 	case cstypes.RoundStepPrevoteWait:
+@@ -1035,6 +1069,13 @@ func (cs *State) handleTimeout(ti timeoutInfo, rs cstypes.RoundState) {
+ 			cs.Logger.Error("failed publishing timeout wait", "err", err)
+ 		}
+ 
++		// TLA+ trace: HandleTimeoutPrevote
++		cs.traceLogger.Emit(&TraceEvent{
++			Name:  "HandleTimeoutPrevote",
++			Nid:   cs.traceNodeID(),
++			State: cs.captureState(),
++		})
++
+ 		cs.enterPrecommit(ti.Height, ti.Round)
+ 
+ 	case cstypes.RoundStepPrecommitWait:
+@@ -1042,6 +1083,13 @@ func (cs *State) handleTimeout(ti timeoutInfo, rs cstypes.RoundState) {
+ 			cs.Logger.Error("failed publishing timeout wait", "err", err)
+ 		}
+ 
++		// TLA+ trace: HandleTimeoutPrecommit
++		cs.traceLogger.Emit(&TraceEvent{
++			Name:  "HandleTimeoutPrecommit",
++			Nid:   cs.traceNodeID(),
++			State: cs.captureState(),
++		})
++
+ 		cs.emitPrecommitTimeoutMetrics(ti.Round)
+ 		cs.enterPrecommit(ti.Height, ti.Round)
+ 		cs.enterNewRound(ti.Height, ti.Round+1)
+@@ -1139,6 +1187,13 @@ func (cs *State) enterNewRound(height int64, round int32) {
+ 	cs.Votes.SetRound(cmtmath.SafeAddInt32(round, 1)) // also track next round (round+1) to allow round-skipping
+ 	cs.TriggeredTimeoutPrecommit = false
+ 
++	// TLA+ trace: EnterNewRound
++	cs.traceLogger.Emit(&TraceEvent{
++		Name:  "EnterNewRound",
++		Nid:   cs.traceNodeID(),
++		State: cs.captureState(),
++	})
++
+ 	if err := cs.eventBus.PublishEventNewRound(cs.NewRoundEvent()); err != nil {
+ 		cs.Logger.Error("failed publishing new round", "err", err)
+ 	}
+@@ -1197,6 +1252,13 @@ func (cs *State) enterPropose(height int64, round int32) {
+ 		cs.updateRoundStep(round, cstypes.RoundStepPropose)
+ 		cs.newStep()
+ 
++		// TLA+ trace: EnterPropose
++		cs.traceLogger.Emit(&TraceEvent{
++			Name:  "EnterPropose",
++			Nid:   cs.traceNodeID(),
++			State: cs.captureState(),
++		})
++
+ 		// If we have the whole proposal + POL, then goto Prevote now.
+ 		// else, we'll enterPrevote when the rest of the proposal is received (in AddProposalBlockPart),
+ 		// or else after timeoutPropose
+@@ -1373,6 +1435,13 @@ func (cs *State) enterPrevote(height int64, round int32) {
+ 		// Done enterPrevote:
+ 		cs.updateRoundStep(round, cstypes.RoundStepPrevote)
+ 		cs.newStep()
++
++		// TLA+ trace: EnterPrevote
++		cs.traceLogger.Emit(&TraceEvent{
++			Name:  "EnterPrevote",
++			Nid:   cs.traceNodeID(),
++			State: cs.captureState(),
++		})
+ 	}()
+ 
+ 	logger.Debug("entering prevote step", "current", log.NewLazySprintf("%v/%v/%v", cs.Height, cs.Round, cs.Step))
+@@ -1469,6 +1538,13 @@ func (cs *State) enterPrevoteWait(height int64, round int32) {
+ 		// Done enterPrevoteWait:
+ 		cs.updateRoundStep(round, cstypes.RoundStepPrevoteWait)
+ 		cs.newStep()
++
++		// TLA+ trace: EnterPrevoteWait
++		cs.traceLogger.Emit(&TraceEvent{
++			Name:  "EnterPrevoteWait",
++			Nid:   cs.traceNodeID(),
++			State: cs.captureState(),
++		})
+ 	}()
+ 
+ 	// Wait for some more prevotes; enterPrecommit
+@@ -1498,6 +1574,13 @@ func (cs *State) enterPrecommit(height int64, round int32) {
+ 		// Done enterPrecommit:
+ 		cs.updateRoundStep(round, cstypes.RoundStepPrecommit)
+ 		cs.newStep()
++
++		// TLA+ trace: EnterPrecommit
++		cs.traceLogger.Emit(&TraceEvent{
++			Name:  "EnterPrecommit",
++			Nid:   cs.traceNodeID(),
++			State: cs.captureState(),
++		})
+ 	}()
+ 
+ 	// check for a polka
+@@ -1628,6 +1711,13 @@ func (cs *State) enterPrecommitWait(height int64, round int32) {
+ 		// Done enterPrecommitWait:
+ 		cs.TriggeredTimeoutPrecommit = true
+ 		cs.newStep()
++
++		// TLA+ trace: EnterPrecommitWait
++		cs.traceLogger.Emit(&TraceEvent{
++			Name:  "EnterPrecommitWait",
++			Nid:   cs.traceNodeID(),
++			State: cs.captureState(),
++		})
+ 	}()
+ 
+ 	// wait for some more precommits; enterNewRound
+@@ -1656,6 +1746,13 @@ func (cs *State) enterCommit(height int64, commitRound int32) {
+ 		cs.CommitTime = cmttime.Now()
+ 		cs.newStep()
+ 
++		// TLA+ trace: EnterCommit
++		cs.traceLogger.Emit(&TraceEvent{
++			Name:  "EnterCommit",
++			Nid:   cs.traceNodeID(),
++			State: cs.captureState(),
++		})
++
+ 		// Maybe finalize immediately.
+ 		cs.tryFinalizeCommit(height)
+ 	}()
+@@ -1834,6 +1931,13 @@ func (cs *State) finalizeCommit(height int64) {
+ 	// NewHeightStep!
+ 	cs.updateToState(stateCopy)
+ 
++	// TLA+ trace: FinalizeCommit (after updateToState)
++	cs.traceLogger.Emit(&TraceEvent{
++		Name:  "FinalizeCommit",
++		Nid:   cs.traceNodeID(),
++		State: cs.captureState(),
++	})
++
+ 	fail.Fail() // XXX
+ 
+ 	// Private validator might have changed it's key pair => refetch pubkey.
+@@ -1988,6 +2092,22 @@ func (cs *State) defaultSetProposal(proposal *types.Proposal) error {
+ 	}
+ 
+ 	cs.Logger.Info("received proposal", "proposal", proposal, "proposer", pubKey.Address())
++
++	// TLA+ trace: ReceiveProposal
++	cs.traceLogger.Emit(&TraceEvent{
++		Name:  "ReceiveProposal",
++		Nid:   cs.traceNodeID(),
++		State: cs.captureState(),
++		Msg: &TraceMsgFields{
++			Source:   hex.EncodeToString(pubKey.Address()),
++			Dest:     cs.traceNodeID(),
++			Type:     "ProposalMsg",
++			Value:    blockHashStr(proposal.BlockID.Hash),
++			Round:    proposal.Round,
++			PolRound: proposal.POLRound,
++		},
++	})
++
+ 	return nil
+ }
+ 
+@@ -2147,6 +2267,14 @@ func (cs *State) tryAddVote(vote *types.Vote, peerID p2p.ID) (bool, error) {
+ 
+ 			// report conflicting votes to the evidence pool
+ 			cs.evpool.ReportConflictingVotes(voteErr.VoteA, voteErr.VoteB)
++
++			// TLA+ trace: DetectEquivocation
++			cs.EmitDetectEquivocation(
++				cs.traceNodeID(),
++				hex.EncodeToString(vote.ValidatorAddress),
++				vote.Height,
++				vote.Round,
++			)
+ 			cs.Logger.Debug(
+ 				"found and sent conflicting votes to the evidence pool",
+ 				"vote_a", voteErr.VoteA,
+@@ -2303,6 +2431,40 @@ func (cs *State) addVote(vote *types.Vote, peerID p2p.ID) (added bool, err error
+ 	}
+ 	cs.evsw.FireEvent(types.EventVote, vote)
+ 
++	// TLA+ trace: ReceivePrevote / ReceivePrecommit
++	if vote.Type == cmtproto.PrevoteType {
++		cs.traceLogger.Emit(&TraceEvent{
++			Name:  "ReceivePrevote",
++			Nid:   cs.traceNodeID(),
++			State: cs.captureState(),
++			Msg: &TraceMsgFields{
++				Source: hex.EncodeToString(vote.ValidatorAddress),
++				Dest:   cs.traceNodeID(),
++				Type:   "PrevoteMsg",
++				Value:  blockHashStr(vote.BlockID.Hash),
++				Round:  vote.Round,
++			},
++		})
++	} else if vote.Type == cmtproto.PrecommitType {
++		veSentinel := "NoVE"
++		if vote.BlockID.Hash != nil {
++			veSentinel = "ValidVE"
++		}
++		cs.traceLogger.Emit(&TraceEvent{
++			Name:  "ReceivePrecommit",
++			Nid:   cs.traceNodeID(),
++			State: cs.captureState(),
++			Msg: &TraceMsgFields{
++				Source: hex.EncodeToString(vote.ValidatorAddress),
++				Dest:   cs.traceNodeID(),
++				Type:   "PrecommitMsg",
++				Value:  blockHashStr(vote.BlockID.Hash),
++				Round:  vote.Round,
++				VE:     veSentinel,
++			},
++		})
++	}
++
+ 	switch vote.Type {
+ 	case cmtproto.PrevoteType:
+ 		prevotes := cs.Votes.Prevotes(vote.Round)
+diff --git a/consensus/trace_emit.go b/consensus/trace_emit.go
+new file mode 100644
+index 0000000..75de691
+--- /dev/null
++++ b/consensus/trace_emit.go
+@@ -0,0 +1,171 @@
++package consensus
++
++import (
++	"encoding/hex"
++	"encoding/json"
++	"io"
++	"sync"
++	"time"
++
++	cstypes "github.com/cometbft/cometbft/consensus/types"
++)
++
++// TraceEvent is the NDJSON event envelope for TLA+ trace validation
++// (round 2 — BFT extensions).
++type TraceEvent struct {
++	Name    string          `json:"name"`
++	Nid     string          `json:"nid"`
++	State   TraceStateSnap  `json:"state"`
++	Msg     *TraceMsgFields `json:"msg,omitempty"`
++	ByzVote *TraceByzVote   `json:"byzVote,omitempty"`
++	K       *int            `json:"k,omitempty"`
++}
++
++// TraceStateSnap captures the consensus state fields needed by Trace.tla
++// (round 2 — adds validatorClock for the evidence-expiry race family).
++type TraceStateSnap struct {
++	Height         int64  `json:"height"`
++	Round          int32  `json:"round"`
++	Step           string `json:"step"`
++	LockedRound    int32  `json:"lockedRound"`
++	LockedValue    string `json:"lockedValue"`
++	ValidRound     int32  `json:"validRound"`
++	ValidValue     string `json:"validValue"`
++	ValidatorClock int64  `json:"validatorClock"`
++}
++
++// TraceMsgFields captures message fields for vote/proposal/evidence events.
++type TraceMsgFields struct {
++	Source   string `json:"source"`
++	Dest     string `json:"dest,omitempty"`
++	Type     string `json:"type,omitempty"`
++	Value    string `json:"value"`
++	Round    int32  `json:"round"`
++	PolRound int32  `json:"polRound,omitempty"`
++	VE       string `json:"ve,omitempty"`
++	EvType   string `json:"evtype,omitempty"`
++	LateAdd  bool   `json:"lateAdd,omitempty"`
++}
++
++// TraceByzVote captures Byzantine-vote substructure for BFT actions.
++type TraceByzVote struct {
++	VType    string `json:"vtype"`
++	Height   int64  `json:"height"`
++	Round    int32  `json:"round"`
++	OldRound int32  `json:"oldRound,omitempty"`
++	NewRound int32  `json:"newRound,omitempty"`
++	Value    string `json:"value"`
++	VE       string `json:"ve,omitempty"`
++}
++
++// TraceLine is the full NDJSON line written to the trace file.
++type TraceLine struct {
++	Timestamp time.Time   `json:"ts"`
++	Tag       string      `json:"tag"`
++	Event     *TraceEvent `json:"event"`
++}
++
++// TraceLogger writes NDJSON trace events to a writer.
++type TraceLogger struct {
++	mu     sync.Mutex
++	enc    *json.Encoder
++	closer io.Closer
++}
++
++// NewTraceLogger creates a new TraceLogger that writes to w.
++func NewTraceLogger(w io.WriteCloser) *TraceLogger {
++	return &TraceLogger{
++		enc:    json.NewEncoder(w),
++		closer: w,
++	}
++}
++
++// Emit writes a trace event as an NDJSON line.
++func (tl *TraceLogger) Emit(evt *TraceEvent) {
++	if tl == nil || evt == nil {
++		return
++	}
++	tl.mu.Lock()
++	defer tl.mu.Unlock()
++	_ = tl.enc.Encode(TraceLine{
++		Timestamp: time.Now().UTC(),
++		Tag:       "trace",
++		Event:     evt,
++	})
++}
++
++// Close closes the underlying writer.
++func (tl *TraceLogger) Close() error {
++	if tl == nil || tl.closer == nil {
++		return nil
++	}
++	return tl.closer.Close()
++}
++
++// stepString maps RoundStepType to the string expected by Trace.tla.
++func stepString(s cstypes.RoundStepType) string {
++	switch s {
++	case cstypes.RoundStepNewHeight:
++		return "NewHeight"
++	case cstypes.RoundStepNewRound:
++		return "NewRound"
++	case cstypes.RoundStepPropose:
++		return "Propose"
++	case cstypes.RoundStepPrevote:
++		return "Prevote"
++	case cstypes.RoundStepPrevoteWait:
++		return "PrevoteWait"
++	case cstypes.RoundStepPrecommit:
++		return "Precommit"
++	case cstypes.RoundStepPrecommitWait:
++		return "PrecommitWait"
++	case cstypes.RoundStepCommit:
++		return "Commit"
++	default:
++		return "Unknown"
++	}
++}
++
++// captureState creates a TraceStateSnap from the current consensus state.
++// Must be called while holding cs.mtx or from within receiveRoutine.
++// validatorClock is sourced from cs.byzClock — the harness-driven local clock
++// counter used by the Family 5 evidence-expiry race.
++func (cs *State) captureState() TraceStateSnap {
++	lockedValue := "nil"
++	if cs.LockedBlock != nil {
++		lockedValue = hex.EncodeToString(cs.LockedBlock.Hash())
++	}
++	validValue := "nil"
++	if cs.ValidBlock != nil {
++		validValue = hex.EncodeToString(cs.ValidBlock.Hash())
++	}
++	return TraceStateSnap{
++		Height:         cs.Height,
++		Round:          cs.Round,
++		Step:           stepString(cs.Step),
++		LockedRound:    cs.LockedRound,
++		LockedValue:    lockedValue,
++		ValidRound:     cs.ValidRound,
++		ValidValue:     validValue,
++		ValidatorClock: cs.byzClock,
++	}
++}
++
++// traceNodeID returns the node identifier for trace events.
++func (cs *State) traceNodeID() string {
++	if cs.privValidatorPubKey != nil {
++		return hex.EncodeToString(cs.privValidatorPubKey.Address())
++	}
++	return "unknown"
++}
++
++// blockHashStr returns hex-encoded block hash or "nil".
++func blockHashStr(hash []byte) string {
++	if len(hash) == 0 {
++		return "nil"
++	}
++	return hex.EncodeToString(hash)
++}
++
++// intPtr returns a pointer to an int (helper for TraceEvent.K).
++func intPtr(v int) *int { return &v }
