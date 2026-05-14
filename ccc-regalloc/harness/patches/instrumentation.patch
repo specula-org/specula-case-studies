@@ -1,0 +1,258 @@
+diff --git a/src/backend/liveness.rs b/src/backend/liveness.rs
+index e2bc818..b2bea76 100644
+--- a/src/backend/liveness.rs
++++ b/src/backend/liveness.rs
+@@ -182,8 +182,40 @@ pub fn compute_live_intervals(func: &IrFunction) -> LivenessResult {
+     let block_loop_depth = compute_loop_depth(&successors, num_blocks);
+ 
+     // Phase 3: Backward dataflow to compute live-in/live-out per block.
++    // TLA+ trace: the AssignProgramPoints event is emitted *before* the
++    // dataflow begins so that the trace cursor sees call_points, def/use, and
++    // the per-block gen/kill sets finalized by Phase 1 + Phase 1b + Phase 1c.
++    // The spec action has no dependency on the GEP/F128 extensions — those
++    // refinements fold into blockGen without changing the action's contract.
++    if super::tla_trace::is_active() {
++        let mut computed_def = std::collections::BTreeMap::new();
++        let mut computed_last_use = std::collections::BTreeMap::new();
++        for (dense, &sparse) in value_ids.iter().enumerate() {
++            let d = ps.def_points[dense];
++            if d != u32::MAX { computed_def.insert(sparse, d); }
++            let u = ps.last_use_points[dense];
++            let effective = if u == u32::MAX { if d == u32::MAX { 0 } else { d } } else { u };
++            computed_last_use.insert(sparse, effective);
++        }
++        let mut block_gen_m = std::collections::BTreeMap::new();
++        let mut block_kill_m = std::collections::BTreeMap::new();
++        for b in 0..num_blocks {
++            let mut g: Vec<u32> = Vec::new();
++            ps.block_gen[b].for_each_set_bit(|i| g.push(value_ids[i]));
++            block_gen_m.insert(b, g);
++            let mut k: Vec<u32> = Vec::new();
++            ps.block_kill[b].for_each_set_bit(|i| k.push(value_ids[i]));
++            block_kill_m.insert(b, k);
++        }
++        super::tla_trace::emit_assign_program_points(
++            &ps.call_points, &computed_def, &computed_last_use,
++            &block_gen_m, &block_kill_m,
++        );
++    }
++
+     let (live_in, live_out) = run_backward_dataflow(
+-        num_blocks, num_values, &successors, &ps.block_gen, &ps.block_kill,
++        num_blocks, num_values, &value_ids,
++        &successors, &ps.block_gen, &ps.block_kill,
+     );
+ 
+     // Phase 4: Extend intervals for values that are live-in or live-out of blocks.
+@@ -199,9 +231,25 @@ pub fn compute_live_intervals(func: &IrFunction) -> LivenessResult {
+         &mut ps.last_use_points,
+     );
+ 
++    // TLA+ trace: ExtendIntervalsFromLiveness fires after BOTH Phase 4 and
++    // Phase 4b finish so that computedLastUse reflects returns-twice extension.
++    if super::tla_trace::is_active() {
++        let mut last_use_m = std::collections::BTreeMap::new();
++        for (dense, &sparse) in value_ids.iter().enumerate() {
++            let u = ps.last_use_points[dense];
++            let d = ps.def_points[dense];
++            let effective = if u == u32::MAX { if d == u32::MAX { 0 } else { d } } else { u };
++            last_use_m.insert(sparse, effective);
++        }
++        super::tla_trace::emit_extend_intervals(&last_use_m);
++    }
++
+     // Phase 5: Build and sort intervals.
+     let intervals = build_intervals(&value_ids, &ps.def_points, &ps.last_use_points);
+ 
++    // TLA+ trace: BuildIntervals is a pure phase-advance marker.
++    super::tla_trace::emit_build_intervals();
++
+     LivenessResult {
+         intervals,
+         call_points: ps.call_points,
+@@ -456,6 +504,7 @@ fn build_successor_lists(
+ fn run_backward_dataflow(
+     num_blocks: usize,
+     num_values: usize,
++    value_ids: &[u32],
+     successors: &[Vec<usize>],
+     block_gen: &[BitSet],
+     block_kill: &[BitSet],
+@@ -489,6 +538,30 @@ fn run_backward_dataflow(
+             );
+             changed |= in_changed;
+         }
++
++        // TLA+ trace: emit one DataflowIterStep per outer sweep, matching the
++        // spec's per-iteration granularity. `fixpoint_reached` is TRUE on the
++        // iteration where no block changed — the loop will exit next.
++        if super::tla_trace::is_active() {
++            let mut li = std::collections::BTreeMap::new();
++            let mut lo = std::collections::BTreeMap::new();
++            for b in 0..num_blocks {
++                let mut iset: Vec<u32> = Vec::new();
++                live_in[b].for_each_set_bit(|i| iset.push(value_ids[i]));
++                li.insert(b, iset);
++                let mut oset: Vec<u32> = Vec::new();
++                live_out[b].for_each_set_bit(|i| oset.push(value_ids[i]));
++                lo.insert(b, oset);
++            }
++            super::tla_trace::emit_dataflow_iter_step(iteration, &li, &lo, !changed);
++        }
++    }
++
++    // TLA+ trace: if we exited the loop because of the iteration cap while
++    // `changed` was still true, emit DataflowCapHit. This is the F3 smoking
++    // gun — the spec action has the same precondition.
++    if changed && iteration >= MAX_ITERATIONS {
++        super::tla_trace::emit_dataflow_cap_hit();
+     }
+ 
+     (live_in, live_out)
+diff --git a/src/backend/mod.rs b/src/backend/mod.rs
+index de4eb30..146c243 100644
+--- a/src/backend/mod.rs
++++ b/src/backend/mod.rs
+@@ -23,6 +23,11 @@ pub(crate) mod x86_common;  // Shared x86/i686 register names, condition codes,
+ pub(crate) mod liveness;     // Live interval computation
+ pub(crate) mod regalloc;     // Linear scan register allocator
+ 
++// TLA+ trace emission for spec validation (Phase 2.5 harness).
++pub(crate) mod tla_trace;
++#[cfg(test)]
++pub(crate) mod tla_trace_scenarios;
++
+ 
+ pub(crate) mod x86;
+ pub(crate) mod i686;
+diff --git a/src/backend/regalloc.rs b/src/backend/regalloc.rs
+index 574e1e8..985fe4a 100644
+--- a/src/backend/regalloc.rs
++++ b/src/backend/regalloc.rs
+@@ -260,9 +260,22 @@ pub fn allocate_registers(
+             reg_free_until[reg_idx] = interval.end + 1;
+             assignments.insert(interval.value_id, config.available_regs[reg_idx]);
+             used_regs_set.insert(config.available_regs[reg_idx].0);
++            // TLA+ trace: one Phase1Allocate event per successful assignment.
++            let used_vec: Vec<u8> = used_regs_set.iter().copied().collect();
++            super::tla_trace::emit_phase1_allocate(
++                interval.value_id,
++                config.available_regs[reg_idx].0,
++                reg_free_until[reg_idx],
++                &used_vec,
++                config.available_regs[reg_idx].0,
++            );
+         }
+     }
+ 
++    // TLA+ trace: Phase1Done marks the pass-to-pass boundary. Fires even when
++    // Phase 1 made no assignments (empty candidates).
++    super::tla_trace::emit_phase1_done();
++
+     let mut used_regs: Vec<PhysReg> = used_regs_set.iter().map(|&r| PhysReg(r)).collect();
+     used_regs.sort_by_key(|r| r.0);
+ 
+@@ -290,10 +303,21 @@ pub fn allocate_registers(
+             if let Some(reg_idx) = best {
+                 caller_free_until[reg_idx] = interval.end + 1;
+                 assignments.insert(interval.value_id, config.caller_saved_regs[reg_idx]);
++                // TLA+ trace: one Phase2Allocate event per successful assignment.
++                super::tla_trace::emit_phase2_allocate(
++                    interval.value_id,
++                    config.caller_saved_regs[reg_idx].0,
++                    caller_free_until[reg_idx],
++                    config.caller_saved_regs[reg_idx].0,
++                );
+             }
+         }
+     }
+ 
++    // TLA+ trace: Phase2Done fires regardless of whether the caller-saved pool
++    // was empty — mirrors the spec's pure phase-advance disjunct.
++    super::tla_trace::emit_phase2_done();
++
+     // Phase 3: Callee-saved spillover for non-call-spanning values.
+     //
+     // After Phases 1 and 2, there may be high-priority values in call-free loops
+@@ -309,6 +333,15 @@ pub fn allocate_registers(
+                 reg_free_until[reg_idx] = interval.end + 1;
+                 assignments.insert(interval.value_id, config.available_regs[reg_idx]);
+                 used_regs_set.insert(config.available_regs[reg_idx].0);
++                // TLA+ trace: one Phase3Allocate event per spillover assignment.
++                let used_vec: Vec<u8> = used_regs_set.iter().copied().collect();
++                super::tla_trace::emit_phase3_allocate(
++                    interval.value_id,
++                    config.available_regs[reg_idx].0,
++                    reg_free_until[reg_idx],
++                    &used_vec,
++                    config.available_regs[reg_idx].0,
++                );
+             }
+         }
+ 
+@@ -316,6 +349,9 @@ pub fn allocate_registers(
+         used_regs.sort_by_key(|r| r.0);
+     }
+ 
++    // TLA+ trace: Phase3Done advances the phase to PackSlots.
++    super::tla_trace::emit_phase3_done();
++
+     RegAllocResult {
+         assignments,
+         used_regs,
+diff --git a/src/backend/stack_layout/slot_assignment.rs b/src/backend/stack_layout/slot_assignment.rs
+index 2a1f6d1..f29aa72 100644
+--- a/src/backend/stack_layout/slot_assignment.rs
++++ b/src/backend/stack_layout/slot_assignment.rs
+@@ -679,6 +679,8 @@ pub(super) fn assign_tier2_liveness_packed_slots(
+     assign_slot: &impl Fn(i64, i64, i64) -> (i64, i64),
+ ) {
+     if multi_block_values.is_empty() {
++        // TLA+ trace: packing phase is trivially done — no multi-block values.
++        super::super::tla_trace::emit_pack_slots_done();
+         return;
+     }
+ 
+@@ -689,6 +691,8 @@ pub(super) fn assign_tier2_liveness_packed_slots(
+             state.value_locations.insert(mbv.dest_id, StackSlot(slot));
+             *non_local_space = new_space;
+         }
++        // TLA+ trace: packing phase ended (permanent-slot fallback path).
++        super::super::tla_trace::emit_pack_slots_done();
+         return;
+     }
+ 
+@@ -726,6 +730,9 @@ pub(super) fn assign_tier2_liveness_packed_slots(
+         state.value_locations.insert(dest_id, StackSlot(slot));
+         *non_local_space = new_space;
+     }
++
++    // TLA+ trace: PackSlotsDone advances the pipeline phase to "Done".
++    super::super::tla_trace::emit_pack_slots_done();
+ }
+ 
+ /// Pack values with known live intervals into shared stack slots using a min-heap.
+@@ -756,6 +763,12 @@ fn pack_values_into_slots(
+                 let slot_offset = slot_offsets[slot_idx];
+                 heap.push(Reverse((end, slot_idx)));
+                 state.value_locations.insert(dest_id, StackSlot(slot_offset));
++                // TLA+ trace: AssignSlot via the reuse branch. slotFreeUntil is
++                // the interval end pushed to the heap, matching the spec's
++                // `computedLastUse[v] + 1` semantics.
++                super::super::tla_trace::emit_assign_slot(
++                    dest_id, slot_offset, end.saturating_add(1),
++                );
+                 continue;
+             }
+         }
+@@ -765,6 +778,10 @@ fn pack_values_into_slots(
+         *non_local_space = new_space;
+         slot_offsets.push(slot);
+         heap.push(Reverse((end, slot_idx)));
++        // TLA+ trace: AssignSlot via the new-slot branch.
++        super::super::tla_trace::emit_assign_slot(
++            dest_id, slot, end.saturating_add(1),
++        );
+     }
+ }
+ 
