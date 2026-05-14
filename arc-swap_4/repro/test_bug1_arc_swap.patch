@@ -1,0 +1,166 @@
+Reproduction patch for arc-swap Family-5 generation-wrap panic.
+
+This patch is applied on top of the round-4 working tree (which already
+contains the tla_trace harness emit calls).  It adds:
+
+  1. src/debt/helping.rs : two #[cfg(test)] hooks on `Local` and `Slots`:
+       - Local::seed_generation_for_test  — pre-load the per-thread
+         generation counter to a chosen value
+       - Slots::reset_for_test            — reset the helping slot's
+         control word back to IDLE (used by the test for cleanup so the
+         dirty slot left by the panic doesn't cascade-fail subsequent
+         tests claiming the same node).
+     Production builds are unaffected because both impls are gated by
+     `#[cfg(test)]`.
+
+  2. src/debt/list.rs    : a unit test
+     `confirm_helping_panic_after_generation_wrap` in the existing
+     `mod tests` block.  The test:
+       a) Seeds the generation to `usize::MAX & !3` so the next
+          `wrapping_add(4)` overflows to 0.
+       b) Calls `LocalNode::new_helping`, which fires `discard = true`,
+          runs `start_cooldown` + `self.node.take()`.
+       c) Calls `LocalNode::confirm_helping`, which panics on the literal
+          `expect("LocalNode::with ensures it is set")` at
+          `src/debt/list.rs:313`.
+     `catch_unwind` captures the panic, then `Node::traverse` resets
+     every helping slot's control via `reset_for_test`.
+
+The seeding is Level-2 state injection per the bug-confirmation skill:
+the per-thread generation counter is private and the natural path to
+wrap (2^62 calls per thread on 64-bit, 2^30 on 32-bit) is impractical
+in a test.  All other state — node allocation, cooldown lifecycle,
+helping-slot control swap — runs unmodified through the public
+LocalNode interface.
+
+To reproduce, run from the repro/ dir:
+  ./test_bug1_run.sh
+
+Or directly:
+  cd /home/ubuntu/Specula/case-studies/arc-swap_4/artifact/arc-swap
+  cargo test --lib confirm_helping_panic_after_generation_wrap -- \
+    --nocapture --test-threads=1
+
+Expected output: "thread '...' panicked at src/debt/list.rs:313:37:
+                  LocalNode::with ensures it is set"
+
+================================================================
+diff --git a/src/debt/helping.rs b/src/debt/helping.rs
+--- a/src/debt/helping.rs
++++ b/src/debt/helping.rs
+@@ -126,6 +126,15 @@ pub(super) struct Local {
+     generation: Cell<usize>,
+ }
+
++#[cfg(test)]
++impl Local {
++    /// Test-only: seed the local generation counter so that the next
++    /// `wrapping_add(4)` in `get_debt` reaches a chosen value.
++    pub(super) fn seed_generation_for_test(&self, gen: usize) {
++        self.generation.set(gen);
++    }
++}
++
+ // Make sure the pointers have 2 empty bits. Always.
+ #[derive(Default)]
+ #[repr(align(4))]
+@@ -195,6 +204,17 @@ impl Slots {
+     pub(super) fn slot(&self) -> &Debt {
+         &self.slot
+     }
+
++    /// Test-only: reset the helping slot back to a clean state.  Used by the
++    /// generation-wrap reproduction test to clean up the control word it
++    /// leaves set to GEN_TAG when `confirm_helping` panics, so subsequent
++    /// tests in the same process can still claim this node.
++    #[cfg(test)]
++    pub(super) fn reset_for_test(&self) {
++        self.control.store(IDLE, SeqCst);
++        self.slot.0.store(Debt::NONE, SeqCst);
++        self.active_addr.store(0, SeqCst);
++    }
++
+     pub(super) fn get_debt(&self, ptr: usize, local: &Local) -> (usize, bool) {
+
+diff --git a/src/debt/list.rs b/src/debt/list.rs
+--- a/src/debt/list.rs
++++ b/src/debt/list.rs
+@@ -382,4 +382,80 @@ mod tests {
+     fn new_empty() {
+         assert!(Node::get_thread().is_empty());
+     }
++
++    /// Reproduces the Family-5 generation-wrap panic in `confirm_helping`.
++    ///
++    /// `helping::Slots::get_debt` increments the per-thread generation
++    /// counter by 4 each call and signals `discard = true` when the wrapped
++    /// value equals 0.  When discard fires, `LocalNode::new_helping` calls
++    /// `node.start_cooldown()` followed by `self.node.take()`, leaving the
++    /// thread's `LocalNode::node` cell as `None`.  The very next operation
++    /// in the fallback path is `LocalNode::confirm_helping`, whose first
++    /// line is
++    /// `let node = &self.node.get().expect("LocalNode::with ensures it is set");`
++    /// — which panics because the cell was just emptied.
++    ///
++    /// Naturally, the wrap requires `2^62` fallback calls per thread on
++    /// 64-bit (effectively unreachable) or `2^30` on 32-bit (≈1 billion).
++    /// We reproduce by seeding the per-thread generation counter to
++    /// `usize::MAX & !3` (i.e., `usize::MAX - 3`), so the next
++    /// `wrapping_add(4)` overflows to 0.  All other state is normal: a real
++    /// LocalNode, a real fallback path through `new_helping` /
++    /// `confirm_helping`.
++    ///
++    /// We use `catch_unwind` so we can both observe the panic *and* assert
++    /// it carries the expected `expect(...)` message.  On a fix (e.g.,
++    /// gating `confirm_helping` on `self.node.is_some()`), the inner
++    /// closure no longer panics and the outer `expect_err` fails the test.
++    ///
++    /// Test isolation: the panic leaves the helping slot's `control` set to
++    /// `GEN_TAG` (= 2) on whichever node we ran against.  Subsequent tests
++    /// that re-acquire that node would hit
++    /// `debug_assert_eq!(IDLE, prev, "Left control in wrong state")` in
++    /// `get_debt`.  We clean up after `catch_unwind` returns by traversing
++    /// the global linked list and resetting every node's helping slot.
++    #[test]
++    fn confirm_helping_panic_after_generation_wrap() {
++        use std::panic;
++        let result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
++            LocalNode::with(|local| {
++                let near_wrap: usize = !0usize & !3;
++                local.helping.seed_generation_for_test(near_wrap);
++
++                let storage_addr: usize = 0x1234;
++                let gen = local.new_helping(storage_addr);
++
++                // confirm_helping's first line is
++                //   let node = &self.node.get().expect("LocalNode::with ensures it is set");
++                // which panics here, since new_helping just took the node.
++                let _ = local.confirm_helping(gen, storage_addr);
++            });
++        }));
++
++        // Cleanup: reset every helping slot in the global linked list so
++        // subsequent tests in this process can claim nodes cleanly.
++        Node::traverse::<(), _>(|node| {
++            node.helping.reset_for_test();
++            None
++        });
++
++        let payload = result.expect_err(
++            "expected confirm_helping to panic after generation wrap; \
++             if this fires, the Family-5 bug has been fixed",
++        );
++        let msg = payload
++            .downcast_ref::<&'static str>()
++            .map(|s| s.to_string())
++            .or_else(|| payload.downcast_ref::<String>().cloned())
++            .unwrap_or_else(|| "<non-string panic payload>".to_string());
++
++        eprintln!("CAPTURED PANIC MESSAGE: {}", msg);
++        assert!(
++            msg.contains("LocalNode::with ensures it is set"),
++            "panic message did not match expected text; got: {}",
++            msg
++        );
++    }
+ }
