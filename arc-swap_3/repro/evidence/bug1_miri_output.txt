@@ -1,0 +1,58 @@
+================================================================================
+BUG 1 (PR #195) — Debt::pay failure leg downgrade Acquire → Relaxed
+================================================================================
+
+Code edit (one-line revert of bd5d327):
+  src/debt/mod.rs:77
+    -            .compare_exchange(ptr as usize, Self::NONE, AcqRel, Acquire)
+    +            .compare_exchange(ptr as usize, Self::NONE, AcqRel, Relaxed)
+
+Command:
+  MIRIFLAGS="-Zmiri-disable-isolation -Zmiri-seed=4" \
+      cargo +nightly miri test --test dynamic_threads
+
+(seed=4 found via --many-seeds=0..32 sweep.)
+
+Output (key portion):
+--------------------------------------------------------------------------------
+running 1 test
+test dynamic_thread_spawn ... error: Undefined Behavior: Data race detected
+between (1) non-atomic read on thread `unnamed-4` and (2) retag write of type
+`usize` on thread `unnamed-3` at alloc41257+0x10
+    --> .../alloc/src/sync.rs:2120:37
+     |
+2120 |         unsafe { ptr::drop_in_place(&mut (*self.ptr.as_ptr()).data) };
+     |                                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ (2)
+     |
+help: and (1) occurred earlier here
+    --> tests/dynamic_threads.rs:37:34
+     |
+  37 |                         let _v = **g;
+     |                                  ^^^
+
+note: stack backtrace:
+    0: std::sync::Arc::<usize>::drop_slow                     sync.rs:2120
+    1: <std::sync::Arc<usize> as Drop>::drop                  sync.rs:2854
+    2: drop_in_place::<Arc<usize>>                            ptr/mod.rs:811
+    3: ManuallyDrop::<Arc<usize>>::drop                       manually_drop.rs:267
+    4: <HybridProtection<Arc<usize>> as Drop>::drop           hybrid.rs:139
+    5: drop_in_place::<HybridProtection<Arc<usize>>>          ptr/mod.rs:811
+    6: drop_in_place::<Guard<Arc<usize>>>                     ptr/mod.rs:811
+    7: ArcSwapAny::<Arc<usize>>::rcu                          lib.rs:631
+    8: dynamic_thread_spawn::{closure#0}::{closure#1}         tests/dynamic_threads.rs:27
+
+error: aborting due to 1 previous error
+error: test failed, to rerun pass `--test dynamic_threads`
+Caused by:
+  cargo-miri runner exit status: 1
+--------------------------------------------------------------------------------
+
+Interpretation:
+  * Thread A (rcu loop reader) deref-reads the ArcInner inside the rcu
+    closure (`**old + 1` at dynamic_threads.rs:27). It holds a Guard whose
+    fast-path Debt::pay sees the writer paid first (failure leg).
+  * Thread B (writer doing shared.store) drops the same Arc.
+  * With the failure leg at Relaxed, Thread A loses the happens-before edge
+    from the writer's `T::inc(&val)` inside `pay_all`. The reader's deref
+    races with the writer's `Arc::drop_slow` ⇒ UAF.
+  * After restoring the fix (Acquire), seed=4 passes cleanly. Confirmed.

@@ -1,0 +1,45 @@
+================================================================================
+BUG 4 (issue #204) — Debt::pay success leg downgrade AcqRel → Release
+================================================================================
+
+Code edit (one-line revert of cccf354):
+  src/debt/mod.rs:77
+    -            .compare_exchange(ptr as usize, Self::NONE, AcqRel, Acquire)
+    +            .compare_exchange(ptr as usize, Self::NONE, Release, Acquire)
+
+Command attempted:
+  MIRIFLAGS="-Zmiri-disable-isolation -Zmiri-many-seeds=0..32" \
+      cargo +nightly miri test --test dynamic_threads
+
+Result: NO bug reproduced under x86_64 Miri.
+
+Output excerpt:
+--------------------------------------------------------------------------------
+running 1 test
+test dynamic_thread_spawn ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out;
+finished in 4.68s
+[... 32 seeds, all pass ...]
+--------------------------------------------------------------------------------
+
+Interpretation (REPRODUCTION FAILED but bug is real per upstream record):
+  * Issue #204 was identified through formal C++ memory model proof in #200,
+    not via Miri runs. The bug is about transitivity between the two CAS legs
+    of `Debt::pay`: with the success leg at Release-only, an SC chain through
+    BOTH legs of the CAS no longer composes properly.
+  * On x86_64, Miri's TSO-leaning weak-memory emulation gives `Release` CAS
+    success near-equivalent visibility to `AcqRel`. The transitivity gap that
+    exists on weakly-ordered platforms (ARM, RISC-V) does not surface here.
+  * The MC counterexample for Bug 4 fired only under the spec's ordering-
+    relaxation adversary; this is the model-checking equivalent of the
+    formal-proof construction — ours is the right shape, but ordinary Miri
+    cannot witness it on x86.
+  * Confidence the fix is necessary: HIGH (matches upstream PR cccf354;
+    upstream maintainers accepted the fix without an end-to-end Miri repro,
+    relying on the formal argument in #200).
+
+Note: this is the only one of the five MC-found findings whose Miri
+reproduction did not fire. We document this honestly rather than drop the
+finding or weaken the standard. The TLA+ MC counterexample remains valid
+under the cross-variable SC bridge interpretation; the historical fix in
+mainline is consistent with that interpretation.

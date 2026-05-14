@@ -1,0 +1,294 @@
+diff --git a/src/debt/fast.rs b/src/debt/fast.rs
+index 7b6ca13..224db99 100644
+--- a/src/debt/fast.rs
++++ b/src/debt/fast.rs
+@@ -56,6 +56,7 @@ impl Slots {
+                 // are the only ones allowed to change NONE to something else. But we still need a
+                 // read-write operation with SeqCst on it :-(
+                 let old = slot.0.swap(ptr, SeqCst);
++                crate::tla_trace::emit_reader_fast_slot_acquire(i, 8);
+                 debug_assert_eq!(Debt::NONE, old);
+                 local.offset.set(i + 1);
+                 return Some(&self.0[i]);
+diff --git a/src/debt/helping.rs b/src/debt/helping.rs
+index af33532..615422a 100644
+--- a/src/debt/helping.rs
++++ b/src/debt/helping.rs
+@@ -201,12 +201,16 @@ impl Slots {
+         // not in between here and the compare_exchange below with a stale gen (eg. if we are in
+         // here, the re-confirm there will load the NO_DEPT and we are fine).
+         self.active_addr.store(ptr, SeqCst);
++        crate::tla_trace::emit_reader_fallback_active_addr();
+ 
+         // We are the only ones allowed to do the IDLE -> * transition and we never leave it in
+         // anything else after an transaction, so this is OK. But we still need a load-store SeqCst
+         // operation here to form a relation between this and the store of the actual pointer in
+         // the writer thread :-(.
+         let prev = self.control.swap(gen, SeqCst);
++        // MaxHelpGen mirrors the Trace.cfg constant (8) so the trace's helpGen
++        // field matches what the spec computes.
++        crate::tla_trace::emit_reader_fallback_control_swap(8);
+         debug_assert_eq!(IDLE, prev, "Left control in wrong state");
+ 
+         (gen, discard)
+@@ -310,6 +314,7 @@ impl Slots {
+         // only (we need Acquire and Acquire works only on loads). Release is to make sure control
+         // is observable by the other thread (but that's probably not necessary anyway?)
+         let prev = self.slot.0.swap(ptr, SeqCst);
++        crate::tla_trace::emit_reader_fallback_slot_store(ptr);
+         debug_assert_eq!(Debt::NONE, prev);
+ 
+         // Confirm by writing to the control (or discover that we got helped). We stop anyone else
+diff --git a/src/debt/list.rs b/src/debt/list.rs
+index 244cd62..48cf6f8 100644
+--- a/src/debt/list.rs
++++ b/src/debt/list.rs
+@@ -53,7 +53,8 @@ pub struct NodeReservation<'a>(&'a Node);
+ 
+ impl Drop for NodeReservation<'_> {
+     fn drop(&mut self) {
+-        self.0.active_writers.fetch_sub(1, Release);
++        let prev = self.0.active_writers.fetch_sub(1, Release);
++        crate::tla_trace::emit_writer_release_node(self.0 as *const _ as usize, prev.saturating_sub(1));
+     }
+ }
+ 
+@@ -99,6 +100,7 @@ impl Node {
+         // Note that the other pointers in the chain never change and are *ordinary* pointers. The
+         // whole linked list is synchronized through the head.
+         let mut current = unsafe { LIST_HEAD.load(SeqCst).as_ref() };
++        crate::tla_trace::emit_writer_traverse_load();
+         while let Some(node) = current {
+             let result = f(node);
+             if result.is_some() {
+@@ -131,16 +133,21 @@ impl Node {
+             // operations. We just see an up to date 0 and allow someone (possibly us) to claim the
+             // node later on.
+             if self.active_writers.load(Relaxed) == 0 {
+-                let _ = self
++                if self
+                     .in_use
+-                    .compare_exchange(NODE_COOLDOWN, NODE_UNUSED, Relaxed, Relaxed);
++                    .compare_exchange(NODE_COOLDOWN, NODE_UNUSED, Relaxed, Relaxed)
++                    .is_ok()
++                {
++                    crate::tla_trace::emit_check_cooldown(self as *const _ as usize);
++                }
+             }
+         }
+     }
+ 
+     /// Mark this node that a writer is currently playing with it.
+     pub fn reserve_writer(&self) -> NodeReservation<'_> {
+-        self.active_writers.fetch_add(1, Acquire);
++        let prev = self.active_writers.fetch_add(1, Acquire);
++        crate::tla_trace::emit_writer_reserve_node(self as *const _ as usize, prev + 1);
+         NodeReservation(self)
+     }
+ 
+@@ -159,6 +166,8 @@ impl Node {
+                 .compare_exchange(NODE_UNUSED, NODE_USED, SeqCst, SeqCst)
+                 .is_ok()
+             {
++                crate::tla_trace::register_node(node as *const _ as usize);
++                crate::tla_trace::emit_claim_node(node as *const _ as usize);
+                 Some(node)
+             } else {
+                 None
+@@ -187,6 +196,7 @@ impl Node {
+                 ) {
+                     head = old;
+                 } else {
++                    crate::tla_trace::register_node(node as *const _ as usize);
+                     return node;
+                 }
+             }
+diff --git a/src/debt/mod.rs b/src/debt/mod.rs
+index 3f0a02b..ea1c293 100644
+--- a/src/debt/mod.rs
++++ b/src/debt/mod.rs
+@@ -84,21 +84,25 @@ impl Debt {
+         T: RefCnt,
+         R: Fn() -> T,
+     {
++        let _payall_scope = crate::tla_trace::PayAllScope::enter();
+         LocalNode::with(|local| {
+             let val = unsafe { T::from_ptr(ptr) };
+             // Pre-pay one ref count that can be safely put into a debt slot to pay it.
+             T::inc(&val);
++            crate::tla_trace::emit_writer_pay_init();
+ 
+             Node::traverse::<(), _>(|node| {
+                 // Make the cooldown trick know we are poking into this node.
+                 let _reservation = node.reserve_writer();
+ 
+                 local.help(node, storage_addr, &replacement);
++                crate::tla_trace::emit_writer_help_node();
+ 
+                 let all_slots = node
+                     .fast_slots()
+                     .chain(core::iter::once(node.helping_slot()));
+-                for slot in all_slots {
++                let node_ptr = node as *const _ as usize;
++                for (slot_idx, slot) in all_slots.enumerate() {
+                     // Note: Release is enough even here. That makes sure the increment is
+                     // visible to whoever might acquire on this slot and can't leak below this.
+                     // And we are the ones doing decrements anyway.
+@@ -106,11 +110,13 @@ impl Debt {
+                         // Pre-pay one more, for another future slot
+                         T::inc(&val);
+                     }
++                    crate::tla_trace::emit_writer_scan_slot(node_ptr, slot_idx);
+                 }
+ 
+                 None
+             });
+             // Implicit dec by dropping val in here, pair for the above
++            crate::tla_trace::emit_writer_pay_done();
+         })
+     }
+ }
+diff --git a/src/lib.rs b/src/lib.rs
+index 0794f8f..cfabdde 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -134,6 +134,7 @@ mod as_raw;
+ pub mod cache;
+ mod compile_fail_tests;
+ mod debt;
++pub mod tla_trace;
+ pub mod docs;
+ mod ref_cnt;
+ #[cfg(feature = "serde")]
+@@ -342,6 +343,7 @@ impl<T: RefCnt, S: Strategy<T>> Drop for ArcSwapAny<T, S> {
+             self.strategy.wait_for_readers(ptr, &self.ptr);
+             // We are getting rid of the one stored ref count
+             T::dec(ptr);
++            crate::tla_trace::emit_drop_arc_swap();
+         }
+     }
+ }
+@@ -481,6 +483,7 @@ impl<T: RefCnt, S: Strategy<T>> ArcSwapAny<T, S> {
+         //
+         // SeqCst to synchronize the time lines with the group counters.
+         let old = self.ptr.swap(new, Ordering::SeqCst);
++        crate::tla_trace::emit_writer_swap(new as usize);
+         unsafe {
+             self.strategy.wait_for_readers(old, &self.ptr);
+             T::from_ptr(old)
+diff --git a/src/strategy/hybrid.rs b/src/strategy/hybrid.rs
+index 99ae5db..1a51504 100644
+--- a/src/strategy/hybrid.rs
++++ b/src/strategy/hybrid.rs
+@@ -42,6 +42,7 @@ impl<T: RefCnt> HybridProtection<T> {
+     fn attempt(node: &LocalNode, storage: &AtomicPtr<T::Base>) -> Option<Self> {
+         // Relaxed is good enough here, see the Acquire below
+         let ptr = storage.load(Relaxed);
++        crate::tla_trace::emit_reader_fast_load(ptr as usize);
+         // Try to get a debt slot. If not possible, fail.
+         let debt = node.new_fast(ptr as usize)?;
+ 
+@@ -49,17 +50,21 @@ impl<T: RefCnt> HybridProtection<T> {
+         //
+         // SeqCst to make sure the storage vs. the debt are well ordered.
+         let confirm = storage.load(SeqCst);
++        crate::tla_trace::emit_reader_fast_confirm_load(confirm as usize);
+         if ptr == confirm {
++            crate::tla_trace::emit_reader_fast_branch_hit();
+             // Successfully got a debt
+             // NOTE: we *must* use `confirm` here instead of `ptr`. The address may compare equal,
+             // but they could have different provenance, if the pointer is freed and then
+             // subsequently reused.
+             Some(unsafe { Self::new(confirm, Some(debt)) })
+         } else if debt.pay::<T>(ptr) {
++            crate::tla_trace::emit_reader_fast_resolve();
+             // It changed in the meantime, we return the debt (that is on the outdated pointer,
+             // possibly destroyed) and fail.
+             None
+         } else {
++            crate::tla_trace::emit_reader_fast_resolve();
+             // It changed in the meantime, but the debt for the previous pointer was already paid
+             // for by someone else, so we are fine using it.
+             Some(unsafe { Self::new(ptr, None) })
+@@ -76,20 +81,28 @@ impl<T: RefCnt> HybridProtection<T> {
+         // With Acquire, this load can return a stale pointer that the writer has
+         // already replaced and freed, leading to use-after-free.
+         let candidate = storage.load(SeqCst);
++        crate::tla_trace::emit_reader_fallback_candidate(candidate as usize);
+ 
+         // Try to replace the debt with our candidate. If it works, we get the debt slot to use. If
+         // not, we get a replacement value, already protected and a debt to take care of.
+         match node.confirm_helping(gen, candidate as usize) {
+             Ok(debt) => {
++                crate::tla_trace::emit_reader_fallback_confirm_ok();
+                 // The fast path -> we got the debt confirmed alright.
+-                Self::from_inner(unsafe { Self::new(candidate, Some(debt)).into_inner() })
++                let inner = {
++                    let _suppress = crate::tla_trace::InternalIntoInnerScope::enter();
++                    unsafe { Self::new(candidate, Some(debt)).into_inner() }
++                };
++                Self::from_inner(inner)
+             }
+             Err((unused_debt, replacement)) => {
++                crate::tla_trace::emit_reader_fallback_confirm_helped();
+                 // The debt is on the candidate we provided and it is unused, we so we just pay it
+                 // back right away.
+                 if !unused_debt.pay::<T>(candidate) {
+                     unsafe { T::dec(candidate) };
+                 }
++                crate::tla_trace::emit_reader_fallback_resolve_envelope();
+                 // We got a (possibly) different pointer out. But that one is already protected and
+                 // the slot is paid back.
+                 unsafe { Self::new(replacement as *mut _, None) }
+@@ -106,6 +119,7 @@ impl<T: RefCnt> HybridProtection<T> {
+ impl<T: RefCnt> Drop for HybridProtection<T> {
+     #[inline]
+     fn drop(&mut self) {
++        crate::tla_trace::emit_drop_guard();
+         match self.debt.take() {
+             // We have our own copy of Arc, so we don't need a protection. Do nothing (but release
+             // the Arc below).
+@@ -142,6 +156,9 @@ impl<T: RefCnt> Protected<T> for HybridProtection<T> {
+         match self.debt.take() {
+             None => (), // We have a fully loaded ref-counted pointer.
+             Some(debt) => {
++                // Only emit when the guard had a real debt to clear — the
++                // no-debt case is a no-op for the spec (no state change).
++                crate::tla_trace::emit_guard_into_inner();
+                 let ptr = T::inc(&self.ptr);
+                 if !debt.pay::<T>(ptr) {
+                     unsafe { T::dec(ptr) };
+@@ -214,18 +231,24 @@ impl<T: RefCnt, Cfg: Config> CaS<T> for HybridStrategy<Cfg> {
+         current: C,
+         new: T,
+     ) -> Self::Protected {
++        let kind = crate::tla_trace::take_pending_cas_kind();
++        // Eagerly compute new_raw so we can include it in CASBegin's trace state.
++        let new_raw = T::as_ptr(&new);
+         loop {
++            let _cas_scope = crate::tla_trace::CasScope::enter();
+             let old = <Self as InnerStrategy<T>>::load(self, storage);
++            crate::tla_trace::emit_cas_begin(&kind, current.as_raw() as usize, new_raw as usize);
+             // Observation of their inequality is enough to make a verdict
+             if old.as_ptr() != current.as_raw() {
++                crate::tla_trace::emit_cas_compare_not_equal();
+                 return old;
+             }
+             // If they are still equal, put the new one in.
+-            let new_raw = T::as_ptr(&new);
+             if storage
+                 .compare_exchange_weak(current.as_raw(), new_raw, SeqCst, Relaxed)
+                 .is_ok()
+             {
++                crate::tla_trace::emit_cas_exchange_ok(new_raw as usize);
+                 // We successfully put the new value in. The ref count went in there too.
+                 T::into_ptr(new);
+                 <Self as InnerStrategy<T>>::wait_for_readers(self, old.as_ptr(), storage);
+@@ -234,6 +257,7 @@ impl<T: RefCnt, Cfg: Config> CaS<T> for HybridStrategy<Cfg> {
+                 T::dec(old.as_ptr());
+                 return old;
+             }
++            crate::tla_trace::emit_cas_exchange_fail();
+         }
+     }
+ }

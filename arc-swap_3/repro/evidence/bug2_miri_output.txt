@@ -1,0 +1,59 @@
+================================================================================
+BUG 2 (issue #198) — Fallback storage.load downgrade SeqCst → Acquire
+================================================================================
+
+Code edit (one-line revert of d5dd00c):
+  src/strategy/hybrid.rs:83
+    -        let candidate = storage.load(SeqCst);
+    +        let candidate = storage.load(Acquire);
+
+Command:
+  MIRIFLAGS="-Zmiri-disable-isolation -Zmiri-seed=39" \
+      cargo +nightly miri test --features internal-test-strategies --test fallback_uaf
+
+(seed=39 was the seed in the original Miri report; on x86_64 it also fires
+ because the cross-variable SC bridge is broken regardless of architecture
+ once the fallback load is downgraded.)
+
+Output (key portion):
+--------------------------------------------------------------------------------
+running 1 test
+test fallback_rcu ... error: Undefined Behavior: Data race detected between
+(1) retag write on thread `unnamed-4` and (2) retag read of type
+`alloc::sync::ArcInner<usize>` on thread `unnamed-2` at alloc203794+0x10
+   --> .../core/src/ptr/non_null.rs:444:18
+    |
+444 |         unsafe { &*self.as_ptr().cast_const() }
+    |                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^ (2) just happened here
+    |
+help: and (1) occurred earlier here
+   --> tests/fallback_uaf.rs:21:48
+    |
+ 21 |                     shared.rcu(|old| **old + 1);
+    |                                                ^
+
+note: stack backtrace:
+    0: NonNull::<ArcInner<usize>>::as_ref                     non_null.rs:444
+    1: Arc::<usize>::inner                                    sync.rs:2104
+    2: <Arc<usize> as Clone>::clone                           sync.rs:2388
+    3: <Arc<usize> as arc_swap::RefCnt>::inc                  ref_cnt.rs:75
+    4: <HybridProtection<Arc<usize>> as Protected>::into_inner hybrid.rs:162
+    5: HybridProtection::<Arc<usize>>::fallback                hybrid.rs:94
+    6..14: <ArcSwap rcu chain>                                lib.rs:467/623
+
+error: aborting due to 1 previous error
+error: test failed, to rerun pass `--test fallback_uaf`
+Caused by:
+  cargo-miri runner exit status: 1
+--------------------------------------------------------------------------------
+
+Interpretation:
+  * tests/fallback_uaf.rs (upstream regression test for issue #198) uses the
+    FillFastSlots strategy, forcing every load() through the fallback path.
+  * Thread A enters fallback, claims a helping-slot, then loads
+    `candidate = storage.load(Acquire)`. With Acquire-only ordering, this
+    load can observe a *prior* storage value the writer already swapped out.
+  * Thread B (writer) replaced storage and finished pay_all; prior Arc freed.
+  * Thread A's `Self::new(candidate, Some(debt)).into_inner()` calls T::inc
+    on the freed Arc — race with the writer's drop_slow.
+  * After restoring the fix (SeqCst), seed=39 passes. Confirmed.

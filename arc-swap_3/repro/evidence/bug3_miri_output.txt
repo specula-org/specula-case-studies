@@ -1,0 +1,58 @@
+================================================================================
+BUG 3 (issue #76) — Fast confirm-load downgrade SeqCst → Acquire
+================================================================================
+
+Code edit (one-line revert of pre-6b644ff state):
+  src/strategy/hybrid.rs:52
+    -        let confirm = storage.load(SeqCst);
+    +        let confirm = storage.load(Acquire);
+
+Command:
+  MIRIFLAGS="-Zmiri-disable-isolation -Zmiri-seed=39" \
+      cargo +nightly miri test --test uaf_stress
+
+(reproduces at every seed tried — the bug is not order-sensitive once the
+ fast confirm-load loses the SC label, because the path is exercised on
+ every successful load() call.)
+
+Output (key portion):
+--------------------------------------------------------------------------------
+running 3 tests
+test mixed_load_store_rcu ... error: Undefined Behavior: Data race detected
+between (1) non-atomic read on thread `unnamed-8` and (2) retag write of
+type `usize` on thread `unnamed-11` at alloc244758+0x10
+    --> .../alloc/src/sync.rs:2120:37
+     |
+2120 |         unsafe { ptr::drop_in_place(&mut (*self.ptr.as_ptr()).data) };
+     |                                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ (2)
+     |
+help: and (1) occurred earlier here
+    --> tests/uaf_stress.rs:80:34
+     |
+  80 |                         let _v = **g;
+     |                                  ^^^
+
+note: stack backtrace:
+    0: Arc::<usize>::drop_slow                                sync.rs:2120
+    1: <Arc<usize> as Drop>::drop                             sync.rs:2854
+    2: drop_in_place::<Arc<usize>>                            ptr/mod.rs:811
+    3: mixed_load_store_rcu::{closure#0}::{closure#0}         tests/uaf_stress.rs:85
+
+error: aborting due to 1 previous error
+error: test failed, to rerun pass `--test uaf_stress`
+Caused by:
+  cargo-miri runner exit status: 1
+--------------------------------------------------------------------------------
+
+Interpretation:
+  * tests/uaf_stress.rs/mixed_load_store_rcu spawns 4 threads each randomly
+    issuing load(), store(), or swap(). The load() takes the fast path.
+  * With confirm-load downgraded to Acquire, the reader's `confirm == ptr`
+    branch can be reached on a stale `confirm` value: the writer has
+    already swapped storage, but the relaxed confirm-load returns the
+    pre-swap pointer from a prior timeline. Reader takes a Guard pointing
+    to the old pointer and dereferences it (`**g`).
+  * Concurrently, the writer's pay_all finishes and the old Arc is dropped
+    via `Arc::drop_slow`.
+  * Miri detects the data race between guard deref and Arc destructor — UAF.
+  * After restoring the fix (SeqCst), the test passes cleanly. Confirmed.

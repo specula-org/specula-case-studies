@@ -1,0 +1,62 @@
+================================================================================
+BUG 5 (issue #164 family) — LIST_HEAD load downgrade SeqCst → Acquire
+================================================================================
+
+Code edit (one-line revert of d849a2d for the read side):
+  src/debt/list.rs:102
+    -        let mut current = unsafe { LIST_HEAD.load(SeqCst).as_ref() };
+    +        let mut current = unsafe { LIST_HEAD.load(Acquire).as_ref() };
+
+Command:
+  MIRIFLAGS="-Zmiri-disable-isolation -Zmiri-seed=1" \
+      cargo +nightly miri test --test dynamic_threads
+
+(reproduces at most seeds — the test deliberately spawns reader threads in
+ waves so fresh nodes get prepended to LIST_HEAD while a writer is mid-scan.)
+
+Output (key portion):
+--------------------------------------------------------------------------------
+running 1 test
+test dynamic_thread_spawn ... error: Undefined Behavior: Data race detected
+between (1) non-atomic read on thread `unnamed-3` and (2) retag write of
+type `usize` on thread `unnamed-2` at alloc41094+0x10
+    --> .../alloc/src/sync.rs:2120:37
+     |
+2120 |         unsafe { ptr::drop_in_place(&mut (*self.ptr.as_ptr()).data) };
+     |                                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ (2)
+     |
+help: and (1) occurred earlier here
+    --> tests/dynamic_threads.rs:27:34
+     |
+  27 |                 shared.rcu(|old| **old + 1);
+     |                                  ^^^^^
+
+note: stack backtrace:
+    0: Arc::<usize>::drop_slow                                sync.rs:2120
+    1: <Arc<usize> as Drop>::drop                             sync.rs:2854
+    2: drop_in_place::<Arc<usize>>                            ptr/mod.rs:811
+    3: drop::<Arc<usize>>                                     mem/mod.rs:975
+    4: ArcSwapAny::<Arc<usize>>::store                        lib.rs:475
+    5: dynamic_thread_spawn::{closure#0}::{closure#0}         tests/dynamic_threads.rs:20
+
+error: aborting due to 1 previous error
+error: test failed, to rerun pass `--test dynamic_threads`
+Caused by:
+  cargo-miri runner exit status: 1
+--------------------------------------------------------------------------------
+
+Interpretation:
+  * tests/dynamic_threads.rs spawns reader threads dynamically while a writer
+    runs `shared.store(...)` and another thread runs `shared.rcu(...)`. New
+    threads cause new debt nodes to be prepended to LIST_HEAD on first load.
+  * With LIST_HEAD.load downgraded to Acquire, the writer's `Node::traverse`
+    (called from `Debt::pay_all`) is allowed to see a stale list head — one
+    that doesn't include a node whose slot was set *before* the writer's
+    storage swap.
+  * The writer's pay_all finishes without paying that slot. The writer drops
+    the old Arc. The reader's deref at dynamic_threads.rs:27 (`**old`) races
+    with `Arc::drop_slow` on that same Arc.
+  * Miri detects the data race on the Arc allocation — UAF.
+  * After restoring the fix (SeqCst), seed=1 passes cleanly. Confirmed —
+    this is the canonical "stale snapshot in writer scan" pattern called out
+    in the brief.
