@@ -1,0 +1,390 @@
+diff --git a/orchagent/fdborch.cpp b/orchagent/fdborch.cpp
+index cbd76835..efcc7aa5 100644
+--- a/orchagent/fdborch.cpp
++++ b/orchagent/fdborch.cpp
+@@ -15,6 +15,25 @@
+ #include "vxlanorch.h"
+ #include "directory.h"
+ 
++#ifdef SONIC_FDB_TRACE
++#include "tla_trace.h"
++static string tla_origin_str(FdbOrigin o) {
++    switch (o) {
++        case FDB_ORIGIN_LEARN: return "learn";
++        case FDB_ORIGIN_PROVISIONED: return "provisioned";
++        case FDB_ORIGIN_VXLAN_ADVERTIZED: return "vxlan_advertized";
++        case FDB_ORIGIN_MCLAG_ADVERTIZED: return "mclag_advertized";
++        default: return "invalid";
++    }
++}
++static string tla_vlan_name(PortsOrch* portsOrch, sai_object_id_t bv_id) {
++    Port vlan;
++    if (portsOrch->getPort(bv_id, vlan))
++        return "Vlan" + to_string(vlan.m_vlan_info.vlan_id);
++    return "";
++}
++#endif
++
+ extern sai_fdb_api_t    *sai_fdb_api;
+ 
+ extern sai_object_id_t  gSwitchId;
+@@ -308,6 +327,19 @@ void FdbOrch::update(sai_fdb_event_t        type,
+         } else {
+             SWSS_LOG_ERROR("Failed to get port by bridge port ID 0x%" PRIx64 ".",
+                         bridge_port_id);
++#ifdef SONIC_FDB_TRACE
++            {
++                string vlanName = tla_vlan_name(m_portsOrch, entry->bv_id);
++                string evtName = (type == SAI_FDB_EVENT_AGED)
++                    ? "age_fdb_entry_dropped" : "learn_fdb_entry_dropped";
++                SONIC_TLA_TRACE_EMIT(nlohmann::json({
++                    {"event", evtName},
++                    {"mac", update.entry.mac.to_string()},
++                    {"vlan", vlanName},
++                    {"port", "bp_0x" + to_string(bridge_port_id)}
++                }));
++            }
++#endif
+             return;
+         }
+     }
+@@ -414,6 +446,19 @@ void FdbOrch::update(sai_fdb_event_t        type,
+         storeFdbEntryState(update);
+         notify(SUBJECT_TYPE_FDB_CHANGE, &update);
+ 
++#ifdef SONIC_FDB_TRACE
++        SONIC_TLA_TRACE_EMIT(nlohmann::json({
++            {"event", "learn_fdb_entry"},
++            {"mac", update.entry.mac.to_string()},
++            {"vlan", "Vlan" + to_string(vlan.m_vlan_info.vlan_id)},
++            {"port", update.port.m_alias},
++            {"entry_exists", true},
++            {"entry_origin", "learn"},
++            {"entry_port", update.port.m_alias},
++            {"port_fdb_count", update.port.m_fdb_count},
++            {"vlan_fdb_count", vlan.m_fdb_count}
++        }));
++#endif
+         break;
+     }
+     case SAI_FDB_EVENT_AGED:
+@@ -544,6 +589,35 @@ void FdbOrch::update(sai_fdb_event_t        type,
+         notify(SUBJECT_TYPE_FDB_CHANGE, &update);
+ 
+         notifyTunnelOrch(update.port);
++
++#ifdef SONIC_FDB_TRACE
++        {
++            string vlanName = "Vlan" + to_string(vlan.m_vlan_info.vlan_id);
++            // Distinguish tunnel entries from physical port entries
++            if (update.port.m_type == Port::TUNNEL)
++            {
++                SONIC_TLA_TRACE_EMIT(nlohmann::json({
++                    {"event", "age_fdb_on_tunnel"},
++                    {"mac", update.entry.mac.to_string()},
++                    {"vlan", vlanName},
++                    {"entry_exists", false},
++                    {"tunnel_fdb_count", update.port.m_fdb_count},
++                    {"tunnel_exists", true}
++                }));
++            }
++            else
++            {
++                SONIC_TLA_TRACE_EMIT(nlohmann::json({
++                    {"event", "age_fdb_entry"},
++                    {"mac", update.entry.mac.to_string()},
++                    {"vlan", vlanName},
++                    {"entry_exists", false},
++                    {"port_fdb_count", update.port.m_fdb_count},
++                    {"vlan_fdb_count", vlan.m_fdb_count}
++                }));
++            }
++        }
++#endif
+         break;
+     }
+     case SAI_FDB_EVENT_MOVE:
+@@ -620,6 +694,18 @@ void FdbOrch::update(sai_fdb_event_t        type,
+ 
+         notifyTunnelOrch(port_old);
+ 
++#ifdef SONIC_FDB_TRACE
++        SONIC_TLA_TRACE_EMIT(nlohmann::json({
++            {"event", "move_fdb_entry"},
++            {"mac", update.entry.mac.to_string()},
++            {"vlan", "Vlan" + to_string(vlan.m_vlan_info.vlan_id)},
++            {"new_port", update.port.m_alias},
++            {"entry_exists", true},
++            {"entry_port", update.port.m_alias},
++            {"port_fdb_count", update.port.m_fdb_count},
++            {"vlan_fdb_count", vlan.m_fdb_count}
++        }));
++#endif
+         break;
+     }
+     case SAI_FDB_EVENT_FLUSHED:
+@@ -639,6 +725,27 @@ void FdbOrch::update(sai_fdb_event_t        type,
+ 
+         handleSyncdFlushNotif(entry->bv_id, bridge_port_id, update.entry.mac, sai_fdb_type);
+ 
++#ifdef SONIC_FDB_TRACE
++        if (bridge_port_id != SAI_NULL_OBJECT_ID && bv_id == SAI_NULL_OBJECT_ID)
++        {
++            // Port-scoped flush notification
++            SONIC_TLA_TRACE_EMIT(nlohmann::json({
++                {"event", "handle_flush_notification"},
++                {"port", update.port.m_alias},
++                {"port_fdb_count", update.port.m_fdb_count},
++                {"vlan_fdb_count", vlan.m_fdb_count}
++            }));
++        }
++        else if (bridge_port_id == SAI_NULL_OBJECT_ID && bv_id != SAI_NULL_OBJECT_ID)
++        {
++            // VLAN-scoped flush notification
++            SONIC_TLA_TRACE_EMIT(nlohmann::json({
++                {"event", "handle_flush_notification_vlan"},
++                {"vlan", vlanName},
++                {"vlan_fdb_count", vlan.m_fdb_count}
++            }));
++        }
++#endif
+         break;
+     }
+ 
+@@ -1162,7 +1269,7 @@ void FdbOrch::flushFdbByVlan(const string &alias)
+     vlan_attr[1].id = SAI_FDB_FLUSH_ATTR_ENTRY_TYPE;
+     vlan_attr[1].value.s32 = SAI_FDB_FLUSH_ENTRY_TYPE_DYNAMIC;
+     status = sai_fdb_api->flush_fdb_entries(gSwitchId, 2, vlan_attr);
+-  
++
+     if (status != SAI_STATUS_SUCCESS)
+     {
+         SWSS_LOG_ERROR("Flush fdb failed, return code %x", status);
+@@ -1173,6 +1280,12 @@ void FdbOrch::flushFdbByVlan(const string &alias)
+                     alias.c_str(), vlan.m_vlan_info.vlan_oid);
+     }
+ 
++#ifdef SONIC_FDB_TRACE
++    SONIC_TLA_TRACE_EMIT(nlohmann::json({
++        {"event", "flush_fdb_by_vlan"},
++        {"vlan", alias}
++    }));
++#endif
+     return;
+ }
+ 
+@@ -1565,6 +1678,37 @@ bool FdbOrch::addFdbEntry(const FdbEntry& entry, const string& port_name,
+ 
+     m_entries[entry] = storeFdbData;
+ 
++#ifdef SONIC_FDB_TRACE
++    {
++        string vlanName = "Vlan" + to_string(vlan.m_vlan_info.vlan_id);
++        if (fdbData.origin == FDB_ORIGIN_PROVISIONED)
++        {
++            SONIC_TLA_TRACE_EMIT(nlohmann::json({
++                {"event", "add_fdb_entry_provisioned"},
++                {"mac", entry.mac.to_string()},
++                {"vlan", vlanName},
++                {"port", port_name},
++                {"entry_exists", true},
++                {"entry_origin", "provisioned"},
++                {"port_fdb_count", port.m_fdb_count},
++                {"vlan_fdb_count", vlan.m_fdb_count}
++            }));
++        }
++        else if (fdbData.origin == FDB_ORIGIN_VXLAN_ADVERTIZED)
++        {
++            SONIC_TLA_TRACE_EMIT(nlohmann::json({
++                {"event", "learn_fdb_on_tunnel"},
++                {"mac", entry.mac.to_string()},
++                {"vlan", vlanName},
++                {"vtep", fdbData.remote_ip},
++                {"entry_exists", true},
++                {"tunnel_fdb_count", port.m_fdb_count},
++                {"tunnel_ref_cnt", 0}
++            }));
++        }
++    }
++#endif
++
+     string key = "Vlan" + to_string(vlan.m_vlan_info.vlan_id) + ":" + entry.mac.to_string();
+ 
+     if (((fdbData.origin != FDB_ORIGIN_MCLAG_ADVERTIZED) &&
+@@ -1687,6 +1831,17 @@ bool FdbOrch::removeFdbEntry(const FdbEntry& entry, FdbOrigin origin)
+              * if so delete it from there. */
+             deleteFdbEntryFromSavedFDB(entry.mac, vlan.m_vlan_info.vlan_id, origin);
+ 
++#ifdef SONIC_FDB_TRACE
++            SONIC_TLA_TRACE_EMIT(nlohmann::json({
++                {"event", "remove_fdb_entry"},
++                {"mac", entry.mac.to_string()},
++                {"vlan", "Vlan" + to_string(vlan.m_vlan_info.vlan_id)},
++                {"origin", tla_origin_str(origin)},
++                {"entry_exists", true},
++                {"port_fdb_count", port.m_fdb_count},
++                {"vlan_fdb_count", vlan.m_fdb_count}
++            }));
++#endif
+             return true;
+         }
+     }
+@@ -1720,6 +1875,18 @@ bool FdbOrch::removeFdbEntry(const FdbEntry& entry, FdbOrigin origin)
+     m_portsOrch->setPort(vlan.m_alias, vlan);
+     (void)m_entries.erase(entry);
+ 
++#ifdef SONIC_FDB_TRACE
++    SONIC_TLA_TRACE_EMIT(nlohmann::json({
++        {"event", "remove_fdb_entry"},
++        {"mac", entry.mac.to_string()},
++        {"vlan", "Vlan" + to_string(vlan.m_vlan_info.vlan_id)},
++        {"origin", tla_origin_str(origin)},
++        {"entry_exists", false},
++        {"port_fdb_count", port.m_fdb_count},
++        {"vlan_fdb_count", vlan.m_fdb_count}
++    }));
++#endif
++
+     // Remove in StateDb
+     if ((fdbData.origin != FDB_ORIGIN_VXLAN_ADVERTIZED) && (fdbData.origin != FDB_ORIGIN_MCLAG_ADVERTIZED))
+     {
+diff --git a/orchagent/portsorch.cpp b/orchagent/portsorch.cpp
+index 1f70636e..c0e33530 100644
+--- a/orchagent/portsorch.cpp
++++ b/orchagent/portsorch.cpp
+@@ -43,6 +43,10 @@
+ 
+ #include "saitam.h"
+ 
++#ifdef SONIC_FDB_TRACE
++#include "tla_trace.h"
++#endif
++
+ extern sai_switch_api_t *sai_switch_api;
+ extern sai_bridge_api_t *sai_bridge_api;
+ extern sai_port_api_t *sai_port_api;
+@@ -5935,7 +5939,21 @@ void PortsOrch::doVlanMemberTask(Consumer &consumer)
+             }
+ 
+             if (addBridgePort(port) && addVlanMember(vlan, port, tagging_mode))
++            {
++#ifdef SONIC_FDB_TRACE
++                // Re-fetch port to get updated bridge_port_id
++                Port updPort;
++                getPort(port_alias, updPort);
++                SONIC_TLA_TRACE_EMIT(nlohmann::json({
++                    {"event", "add_vlan_member"},
++                    {"port", port_alias},
++                    {"vlan", vlan_alias},
++                    {"bridge_port_exists", updPort.m_bridge_port_id != SAI_NULL_OBJECT_ID},
++                    {"in_oid_map", saiOidToAlias.find(updPort.m_bridge_port_id) != saiOidToAlias.end()}
++                }));
++#endif
+                 it = consumer.m_toSync.erase(it);
++            }
+             else
+                 it++;
+         }
+@@ -5945,6 +5963,15 @@ void PortsOrch::doVlanMemberTask(Consumer &consumer)
+             {
+                 if (removeVlanMember(vlan, port))
+                 {
++#ifdef SONIC_FDB_TRACE
++                    SONIC_TLA_TRACE_EMIT(nlohmann::json({
++                        {"event", "remove_vlan_member"},
++                        {"port", port_alias},
++                        {"vlan", vlan_alias},
++                        {"bridge_port_exists", port.m_bridge_port_id != SAI_NULL_OBJECT_ID},
++                        {"in_oid_map", saiOidToAlias.find(port.m_bridge_port_id) != saiOidToAlias.end()}
++                    }));
++#endif
+                     if (m_portVlanMember[port.m_alias].empty())
+                     {
+                         removeBridgePort(port);
+@@ -7319,6 +7346,13 @@ bool PortsOrch::removeBridgePort(Port &port)
+     gFdbOrch->flushFDBEntries(port.m_bridge_port_id, SAI_NULL_OBJECT_ID);
+     SWSS_LOG_INFO("Flush FDB entries for port %s", port.m_alias.c_str());
+ 
++#ifdef SONIC_FDB_TRACE
++    SONIC_TLA_TRACE_EMIT(nlohmann::json({
++        {"event", "flush_fdb_for_remove"},
++        {"port", port.m_alias}
++    }));
++#endif
++
+     /* Remove bridge port */
+     status = sai_bridge_api->remove_bridge_port(port.m_bridge_port_id);
+     if (status != SAI_STATUS_SUCCESS)
+@@ -7334,6 +7368,15 @@ bool PortsOrch::removeBridgePort(Port &port)
+     saiOidToAlias.erase(port.m_bridge_port_id);
+     port.m_bridge_port_id = SAI_NULL_OBJECT_ID;
+ 
++#ifdef SONIC_FDB_TRACE
++    SONIC_TLA_TRACE_EMIT(nlohmann::json({
++        {"event", "remove_bridge_port_hw"},
++        {"port", port.m_alias},
++        {"bridge_port_exists", false},
++        {"in_oid_map", false}
++    }));
++#endif
++
+     /* Remove bridge port */
+     PortUpdate update = { port, false };
+     notify(SUBJECT_TYPE_BRIDGE_PORT_CHANGE, static_cast<void *>(&update));
+diff --git a/orchagent/vxlanorch.cpp b/orchagent/vxlanorch.cpp
+index b094af09..98c92785 100644
+--- a/orchagent/vxlanorch.cpp
++++ b/orchagent/vxlanorch.cpp
+@@ -22,6 +22,10 @@ extern "C" {
+ #include "converter.h"
+ #include "saihelper.h"
+ 
++#ifdef SONIC_FDB_TRACE
++#include "tla_trace.h"
++#endif
++
+ /* Global variables */
+ extern sai_object_id_t gSwitchId;
+ extern sai_object_id_t gVirtualRouterId;
+@@ -1199,7 +1203,19 @@ bool VxlanTunnel::deleteDynamicDIPTunnel(const std::string dip, tunnel_user_t us
+             updateRemoteEndPointRefCnt(false,tnl_refcnts,usr);
+             tnl_users_[dip] = tnl_refcnts;
+         }
+- 
++
++#ifdef SONIC_FDB_TRACE
++        {
++            int total_refcnt = tnl_refcnts.imr_refcnt + tnl_refcnts.mac_refcnt + tnl_refcnts.ip_refcnt;
++            SONIC_TLA_TRACE_EMIT(nlohmann::json({
++                {"event", "del_remote_vni"},
++                {"vtep", dip},
++                {"tunnel_exists", total_refcnt > 0},
++                {"tunnel_ref_cnt", total_refcnt}
++            }));
++        }
++#endif
++
+         SWSS_LOG_INFO("diprefcnt = %d",
+                       tnl_refcnts.imr_refcnt + tnl_refcnts.mac_refcnt + tnl_refcnts.ip_refcnt);
+         
+@@ -2515,6 +2531,20 @@ bool EvpnRemoteVnip2pOrch::addOperation(const Request& request)
+ 
+     tunnel_orch->addTunnelUser(remote_vtep, vni_id, vlan_id, TUNNEL_USER_IMR);
+ 
++#ifdef SONIC_FDB_TRACE
++    {
++        auto tnl_refcnts = vtep_ptr->getRemoteEndPointRefCnt(remote_vtep);
++        int total_refcnt = 0;
++        for (auto& rc : tnl_refcnts) total_refcnt += rc.second;
++        SONIC_TLA_TRACE_EMIT(nlohmann::json({
++            {"event", "add_remote_vni"},
++            {"vtep", remote_vtep},
++            {"tunnel_exists", true},
++            {"tunnel_ref_cnt", total_refcnt}
++        }));
++    }
++#endif
++
+     if (!tunnel_orch->getTunnelPort(remote_vtep,tunnelPort))
+     {
+         SWSS_LOG_WARN("Vxlan tunnelPort doesn't exist: %s", remote_vtep.c_str());
