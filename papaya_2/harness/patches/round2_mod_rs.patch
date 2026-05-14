@@ -1,0 +1,528 @@
+diff --git a/src/raw/mod.rs b/src/raw/mod.rs
+index efe3fca..c645c39 100644
+--- a/src/raw/mod.rs
++++ b/src/raw/mod.rs
+@@ -235,8 +235,17 @@ impl<K, V, S> HashMap<K, V, S> {
+         }
+ 
+         // Initialize the table and mark it as the root.
++        let _tla_eager_start = if crate::tla_trace::is_enabled() {
++            crate::tla_trace::timestamp_ns()
++        } else { 0 };
+         let mut table = Table::alloc(probe::entries_for(capacity));
+         *table.state_mut().status.get_mut() = State::PROMOTED;
++        // TLA+ trace: init_table (eager-allocation path)
++        if crate::tla_trace::is_enabled() {
++            let t_end = crate::tla_trace::timestamp_ns();
++            let tbl_id = crate::tla_trace::table_id(table.raw as usize);
++            crate::tla_trace::emit_init_table(_tla_eager_start, t_end, tbl_id, table.len());
++        }
+ 
+         HashMap {
+             hasher,
+@@ -326,6 +335,13 @@ where
+ 
+         let (h1, h2) = self.hash(key);
+ 
++
++        // TLA+ trace: GetBegin
++        if crate::tla_trace::is_enabled() {
++            let ts = crate::tla_trace::timestamp_ns();
++            let tbl_id = crate::tla_trace::table_id(table.raw as usize);
++            crate::tla_trace::emit_get_begin(ts, ts, tbl_id);
++        }
+         loop {
+             // Initialize the probe state.
+             let mut probe = Probe::start(h1, table.mask);
+@@ -591,6 +607,12 @@ where
+ 
+                 // The entry is being copied to the new table.
+                 if entry.tag() & Entry::COPYING != 0 {
++                    // TLA+ trace: InsertCopyingRetry (COPYING detected, retry in next table)
++                    if crate::tla_trace::is_enabled() {
++                        let ts = crate::tla_trace::timestamp_ns();
++                        let tbl_id = crate::tla_trace::table_id(table.raw as usize);
++                        crate::tla_trace::emit_insert_copying_retry(ts, ts, tbl_id);
++                    }
+                     break 'probe Some(probe.i);
+                 }
+ 
+@@ -617,10 +639,24 @@ where
+                     }
+ 
+                     // The entry is being copied.
+-                    UpdateStatus::Found(EntryStatus::Copied(_)) => break 'probe Some(probe.i),
++                    UpdateStatus::Found(EntryStatus::Copied(_)) => {
++                        // TLA+ trace: InsertUpdateCopying (CAS failed, entry now COPYING)
++                        if crate::tla_trace::is_enabled() {
++                            let ts = crate::tla_trace::timestamp_ns();
++                            let tbl_id = crate::tla_trace::table_id(table.raw as usize);
++                            crate::tla_trace::emit_insert_update_copying(ts, ts, tbl_id);
++                        }
++                        break 'probe Some(probe.i);
++                    }
+ 
+                     // The entry was deleted before we could update it, continue probing.
+                     UpdateStatus::Found(EntryStatus::Null) => {
++                        // TLA+ trace: InsertUpdateDeleted (CAS failed, entry deleted)
++                        if crate::tla_trace::is_enabled() {
++                            let ts = crate::tla_trace::timestamp_ns();
++                            let tbl_id = crate::tla_trace::table_id(table.raw as usize);
++                            crate::tla_trace::emit_insert_update_deleted(ts, ts, tbl_id, probe.i);
++                        }
+                         probe.next(table.mask);
+                         continue 'probe;
+                     }
+@@ -660,7 +696,15 @@ where
+                 //
+                 // Note that the pointer we find here is a non-null entry that was inserted
+                 // into the map.
+-                UpdateStatus::Found(EntryStatus::Value(found)) => entry = found,
++                UpdateStatus::Found(EntryStatus::Value(found)) => {
++                    // TLA+ trace: InsertUpdateRetry (CAS failed, entry has new value)
++                    if crate::tla_trace::is_enabled() {
++                        let ts = crate::tla_trace::timestamp_ns();
++                        let tbl_id = crate::tla_trace::table_id(table.raw as usize);
++                        crate::tla_trace::emit_insert_update_retry(ts, ts, tbl_id, i);
++                    }
++                    entry = found;
++                }
+ 
+                 status => return status,
+             }
+@@ -776,6 +820,12 @@ where
+                 // The key is not in the table.
+                 // It also cannot be in the next table because we have not went over the probe limit.
+                 if meta == meta::EMPTY {
++                    // TLA+ trace: RemoveNotFound (key not in table)
++                    if crate::tla_trace::is_enabled() {
++                        let ts = crate::tla_trace::timestamp_ns();
++                        let tbl_id = crate::tla_trace::table_id(table.raw as usize);
++                        crate::tla_trace::emit_remove_not_found(ts, ts, tbl_id);
++                    }
+                     return Ok(None);
+                 }
+ 
+@@ -828,6 +878,12 @@ where
+                 // The entry is being copied to the new table, we have to complete the copy before
+                 // we can remove it.
+                 if entry.tag() & Entry::COPYING != 0 {
++                    // TLA+ trace: RemoveCopying (COPYING detected during remove)
++                    if crate::tla_trace::is_enabled() {
++                        let ts = crate::tla_trace::timestamp_ns();
++                        let tbl_id = crate::tla_trace::table_id(table.raw as usize);
++                        crate::tla_trace::emit_remove_copying(ts, ts, tbl_id);
++                    }
+                     break 'probe Some(probe.i);
+                 }
+ 
+@@ -987,24 +1043,37 @@ where
+         ) {
+             // Successfully claimed the entry.
+             Ok(_) => {
+-                // TLA+ trace: InsertCAS (success - entry claimed, meta still EMPTY)
++                // TLA+ trace: InsertCASNew (success - entry claimed, meta still EMPTY)
+                 if crate::tla_trace::is_enabled() {
+                     let t_end = crate::tla_trace::timestamp_ns();
+                     let tbl_id = crate::tla_trace::table_id(table.raw as usize);
+-                    crate::tla_trace::emit_insert_cas(
++                    crate::tla_trace::emit_insert_cas_new(
+                         _tla_cas_start, t_end, tbl_id, i,
+-                        crate::tla_trace::meta_str(meta_entry.load(Ordering::Relaxed)),
+                     );
+                 }
+ 
++                // [BUG-1 REPRODUCTION: Level 3 — widen race window between CAS and meta store]
++                for _ in 0..100 { std::thread::yield_now(); }
++
+                 // Update the metadata table.
+                 let _tla_meta_start = if crate::tla_trace::is_enabled() { crate::tla_trace::timestamp_ns() } else { 0 };
+                 meta_entry.store(meta, Ordering::Release);
+-                // TLA+ trace: StoreMeta (entry now visible)
++
++                // [BUG-1 DETECTION: check if entry was tombstoned during the race window]
++                {
++                    let current_ptr = entry.load(Ordering::Acquire);
++                    if current_ptr != new_entry {
++                        crate::META_OVERWRITE_BUG_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
++                    }
++                }
++                // TLA+ trace: insert_meta (round-2 winner unconditional store)
+                 if crate::tla_trace::is_enabled() {
+                     let t_end = crate::tla_trace::timestamp_ns();
+                     let tbl_id = crate::tla_trace::table_id(table.raw as usize);
+-                    crate::tla_trace::emit_insert_store_meta(_tla_meta_start, t_end, tbl_id, i, "H2");
++                    let entry_at_store_null = entry.load(Ordering::Acquire).is_null();
++                    crate::tla_trace::emit_insert_meta(
++                        _tla_meta_start, t_end, tbl_id, i, "H2", entry_at_store_null,
++                    );
+                 }
+ 
+                 // Return the value we inserted.
+@@ -1013,15 +1082,8 @@ where
+ 
+             // Lost to a concurrent update.
+             Err(found) => {
+-                // TLA+ trace: InsertCAS (failure - lost to concurrent insert)
+-                if crate::tla_trace::is_enabled() {
+-                    let t_end = crate::tla_trace::timestamp_ns();
+-                    let tbl_id = crate::tla_trace::table_id(table.raw as usize);
+-                    crate::tla_trace::emit_insert_cas(
+-                        _tla_cas_start, t_end, tbl_id, i,
+-                        crate::tla_trace::meta_str(meta_entry.load(Ordering::Relaxed)),
+-                    );
+-                }
++                // No spec event on CAS-loss; round-2 `insert_cas` fires only on Ok(_).
++                let _ = _tla_cas_start;
+                 found.unpack()
+             }
+         };
+@@ -1046,8 +1108,24 @@ where
+         };
+ 
+         // Ensure the meta table is updated to keep the probe chain alive for readers.
+-        if meta_entry.load(Ordering::Relaxed) == meta::EMPTY {
++        let _tla_fixup_start = if crate::tla_trace::is_enabled() {
++            crate::tla_trace::timestamp_ns()
++        } else { 0 };
++        let meta_pre = meta_entry.load(Ordering::Relaxed);
++        if meta_pre == meta::EMPTY {
+             meta_entry.store(meta, Ordering::Release);
++            // TLA+ trace: insert_meta_fixup (round-2, loser fixup path)
++            if crate::tla_trace::is_enabled() {
++                let t_end = crate::tla_trace::timestamp_ns();
++                let tbl_id = crate::tla_trace::table_id(table.raw as usize);
++                let observed_key = crate::tla_trace::pending_key();
++                crate::tla_trace::emit_insert_meta_fixup(
++                    _tla_fixup_start, t_end, tbl_id, i,
++                    &observed_key,
++                    crate::tla_trace::meta_byte(meta_pre),
++                    crate::tla_trace::meta_byte(meta),
++                );
++            }
+         }
+ 
+         InsertStatus::Found(status)
+@@ -1086,15 +1164,14 @@ where
+         ) {
+             // Successfully updated.
+             Ok(_) => unsafe {
+-                // TLA+ trace: InsertUpdate or RemoveCAS (success)
++                // TLA+ trace: insert_update or remove (success)
+                 if crate::tla_trace::is_enabled() {
+                     let t_end = crate::tla_trace::timestamp_ns();
+                     let tbl_id = crate::tla_trace::table_id(table.raw as usize);
+-                    // Distinguish insert-update from remove by checking if new_entry is TOMBSTONE
+                     if new_entry == Entry::TOMBSTONE {
+-                        crate::tla_trace::emit_remove_cas(_tla_upd_start, t_end, tbl_id, i);
++                        crate::tla_trace::emit_remove(_tla_upd_start, t_end, tbl_id, i);
+                     } else {
+-                        crate::tla_trace::emit_insert_update(_tla_upd_start, t_end, tbl_id, i);
++                        crate::tla_trace::emit_insert_update(_tla_upd_start, t_end, tbl_id, i, "?");
+                     }
+                 }
+ 
+@@ -1344,6 +1421,9 @@ where
+     where
+         G: VerifiedGuard,
+     {
++        let _tla_iter_start = if crate::tla_trace::is_enabled() {
++            crate::tla_trace::timestamp_ns()
++        } else { 0 };
+         // Load the root table.
+         let root = self.root(guard);
+ 
+@@ -1353,13 +1433,24 @@ where
+                 i: 0,
+                 guard,
+                 table: root,
++                tla_snap_id: 0,
++                tla_yielded: 0,
++                tla_done: false,
+             };
+         }
+ 
+         // Get a clean copy of the table to iterate over.
+         let table = self.linearize(root, guard);
+ 
+-        Iter { i: 0, guard, table }
++        // TLA+ trace: iter_begin (round-2)
++        let snap_id = if crate::tla_trace::is_enabled() {
++            let t_end = crate::tla_trace::timestamp_ns();
++            let id = crate::tla_trace::table_id(table.raw as usize);
++            crate::tla_trace::emit_iter_begin(_tla_iter_start, t_end, id);
++            id
++        } else { 0 };
++
++        Iter { i: 0, guard, table, tla_snap_id: snap_id, tla_yielded: 0, tla_done: false }
+     }
+ 
+     /// Returns the h1 and h2 hash for the given key.
+@@ -1991,6 +2082,10 @@ where
+         let mut new = Table::alloc(capacity.unwrap_or(CAPACITY));
+         *new.state_mut().status.get_mut() = State::PROMOTED;
+ 
++        let _tla_init_start = if crate::tla_trace::is_enabled() {
++            crate::tla_trace::timestamp_ns()
++        } else { 0 };
++
+         // Race to write the initial table.
+         match self.table.compare_exchange(
+             ptr::null_mut(),
+@@ -1999,7 +2094,15 @@ where
+             Ordering::Acquire,
+         ) {
+             // Successfully initialized the table.
+-            Ok(_) => new,
++            Ok(_) => {
++                // TLA+ trace: init_table (round-2)
++                if crate::tla_trace::is_enabled() {
++                    let t_end = crate::tla_trace::timestamp_ns();
++                    let tbl_id = crate::tla_trace::table_id(new.raw as usize);
++                    crate::tla_trace::emit_init_table(_tla_init_start, t_end, tbl_id, new.len());
++                }
++                new
++            }
+ 
+             // Someone beat us, deallocate our table and use the table that was written.
+             Err(found) => {
+@@ -2160,6 +2263,12 @@ where
+         // Load the next table.
+         let mut next = table.next_table().unwrap();
+ 
++        // TLA+ trace: CopyBegin (blocking mode)
++        if crate::tla_trace::is_enabled() {
++            let ts = crate::tla_trace::timestamp_ns();
++            crate::tla_trace::emit_copy_begin(ts, ts);
++        }
++
+         'copy: loop {
+             // Make sure we are copying to the correct table.
+             while next.state().status.load(Ordering::Relaxed) == State::ABORTED {
+@@ -2207,12 +2316,20 @@ where
+                         // Allocate the next table.
+                         let allocated = self.get_or_alloc_next(None, next);
+ 
+-                        // TLA+ trace: AbortResize
++                        // TLA+ trace: abort_resize (round-2). Captures the buggy parker
++                        // routing: parker_used = src_table, key_used = src_table, per the
++                        // unpark target at `state.parker.unpark(&state.status)` below.
+                         if crate::tla_trace::is_enabled() {
+                             let t_end = crate::tla_trace::timestamp_ns();
+-                            let status_tbl = crate::tla_trace::table_id(next.raw as usize);
+-                            let next_tbl = crate::tla_trace::table_id(allocated.raw as usize);
+-                            crate::tla_trace::emit_abort_resize(_tla_abort_start, t_end, "Aborted", status_tbl, next_tbl);
++                            let src_id = crate::tla_trace::table_id(table.raw as usize);
++                            let aborted_id = crate::tla_trace::table_id(next.raw as usize);
++                            let _ = allocated;
++                            crate::tla_trace::emit_abort_resize(
++                                _tla_abort_start, t_end,
++                                src_id, aborted_id,
++                                /* parker_used = */ src_id,
++                                /* key_used    = */ src_id,
++                            );
+                         }
+ 
+                         // Wake anyone waiting for us to finish.
+@@ -2362,10 +2479,18 @@ where
+         // or removals wait until we complete the copy, and allowing us to get
+         // away without a protected load. Additionally, we verified that the
+         // entry is non-null, meaning that it is valid for reads.
+-        unsafe {
++        if crate::tla_trace::is_enabled() {
++            let src_id = crate::tla_trace::table_id(table.raw as usize);
++            crate::tla_trace::set_pending_copy_src(src_id, i);
++        }
++        let result = unsafe {
+             self.insert_copy(entry.ptr.unpack(), false, next_table, guard)
+                 .is_some()
++        };
++        if crate::tla_trace::is_enabled() {
++            crate::tla_trace::clear_pending_copy_src();
+         }
++        result
+     }
+ 
+     /// Help along an in-progress resize incrementally by copying a chunk of entries.
+@@ -2380,6 +2505,12 @@ where
+         // Always help the highest priority root resize.
+         let table = self.root(guard);
+ 
++        // TLA+ trace: CopyBegin (incremental mode)
++        if crate::tla_trace::is_enabled() {
++            let ts = crate::tla_trace::timestamp_ns();
++            crate::tla_trace::emit_copy_begin(ts, ts);
++        }
++
+         // Load the next table.
+         let Some(next) = table.next_table() else {
+             // The copy we tried to help was already promoted.
+@@ -2545,10 +2676,17 @@ where
+         // or removals wait until we complete the copy, and allowing us to get
+         // away without a protected load. Additionally, we verified that the
+         // entry is non-null, meaning that it is valid for reads.
++        if crate::tla_trace::is_enabled() {
++            let src_id = crate::tla_trace::table_id(table.raw as usize);
++            crate::tla_trace::set_pending_copy_src(src_id, i);
++        }
+         unsafe {
+             self.insert_copy(new_entry, true, next_table, guard)
+                 .unwrap();
+         }
++        if crate::tla_trace::is_enabled() {
++            crate::tla_trace::clear_pending_copy_src();
++        }
+ 
+         // Mark the entry as copied.
+         let copied = found
+@@ -2624,11 +2762,18 @@ where
+                         Ok(_) => {
+                             // Update the metadata table.
+                             meta_entry.store(h2, Ordering::Release);
+-                            // TLA+ trace: CopyEntry (successful copy to destination table)
++                            // TLA+ trace: copy_insert (round-2)
+                             if crate::tla_trace::is_enabled() {
+                                 let t_end = crate::tla_trace::timestamp_ns();
+-                                let tbl_id = crate::tla_trace::table_id(table.raw as usize);
+-                                crate::tla_trace::emit_copy_entry(_tla_ce_start, t_end, tbl_id, probe.i, "H2");
++                                let dst_id = crate::tla_trace::table_id(table.raw as usize);
++                                let (src_id, src_slot) = crate::tla_trace::pending_copy_src();
++                                let key_str = crate::tla_trace::fmt_iter_key(key as *const K as *const u8);
++                                crate::tla_trace::emit_copy_insert(
++                                    _tla_ce_start, t_end,
++                                    src_id, src_slot,
++                                    dst_id, probe.i,
++                                    &key_str,
++                                );
+                             }
+                             return Some((table, probe.i));
+                         }
+@@ -2690,6 +2835,12 @@ where
+ 
+         // If we copied all the entries in the table, we can try to promote.
+         if copied == table.len() {
++            // TLA+ trace: CopyDone (all entries copied)
++            if crate::tla_trace::is_enabled() {
++                let ts = crate::tla_trace::timestamp_ns();
++                let tbl_id = crate::tla_trace::table_id(table.raw as usize);
++                crate::tla_trace::emit_copy_done(ts, ts, tbl_id, copied);
++            }
+             let root = self.table.load(Ordering::Relaxed);
+ 
+             // Only promote root copies.
+@@ -2710,13 +2861,14 @@ where
+                     // that are unparked.
+                     state.status.store(State::PROMOTED, Ordering::SeqCst);
+ 
+-                    // TLA+ trace: TryPromote (success)
++                    // TLA+ trace: try_promote (round-2)
+                     if crate::tla_trace::is_enabled() {
+                         let t_end = crate::tla_trace::timestamp_ns();
+-                        let root_id = crate::tla_trace::table_id(next.raw as usize);
+-                        let status_tbl = crate::tla_trace::table_id(next.raw as usize);
++                        let old_root_id = crate::tla_trace::table_id(table.raw as usize);
++                        let new_root_id = crate::tla_trace::table_id(next.raw as usize);
+                         crate::tla_trace::emit_try_promote(
+-                            _tla_promote_start, t_end, root_id, "Promoted", status_tbl,
++                            _tla_promote_start, t_end,
++                            old_root_id, new_root_id,
+                             state.copied.load(Ordering::Relaxed),
+                         );
+                     }
+@@ -2868,6 +3020,12 @@ pub struct Iter<'g, K, V, G> {
+     i: usize,
+     table: Table<Entry<K, V>>,
+     guard: &'g G,
++    /// TLA+ trace: snapshot table id (captured at iter_begin)
++    pub(crate) tla_snap_id: u64,
++    /// TLA+ trace: count of entries yielded so far
++    pub(crate) tla_yielded: usize,
++    /// TLA+ trace: whether iter_end has been emitted
++    pub(crate) tla_done: bool,
+ }
+ 
+ impl<'g, K: 'g, V: 'g, G> Iterator for Iter<'g, K, V, G>
+@@ -2880,15 +3038,29 @@ where
+     fn next(&mut self) -> Option<Self::Item> {
+         // The table has not yet been allocated.
+         if self.table.raw.is_null() {
++            if !self.tla_done && crate::tla_trace::is_enabled() {
++                let ts = crate::tla_trace::timestamp_ns();
++                crate::tla_trace::emit_iter_end(ts, ts, self.tla_snap_id, self.tla_yielded);
++                self.tla_done = true;
++            }
+             return None;
+         }
+ 
+         loop {
+             // Iterated over every entry in the table, we're done.
+             if self.i >= self.table.len() {
++                if !self.tla_done && crate::tla_trace::is_enabled() {
++                    let ts = crate::tla_trace::timestamp_ns();
++                    crate::tla_trace::emit_iter_end(ts, ts, self.tla_snap_id, self.tla_yielded);
++                    self.tla_done = true;
++                }
+                 return None;
+             }
+ 
++            let _tla_step_start = if crate::tla_trace::is_enabled() {
++                crate::tla_trace::timestamp_ns()
++            } else { 0 };
++
+             // Load the entry metadata first to ensure consistency with calls to `get`.
+             //
+             // Safety: We verified that `self.i` is in-bounds above.
+@@ -2896,6 +3068,13 @@ where
+ 
+             // The entry is empty or deleted.
+             if matches!(meta, meta::EMPTY | meta::TOMBSTONE) {
++                if crate::tla_trace::is_enabled() {
++                    let t_end = crate::tla_trace::timestamp_ns();
++                    let reason = if meta == meta::EMPTY { "empty" } else { "tombstone" };
++                    crate::tla_trace::emit_iter_skip(
++                        _tla_step_start, t_end, self.tla_snap_id, self.i, reason,
++                    );
++                }
+                 self.i += 1;
+                 continue;
+             }
+@@ -2910,6 +3089,12 @@ where
+ 
+             // The entry was deleted.
+             if entry.ptr.is_null() {
++                if crate::tla_trace::is_enabled() {
++                    let t_end = crate::tla_trace::timestamp_ns();
++                    crate::tla_trace::emit_iter_skip(
++                        _tla_step_start, t_end, self.tla_snap_id, self.i, "null_entry",
++                    );
++                }
+                 self.i += 1;
+                 continue;
+             }
+@@ -2919,7 +3104,16 @@ where
+             // as we hold the guard.
+             let entry_ref = unsafe { &(*entry.ptr) };
+ 
++            let yielded_slot = self.i;
+             self.i += 1;
++            self.tla_yielded += 1;
++            if crate::tla_trace::is_enabled() {
++                let t_end = crate::tla_trace::timestamp_ns();
++                let key_str = crate::tla_trace::fmt_iter_key(&entry_ref.key as *const K as *const u8);
++                crate::tla_trace::emit_iter_yield(
++                    _tla_step_start, t_end, self.tla_snap_id, yielded_slot, &key_str,
++                );
++            }
+             return Some((&entry_ref.key, &entry_ref.value));
+         }
+     }
+@@ -2955,6 +3149,9 @@ impl<K, V, G> Clone for Iter<'_, K, V, G> {
+             i: self.i,
+             table: self.table,
+             guard: self.guard,
++            tla_snap_id: self.tla_snap_id,
++            tla_yielded: self.tla_yielded,
++            tla_done: self.tla_done,
+         }
+     }
+ }
