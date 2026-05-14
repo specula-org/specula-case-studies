@@ -1,0 +1,2557 @@
+diff --git a/src/backend/liveness.rs b/src/backend/liveness.rs
+index e2bc818..b2bea76 100644
+--- a/src/backend/liveness.rs
++++ b/src/backend/liveness.rs
+@@ -182,8 +182,40 @@ pub fn compute_live_intervals(func: &IrFunction) -> LivenessResult {
+     let block_loop_depth = compute_loop_depth(&successors, num_blocks);
+ 
+     // Phase 3: Backward dataflow to compute live-in/live-out per block.
++    // TLA+ trace: the AssignProgramPoints event is emitted *before* the
++    // dataflow begins so that the trace cursor sees call_points, def/use, and
++    // the per-block gen/kill sets finalized by Phase 1 + Phase 1b + Phase 1c.
++    // The spec action has no dependency on the GEP/F128 extensions — those
++    // refinements fold into blockGen without changing the action's contract.
++    if super::tla_trace::is_active() {
++        let mut computed_def = std::collections::BTreeMap::new();
++        let mut computed_last_use = std::collections::BTreeMap::new();
++        for (dense, &sparse) in value_ids.iter().enumerate() {
++            let d = ps.def_points[dense];
++            if d != u32::MAX { computed_def.insert(sparse, d); }
++            let u = ps.last_use_points[dense];
++            let effective = if u == u32::MAX { if d == u32::MAX { 0 } else { d } } else { u };
++            computed_last_use.insert(sparse, effective);
++        }
++        let mut block_gen_m = std::collections::BTreeMap::new();
++        let mut block_kill_m = std::collections::BTreeMap::new();
++        for b in 0..num_blocks {
++            let mut g: Vec<u32> = Vec::new();
++            ps.block_gen[b].for_each_set_bit(|i| g.push(value_ids[i]));
++            block_gen_m.insert(b, g);
++            let mut k: Vec<u32> = Vec::new();
++            ps.block_kill[b].for_each_set_bit(|i| k.push(value_ids[i]));
++            block_kill_m.insert(b, k);
++        }
++        super::tla_trace::emit_assign_program_points(
++            &ps.call_points, &computed_def, &computed_last_use,
++            &block_gen_m, &block_kill_m,
++        );
++    }
++
+     let (live_in, live_out) = run_backward_dataflow(
+-        num_blocks, num_values, &successors, &ps.block_gen, &ps.block_kill,
++        num_blocks, num_values, &value_ids,
++        &successors, &ps.block_gen, &ps.block_kill,
+     );
+ 
+     // Phase 4: Extend intervals for values that are live-in or live-out of blocks.
+@@ -199,9 +231,25 @@ pub fn compute_live_intervals(func: &IrFunction) -> LivenessResult {
+         &mut ps.last_use_points,
+     );
+ 
++    // TLA+ trace: ExtendIntervalsFromLiveness fires after BOTH Phase 4 and
++    // Phase 4b finish so that computedLastUse reflects returns-twice extension.
++    if super::tla_trace::is_active() {
++        let mut last_use_m = std::collections::BTreeMap::new();
++        for (dense, &sparse) in value_ids.iter().enumerate() {
++            let u = ps.last_use_points[dense];
++            let d = ps.def_points[dense];
++            let effective = if u == u32::MAX { if d == u32::MAX { 0 } else { d } } else { u };
++            last_use_m.insert(sparse, effective);
++        }
++        super::tla_trace::emit_extend_intervals(&last_use_m);
++    }
++
+     // Phase 5: Build and sort intervals.
+     let intervals = build_intervals(&value_ids, &ps.def_points, &ps.last_use_points);
+ 
++    // TLA+ trace: BuildIntervals is a pure phase-advance marker.
++    super::tla_trace::emit_build_intervals();
++
+     LivenessResult {
+         intervals,
+         call_points: ps.call_points,
+@@ -456,6 +504,7 @@ fn build_successor_lists(
+ fn run_backward_dataflow(
+     num_blocks: usize,
+     num_values: usize,
++    value_ids: &[u32],
+     successors: &[Vec<usize>],
+     block_gen: &[BitSet],
+     block_kill: &[BitSet],
+@@ -489,6 +538,30 @@ fn run_backward_dataflow(
+             );
+             changed |= in_changed;
+         }
++
++        // TLA+ trace: emit one DataflowIterStep per outer sweep, matching the
++        // spec's per-iteration granularity. `fixpoint_reached` is TRUE on the
++        // iteration where no block changed — the loop will exit next.
++        if super::tla_trace::is_active() {
++            let mut li = std::collections::BTreeMap::new();
++            let mut lo = std::collections::BTreeMap::new();
++            for b in 0..num_blocks {
++                let mut iset: Vec<u32> = Vec::new();
++                live_in[b].for_each_set_bit(|i| iset.push(value_ids[i]));
++                li.insert(b, iset);
++                let mut oset: Vec<u32> = Vec::new();
++                live_out[b].for_each_set_bit(|i| oset.push(value_ids[i]));
++                lo.insert(b, oset);
++            }
++            super::tla_trace::emit_dataflow_iter_step(iteration, &li, &lo, !changed);
++        }
++    }
++
++    // TLA+ trace: if we exited the loop because of the iteration cap while
++    // `changed` was still true, emit DataflowCapHit. This is the F3 smoking
++    // gun — the spec action has the same precondition.
++    if changed && iteration >= MAX_ITERATIONS {
++        super::tla_trace::emit_dataflow_cap_hit();
+     }
+ 
+     (live_in, live_out)
+diff --git a/src/backend/mod.rs b/src/backend/mod.rs
+index de4eb30..146c243 100644
+--- a/src/backend/mod.rs
++++ b/src/backend/mod.rs
+@@ -23,6 +23,11 @@ pub(crate) mod x86_common;  // Shared x86/i686 register names, condition codes,
+ pub(crate) mod liveness;     // Live interval computation
+ pub(crate) mod regalloc;     // Linear scan register allocator
+ 
++// TLA+ trace emission for spec validation (Phase 2.5 harness).
++pub(crate) mod tla_trace;
++#[cfg(test)]
++pub(crate) mod tla_trace_scenarios;
++
+ 
+ pub(crate) mod x86;
+ pub(crate) mod i686;
+diff --git a/src/backend/regalloc.rs b/src/backend/regalloc.rs
+index 574e1e8..985fe4a 100644
+--- a/src/backend/regalloc.rs
++++ b/src/backend/regalloc.rs
+@@ -260,9 +260,22 @@ pub fn allocate_registers(
+             reg_free_until[reg_idx] = interval.end + 1;
+             assignments.insert(interval.value_id, config.available_regs[reg_idx]);
+             used_regs_set.insert(config.available_regs[reg_idx].0);
++            // TLA+ trace: one Phase1Allocate event per successful assignment.
++            let used_vec: Vec<u8> = used_regs_set.iter().copied().collect();
++            super::tla_trace::emit_phase1_allocate(
++                interval.value_id,
++                config.available_regs[reg_idx].0,
++                reg_free_until[reg_idx],
++                &used_vec,
++                config.available_regs[reg_idx].0,
++            );
+         }
+     }
+ 
++    // TLA+ trace: Phase1Done marks the pass-to-pass boundary. Fires even when
++    // Phase 1 made no assignments (empty candidates).
++    super::tla_trace::emit_phase1_done();
++
+     let mut used_regs: Vec<PhysReg> = used_regs_set.iter().map(|&r| PhysReg(r)).collect();
+     used_regs.sort_by_key(|r| r.0);
+ 
+@@ -290,10 +303,21 @@ pub fn allocate_registers(
+             if let Some(reg_idx) = best {
+                 caller_free_until[reg_idx] = interval.end + 1;
+                 assignments.insert(interval.value_id, config.caller_saved_regs[reg_idx]);
++                // TLA+ trace: one Phase2Allocate event per successful assignment.
++                super::tla_trace::emit_phase2_allocate(
++                    interval.value_id,
++                    config.caller_saved_regs[reg_idx].0,
++                    caller_free_until[reg_idx],
++                    config.caller_saved_regs[reg_idx].0,
++                );
+             }
+         }
+     }
+ 
++    // TLA+ trace: Phase2Done fires regardless of whether the caller-saved pool
++    // was empty — mirrors the spec's pure phase-advance disjunct.
++    super::tla_trace::emit_phase2_done();
++
+     // Phase 3: Callee-saved spillover for non-call-spanning values.
+     //
+     // After Phases 1 and 2, there may be high-priority values in call-free loops
+@@ -309,6 +333,15 @@ pub fn allocate_registers(
+                 reg_free_until[reg_idx] = interval.end + 1;
+                 assignments.insert(interval.value_id, config.available_regs[reg_idx]);
+                 used_regs_set.insert(config.available_regs[reg_idx].0);
++                // TLA+ trace: one Phase3Allocate event per spillover assignment.
++                let used_vec: Vec<u8> = used_regs_set.iter().copied().collect();
++                super::tla_trace::emit_phase3_allocate(
++                    interval.value_id,
++                    config.available_regs[reg_idx].0,
++                    reg_free_until[reg_idx],
++                    &used_vec,
++                    config.available_regs[reg_idx].0,
++                );
+             }
+         }
+ 
+@@ -316,6 +349,9 @@ pub fn allocate_registers(
+         used_regs.sort_by_key(|r| r.0);
+     }
+ 
++    // TLA+ trace: Phase3Done advances the phase to PackSlots.
++    super::tla_trace::emit_phase3_done();
++
+     RegAllocResult {
+         assignments,
+         used_regs,
+diff --git a/src/backend/stack_layout/slot_assignment.rs b/src/backend/stack_layout/slot_assignment.rs
+index 2a1f6d1..f29aa72 100644
+--- a/src/backend/stack_layout/slot_assignment.rs
++++ b/src/backend/stack_layout/slot_assignment.rs
+@@ -679,6 +679,8 @@ pub(super) fn assign_tier2_liveness_packed_slots(
+     assign_slot: &impl Fn(i64, i64, i64) -> (i64, i64),
+ ) {
+     if multi_block_values.is_empty() {
++        // TLA+ trace: packing phase is trivially done — no multi-block values.
++        super::super::tla_trace::emit_pack_slots_done();
+         return;
+     }
+ 
+@@ -689,6 +691,8 @@ pub(super) fn assign_tier2_liveness_packed_slots(
+             state.value_locations.insert(mbv.dest_id, StackSlot(slot));
+             *non_local_space = new_space;
+         }
++        // TLA+ trace: packing phase ended (permanent-slot fallback path).
++        super::super::tla_trace::emit_pack_slots_done();
+         return;
+     }
+ 
+@@ -726,6 +730,9 @@ pub(super) fn assign_tier2_liveness_packed_slots(
+         state.value_locations.insert(dest_id, StackSlot(slot));
+         *non_local_space = new_space;
+     }
++
++    // TLA+ trace: PackSlotsDone advances the pipeline phase to "Done".
++    super::super::tla_trace::emit_pack_slots_done();
+ }
+ 
+ /// Pack values with known live intervals into shared stack slots using a min-heap.
+@@ -756,6 +763,12 @@ fn pack_values_into_slots(
+                 let slot_offset = slot_offsets[slot_idx];
+                 heap.push(Reverse((end, slot_idx)));
+                 state.value_locations.insert(dest_id, StackSlot(slot_offset));
++                // TLA+ trace: AssignSlot via the reuse branch. slotFreeUntil is
++                // the interval end pushed to the heap, matching the spec's
++                // `computedLastUse[v] + 1` semantics.
++                super::super::tla_trace::emit_assign_slot(
++                    dest_id, slot_offset, end.saturating_add(1),
++                );
+                 continue;
+             }
+         }
+@@ -765,6 +778,10 @@ fn pack_values_into_slots(
+         *non_local_space = new_space;
+         slot_offsets.push(slot);
+         heap.push(Reverse((end, slot_idx)));
++        // TLA+ trace: AssignSlot via the new-slot branch.
++        super::super::tla_trace::emit_assign_slot(
++            dest_id, slot, end.saturating_add(1),
++        );
+     }
+ }
+ 
+diff --git a/src/backend/tla_trace.rs b/src/backend/tla_trace.rs
+new file mode 100644
+index 0000000..ed04c49
+--- /dev/null
++++ b/src/backend/tla_trace.rs
+@@ -0,0 +1,440 @@
++//! TLA+ trace emission module — Phase 2.5 harness for the CCC regalloc /
++//! liveness spec. Writes one NDJSON event line per spec action to a
++//! thread-local trace file. No-op when the caller has not opened a file via
++//! `tla_trace::open(path)`.
++//!
++//! The trace format is Category A (sequential compiler pipeline), one linear
++//! cursor. Every line contains `"tag": "trace"` so that the Trace.tla
++//! ndJsonDeserialize filter picks it up.
++//!
++//! All JSON values are emitted by hand (no serde dependency) because the
++//! upstream `ccc` crate does not depend on serde and we do not want to drag in
++//! a new dependency for trace collection.
++
++#![allow(dead_code)]
++
++use std::cell::RefCell;
++use std::collections::BTreeMap;
++use std::fs::File;
++use std::io::{BufWriter, Write};
++use std::time::{SystemTime, UNIX_EPOCH};
++
++#[derive(Default)]
++struct Ctx {
++    writer: Option<BufWriter<File>>,
++    func_name: String,
++    seq: u64,
++}
++
++thread_local! {
++    static CTX: RefCell<Ctx> = RefCell::new(Ctx::default());
++}
++
++/// Open a fresh trace file for this thread.
++pub fn open(path: &str) {
++    let file = File::create(path).expect("tla_trace: failed to open trace file");
++    CTX.with(|c| {
++        let mut c = c.borrow_mut();
++        c.writer = Some(BufWriter::new(file));
++        c.seq = 0;
++    });
++}
++
++/// Close the trace file, flushing buffers.
++pub fn close() {
++    CTX.with(|c| {
++        let mut c = c.borrow_mut();
++        if let Some(mut w) = c.writer.take() {
++            let _ = w.flush();
++        }
++    });
++}
++
++/// Set the "func" field for all subsequent events.
++pub fn begin_function(name: &str) {
++    CTX.with(|c| c.borrow_mut().func_name = name.to_string());
++}
++
++/// Return whether a writer is active — instrumentation call sites can use
++/// this to skip expensive bitset decoding when tracing is off.
++pub fn is_active() -> bool {
++    CTX.with(|c| c.borrow().writer.is_some())
++}
++
++fn ts_ns() -> u128 {
++    SystemTime::now()
++        .duration_since(UNIX_EPOCH)
++        .map(|d| d.as_nanos())
++        .unwrap_or(0)
++}
++
++fn next_seq() -> u64 {
++    CTX.with(|c| {
++        let mut c = c.borrow_mut();
++        c.seq += 1;
++        c.seq
++    })
++}
++
++fn current_func() -> String {
++    CTX.with(|c| c.borrow().func_name.clone())
++}
++
++fn write_line(line: &str) {
++    CTX.with(|c| {
++        let mut c = c.borrow_mut();
++        if let Some(ref mut w) = c.writer {
++            let _ = w.write_all(line.as_bytes());
++            let _ = w.write_all(b"\n");
++        }
++    });
++}
++
++// ── JSON encoding helpers ───────────────────────────────────────────────────
++
++fn json_escape(s: &str) -> String {
++    let mut out = String::with_capacity(s.len() + 2);
++    out.push('"');
++    for ch in s.chars() {
++        match ch {
++            '"' => out.push_str("\\\""),
++            '\\' => out.push_str("\\\\"),
++            '\n' => out.push_str("\\n"),
++            '\r' => out.push_str("\\r"),
++            '\t' => out.push_str("\\t"),
++            c if (c as u32) < 0x20 => {
++                out.push_str(&format!("\\u{:04x}", c as u32));
++            }
++            c => out.push(c),
++        }
++    }
++    out.push('"');
++    out
++}
++
++fn fmt_u32_set(xs: &[u32]) -> String {
++    let mut sorted: Vec<u32> = xs.to_vec();
++    sorted.sort_unstable();
++    sorted.dedup();
++    let parts: Vec<String> = sorted.iter().map(|x| x.to_string()).collect();
++    format!("[{}]", parts.join(","))
++}
++
++fn fmt_u8_set(xs: &[u8]) -> String {
++    let mut sorted: Vec<u8> = xs.to_vec();
++    sorted.sort_unstable();
++    sorted.dedup();
++    let parts: Vec<String> = sorted.iter().map(|x| x.to_string()).collect();
++    format!("[{}]", parts.join(","))
++}
++
++fn fmt_map_u32_u32(m: &BTreeMap<u32, u32>) -> String {
++    let parts: Vec<String> = m
++        .iter()
++        .map(|(k, v)| format!("{}:{}", json_escape(&k.to_string()), v))
++        .collect();
++    format!("{{{}}}", parts.join(","))
++}
++
++fn fmt_map_u32_i64(m: &BTreeMap<u32, i64>) -> String {
++    let parts: Vec<String> = m
++        .iter()
++        .map(|(k, v)| format!("{}:{}", json_escape(&k.to_string()), v))
++        .collect();
++    format!("{{{}}}", parts.join(","))
++}
++
++fn fmt_map_usize_u32set(m: &BTreeMap<usize, Vec<u32>>) -> String {
++    let parts: Vec<String> = m
++        .iter()
++        .map(|(k, v)| format!("{}:{}", json_escape(&k.to_string()), fmt_u32_set(v)))
++        .collect();
++    format!("{{{}}}", parts.join(","))
++}
++
++fn fmt_map_u8_u32(m: &BTreeMap<u8, u32>) -> String {
++    let parts: Vec<String> = m
++        .iter()
++        .map(|(k, v)| format!("{}:{}", json_escape(&k.to_string()), v))
++        .collect();
++    format!("{{{}}}", parts.join(","))
++}
++
++// ── Config line (once per trace, before any events) ─────────────────────────
++
++pub struct FunctionConfig<'a> {
++    pub name: &'a str,
++    pub vals: &'a [u32],
++    pub points: &'a [u32],
++    pub blocks: &'a [u32],
++    pub func_end: u32,
++    pub max_iters: u32,
++    pub block_of_point: &'a BTreeMap<u32, u32>,
++    pub block_succs: &'a BTreeMap<u32, Vec<u32>>,
++    pub true_def: &'a BTreeMap<u32, u32>,
++    pub true_uses: &'a BTreeMap<u32, Vec<u32>>,
++    pub call_points: &'a [u32],
++    pub asm_points: &'a [u32],
++    pub asm_has_operands: &'a BTreeMap<u32, bool>,
++    pub asm_clobbers: &'a BTreeMap<u32, Vec<u8>>,
++    pub returns_twice_points: &'a [u32],
++    pub is_recognized_returns_twice: &'a BTreeMap<u32, bool>,
++    pub callee_saved_regs: &'a [u8],
++    pub caller_saved_regs: &'a [u8],
++    pub slots: &'a [u32],
++    pub priority: &'a BTreeMap<u32, u32>,
++}
++
++pub fn emit_config(cfg: &FunctionConfig) {
++    if !is_active() { return; }
++    let mut buf = String::new();
++    buf.push_str(&format!(
++        "{{\"tag\":\"config\",\"ts\":{},\"func\":{},\"config\":{{",
++        ts_ns(),
++        json_escape(cfg.name),
++    ));
++    buf.push_str(&format!("\"Vals\":{},", fmt_u32_set(cfg.vals)));
++    buf.push_str(&format!("\"Points\":{},", fmt_u32_set(cfg.points)));
++    buf.push_str(&format!("\"Blocks\":{},", fmt_u32_set(cfg.blocks)));
++    buf.push_str(&format!("\"FuncEnd\":{},", cfg.func_end));
++    buf.push_str(&format!("\"MaxIters\":{},", cfg.max_iters));
++    buf.push_str(&format!("\"BlockOfPoint\":{},", fmt_map_u32_u32(cfg.block_of_point)));
++    // BlockSuccs — object from block_id → list of successor block_ids.
++    let bs_parts: Vec<String> = cfg.block_succs.iter()
++        .map(|(k, v)| format!("{}:{}", json_escape(&k.to_string()), fmt_u32_set(v)))
++        .collect();
++    buf.push_str(&format!("\"BlockSuccs\":{{{}}},", bs_parts.join(",")));
++    buf.push_str(&format!("\"TrueDef\":{},", fmt_map_u32_u32(cfg.true_def)));
++    let tu_parts: Vec<String> = cfg.true_uses.iter()
++        .map(|(k, v)| format!("{}:{}", json_escape(&k.to_string()), fmt_u32_set(v)))
++        .collect();
++    buf.push_str(&format!("\"TrueUses\":{{{}}},", tu_parts.join(",")));
++    buf.push_str(&format!("\"CallPoints\":{},", fmt_u32_set(cfg.call_points)));
++    buf.push_str(&format!("\"AsmPoints\":{},", fmt_u32_set(cfg.asm_points)));
++    let aho_parts: Vec<String> = cfg.asm_has_operands.iter()
++        .map(|(k, v)| format!("{}:{}", json_escape(&k.to_string()), v))
++        .collect();
++    buf.push_str(&format!("\"AsmHasOperands\":{{{}}},", aho_parts.join(",")));
++    let ac_parts: Vec<String> = cfg.asm_clobbers.iter()
++        .map(|(k, v)| format!("{}:{}", json_escape(&k.to_string()), fmt_u8_set(v)))
++        .collect();
++    buf.push_str(&format!("\"AsmClobbers\":{{{}}},", ac_parts.join(",")));
++    buf.push_str(&format!("\"ReturnsTwicePoints\":{},", fmt_u32_set(cfg.returns_twice_points)));
++    let irt_parts: Vec<String> = cfg.is_recognized_returns_twice.iter()
++        .map(|(k, v)| format!("{}:{}", json_escape(&k.to_string()), v))
++        .collect();
++    buf.push_str(&format!("\"IsRecognizedReturnsTwice\":{{{}}},", irt_parts.join(",")));
++    buf.push_str(&format!("\"CalleeSavedRegs\":{},", fmt_u8_set(cfg.callee_saved_regs)));
++    buf.push_str(&format!("\"CallerSavedRegs\":{},", fmt_u8_set(cfg.caller_saved_regs)));
++    buf.push_str(&format!("\"Slots\":{},", fmt_u32_set(cfg.slots)));
++    buf.push_str(&format!("\"Priority\":{}", fmt_map_u32_u32(cfg.priority)));
++    buf.push_str("}}");
++    write_line(&buf);
++}
++
++// ── Event emitters (one per spec action) ────────────────────────────────────
++
++fn envelope_prefix(event: &str) -> String {
++    format!(
++        "{{\"tag\":\"trace\",\"ts\":{},\"seq\":{},\"func\":{},\"event\":{},",
++        ts_ns(),
++        next_seq(),
++        json_escape(&current_func()),
++        json_escape(event),
++    )
++}
++
++/// Section 2.1 — AssignProgramPoints.
++pub fn emit_assign_program_points(
++    recorded_call_points: &[u32],
++    computed_def: &BTreeMap<u32, u32>,
++    computed_last_use: &BTreeMap<u32, u32>,
++    block_gen: &BTreeMap<usize, Vec<u32>>,
++    block_kill: &BTreeMap<usize, Vec<u32>>,
++) {
++    if !is_active() { return; }
++    let mut buf = envelope_prefix("AssignProgramPoints");
++    buf.push_str("\"state\":{");
++    buf.push_str(&format!("\"phase\":\"Dataflow\","));
++    buf.push_str(&format!("\"recordedCallPoints\":{},", fmt_u32_set(recorded_call_points)));
++    buf.push_str(&format!("\"computedDef\":{},", fmt_map_u32_u32(computed_def)));
++    buf.push_str(&format!("\"computedLastUse\":{},", fmt_map_u32_u32(computed_last_use)));
++    buf.push_str(&format!("\"blockGen\":{},", fmt_map_usize_u32set(block_gen)));
++    buf.push_str(&format!("\"blockKill\":{}", fmt_map_usize_u32set(block_kill)));
++    buf.push_str("}}");
++    write_line(&buf);
++}
++
++/// Section 2.2 — DataflowIterStep (one per outer iteration).
++pub fn emit_dataflow_iter_step(
++    iter: u32,
++    live_in: &BTreeMap<usize, Vec<u32>>,
++    live_out: &BTreeMap<usize, Vec<u32>>,
++    fixpoint_reached: bool,
++) {
++    if !is_active() { return; }
++    let phase = if fixpoint_reached { "ExtendIntervals" } else { "Dataflow" };
++    let mut buf = envelope_prefix("DataflowIterStep");
++    buf.push_str("\"state\":{");
++    buf.push_str(&format!("\"phase\":{},", json_escape(phase)));
++    buf.push_str(&format!("\"iter\":{},", iter));
++    buf.push_str(&format!("\"liveIn\":{},", fmt_map_usize_u32set(live_in)));
++    buf.push_str(&format!("\"liveOut\":{},", fmt_map_usize_u32set(live_out)));
++    buf.push_str(&format!("\"fixpointReached\":{}", fixpoint_reached));
++    buf.push_str("}}");
++    write_line(&buf);
++}
++
++/// Section 2.3 — DataflowCapHit (emitted only when loop exited due to cap).
++pub fn emit_dataflow_cap_hit() {
++    if !is_active() { return; }
++    let mut buf = envelope_prefix("DataflowCapHit");
++    buf.push_str("\"state\":{");
++    buf.push_str("\"phase\":\"ExtendIntervals\",");
++    buf.push_str("\"fixpointReached\":false");
++    buf.push_str("}}");
++    write_line(&buf);
++}
++
++/// Section 2.4 — ExtendIntervalsFromLiveness.
++pub fn emit_extend_intervals(computed_last_use: &BTreeMap<u32, u32>) {
++    if !is_active() { return; }
++    let mut buf = envelope_prefix("ExtendIntervalsFromLiveness");
++    buf.push_str("\"state\":{");
++    buf.push_str(&format!("\"phase\":\"BuildIntervals\","));
++    buf.push_str(&format!("\"computedLastUse\":{}", fmt_map_u32_u32(computed_last_use)));
++    buf.push_str("}}");
++    write_line(&buf);
++}
++
++/// Section 2.5 — BuildIntervals (pure phase marker).
++pub fn emit_build_intervals() {
++    if !is_active() { return; }
++    let mut buf = envelope_prefix("BuildIntervals");
++    buf.push_str("\"state\":{\"phase\":\"Phase1\"}}");
++    write_line(&buf);
++}
++
++/// Section 2.6 — Phase1Allocate (one per successful assignment).
++pub fn emit_phase1_allocate(
++    value: u32,
++    reg: u8,
++    reg_free_until_at_r: u32,
++    used_regs: &[u8],
++    assignment_v: u8,
++) {
++    if !is_active() { return; }
++    let mut buf = envelope_prefix("Phase1Allocate");
++    buf.push_str(&format!("\"value\":{},\"reg\":{},", value, reg));
++    buf.push_str("\"state\":{");
++    buf.push_str(&format!("\"regFreeUntilAtR\":{},", reg_free_until_at_r));
++    buf.push_str(&format!("\"usedRegs\":{},", fmt_u8_set(used_regs)));
++    buf.push_str(&format!("\"assignmentV\":{}", assignment_v));
++    buf.push_str("}}");
++    write_line(&buf);
++}
++
++/// Section 2.7 — Phase1Done.
++pub fn emit_phase1_done() {
++    if !is_active() { return; }
++    let mut buf = envelope_prefix("Phase1Done");
++    buf.push_str("\"state\":{\"phase\":\"Phase2\"}}");
++    write_line(&buf);
++}
++
++/// Section 2.8 — Phase2Allocate.
++pub fn emit_phase2_allocate(
++    value: u32,
++    reg: u8,
++    caller_free_until_at_r: u32,
++    assignment_v: u8,
++) {
++    if !is_active() { return; }
++    let mut buf = envelope_prefix("Phase2Allocate");
++    buf.push_str(&format!("\"value\":{},\"reg\":{},", value, reg));
++    buf.push_str("\"state\":{");
++    buf.push_str(&format!("\"callerFreeUntilAtR\":{},", caller_free_until_at_r));
++    buf.push_str(&format!("\"assignmentV\":{}", assignment_v));
++    buf.push_str("}}");
++    write_line(&buf);
++}
++
++/// Section 2.9 — Phase2Done.
++pub fn emit_phase2_done() {
++    if !is_active() { return; }
++    let mut buf = envelope_prefix("Phase2Done");
++    buf.push_str("\"state\":{\"phase\":\"Phase3\"}}");
++    write_line(&buf);
++}
++
++/// Section 2.10 — Phase3Allocate.
++pub fn emit_phase3_allocate(
++    value: u32,
++    reg: u8,
++    reg_free_until_at_r: u32,
++    used_regs: &[u8],
++    assignment_v: u8,
++) {
++    if !is_active() { return; }
++    let mut buf = envelope_prefix("Phase3Allocate");
++    buf.push_str(&format!("\"value\":{},\"reg\":{},", value, reg));
++    buf.push_str("\"state\":{");
++    buf.push_str(&format!("\"regFreeUntilAtR\":{},", reg_free_until_at_r));
++    buf.push_str(&format!("\"usedRegs\":{},", fmt_u8_set(used_regs)));
++    buf.push_str(&format!("\"assignmentV\":{}", assignment_v));
++    buf.push_str("}}");
++    write_line(&buf);
++}
++
++/// Section 2.11 — Phase3Done.
++pub fn emit_phase3_done() {
++    if !is_active() { return; }
++    let mut buf = envelope_prefix("Phase3Done");
++    buf.push_str("\"state\":{\"phase\":\"PackSlots\"}}");
++    write_line(&buf);
++}
++
++/// Section 2.12 — AssignSlot.
++pub fn emit_assign_slot(value: u32, slot: i64, slot_free_until_at_s: u32) {
++    if !is_active() { return; }
++    let mut buf = envelope_prefix("AssignSlot");
++    buf.push_str(&format!("\"value\":{},\"slot\":{},", value, slot));
++    buf.push_str("\"state\":{");
++    buf.push_str(&format!("\"slotFreeUntilAtS\":{},", slot_free_until_at_s));
++    buf.push_str(&format!("\"slotOfV\":{}", slot));
++    buf.push_str("}}");
++    write_line(&buf);
++}
++
++/// Section 2.13 — PackSlotsDone.
++pub fn emit_pack_slots_done() {
++    if !is_active() { return; }
++    let mut buf = envelope_prefix("PackSlotsDone");
++    buf.push_str("\"state\":{\"phase\":\"Done\"}}");
++    write_line(&buf);
++}
++
++// ── Re-exported helpers for instrumentation points ───────────────────────────
++
++/// Convert a slice of u32 to a BTreeMap keyed by dense index, used to decode
++/// dense BitSet contents to sparse value ids for instrumentation emit calls.
++pub fn dense_vec_to_sparse_set(dense: &[usize], dense_to_sparse: &[u32]) -> Vec<u32> {
++    dense.iter().map(|&d| dense_to_sparse[d]).collect()
++}
++
++/// Helper used by instrumentation: convert a u32-indexed Vec to a BTreeMap
++/// keyed by sparse value id, skipping u32::MAX entries (not defined yet).
++pub fn dense_u32_to_sparse_map(
++    dense: &[u32],
++    dense_to_sparse: &[u32],
++) -> BTreeMap<u32, u32> {
++    let mut out = BTreeMap::new();
++    for (d, &sparse) in dense_to_sparse.iter().enumerate() {
++        if d >= dense.len() { break; }
++        let v = dense[d];
++        if v != u32::MAX {
++            out.insert(sparse, v);
++        }
++    }
++    out
++}
+diff --git a/src/backend/tla_trace_scenarios.rs b/src/backend/tla_trace_scenarios.rs
+new file mode 100644
+index 0000000..ce56f17
+--- /dev/null
++++ b/src/backend/tla_trace_scenarios.rs
+@@ -0,0 +1,758 @@
++//! Trace-generation scenarios for the TLA+ regalloc / liveness spec.
++//!
++//! Each `#[test]` drives the **real** compiler pipeline (allocate_registers +
++//! calculate_stack_space_common) on a hand-constructed `IrFunction` and writes
++//! one NDJSON trace to the directory named by the `TLA_TRACE_DIR` environment
++//! variable. The bundled `run.sh` sets this variable so the traces land under
++//! `.specula-output/traces/`.
++//!
++//! Design points:
++//! 1. Each scenario owns its own trace file, keyed by scenario name. The
++//!    emission module uses thread-local writers, so parallel `cargo test` is
++//!    safe.
++//! 2. Every scenario also emits a `config` line as the first JSON line.
++//!    Phase 3 can extract this block into the TLC CONSTANTS configuration.
++//! 3. Where possible, scenarios use distinct bug surfaces (F1 asm-no-operand
++//!    drop, F3 dataflow cap, ordinary straight-line, multi-block dataflow).
++
++#![cfg(test)]
++
++use std::collections::BTreeMap;
++use std::path::PathBuf;
++
++use crate::common::types::IrType;
++use crate::ir::reexports::{
++    BasicBlock, BlockId, CallInfo, Instruction, IrBinOp, IrConst, IrFunction, Operand, Terminator,
++    Value,
++};
++
++use super::regalloc::{PhysReg, RegAllocConfig};
++use super::tla_trace;
++
++// ── Helpers ──────────────────────────────────────────────────────────────────
++
++fn trace_path(name: &str) -> PathBuf {
++    let dir = std::env::var("TLA_TRACE_DIR").unwrap_or_else(|_| {
++        let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
++        p.push("target");
++        p.push("tla_traces");
++        p.to_string_lossy().into_owned()
++    });
++    let mut p = PathBuf::from(dir);
++    std::fs::create_dir_all(&p).expect("create trace dir");
++    p.push(format!("{}.ndjson", name));
++    p
++}
++
++/// Callee-saved register pool used by Phase 1 and Phase 3 (x86-64 IDs).
++fn callee_saved() -> Vec<PhysReg> {
++    vec![PhysReg(1), PhysReg(2), PhysReg(3), PhysReg(4), PhysReg(5)]
++}
++
++/// Caller-saved register pool used by Phase 2 (x86-64 IDs).
++fn caller_saved() -> Vec<PhysReg> {
++    vec![
++        PhysReg(10), PhysReg(11), PhysReg(12),
++        PhysReg(13), PhysReg(14), PhysReg(15),
++    ]
++}
++
++/// Simplified x86-style slot assignment closure.
++fn x86_assign_slot() -> impl Fn(i64, i64, i64) -> (i64, i64) {
++    |space, alloc_size, align| {
++        let effective_align = if align > 0 { align.max(8) } else { 8 };
++        let alloc = (alloc_size + 7) & !7;
++        let new_space = ((space + alloc + effective_align - 1) / effective_align) * effective_align;
++        (-new_space, new_space)
++    }
++}
++
++/// Drive allocate_registers + calculate_stack_space_common end-to-end for one
++/// scenario. Caller must have already called `tla_trace::open` / emitted the
++/// config line.
++fn drive_pipeline(func: &IrFunction) {
++    let config = RegAllocConfig {
++        available_regs: callee_saved(),
++        caller_saved_regs: caller_saved(),
++        allow_inline_asm_regalloc: false,
++    };
++    let alloc_result = super::regalloc::allocate_registers(func, &config);
++    let reg_assigned = alloc_result.assignments.clone();
++    let cached_liveness = alloc_result.liveness;
++
++    let mut state = super::state::CodegenState::new();
++    let _ = super::stack_layout::calculate_stack_space_common(
++        &mut state,
++        func,
++        0,
++        x86_assign_slot(),
++        &reg_assigned,
++        &callee_saved(),
++        cached_liveness,
++        false,
++    );
++}
++
++/// Emit a configuration JSON line at the top of the trace. The body is passed
++/// as a ready-formatted JSON object; this function simply wraps it in the
++/// outer envelope used by Trace.tla.
++fn emit_scenario_config(
++    name: &str,
++    vals: &[u32],
++    points: &[u32],
++    blocks: &[u32],
++    func_end: u32,
++    block_of_point: &BTreeMap<u32, u32>,
++    block_succs: &BTreeMap<u32, Vec<u32>>,
++    true_def: &BTreeMap<u32, u32>,
++    true_uses: &BTreeMap<u32, Vec<u32>>,
++    call_points: &[u32],
++    asm_points: &[u32],
++    asm_has_operands: &BTreeMap<u32, bool>,
++    asm_clobbers: &BTreeMap<u32, Vec<u8>>,
++    returns_twice_points: &[u32],
++    is_recognized_returns_twice: &BTreeMap<u32, bool>,
++    slots: &[u32],
++    priority: &BTreeMap<u32, u32>,
++) {
++    let cs = callee_saved();
++    let cr = caller_saved();
++    let cs_ids: Vec<u8> = cs.iter().map(|r| r.0).collect();
++    let cr_ids: Vec<u8> = cr.iter().map(|r| r.0).collect();
++    let cfg = tla_trace::FunctionConfig {
++        name,
++        vals,
++        points,
++        blocks,
++        func_end,
++        max_iters: 50,
++        block_of_point,
++        block_succs,
++        true_def,
++        true_uses,
++        call_points,
++        asm_points,
++        asm_has_operands,
++        asm_clobbers,
++        returns_twice_points,
++        is_recognized_returns_twice,
++        callee_saved_regs: &cs_ids,
++        caller_saved_regs: &cr_ids,
++        slots,
++        priority,
++    };
++    tla_trace::emit_config(&cfg);
++}
++
++fn call_info(dest: Option<Value>, args: Vec<Operand>, arg_types: Vec<IrType>, ret: IrType) -> CallInfo {
++    let n = args.len();
++    CallInfo {
++        dest,
++        args,
++        arg_types,
++        return_type: ret,
++        is_variadic: false,
++        num_fixed_args: n,
++        struct_arg_sizes: vec![None; n],
++        struct_arg_aligns: vec![None; n],
++        struct_arg_classes: (0..n).map(|_| Vec::new()).collect(),
++        struct_arg_riscv_float_classes: vec![None; n],
++        is_sret: false,
++        is_fastcall: false,
++        ret_eightbyte_classes: Vec::new(),
++    }
++}
++
++// ── Scenario 1: straight-line, no calls ──────────────────────────────────────
++//
++// Single block, two binops, one return. Exercises:
++// - AssignProgramPoints (no call_points, no asm_points)
++// - DataflowIterStep — converges in 1-2 iterations
++// - ExtendIntervalsFromLiveness, BuildIntervals
++// - Phase1 empty, Phase2 allocates %0 and %1 to caller-saved
++// - Phase3 empty, PackSlots empty
++#[test]
++fn scenario_straight_line_sum() {
++    let mut func = IrFunction::new("straight_line_sum".into(), IrType::I32, vec![], false);
++    func.blocks.push(BasicBlock {
++        label: BlockId(0),
++        instructions: vec![
++            Instruction::BinOp {
++                dest: Value(1), op: IrBinOp::Add,
++                lhs: Operand::Const(IrConst::I32(10)),
++                rhs: Operand::Const(IrConst::I32(20)),
++                ty: IrType::I32,
++            },
++            Instruction::BinOp {
++                dest: Value(2), op: IrBinOp::Add,
++                lhs: Operand::Value(Value(1)),
++                rhs: Operand::Const(IrConst::I32(30)),
++                ty: IrType::I32,
++            },
++        ],
++        terminator: Terminator::Return(Some(Operand::Value(Value(2)))),
++        source_spans: Vec::new(),
++    });
++    func.next_value_id = 3;
++
++    let path = trace_path("straight_line_sum");
++    tla_trace::open(path.to_str().unwrap());
++    tla_trace::begin_function("straight_line_sum");
++
++    let vals = [1u32, 2];
++    let points = [0u32, 1, 2];
++    let blocks = [0u32];
++    let func_end = 3;
++    let block_of_point: BTreeMap<u32, u32> =
++        [(0, 0), (1, 0), (2, 0)].iter().cloned().collect();
++    let block_succs: BTreeMap<u32, Vec<u32>> = [(0, vec![])].iter().cloned().collect();
++    let true_def: BTreeMap<u32, u32> = [(1, 0), (2, 1)].iter().cloned().collect();
++    let true_uses: BTreeMap<u32, Vec<u32>> = [(1, vec![1]), (2, vec![2])].iter().cloned().collect();
++    let empty_asm_bool: BTreeMap<u32, bool> = BTreeMap::new();
++    let empty_asm_clb: BTreeMap<u32, Vec<u8>> = BTreeMap::new();
++    let empty_irt: BTreeMap<u32, bool> = BTreeMap::new();
++    let priority: BTreeMap<u32, u32> = [(1, 1), (2, 1)].iter().cloned().collect();
++
++    emit_scenario_config(
++        "straight_line_sum",
++        &vals, &points, &blocks, func_end,
++        &block_of_point, &block_succs, &true_def, &true_uses,
++        &[], &[], &empty_asm_bool, &empty_asm_clb,
++        &[], &empty_irt,
++        &[100, 104], &priority,
++    );
++
++    drive_pipeline(&func);
++    tla_trace::close();
++}
++
++// ── Scenario 2: value live across a call ─────────────────────────────────────
++//
++// Exercises Phase 1 callee-saved allocation (value live across a call point).
++#[test]
++fn scenario_value_across_call() {
++    let mut func = IrFunction::new("value_across_call".into(), IrType::I32, vec![], false);
++    func.blocks.push(BasicBlock {
++        label: BlockId(0),
++        instructions: vec![
++            Instruction::BinOp {
++                dest: Value(1), op: IrBinOp::Add,
++                lhs: Operand::Const(IrConst::I32(7)),
++                rhs: Operand::Const(IrConst::I32(13)),
++                ty: IrType::I32,
++            },
++            Instruction::Call {
++                func: "helper".to_string(),
++                info: call_info(None, vec![], vec![], IrType::Void),
++            },
++            Instruction::BinOp {
++                dest: Value(2), op: IrBinOp::Add,
++                lhs: Operand::Value(Value(1)),
++                rhs: Operand::Const(IrConst::I32(1)),
++                ty: IrType::I32,
++            },
++        ],
++        terminator: Terminator::Return(Some(Operand::Value(Value(2)))),
++        source_spans: Vec::new(),
++    });
++    func.next_value_id = 3;
++
++    let path = trace_path("value_across_call");
++    tla_trace::open(path.to_str().unwrap());
++    tla_trace::begin_function("value_across_call");
++
++    // Points: 0 = BinOp(%1), 1 = Call, 2 = BinOp(%2), block_end = 3
++    let vals = [1u32, 2];
++    let points = [0u32, 1, 2];
++    let blocks = [0u32];
++    let func_end = 3;
++    let block_of_point: BTreeMap<u32, u32> =
++        [(0, 0), (1, 0), (2, 0)].iter().cloned().collect();
++    let block_succs: BTreeMap<u32, Vec<u32>> = [(0, vec![])].iter().cloned().collect();
++    let true_def: BTreeMap<u32, u32> = [(1, 0), (2, 2)].iter().cloned().collect();
++    let true_uses: BTreeMap<u32, Vec<u32>> = [(1, vec![2]), (2, vec![2])].iter().cloned().collect();
++    let empty_asm_bool: BTreeMap<u32, bool> = BTreeMap::new();
++    let empty_asm_clb: BTreeMap<u32, Vec<u8>> = BTreeMap::new();
++    let empty_irt: BTreeMap<u32, bool> = BTreeMap::new();
++    let priority: BTreeMap<u32, u32> = [(1, 2), (2, 1)].iter().cloned().collect();
++
++    emit_scenario_config(
++        "value_across_call",
++        &vals, &points, &blocks, func_end,
++        &block_of_point, &block_succs, &true_def, &true_uses,
++        &[1],            // CallPoints — one real call at point 1
++        &[],
++        &empty_asm_bool, &empty_asm_clb,
++        &[], &empty_irt,
++        &[100, 104], &priority,
++    );
++
++    drive_pipeline(&func);
++    tla_trace::close();
++}
++
++// ── Scenario 3: two-block control flow (branch + join) ───────────────────────
++//
++// Exercises multi-block dataflow with a cond-branch and join. Values are
++// defined in block 0 and used in blocks 0 and 1 — Phase 4 must extend
++// intervals through live-in/live-out.
++#[test]
++fn scenario_two_block_branch() {
++    let mut func = IrFunction::new("two_block_branch".into(), IrType::I32, vec![], false);
++    // Block 0 — compute %1, cond-branch on %2.
++    func.blocks.push(BasicBlock {
++        label: BlockId(0),
++        instructions: vec![
++            Instruction::BinOp {
++                dest: Value(1), op: IrBinOp::Add,
++                lhs: Operand::Const(IrConst::I32(1)),
++                rhs: Operand::Const(IrConst::I32(2)),
++                ty: IrType::I32,
++            },
++            Instruction::BinOp {
++                dest: Value(2), op: IrBinOp::Add,
++                lhs: Operand::Value(Value(1)),
++                rhs: Operand::Const(IrConst::I32(3)),
++                ty: IrType::I32,
++            },
++        ],
++        terminator: Terminator::CondBranch {
++            cond: Operand::Value(Value(2)),
++            true_label: BlockId(1),
++            false_label: BlockId(2),
++        },
++        source_spans: Vec::new(),
++    });
++    // Block 1 — use %1, return.
++    func.blocks.push(BasicBlock {
++        label: BlockId(1),
++        instructions: vec![
++            Instruction::BinOp {
++                dest: Value(3), op: IrBinOp::Add,
++                lhs: Operand::Value(Value(1)),
++                rhs: Operand::Const(IrConst::I32(10)),
++                ty: IrType::I32,
++            },
++        ],
++        terminator: Terminator::Return(Some(Operand::Value(Value(3)))),
++        source_spans: Vec::new(),
++    });
++    // Block 2 — return %2 directly.
++    func.blocks.push(BasicBlock {
++        label: BlockId(2),
++        instructions: vec![],
++        terminator: Terminator::Return(Some(Operand::Value(Value(2)))),
++        source_spans: Vec::new(),
++    });
++    func.next_value_id = 4;
++
++    let path = trace_path("two_block_branch");
++    tla_trace::open(path.to_str().unwrap());
++    tla_trace::begin_function("two_block_branch");
++
++    // Points: 0 = %1, 1 = %2, 2 = block 0 end, 3 = %3, 4 = block 1 end,
++    //         5 = block 2 empty end.
++    let vals = [1u32, 2, 3];
++    let points = [0u32, 1, 2, 3, 4, 5];
++    let blocks = [0u32, 1, 2];
++    let func_end = 6;
++    let block_of_point: BTreeMap<u32, u32> =
++        [(0, 0), (1, 0), (2, 0), (3, 1), (4, 1), (5, 2)].iter().cloned().collect();
++    let block_succs: BTreeMap<u32, Vec<u32>> =
++        [(0, vec![1, 2]), (1, vec![]), (2, vec![])].iter().cloned().collect();
++    let true_def: BTreeMap<u32, u32> = [(1, 0), (2, 1), (3, 3)].iter().cloned().collect();
++    let true_uses: BTreeMap<u32, Vec<u32>> =
++        [(1, vec![1, 3]), (2, vec![2, 5]), (3, vec![4])]
++            .iter().cloned().collect();
++    let empty_asm_bool: BTreeMap<u32, bool> = BTreeMap::new();
++    let empty_asm_clb: BTreeMap<u32, Vec<u8>> = BTreeMap::new();
++    let empty_irt: BTreeMap<u32, bool> = BTreeMap::new();
++    let priority: BTreeMap<u32, u32> = [(1, 2), (2, 2), (3, 1)].iter().cloned().collect();
++
++    emit_scenario_config(
++        "two_block_branch",
++        &vals, &points, &blocks, func_end,
++        &block_of_point, &block_succs, &true_def, &true_uses,
++        &[], &[], &empty_asm_bool, &empty_asm_clb,
++        &[], &empty_irt,
++        &[100, 104, 108], &priority,
++    );
++
++    drive_pipeline(&func);
++    tla_trace::close();
++}
++
++// ── Scenario 4: empty inline-asm barrier (F1 surface) ────────────────────────
++//
++// Uses an inline asm with empty inputs/outputs and a caller-saved clobber
++// ("r11" → PhysReg(10)). The implementation filters this point out of
++// `call_points` (liveness.rs:316-322), so the trace's `recordedCallPoints`
++// will NOT list the asm point. The scenario's config declares the *ground-
++// truth* clobber so Phase 3's `CallerSavedDeadAcrossAsmClobber` invariant
++// can fire.
++#[test]
++fn scenario_asm_no_operands_f1() {
++    let mut func = IrFunction::new("asm_no_operands_f1".into(), IrType::I32, vec![], false);
++    func.blocks.push(BasicBlock {
++        label: BlockId(0),
++        instructions: vec![
++            Instruction::BinOp {
++                dest: Value(1), op: IrBinOp::Add,
++                lhs: Operand::Const(IrConst::I32(100)),
++                rhs: Operand::Const(IrConst::I32(200)),
++                ty: IrType::I32,
++            },
++            // Empty inline asm barrier ("clobbers r11 but reports no operands")
++            // — this is the F1 surface. The liveness pass drops it from
++            // recordedCallPoints because outputs.is_empty() && inputs.is_empty().
++            Instruction::InlineAsm {
++                template: "".to_string(),
++                outputs: vec![],
++                inputs: vec![],
++                clobbers: vec!["r11".to_string(), "memory".to_string()],
++                operand_types: vec![],
++                goto_labels: vec![],
++                input_symbols: vec![],
++                seg_overrides: vec![],
++            },
++            Instruction::BinOp {
++                dest: Value(2), op: IrBinOp::Add,
++                lhs: Operand::Value(Value(1)),
++                rhs: Operand::Const(IrConst::I32(1)),
++                ty: IrType::I32,
++            },
++        ],
++        terminator: Terminator::Return(Some(Operand::Value(Value(2)))),
++        source_spans: Vec::new(),
++    });
++    func.next_value_id = 3;
++
++    let path = trace_path("asm_no_operands_f1");
++    tla_trace::open(path.to_str().unwrap());
++    tla_trace::begin_function("asm_no_operands_f1");
++
++    let vals = [1u32, 2];
++    let points = [0u32, 1, 2];
++    let blocks = [0u32];
++    let func_end = 3;
++    let block_of_point: BTreeMap<u32, u32> =
++        [(0, 0), (1, 0), (2, 0)].iter().cloned().collect();
++    let block_succs: BTreeMap<u32, Vec<u32>> = [(0, vec![])].iter().cloned().collect();
++    let true_def: BTreeMap<u32, u32> = [(1, 0), (2, 2)].iter().cloned().collect();
++    // %1 is used at point 2 (in the BinOp) — it's live across the asm at 1.
++    let true_uses: BTreeMap<u32, Vec<u32>> = [(1, vec![2]), (2, vec![2])].iter().cloned().collect();
++    let asm_points = [1u32];
++    let asm_has_operands: BTreeMap<u32, bool> = [(1u32, false)].iter().cloned().collect();
++    // Ground-truth clobber set includes r11 (caller-saved, id 10).
++    let asm_clobbers: BTreeMap<u32, Vec<u8>> = [(1u32, vec![10u8])].iter().cloned().collect();
++    let empty_irt: BTreeMap<u32, bool> = BTreeMap::new();
++    let priority: BTreeMap<u32, u32> = [(1, 2), (2, 1)].iter().cloned().collect();
++
++    emit_scenario_config(
++        "asm_no_operands_f1",
++        &vals, &points, &blocks, func_end,
++        &block_of_point, &block_succs, &true_def, &true_uses,
++        &[],              // CallPoints — ground truth: no *real* calls
++        &asm_points,
++        &asm_has_operands, &asm_clobbers,
++        &[], &empty_irt,
++        &[100, 104], &priority,
++    );
++
++    drive_pipeline(&func);
++    tla_trace::close();
++}
++
++// ── Scenario 5: f32 multi-block values force Tier-2 slot packing ─────────────
++//
++// f32 values are non-GPR and therefore never register-assigned. Several f32
++// values defined in block 0 and used in block 1 flow into Tier-2 packing,
++// producing `AssignSlot` events. Exercises the slot-reuse path in
++// slot_assignment.rs:752-760 (F4 bug surface).
++#[test]
++fn scenario_slot_packing_floats() {
++    let mut func = IrFunction::new("slot_packing_floats".into(), IrType::F32, vec![], false);
++    func.blocks.push(BasicBlock {
++        label: BlockId(0),
++        instructions: vec![
++            Instruction::BinOp {
++                dest: Value(1), op: IrBinOp::Add,
++                lhs: Operand::Const(IrConst::F32(1.0)),
++                rhs: Operand::Const(IrConst::F32(2.0)),
++                ty: IrType::F32,
++            },
++            Instruction::BinOp {
++                dest: Value(2), op: IrBinOp::Add,
++                lhs: Operand::Const(IrConst::F32(3.0)),
++                rhs: Operand::Const(IrConst::F32(4.0)),
++                ty: IrType::F32,
++            },
++            Instruction::BinOp {
++                dest: Value(3), op: IrBinOp::Add,
++                lhs: Operand::Const(IrConst::F32(5.0)),
++                rhs: Operand::Const(IrConst::F32(6.0)),
++                ty: IrType::F32,
++            },
++            Instruction::BinOp {
++                dest: Value(4), op: IrBinOp::Add,
++                lhs: Operand::Const(IrConst::F32(7.0)),
++                rhs: Operand::Const(IrConst::F32(8.0)),
++                ty: IrType::F32,
++            },
++        ],
++        terminator: Terminator::Branch(BlockId(1)),
++        source_spans: Vec::new(),
++    });
++    func.blocks.push(BasicBlock {
++        label: BlockId(1),
++        instructions: vec![
++            Instruction::BinOp {
++                dest: Value(5), op: IrBinOp::Add,
++                lhs: Operand::Value(Value(1)),
++                rhs: Operand::Value(Value(2)),
++                ty: IrType::F32,
++            },
++            Instruction::BinOp {
++                dest: Value(6), op: IrBinOp::Add,
++                lhs: Operand::Value(Value(3)),
++                rhs: Operand::Value(Value(4)),
++                ty: IrType::F32,
++            },
++            Instruction::BinOp {
++                dest: Value(7), op: IrBinOp::Add,
++                lhs: Operand::Value(Value(5)),
++                rhs: Operand::Value(Value(6)),
++                ty: IrType::F32,
++            },
++        ],
++        terminator: Terminator::Return(Some(Operand::Value(Value(7)))),
++        source_spans: Vec::new(),
++    });
++    func.next_value_id = 8;
++
++    let path = trace_path("slot_packing_floats");
++    tla_trace::open(path.to_str().unwrap());
++    tla_trace::begin_function("slot_packing_floats");
++
++    let vals = [1u32, 2, 3, 4, 5, 6, 7];
++    let points = [0u32, 1, 2, 3, 4, 5, 6, 7, 8];
++    let blocks = [0u32, 1];
++    let func_end = 9;
++    let block_of_point: BTreeMap<u32, u32> =
++        [(0, 0), (1, 0), (2, 0), (3, 0), (4, 0),
++         (5, 1), (6, 1), (7, 1), (8, 1)].iter().cloned().collect();
++    let block_succs: BTreeMap<u32, Vec<u32>> =
++        [(0, vec![1]), (1, vec![])].iter().cloned().collect();
++    let true_def: BTreeMap<u32, u32> =
++        [(1, 0), (2, 1), (3, 2), (4, 3), (5, 5), (6, 6), (7, 7)]
++            .iter().cloned().collect();
++    let true_uses: BTreeMap<u32, Vec<u32>> =
++        [(1, vec![5]), (2, vec![5]), (3, vec![6]), (4, vec![6]),
++         (5, vec![7]), (6, vec![7]), (7, vec![8])]
++            .iter().cloned().collect();
++    let empty_asm_bool: BTreeMap<u32, bool> = BTreeMap::new();
++    let empty_asm_clb: BTreeMap<u32, Vec<u8>> = BTreeMap::new();
++    let empty_irt: BTreeMap<u32, bool> = BTreeMap::new();
++    let priority: BTreeMap<u32, u32> =
++        [(1, 1), (2, 1), (3, 1), (4, 1), (5, 1), (6, 1), (7, 1)]
++            .iter().cloned().collect();
++
++    emit_scenario_config(
++        "slot_packing_floats",
++        &vals, &points, &blocks, func_end,
++        &block_of_point, &block_succs, &true_def, &true_uses,
++        &[], &[], &empty_asm_bool, &empty_asm_clb,
++        &[], &empty_irt,
++        &[100, 104, 108, 112, 116, 120, 124], &priority,
++    );
++
++    drive_pipeline(&func);
++    tla_trace::close();
++}
++
++// ── Scenario 6: simple loop (multi-iteration dataflow) ───────────────────────
++//
++// A back-edge forces dataflow to iterate more than once and produces a
++// meaningful sequence of `DataflowIterStep` events.
++#[test]
++fn scenario_loop_fixpoint() {
++    let mut func = IrFunction::new("loop_fixpoint".into(), IrType::I32, vec![], false);
++    // Block 0 (entry): define %1, jmp to header.
++    func.blocks.push(BasicBlock {
++        label: BlockId(0),
++        instructions: vec![
++            Instruction::BinOp {
++                dest: Value(1), op: IrBinOp::Add,
++                lhs: Operand::Const(IrConst::I32(0)),
++                rhs: Operand::Const(IrConst::I32(0)),
++                ty: IrType::I32,
++            },
++        ],
++        terminator: Terminator::Branch(BlockId(1)),
++        source_spans: Vec::new(),
++    });
++    // Block 1 (header): cond-branch on %1 — exits or continues.
++    func.blocks.push(BasicBlock {
++        label: BlockId(1),
++        instructions: vec![
++            Instruction::BinOp {
++                dest: Value(2), op: IrBinOp::Add,
++                lhs: Operand::Value(Value(1)),
++                rhs: Operand::Const(IrConst::I32(1)),
++                ty: IrType::I32,
++            },
++        ],
++        terminator: Terminator::CondBranch {
++            cond: Operand::Value(Value(2)),
++            true_label: BlockId(2),
++            false_label: BlockId(3),
++        },
++        source_spans: Vec::new(),
++    });
++    // Block 2 (body): back-edge to header.
++    func.blocks.push(BasicBlock {
++        label: BlockId(2),
++        instructions: vec![],
++        terminator: Terminator::Branch(BlockId(1)),
++        source_spans: Vec::new(),
++    });
++    // Block 3 (exit): return %2.
++    func.blocks.push(BasicBlock {
++        label: BlockId(3),
++        instructions: vec![],
++        terminator: Terminator::Return(Some(Operand::Value(Value(2)))),
++        source_spans: Vec::new(),
++    });
++    func.next_value_id = 3;
++
++    let path = trace_path("loop_fixpoint");
++    tla_trace::open(path.to_str().unwrap());
++    tla_trace::begin_function("loop_fixpoint");
++
++    // Points layout: 0=%1 block 0 inst, 1=block0 end, 2=%2, 3=block1 end,
++    // 4=block2 end, 5=block3 end.
++    let vals = [1u32, 2];
++    let points = [0u32, 1, 2, 3, 4, 5];
++    let blocks = [0u32, 1, 2, 3];
++    let func_end = 6;
++    let block_of_point: BTreeMap<u32, u32> =
++        [(0, 0), (1, 0), (2, 1), (3, 1), (4, 2), (5, 3)]
++            .iter().cloned().collect();
++    let block_succs: BTreeMap<u32, Vec<u32>> =
++        [(0, vec![1]), (1, vec![2, 3]), (2, vec![1]), (3, vec![])]
++            .iter().cloned().collect();
++    let true_def: BTreeMap<u32, u32> = [(1, 0), (2, 2)].iter().cloned().collect();
++    let true_uses: BTreeMap<u32, Vec<u32>> =
++        [(1, vec![2]), (2, vec![3, 5])].iter().cloned().collect();
++    let empty_asm_bool: BTreeMap<u32, bool> = BTreeMap::new();
++    let empty_asm_clb: BTreeMap<u32, Vec<u8>> = BTreeMap::new();
++    let empty_irt: BTreeMap<u32, bool> = BTreeMap::new();
++    let priority: BTreeMap<u32, u32> = [(1, 1), (2, 2)].iter().cloned().collect();
++
++    emit_scenario_config(
++        "loop_fixpoint",
++        &vals, &points, &blocks, func_end,
++        &block_of_point, &block_succs, &true_def, &true_uses,
++        &[], &[], &empty_asm_bool, &empty_asm_clb,
++        &[], &empty_irt,
++        &[100, 104], &priority,
++    );
++
++    drive_pipeline(&func);
++    tla_trace::close();
++}
++
++// ── Scenario 7: Phase 3 spillover — too many non-call-spanning values ────────
++//
++// With 6 caller-saved registers, define 8 i32 values whose live ranges do NOT
++// span any call. Phase 2 fills 6 of them; the remaining 2 spill over into
++// Phase 3 (callee-saved spillover), producing `Phase3Allocate` events.
++#[test]
++fn scenario_phase3_spillover() {
++    let mut func = IrFunction::new("phase3_spillover".into(), IrType::I32, vec![], false);
++    let mut instructions = Vec::new();
++    // Define 8 values in block 0 by chaining binops; each uses the previous
++    // so they're all live simultaneously near the return.
++    instructions.push(Instruction::BinOp {
++        dest: Value(1), op: IrBinOp::Add,
++        lhs: Operand::Const(IrConst::I32(1)),
++        rhs: Operand::Const(IrConst::I32(2)),
++        ty: IrType::I32,
++    });
++    for i in 2u32..=8 {
++        instructions.push(Instruction::BinOp {
++            dest: Value(i), op: IrBinOp::Add,
++            lhs: Operand::Const(IrConst::I32(i as i32)),
++            rhs: Operand::Const(IrConst::I32(i as i32 + 10)),
++            ty: IrType::I32,
++        });
++    }
++    // Final value — sum of all, keeps the previous 8 live.
++    let mut acc = Value(9);
++    instructions.push(Instruction::BinOp {
++        dest: acc, op: IrBinOp::Add,
++        lhs: Operand::Value(Value(1)),
++        rhs: Operand::Value(Value(2)),
++        ty: IrType::I32,
++    });
++    for i in 3u32..=8 {
++        let dest = Value(acc.0 + 1);
++        instructions.push(Instruction::BinOp {
++            dest, op: IrBinOp::Add,
++            lhs: Operand::Value(acc),
++            rhs: Operand::Value(Value(i)),
++            ty: IrType::I32,
++        });
++        acc = dest;
++    }
++    func.blocks.push(BasicBlock {
++        label: BlockId(0),
++        instructions,
++        terminator: Terminator::Return(Some(Operand::Value(acc))),
++        source_spans: Vec::new(),
++    });
++    func.next_value_id = acc.0 + 1;
++
++    let path = trace_path("phase3_spillover");
++    tla_trace::open(path.to_str().unwrap());
++    tla_trace::begin_function("phase3_spillover");
++
++    // Points 0..7 define %1..%8; 8..13 fold them together; 14 block end.
++    let final_v = acc.0;
++    let num_points = final_v as u32; // Last instruction's point is final_v - 1.
++    let vals: Vec<u32> = (1..=final_v).collect();
++    let points: Vec<u32> = (0..=num_points).collect();
++    let blocks = [0u32];
++    let func_end = num_points + 1;
++    let block_of_point: BTreeMap<u32, u32> = points.iter().map(|&p| (p, 0u32)).collect();
++    let block_succs: BTreeMap<u32, Vec<u32>> = [(0, vec![])].iter().cloned().collect();
++    let mut true_def: BTreeMap<u32, u32> = BTreeMap::new();
++    for v in 1..=8u32 { true_def.insert(v, v - 1); }
++    for v in 9..=final_v { true_def.insert(v, v - 1); }
++    let mut true_uses: BTreeMap<u32, Vec<u32>> = BTreeMap::new();
++    for v in 1..=8u32 {
++        // each initial value used by the corresponding fold.
++        true_uses.insert(v, vec![8 + (v - 1).max(1)]);
++    }
++    for v in 10..final_v {
++        true_uses.insert(v, vec![v]);
++    }
++    true_uses.insert(final_v, vec![final_v]);
++    let empty_asm_bool: BTreeMap<u32, bool> = BTreeMap::new();
++    let empty_asm_clb: BTreeMap<u32, Vec<u8>> = BTreeMap::new();
++    let empty_irt: BTreeMap<u32, bool> = BTreeMap::new();
++    let priority: BTreeMap<u32, u32> = vals.iter().map(|&v| (v, 1u32)).collect();
++    let slots: Vec<u32> = (0..vals.len() as u32).map(|i| 100 + 4 * i).collect();
++
++    emit_scenario_config(
++        "phase3_spillover",
++        &vals, &points, &blocks, func_end,
++        &block_of_point, &block_succs, &true_def, &true_uses,
++        &[], &[], &empty_asm_bool, &empty_asm_clb,
++        &[], &empty_irt,
++        &slots, &priority,
++    );
++
++    drive_pipeline(&func);
++    tla_trace::close();
++}
+diff --git a/src/ir/analysis.rs b/src/ir/analysis.rs
+index 40428b6..6865610 100644
+--- a/src/ir/analysis.rs
++++ b/src/ir/analysis.rs
+@@ -13,6 +13,8 @@
+ 
+ use crate::common::fx_hash::{FxHashMap, FxHashSet};
+ use crate::ir::reexports::{BlockId, Instruction, IrFunction, Terminator};
++use crate::ir::mem2reg::trace_helpers as th;
++use crate::ir::mem2reg::tla_trace as tt;
+ 
+ // ── Flat adjacency list (CSR format) ──────────────────────────────────────────
+ 
+@@ -183,6 +185,11 @@ pub fn build_cfg(
+         }
+     }
+ 
++    // [trace] BuildCFG — emit succs (per-block successor sets) before packing.
++    if tt::enabled() {
++        th::build_cfg(n, &succs);
++    }
++
+     (FlatAdj::from_vecs(preds), FlatAdj::from_vecs(succs))
+ }
+ 
+@@ -254,7 +261,13 @@ pub fn compute_dominators(
+     }
+     idom[rpo[0]] = rpo[0]; // Entry dominates itself
+ 
++    // [trace] ComputeRPO — emitted after RPO + idom array init.
++    if tt::enabled() {
++        th::compute_rpo(&rpo);
++    }
++
+     let mut changed = true;
++    let mut iters: usize = 0;
+     while changed {
+         changed = false;
+         for &b in rpo.iter().skip(1) {
+@@ -290,6 +303,18 @@ pub fn compute_dominators(
+                 changed = true;
+             }
+         }
++        if changed {
++            iters += 1;
++            // [trace] IdomIterStep — one full pass that changed at least one idom.
++            if tt::enabled() {
++                th::idom_iter_step(&idom, iters);
++            }
++        }
++    }
++
++    // [trace] IdomDone — fixpoint reached.
++    if tt::enabled() {
++        th::idom_done();
+     }
+ 
+     idom
+@@ -322,6 +347,11 @@ pub fn compute_dominance_frontiers(
+         }
+     }
+ 
++    // [trace] ComputeDF — emit per-block dominance frontiers.
++    if tt::enabled() {
++        th::compute_df(&df);
++    }
++
+     df
+ }
+ 
+diff --git a/src/ir/mem2reg/mod.rs b/src/ir/mem2reg/mod.rs
+index 6e5a23c..936895b 100644
+--- a/src/ir/mem2reg/mod.rs
++++ b/src/ir/mem2reg/mod.rs
+@@ -1,5 +1,9 @@
+ pub(crate) mod promote;
+ pub(crate) mod phi_eliminate;
++pub(crate) mod tla_trace;
++pub(crate) mod trace_helpers;
++#[cfg(test)]
++mod trace_scenarios;
+ 
+ pub(crate) use promote::promote_allocas;
+ pub(crate) use promote::promote_allocas_with_params;
+diff --git a/src/ir/mem2reg/phi_eliminate.rs b/src/ir/mem2reg/phi_eliminate.rs
+index 8f58f25..8cab146 100644
+--- a/src/ir/mem2reg/phi_eliminate.rs
++++ b/src/ir/mem2reg/phi_eliminate.rs
+@@ -46,6 +46,8 @@ use crate::ir::reexports::{
+     Terminator,
+     Value,
+ };
++use super::trace_helpers as th;
++use super::tla_trace as tt;
+ 
+ /// Eliminate all phi nodes in the module by lowering them to copies.
+ pub fn eliminate_phis(module: &mut IrModule) {
+@@ -283,6 +285,13 @@ fn eliminate_phis_in_function(func: &mut IrFunction, next_block_id: &mut u32) {
+ 
+     apply_phi_transformations(func, &mut ctx);
+     func.next_value_id = ctx.next_value;
++
++    // [trace] PhiElimPlan — after all phi-elimination transformations land.
++    if tt::enabled() {
++        // ctx.trampolines was drained in apply_phi_transformations; recount via
++        // the trampoline_map (one entry per (pred, target) trampoline created).
++        th::phi_elim_plan(ctx.trampoline_map.len());
++    }
+ }
+ 
+ /// Collect PhiInfo from all blocks.
+diff --git a/src/ir/mem2reg/promote.rs b/src/ir/mem2reg/promote.rs
+index 7cfa2c3..b974f71 100644
+--- a/src/ir/mem2reg/promote.rs
++++ b/src/ir/mem2reg/promote.rs
+@@ -25,6 +25,8 @@ use crate::ir::reexports::{
+ use crate::ir::analysis;
+ use crate::backend::inline_asm::constraint_is_memory_only;
+ use crate::common::types::IrType;
++use super::trace_helpers as th;
++use super::tla_trace as tt;
+ 
+ /// Maximum byte size for an alloca to be considered promotable to an SSA register.
+ /// This corresponds to the width of a general-purpose register (8 bytes on 64-bit,
+@@ -81,6 +83,9 @@ fn promote_function(func: &mut IrFunction, promote_params: bool) {
+         return;
+     }
+ 
++    // [trace] StartFilter — phase INIT -> FILTER, before find_promotable_allocas.
++    th::start_filter();
++
+     // Step 1: Identify promotable allocas
+     let mut alloca_infos = find_promotable_allocas(func, promote_params);
+     if std::env::var("CCC_DEBUG_MEM2REG").is_ok() {
+@@ -117,7 +122,10 @@ fn promote_function(func: &mut IrFunction, promote_params: bool) {
+     // stack limit while accommodating moderately complex functions.
+     const MAX_PHI_COPY_COST: usize = 50_000;
+ 
++    // [trace] First insert_phis call — emit IDF events.
++    th::set_idf_emit(true);
+     let phi_locations = insert_phis(&alloca_infos, &df, num_blocks);
++    th::set_idf_emit(false);
+ 
+     // Compute per-alloca phi cost: sum of predecessor counts at all phi sites
+     let total_phi_cost: usize = alloca_infos.iter().enumerate()
+@@ -129,6 +137,9 @@ fn promote_function(func: &mut IrFunction, promote_params: bool) {
+         })
+         .sum();
+ 
++    // [trace] Track which allocas are dropped by cost (none if under cap).
++    let mut dropped_value_ids: FxHashSet<u32> = FxHashSet::default();
++
+     if total_phi_cost > MAX_PHI_COPY_COST {
+         // Compute per-alloca costs and remove the most expensive first
+         let mut alloca_phi_costs: Vec<(usize, usize)> = alloca_infos.iter().enumerate()
+@@ -153,6 +164,12 @@ fn promote_function(func: &mut IrFunction, promote_params: bool) {
+         }
+ 
+         if !remove_set.is_empty() {
++            // [trace] Capture which value-ids were dropped before alloca_infos is rebuilt.
++            for (idx, info) in alloca_infos.iter().enumerate() {
++                if remove_set.contains(&idx) {
++                    dropped_value_ids.insert(info.alloca_value.0);
++                }
++            }
+             alloca_infos = alloca_infos.into_iter().enumerate()
+                 .filter(|(idx, _)| !remove_set.contains(idx))
+                 .map(|(_, info)| info)
+@@ -160,16 +177,28 @@ fn promote_function(func: &mut IrFunction, promote_params: bool) {
+         }
+     }
+ 
++    // [trace] CostDropAction — phase REINSERT.
++    th::cost_drop_action(&dropped_value_ids, total_phi_cost);
++
+     if alloca_infos.is_empty() {
+         return;
+     }
+ 
+-    // Recompute phi locations after any cost-based filtering
++    // Recompute phi locations after any cost-based filtering.
++    // Do NOT emit IDF events on this second call (spec models it as a set diff).
+     let phi_locations = insert_phis(&alloca_infos, &df, num_blocks);
+ 
++    // [trace] ReinsertPhis — phase RENAME, list of promoted allocas.
++    {
++        let promoted_ids: Vec<u32> = alloca_infos.iter().map(|i| i.alloca_value.0).collect();
++        th::reinsert_phis(&promoted_ids);
++    }
++
+     // Step 6: Rename variables
+     let dom_children = analysis::build_dom_tree_children(num_blocks, &idom);
+     rename_variables(func, &alloca_infos, &phi_locations, &dom_children, &preds, &label_to_idx);
++
++    // [trace] PhiElim is invoked separately by the caller; nothing to emit here.
+ }
+ 
+ /// Find all allocas that can be promoted to SSA registers.
+@@ -248,11 +277,22 @@ fn find_promotable_allocas(func: &IrFunction, promote_params: bool) -> Vec<Alloc
+     // Build set of candidate alloca values
+     let candidate_set: FxHashSet<u32> = all_allocas.iter().map(|(v, _, _)| v.0).collect();
+ 
++    // [trace] Pre-register candidate alloca value-ids so they receive
++    // deterministic spec alloca-ids (1..) regardless of FilterStep order.
++    if tt::enabled() {
++        let mut cs: Vec<u32> = candidate_set.iter().copied().collect();
++        cs.sort();
++        tt::register_allocas_sorted(&cs);
++    }
++
+     // Check all uses: only Load and Store targeting the alloca pointer are allowed
+     let mut disqualified: FxHashSet<u32> = FxHashSet::default();
+     let mut def_blocks: FxHashMap<u32, FxHashSet<usize>> = FxHashMap::default();
+     let mut use_blocks: FxHashMap<u32, FxHashSet<usize>> = FxHashMap::default();
+ 
++    // [trace] Per-block instruction-position counters so FilterStep events
++    // record positions monotonically within each block (matches spec UseSites).
++    let mut filter_pos: FxHashMap<usize, usize> = FxHashMap::default();
+     for (block_idx, block) in func.blocks.iter().enumerate() {
+         for inst in &block.instructions {
+             match inst {
+@@ -260,11 +300,22 @@ fn find_promotable_allocas(func: &IrFunction, promote_params: bool) -> Vec<Alloc
+                     if candidate_set.contains(&ptr.0) && !disqualified.contains(&ptr.0) {
+                         use_blocks.entry(ptr.0).or_default().insert(block_idx);
+                     }
++                    // [trace] FilterStep for LOAD on a candidate alloca.
++                    if candidate_set.contains(&ptr.0) {
++                        let pos = { let p = filter_pos.entry(block_idx).or_insert(0); *p += 1; *p };
++                        th::filter_step(block_idx, pos, "LOAD", ptr.0, &disqualified);
++                    }
+                 }
+                 Instruction::Store { val, ptr, .. } => {
+                     if candidate_set.contains(&ptr.0) && !disqualified.contains(&ptr.0) {
+                         def_blocks.entry(ptr.0).or_default().insert(block_idx);
+                     }
++                    // [trace] STORE_PTR for the ptr operand if it's a candidate.
++                    // Emit BEFORE STORE_VAL so trace order matches impl scan order.
++                    if candidate_set.contains(&ptr.0) {
++                        let pos = { let p = filter_pos.entry(block_idx).or_insert(0); *p += 1; *p };
++                        th::filter_step(block_idx, pos, "STORE_PTR", ptr.0, &disqualified);
++                    }
+                     // If a candidate alloca value appears as the stored VALUE (not ptr),
+                     // it means the alloca's address is being used as data (e.g., array-to-pointer
+                     // decay: Y.p = local_array). This is an address-taken use and the alloca
+@@ -272,6 +323,9 @@ fn find_promotable_allocas(func: &IrFunction, promote_params: bool) -> Vec<Alloc
+                     if let Operand::Value(v) = val {
+                         if candidate_set.contains(&v.0) {
+                             disqualified.insert(v.0);
++                            // [trace] STORE_VAL — candidate alloca used as value (escape).
++                            let pos = { let p = filter_pos.entry(block_idx).or_insert(0); *p += 1; *p };
++                            th::filter_step(block_idx, pos, "STORE_VAL", v.0, &disqualified);
+                         }
+                     }
+                 }
+@@ -332,7 +386,7 @@ fn find_promotable_allocas(func: &IrFunction, promote_params: bool) -> Vec<Alloc
+     let param_alloca_set: FxHashSet<u32> = func.param_alloca_values.iter().map(|v| v.0).collect();
+ 
+     // Build final list of promotable allocas
+-    all_allocas
++    let final_infos: Vec<AllocaInfo> = all_allocas
+         .into_iter()
+         .filter(|(v, _, _)| !disqualified.contains(&v.0))
+         .map(|(alloca_value, ty, _)| {
+@@ -356,7 +410,21 @@ fn find_promotable_allocas(func: &IrFunction, promote_params: bool) -> Vec<Alloc
+                 true
+             }
+         })
+-        .collect()
++        .collect();
++
++    // [trace] FilterDone — final disqualified set = candidates - kept.
++    if tt::enabled() {
++        let kept: FxHashSet<u32> = final_infos.iter().map(|i| i.alloca_value.0).collect();
++        let mut final_dq: FxHashSet<u32> = disqualified.clone();
++        for c in &candidate_set {
++            if !kept.contains(c) {
++                final_dq.insert(*c);
++            }
++        }
++        th::filter_done(&final_dq);
++    }
++
++    final_infos
+ }
+ 
+ /// Determine where phi nodes need to be inserted.
+@@ -375,6 +443,11 @@ fn insert_phis(
+         let mut has_phi: FxHashSet<usize> = FxHashSet::default();
+         let mut ever_in_worklist: FxHashSet<usize> = info.def_blocks.clone();
+ 
++        // [trace] IdfInitAlloca — only emit on the first insert_phis call.
++        if th::idf_emit_enabled() {
++            th::idf_init_alloca(info.alloca_value.0, &info.def_blocks);
++        }
++
+         while let Some(block) = worklist.pop_front() {
+             for &df_block in &df[block] {
+                 if has_phi.insert(df_block) {
+@@ -384,9 +457,27 @@ fn insert_phis(
+                     }
+                 }
+             }
++            // [trace] IdfWorklistStep — after walking this block's DF.
++            // Convert alloca-idx set at phi_locations[block] to value-id list.
++            if th::idf_emit_enabled() {
++                let value_ids: Vec<u32> = phi_locations[block].iter()
++                    .map(|&idx| alloca_infos[idx].alloca_value.0)
++                    .collect();
++                th::idf_worklist_step(info.alloca_value.0, block, &value_ids);
++            }
++        }
++
++        // [trace] IdfFinishAlloca — worklist drained for this alloca.
++        if th::idf_emit_enabled() {
++            th::idf_finish_alloca(info.alloca_value.0);
+         }
+     }
+ 
++    // [trace] IdfPhaseDone — outer loop over allocas finished.
++    if th::idf_emit_enabled() {
++        th::idf_phase_done();
++    }
++
+     phi_locations
+ }
+ 
+@@ -461,6 +552,9 @@ fn rename_variables(
+         def_stacks[i].push(Operand::Const(IrConst::zero(info.ty)));
+     }
+ 
++    // [trace] StartRename — entering top-level rename_block(0, ...)
++    th::start_rename();
++
+     rename_block(
+         0,
+         func,
+@@ -474,9 +568,32 @@ fn rename_variables(
+         label_to_idx,
+     );
+ 
++    // [trace] RenameDone — outermost rename_block returned.
++    th::rename_done();
++
+     // Remove promoted allocas from the entry block, and remove dead loads/stores
+     remove_promoted_instructions(func, &alloca_to_idx);
+ 
++    // [trace] RemoveAction — removed-allocas (excluding param positional).
++    if tt::enabled() {
++        let mut param_alloca_values: FxHashSet<u32> = FxHashSet::default();
++        let num_params = func.params.len();
++        let mut alloca_count = 0;
++        for inst in &func.blocks[0].instructions {
++            if let Instruction::Alloca { dest, .. } = inst {
++                if alloca_count < num_params {
++                    param_alloca_values.insert(dest.0);
++                }
++                alloca_count += 1;
++            }
++        }
++        let removed: Vec<u32> = alloca_infos.iter()
++            .map(|i| i.alloca_value.0)
++            .filter(|v| !param_alloca_values.contains(v))
++            .collect();
++        th::remove_action(&removed);
++    }
++
+     // Update cached next_value_id for downstream passes
+     func.next_value_id = next_value;
+ }
+@@ -498,6 +615,7 @@ fn rename_block(
+     let stack_depths: Vec<usize> = def_stacks.iter().map(|s| s.len()).collect();
+ 
+     // Process phi nodes in this block - push their dests onto stacks
++    let mut phi_pushed: Vec<u32> = Vec::new();
+     for inst in &func.blocks[block_idx].instructions {
+         if let Instruction::Phi { dest, .. } = inst {
+             // Find which alloca this phi is for
+@@ -507,10 +625,14 @@ fn rename_block(
+                 .map(|(idx, _)| idx)
+             {
+                 def_stacks[alloca_idx].push(Operand::Value(*dest));
++                phi_pushed.push(alloca_infos[alloca_idx].alloca_value.0);
+             }
+         }
+     }
+ 
++    // [trace] RenamePushPhiDefs — after the push-phi-defs loop.
++    th::rename_push_phi_defs(block_idx, &phi_pushed);
++
+     // Rewrite instructions in this block.
+     //
+     // asm goto snapshot: An InlineAsm with goto_labels creates implicit
+@@ -530,9 +652,12 @@ fn rename_block(
+     // Each snapshot is a Vec<Operand> indexed by alloca_idx.
+     let mut goto_label_snapshots: FxHashMap<BlockId, Vec<Operand>> = FxHashMap::default();
+     let old_spans = std::mem::take(&mut func.blocks[block_idx].source_spans);
++    // [trace] Per-block use-site cursor matching spec UseSites enumeration.
++    let mut use_site_pos: usize = 0;
+     for (inst_idx, inst) in func.blocks[block_idx].instructions.drain(..).enumerate() {
+         match inst {
+             Instruction::Load { dest, ptr, ty, seg_override } => {
++                let promoted_alloca = alloca_to_idx.get(&ptr.0).is_some();
+                 if let Some(&alloca_idx) = alloca_to_idx.get(&ptr.0) {
+                     // Replace load with copy from current SSA value
+                     let current_val = def_stacks[alloca_idx].last().cloned()
+@@ -546,8 +671,14 @@ fn rename_block(
+                     new_instructions.push(Instruction::Load { dest, ptr, ty, seg_override });
+                     if has_spans { new_spans.push(old_spans[inst_idx]); }
+                 }
++                // [trace] RenameInstStep for LOAD if promoted.
++                if promoted_alloca {
++                    use_site_pos += 1;
++                    th::rename_inst_step(block_idx, use_site_pos, "LOAD", Some(ptr.0));
++                }
+             }
+             Instruction::Store { val, ptr, ty, seg_override } => {
++                let promoted_alloca = alloca_to_idx.get(&ptr.0).is_some();
+                 if let Some(&alloca_idx) = alloca_to_idx.get(&ptr.0) {
+                     // Push the stored value onto the def stack.
+                     // Narrow constants to match the alloca type: the IR lowering
+@@ -568,11 +699,18 @@ fn rename_block(
+                     new_instructions.push(Instruction::Store { val, ptr, ty, seg_override });
+                     if has_spans { new_spans.push(old_spans[inst_idx]); }
+                 }
++                // [trace] RenameInstStep for STORE_PTR if promoted.
++                if promoted_alloca {
++                    use_site_pos += 1;
++                    th::rename_inst_step(block_idx, use_site_pos, "STORE_PTR", Some(ptr.0));
++                }
+             }
+             Instruction::InlineAsm {
+                 template, mut outputs, inputs, clobbers,
+                 operand_types, goto_labels, input_symbols, seg_overrides,
+             } => {
++                // [trace] Capture asm-goto presence for kind selection.
++                let has_goto = !goto_labels.is_empty();
+                 // Snapshot def stacks BEFORE processing outputs, so goto
+                 // targets see the values that were live at the point of the
+                 // asm goto, not any definitions produced by the asm outputs.
+@@ -589,12 +727,15 @@ fn rename_block(
+                 }
+ 
+                 // Replace output pointers that are promoted allocas with fresh SSA values
++                let mut emit_alloca: Option<u32> = None;
+                 for (_, out_ptr, _) in outputs.iter_mut() {
+                     if let Some(&alloca_idx) = alloca_to_idx.get(&out_ptr.0) {
++                        let orig = out_ptr.0;
+                         let fresh = Value(*next_value);
+                         *next_value += 1;
+                         *out_ptr = fresh;
+                         def_stacks[alloca_idx].push(Operand::Value(fresh));
++                        emit_alloca.get_or_insert(orig);
+                     }
+                 }
+                 new_instructions.push(Instruction::InlineAsm {
+@@ -602,6 +743,12 @@ fn rename_block(
+                     operand_types, goto_labels, input_symbols, seg_overrides,
+                 });
+                 if has_spans { new_spans.push(old_spans[inst_idx]); }
++                // [trace] RenameInstStep for InlineAsm.
++                if has_goto || emit_alloca.is_some() {
++                    use_site_pos += 1;
++                    let kind = if has_goto { "ASM_HAS_GOTO_LABELS" } else { "ASM_OUT_REG" };
++                    th::rename_inst_step(block_idx, use_site_pos, kind, emit_alloca);
++                }
+             }
+             other => {
+                 new_instructions.push(other);
+@@ -629,6 +776,7 @@ fn rename_block(
+     }
+     let current_block_label = func.blocks[block_idx].label;
+ 
++    let mut succs_filled: Vec<usize> = Vec::new();
+     for succ_label in &succ_labels {
+         if let Some(&succ_idx) = label_to_idx.get(succ_label) {
+             // For each phi in the successor block, fill in our value.
+@@ -655,9 +803,13 @@ fn rename_block(
+                     break; // Phis are always at the start of a block
+                 }
+             }
++            succs_filled.push(succ_idx);
+         }
+     }
+ 
++    // [trace] RenameFillPhis — after the per-successor fill loop.
++    th::rename_fill_phis(block_idx, &succs_filled);
++
+     // Recurse into dominator tree children.
+     //
+     // For children that are asm-goto targets from this block, we must
+@@ -676,6 +828,8 @@ fn rename_block(
+ 
+     for child in children {
+         if let Some(snapshot) = goto_target_indices.get(&child) {
++            // [trace] RenameDescendChild (is_goto = true) — before recursive call.
++            th::rename_descend_child(block_idx, child, true, 0);
+             // This child is an asm-goto target: temporarily push snapshot
+             // values so that loads in the child block see the pre-goto defs.
+             let child_depths: Vec<usize> = def_stacks.iter().map(|s| s.len()).collect();
+@@ -698,6 +852,8 @@ fn rename_block(
+                 def_stacks[i].truncate(depth);
+             }
+         } else {
++            // [trace] RenameDescendChild (is_goto = false) — before recursive call.
++            th::rename_descend_child(block_idx, child, false, 0);
+             rename_block(
+                 child,
+                 func,
+@@ -717,6 +873,9 @@ fn rename_block(
+     for (i, &depth) in stack_depths.iter().enumerate() {
+         def_stacks[i].truncate(depth);
+     }
++
++    // [trace] RenamePopFrame — after the pop loop.
++    th::rename_pop_frame(block_idx, 0);
+ }
+ 
+ /// Get successor labels from a terminator.
+diff --git a/src/ir/mem2reg/tla_trace.rs b/src/ir/mem2reg/tla_trace.rs
+new file mode 100644
+index 0000000..2be23b5
+--- /dev/null
++++ b/src/ir/mem2reg/tla_trace.rs
+@@ -0,0 +1,136 @@
++//! NDJSON trace emission for mem2reg algorithm.
++//!
++//! Instrumentation drop-in. Activated by env var `CCC_TRACE_OUT=<path>`.
++//! When unset, all `emit` calls become near-no-ops (a quick guard check).
++//!
++//! Schema: see `.specula-output/spec/Trace.tla`. Each line is
++//!   {"tag":"trace","ts":<ns>,"event":{"name":"<Action>","state":{...}, ...}}
++
++use std::collections::BTreeMap;
++use std::fs::File;
++use std::io::{BufWriter, Write};
++use std::sync::Mutex;
++use std::time::{SystemTime, UNIX_EPOCH};
++
++static WRITER: Mutex<Option<BufWriter<File>>> = Mutex::new(None);
++static ALLOCA_MAP: Mutex<Option<BTreeMap<u32, u32>>> = Mutex::new(None);
++static NEXT_ALLOCA_ID: Mutex<u32> = Mutex::new(1);
++
++/// Open the trace file. Subsequent emits write to it. Re-init clears state.
++pub fn init(path: &str) {
++    let f = File::create(path).expect("open trace file");
++    *WRITER.lock().unwrap() = Some(BufWriter::new(f));
++    *ALLOCA_MAP.lock().unwrap() = Some(BTreeMap::new());
++    *NEXT_ALLOCA_ID.lock().unwrap() = 1;
++}
++
++/// Flush and close the trace file.
++pub fn shutdown() {
++    let mut g = WRITER.lock().unwrap();
++    if let Some(mut w) = g.take() {
++        w.flush().ok();
++    }
++    *ALLOCA_MAP.lock().unwrap() = None;
++}
++
++/// True if a trace is currently active.
++#[inline]
++pub fn enabled() -> bool {
++    WRITER.lock().unwrap().is_some()
++}
++
++/// Map an LLVM `Value(u32)` for an alloca to a stable spec alloca id (1..).
++/// First call assigns id 1, second call id 2, etc. Repeat calls return the
++/// previously assigned id.
++pub fn alloca_id(value_id: u32) -> u32 {
++    let mut g = ALLOCA_MAP.lock().unwrap();
++    let m = g.as_mut().expect("alloca_id called before init");
++    if let Some(&id) = m.get(&value_id) {
++        return id;
++    }
++    let mut next = NEXT_ALLOCA_ID.lock().unwrap();
++    let id = *next;
++    *next += 1;
++    m.insert(value_id, id);
++    id
++}
++
++/// Pre-register a set of candidate alloca value-ids in sorted order so they
++/// receive deterministic spec ids (1..) regardless of later encounter order.
++pub fn register_allocas_sorted(values: &[u32]) {
++    let mut sorted = values.to_vec();
++    sorted.sort();
++    for v in sorted {
++        let _ = alloca_id(v);
++    }
++}
++
++/// Emit one event line. The `event_inner` string is a JSON object body
++/// (without the outer braces) that names the action and adds fields.
++pub fn emit_raw(event_inner: &str) {
++    let now = SystemTime::now()
++        .duration_since(UNIX_EPOCH)
++        .map(|d| d.as_nanos())
++        .unwrap_or(0);
++    let mut g = WRITER.lock().unwrap();
++    if let Some(w) = g.as_mut() {
++        let line = format!("{{\"tag\":\"trace\",\"ts\":{},\"event\":{{{}}}}}\n", now, event_inner);
++        w.write_all(line.as_bytes()).ok();
++        w.flush().ok();
++    }
++}
++
++// ── Helpers to format JSON fragments ─────────────────────────────────────
++
++/// `{"k":n, "k":n, ...}` for a sorted-key map of u32 → u32.
++pub fn json_map_u32(m: &BTreeMap<u32, u32>) -> String {
++    let mut s = String::from("{");
++    let mut first = true;
++    for (k, v) in m {
++        if !first { s.push(','); }
++        first = false;
++        s.push_str(&format!("\"{}\":{}", k, v));
++    }
++    s.push('}');
++    s
++}
++
++/// `[a, b, c]` for a sorted-int sequence.
++pub fn json_arr_u32(xs: &[u32]) -> String {
++    let mut s = String::from("[");
++    let mut first = true;
++    for x in xs {
++        if !first { s.push(','); }
++        first = false;
++        s.push_str(&format!("{}", x));
++    }
++    s.push(']');
++    s
++}
++
++/// `[a, b, c]` from a usize slice.
++pub fn json_arr_usize(xs: &[usize]) -> String {
++    let mut s = String::from("[");
++    let mut first = true;
++    for x in xs {
++        if !first { s.push(','); }
++        first = false;
++        s.push_str(&format!("{}", x));
++    }
++    s.push(']');
++    s
++}
++
++/// `[1, 2, 3]` for a sorted set of alloca-ids (translated through `alloca_id`).
++pub fn json_arr_alloca_ids(values: &[u32]) -> String {
++    let mut ids: Vec<u32> = values.iter().map(|v| alloca_id(*v)).collect();
++    ids.sort();
++    json_arr_u32(&ids)
++}
++
++/// `[1, 2, 3]` from a usize iterator (sorted).
++pub fn json_arr_blocks(values: &[usize]) -> String {
++    let mut v: Vec<usize> = values.to_vec();
++    v.sort();
++    json_arr_usize(&v)
++}
+diff --git a/src/ir/mem2reg/trace_helpers.rs b/src/ir/mem2reg/trace_helpers.rs
+new file mode 100644
+index 0000000..8e34c6e
+--- /dev/null
++++ b/src/ir/mem2reg/trace_helpers.rs
+@@ -0,0 +1,288 @@
++//! Mem2reg-specific event emitters that build on `tla_trace`.
++//!
++//! Each function corresponds to a base spec action (see Trace.tla).
++//! All emit JSON event bodies (no outer braces) per the schema in
++//! `instrumentation-spec.md`.
++
++use super::tla_trace as tt;
++use crate::common::fx_hash::FxHashSet;
++use std::cell::Cell;
++
++thread_local! {
++    /// Whether the current `insert_phis` invocation should emit IDF events.
++    /// `promote_function` sets this true before the first call (with cost calc)
++    /// and clears it before the second call (after cost drop).
++    pub static IDF_EMIT: Cell<bool> = const { Cell::new(false) };
++}
++
++pub fn set_idf_emit(v: bool) {
++    IDF_EMIT.with(|c| c.set(v));
++}
++
++pub fn idf_emit_enabled() -> bool {
++    IDF_EMIT.with(|c| c.get())
++}
++
++// ── Phase 0/1: filter ────────────────────────────────────────────────────
++
++pub fn start_filter() {
++    if !tt::enabled() { return; }
++    tt::emit_raw("\"name\":\"StartFilter\",\"state\":{\"phase\":\"FILTER\"}");
++}
++
++pub fn filter_step(block: usize, pos: usize, kind: &str, alloca_value: u32, disqualified: &FxHashSet<u32>) {
++    if !tt::enabled() { return; }
++    let aid = tt::alloca_id(alloca_value);
++    let mut dq: Vec<u32> = disqualified.iter().map(|v| tt::alloca_id(*v)).collect();
++    dq.sort();
++    let body = format!(
++        "\"name\":\"FilterStep\",\"block\":{},\"pos\":{},\"kind\":\"{}\",\"alloca\":{},\"state\":{{\"disqualified\":{}}}",
++        block, pos, kind, aid, tt::json_arr_u32(&dq)
++    );
++    tt::emit_raw(&body);
++}
++
++pub fn filter_done(disqualified: &FxHashSet<u32>) {
++    if !tt::enabled() { return; }
++    let mut dq: Vec<u32> = disqualified.iter().map(|v| tt::alloca_id(*v)).collect();
++    dq.sort();
++    let body = format!(
++        "\"name\":\"FilterDone\",\"state\":{{\"phase\":\"BUILD_CFG\",\"disqualified\":{}}}",
++        tt::json_arr_u32(&dq)
++    );
++    tt::emit_raw(&body);
++}
++
++// ── Phase 2: build_cfg ───────────────────────────────────────────────────
++
++/// Emit BuildCFG.
++/// `succs[b]` is the set of successor block indices (after dedup).
++pub fn build_cfg(num_blocks: usize, succs: &[Vec<u32>]) {
++    if !tt::enabled() { return; }
++    let mut succ_str = String::from("{");
++    let mut first = true;
++    for (b, s) in succs.iter().enumerate() {
++        if b >= num_blocks { break; }
++        if !first { succ_str.push(','); }
++        first = false;
++        let mut v: Vec<u32> = s.clone();
++        v.sort();
++        succ_str.push_str(&format!("\"{}\":{}", b, tt::json_arr_u32(&v)));
++    }
++    succ_str.push('}');
++    let body = format!(
++        "\"name\":\"BuildCFG\",\"state\":{{\"phase\":\"IDOM\",\"succs\":{}}}",
++        succ_str
++    );
++    tt::emit_raw(&body);
++}
++
++// ── Phase 3: dominators ──────────────────────────────────────────────────
++
++pub fn compute_rpo(rpo: &[usize]) {
++    if !tt::enabled() { return; }
++    let body = format!(
++        "\"name\":\"ComputeRPO\",\"state\":{{\"rpo\":{}}}",
++        tt::json_arr_usize(rpo)
++    );
++    tt::emit_raw(&body);
++}
++
++pub fn idom_iter_step(idom: &[usize], iters: usize) {
++    if !tt::enabled() { return; }
++    // Emit idom as a JSON array so it parses to a TLA+ sequence
++    // indexable by block-index + 1. usize::MAX -> -1 = spec UNDEF.
++    let mut s = String::from("[");
++    let mut first = true;
++    for &d in idom {
++        if !first { s.push(','); }
++        first = false;
++        let v: i64 = if d == usize::MAX { -1 } else { d as i64 };
++        s.push_str(&format!("{}", v));
++    }
++    s.push(']');
++    let body = format!(
++        "\"name\":\"IdomIterStep\",\"state\":{{\"idom_arr\":{},\"idomIters\":{}}}",
++        s, iters
++    );
++    tt::emit_raw(&body);
++}
++
++pub fn idom_done() {
++    if !tt::enabled() { return; }
++    tt::emit_raw("\"name\":\"IdomDone\",\"state\":{\"phase\":\"DF\"}");
++}
++
++// ── Phase 4: dominance frontiers ─────────────────────────────────────────
++
++pub fn compute_df(df: &[FxHashSet<usize>]) {
++    if !tt::enabled() { return; }
++    let mut s = String::from("{");
++    let mut first = true;
++    for (b, set) in df.iter().enumerate() {
++        if !first { s.push(','); }
++        first = false;
++        let mut v: Vec<usize> = set.iter().copied().collect();
++        v.sort();
++        s.push_str(&format!("\"{}\":{}", b, tt::json_arr_usize(&v)));
++    }
++    s.push('}');
++    let body = format!(
++        "\"name\":\"ComputeDF\",\"state\":{{\"phase\":\"IDF\",\"df\":{}}}",
++        s
++    );
++    tt::emit_raw(&body);
++}
++
++// ── Phase 5: IDF ─────────────────────────────────────────────────────────
++
++pub fn idf_init_alloca(alloca_value: u32, def_blocks: &FxHashSet<usize>) {
++    if !tt::enabled() { return; }
++    let aid = tt::alloca_id(alloca_value);
++    let mut v: Vec<usize> = def_blocks.iter().copied().collect();
++    v.sort();
++    let body = format!(
++        "\"name\":\"IdfInitAlloca\",\"alloca\":{},\"state\":{{\"def_blocks_a\":{}}}",
++        aid, tt::json_arr_usize(&v)
++    );
++    tt::emit_raw(&body);
++}
++
++pub fn idf_worklist_step(alloca_value: u32, block: usize, phi_site_value_ids: &[u32]) {
++    if !tt::enabled() { return; }
++    let aid = tt::alloca_id(alloca_value);
++    let mut v: Vec<u32> = phi_site_value_ids.iter().map(|val| tt::alloca_id(*val)).collect();
++    v.sort();
++    let body = format!(
++        "\"name\":\"IdfWorklistStep\",\"alloca\":{},\"block\":{},\"state\":{{\"phi_sites_b\":{}}}",
++        aid, block, tt::json_arr_u32(&v)
++    );
++    tt::emit_raw(&body);
++}
++
++pub fn idf_finish_alloca(alloca_value: u32) {
++    if !tt::enabled() { return; }
++    let aid = tt::alloca_id(alloca_value);
++    let body = format!("\"name\":\"IdfFinishAlloca\",\"alloca\":{}", aid);
++    tt::emit_raw(&body);
++}
++
++pub fn idf_phase_done() {
++    if !tt::enabled() { return; }
++    tt::emit_raw("\"name\":\"IdfPhaseDone\",\"state\":{\"phase\":\"COST_DROP\"}");
++}
++
++// ── Phase 6: cost drop ───────────────────────────────────────────────────
++
++pub fn cost_drop_action(dropped: &FxHashSet<u32>, total_cost: usize) {
++    if !tt::enabled() { return; }
++    let mut v: Vec<u32> = dropped.iter().map(|val| tt::alloca_id(*val)).collect();
++    v.sort();
++    let body = format!(
++        "\"name\":\"CostDropAction\",\"state\":{{\"phase\":\"REINSERT\",\"dropped_by_cost\":{},\"total_phi_cost\":{}}}",
++        tt::json_arr_u32(&v), total_cost
++    );
++    tt::emit_raw(&body);
++}
++
++// ── Phase 7: reinsert ────────────────────────────────────────────────────
++
++pub fn reinsert_phis(promoted: &[u32]) {
++    if !tt::enabled() { return; }
++    let mut v: Vec<u32> = promoted.iter().map(|val| tt::alloca_id(*val)).collect();
++    v.sort();
++    let body = format!(
++        "\"name\":\"ReinsertPhis\",\"state\":{{\"phase\":\"RENAME\",\"promoted\":{}}}",
++        tt::json_arr_u32(&v)
++    );
++    tt::emit_raw(&body);
++}
++
++// ── Phase 8: rename ──────────────────────────────────────────────────────
++
++pub fn start_rename() {
++    if !tt::enabled() { return; }
++    tt::emit_raw("\"name\":\"StartRename\",\"state\":{\"rename_stack_len\":1}");
++}
++
++pub fn rename_push_phi_defs(block: usize, phi_pushed: &[u32]) {
++    if !tt::enabled() { return; }
++    let mut v: Vec<u32> = phi_pushed.iter().map(|val| tt::alloca_id(*val)).collect();
++    v.sort();
++    let body = format!(
++        "\"name\":\"RenamePushPhiDefs\",\"block\":{},\"state\":{{\"phi_pushed\":{}}}",
++        block, tt::json_arr_u32(&v)
++    );
++    tt::emit_raw(&body);
++}
++
++pub fn rename_inst_step(block: usize, pos: usize, kind: &str, alloca_value: Option<u32>) {
++    if !tt::enabled() { return; }
++    let aid_str = match alloca_value {
++        Some(v) => format!(",\"alloca\":{}", tt::alloca_id(v)),
++        None => String::new(),
++    };
++    let body = format!(
++        "\"name\":\"RenameInstStep\",\"block\":{},\"pos\":{},\"kind\":\"{}\"{}",
++        block, pos, kind, aid_str
++    );
++    tt::emit_raw(&body);
++}
++
++pub fn rename_fill_phis(block: usize, succs_filled: &[usize]) {
++    if !tt::enabled() { return; }
++    let mut v: Vec<usize> = succs_filled.to_vec();
++    v.sort();
++    let body = format!(
++        "\"name\":\"RenameFillPhis\",\"block\":{},\"state\":{{\"succs_filled\":{}}}",
++        block, tt::json_arr_usize(&v)
++    );
++    tt::emit_raw(&body);
++}
++
++pub fn rename_descend_child(block: usize, child: usize, is_goto: bool, stack_len: usize) {
++    if !tt::enabled() { return; }
++    let body = format!(
++        "\"name\":\"RenameDescendChild\",\"block\":{},\"child\":{},\"is_goto\":{},\"state\":{{\"rename_stack_len\":{}}}",
++        block, child, is_goto, stack_len
++    );
++    tt::emit_raw(&body);
++}
++
++pub fn rename_pop_frame(block: usize, stack_len: usize) {
++    if !tt::enabled() { return; }
++    let body = format!(
++        "\"name\":\"RenamePopFrame\",\"block\":{},\"state\":{{\"rename_stack_len\":{}}}",
++        block, stack_len
++    );
++    tt::emit_raw(&body);
++}
++
++pub fn rename_done() {
++    if !tt::enabled() { return; }
++    tt::emit_raw("\"name\":\"RenameDone\",\"state\":{\"phase\":\"REMOVE\"}");
++}
++
++// ── Phase 9: remove ──────────────────────────────────────────────────────
++
++pub fn remove_action(removed: &[u32]) {
++    if !tt::enabled() { return; }
++    let mut v: Vec<u32> = removed.iter().map(|val| tt::alloca_id(*val)).collect();
++    v.sort();
++    let body = format!(
++        "\"name\":\"RemoveAction\",\"state\":{{\"phase\":\"PHI_ELIM\",\"removed_allocas\":{}}}",
++        tt::json_arr_u32(&v)
++    );
++    tt::emit_raw(&body);
++}
++
++// ── Phase 10: phi elim ───────────────────────────────────────────────────
++
++pub fn phi_elim_plan(num_trampolines: usize) {
++    if !tt::enabled() { return; }
++    let body = format!(
++        "\"name\":\"PhiElimPlan\",\"state\":{{\"phase\":\"DONE\",\"num_trampolines\":{}}}",
++        num_trampolines
++    );
++    tt::emit_raw(&body);
++}
+diff --git a/src/ir/mem2reg/trace_scenarios.rs b/src/ir/mem2reg/trace_scenarios.rs
+new file mode 100644
+index 0000000..21eff30
+--- /dev/null
++++ b/src/ir/mem2reg/trace_scenarios.rs
+@@ -0,0 +1,129 @@
++//! Trace scenarios for mem2reg validation.
++//!
++//! Each test builds an IrFunction matching one of the spec fixtures
++//! (DefaultUseSites etc.) and runs `promote_allocas` + `eliminate_phis`
++//! with trace emission enabled. The resulting NDJSON file is consumed
++//! by Trace.tla.
++
++#![cfg(test)]
++
++use crate::common::types::AddressSpace;
++use crate::ir::mem2reg::{promote_allocas, eliminate_phis};
++use crate::ir::mem2reg::tla_trace;
++use crate::ir::reexports::{
++    BasicBlock, BlockId, Instruction, IrConst, IrFunction, IrModule, Operand,
++    Terminator, Value,
++};
++use crate::common::types::IrType;
++
++fn trace_path(name: &str) -> Option<String> {
++    if let Ok(dir) = std::env::var("CCC_TRACE_DIR") {
++        Some(format!("{}/{}.ndjson", dir, name))
++    } else {
++        None
++    }
++}
++
++/// Build the diamond fixture matching `DefaultUseSites` from MC.tla:
++///   block 0 (entry): alloca, STORE_PTR a1, CondBranch -> b1 / b2
++///   block 1: STORE_PTR a1 -> Branch b3
++///   block 2: STORE_PTR a1 -> Branch b3
++///   block 3: LOAD a1 -> Return
++fn build_diamond() -> IrModule {
++    let mut func = IrFunction::new("diamond".to_string(), IrType::I32, vec![], false);
++
++    // Block 0 (entry): alloca, store, cond branch
++    func.blocks.push(BasicBlock {
++        label: BlockId(0),
++        instructions: vec![
++            Instruction::Alloca {
++                dest: Value(0),
++                ty: IrType::I32,
++                size: 4,
++                align: 4,
++                volatile: false,
++            },
++            Instruction::Store {
++                val: Operand::Const(IrConst::I32(10)),
++                ptr: Value(0),
++                ty: IrType::I32,
++                seg_override: AddressSpace::Default,
++            },
++        ],
++        terminator: Terminator::CondBranch {
++            cond: Operand::Const(IrConst::I32(1)),
++            true_label: BlockId(1),
++            false_label: BlockId(2),
++        },
++        source_spans: Vec::new(),
++    });
++
++    // Block 1: store, branch
++    func.blocks.push(BasicBlock {
++        label: BlockId(1),
++        instructions: vec![Instruction::Store {
++            val: Operand::Const(IrConst::I32(20)),
++            ptr: Value(0),
++            ty: IrType::I32,
++            seg_override: AddressSpace::Default,
++        }],
++        terminator: Terminator::Branch(BlockId(3)),
++        source_spans: Vec::new(),
++    });
++
++    // Block 2: store, branch
++    func.blocks.push(BasicBlock {
++        label: BlockId(2),
++        instructions: vec![Instruction::Store {
++            val: Operand::Const(IrConst::I32(30)),
++            ptr: Value(0),
++            ty: IrType::I32,
++            seg_override: AddressSpace::Default,
++        }],
++        terminator: Terminator::Branch(BlockId(3)),
++        source_spans: Vec::new(),
++    });
++
++    // Block 3: load, return
++    func.blocks.push(BasicBlock {
++        label: BlockId(3),
++        instructions: vec![Instruction::Load {
++            dest: Value(1),
++            ptr: Value(0),
++            ty: IrType::I32,
++            seg_override: AddressSpace::Default,
++        }],
++        terminator: Terminator::Return(Some(Operand::Value(Value(1)))),
++        source_spans: Vec::new(),
++    });
++    func.next_value_id = 2;
++
++    let mut module = IrModule::new();
++    module.functions.push(func);
++    module
++}
++
++/// Run mem2reg + phi elim with tracing enabled to a per-scenario file.
++fn run_traced<F: FnOnce() -> IrModule>(scenario_name: &str, build: F) {
++    let path = match trace_path(scenario_name) {
++        Some(p) => p,
++        None => {
++            // No trace directory configured — just run without tracing.
++            let mut m = build();
++            promote_allocas(&mut m);
++            eliminate_phis(&mut m);
++            return;
++        }
++    };
++
++    tla_trace::init(&path);
++    let mut module = build();
++    promote_allocas(&mut module);
++    eliminate_phis(&mut module);
++    tla_trace::shutdown();
++}
++
++#[test]
++fn trace_diamond() {
++    run_traced("diamond", build_diamond);
++}
