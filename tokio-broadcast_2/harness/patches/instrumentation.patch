@@ -1,0 +1,718 @@
+diff --git a/tokio/src/sync/broadcast.rs b/tokio/src/sync/broadcast.rs
+index 3ab9a2ca..ecee9c20 100644
+--- a/tokio/src/sync/broadcast.rs
++++ b/tokio/src/sync/broadcast.rs
+@@ -119,6 +119,7 @@
+ use crate::loom::cell::UnsafeCell;
+ use crate::loom::sync::atomic::{AtomicBool, AtomicUsize};
+ use crate::loom::sync::{Arc, Mutex, MutexGuard};
++use crate::sync::tla_trace as tla;
+ use crate::task::coop::cooperative;
+ use crate::util::linked_list::{self, GuardedLinkedList, LinkedList};
+ use crate::util::WakeList;
+@@ -628,10 +629,22 @@ impl<T> Sender<T> {
+     /// tx.send(20).unwrap();
+     /// # }
+     /// ```
+-    pub fn send(&self, value: T) -> Result<usize, SendError<T>> {
++    pub fn send(&self, value: T) -> Result<usize, SendError<T>>
++    where
++        T: std::fmt::Debug,
++    {
++        let actor = tla::actor();
++        let t0 = tla::now();
+         let mut tail = self.shared.tail.lock();
++        let t1 = tla::now();
++        let num_tx = self.shared.num_tx.load(Acquire);
++        tla::emit_send(
++            "Send_AcquireTail", t0, t1, &actor, "",
++            tail.pos, tail.rx_cnt, tail.closed, 0usize, num_tx,
++        );
+ 
+         if tail.rx_cnt == 0 {
++            // Send_NoReceiversReturn — not in trace dispatch table; skip emit.
+             return Err(SendError(value));
+         }
+ 
+@@ -640,11 +653,29 @@ impl<T> Sender<T> {
+         let rem = tail.rx_cnt;
+         let idx = (pos & self.shared.mask as u64) as usize;
+ 
++        let value_str = format!("{:?}", value);
++        let t2 = tla::now();
+         // Update the tail position
+         tail.pos = tail.pos.wrapping_add(1);
++        let t3 = tla::now();
++        let extra_bump = format!(
++            r#","value":{},"pos":{},"idx":{}"#,
++            tla::esc(&value_str), pos, idx,
++        );
++        tla::emit_send(
++            "Send_BumpPos", t2, t3, &actor, &extra_bump,
++            tail.pos, tail.rx_cnt, tail.closed, 0usize, num_tx,
++        );
+ 
++        let t4 = tla::now();
+         // Get the slot
+         let mut slot = self.shared.buffer[idx].lock();
++        let t5 = tla::now();
++        let extra_lock = format!(r#","idx":{}"#, idx);
++        tla::emit_send(
++            "Send_LockSlot", t4, t5, &actor, &extra_lock,
++            tail.pos, tail.rx_cnt, tail.closed, 0usize, num_tx,
++        );
+ 
+         // Track the position
+         slot.pos = pos;
+@@ -652,16 +683,39 @@ impl<T> Sender<T> {
+         // Set remaining receivers
+         slot.rem.with_mut(|v| *v = rem);
+ 
++        let t6 = tla::now();
+         // Write the value
+         slot.val = Some(value);
++        let t7 = tla::now();
++        let extra_write = format!(
++            r#","idx":{},"pos":{},"value":{},"rem":{},"slotPos":{},"slotRem":{},"slotVal":"Some""#,
++            idx, pos, tla::esc(&value_str), rem, slot.pos, rem,
++        );
++        tla::emit_send(
++            "Send_WriteSlot", t6, t7, &actor, &extra_write,
++            tail.pos, tail.rx_cnt, tail.closed, 0usize, num_tx,
++        );
+ 
++        let t8 = tla::now();
+         // Release the slot lock before notifying the receivers.
+         drop(slot);
++        let t9 = tla::now();
++        let extra_drop = format!(r#","idx":{}"#, idx);
++        tla::emit_send(
++            "Send_DropSlot", t8, t9, &actor, &extra_drop,
++            tail.pos, tail.rx_cnt, tail.closed, 0usize, num_tx,
++        );
+ 
++        let t10 = tla::now();
++        tla::emit_send(
++            "Send_NotifyRx_Enter", t10, t10, &actor, "",
++            tail.pos, tail.rx_cnt, tail.closed, 0usize, num_tx,
++        );
+         // Notify and release the mutex. This must happen after the slot lock is
+         // released, otherwise the writer lock bit could be cleared while another
+         // thread is in the critical section.
+-        self.shared.notify_rx(tail);
++        let triggered_by = format!("send_{}", actor);
++        self.shared.notify_rx(tail, &triggered_by);
+ 
+         Ok(rem)
+     }
+@@ -903,10 +957,24 @@ impl<T> Sender<T> {
+     }
+ 
+     fn close_channel(&self) {
++        let actor = tla::actor();
+         let mut tail = self.shared.tail.lock();
++        let t0 = tla::now();
+         tail.closed = true;
++        let t1 = tla::now();
++        let num_tx = self.shared.num_tx.load(Acquire);
++        tla::emit_send(
++            "TxDrop_CloseChannelEnter", t0, t1, &actor, "",
++            tail.pos, tail.rx_cnt, tail.closed, 0usize, num_tx,
++        );
+ 
+-        self.shared.notify_rx(tail);
++        let t2 = tla::now();
++        tla::emit_send(
++            "TxDrop_NotifyEnter", t2, t2, &actor, "",
++            tail.pos, tail.rx_cnt, tail.closed, 0usize, num_tx,
++        );
++        let triggered_by = format!("close_{}", actor);
++        self.shared.notify_rx(tail, &triggered_by);
+     }
+ 
+     /// Returns the number of [`Sender`] handles.
+@@ -922,10 +990,13 @@ impl<T> Sender<T> {
+ 
+ /// Create a new `Receiver` which reads starting from the tail.
+ fn new_receiver<T>(shared: Arc<Shared<T>>) -> Receiver<T> {
++    let actor = tla::actor();
++    let t0 = tla::now();
+     let mut tail = shared.tail.lock();
+ 
+     assert!(tail.rx_cnt != MAX_RECEIVERS, "max receivers");
+ 
++    let reopened = tail.rx_cnt == 0;
+     if tail.rx_cnt == 0 {
+         // Potentially need to re-open the channel, if a new receiver has been added between calls
+         // to poll(). Note that we use rx_cnt == 0 instead of is_closed since is_closed also
+@@ -935,8 +1006,22 @@ fn new_receiver<T>(shared: Arc<Shared<T>>) -> Receiver<T> {
+ 
+     tail.rx_cnt = tail.rx_cnt.checked_add(1).expect("overflow");
+     let next = tail.pos;
++    let tail_pos = tail.pos;
++    let rx_cnt = tail.rx_cnt;
++    let closed = tail.closed;
++    let waiter_count = 0usize;
+ 
+     drop(tail);
++    let t1 = tla::now();
++    let num_tx = shared.num_tx.load(Acquire);
++    let extra = format!(
++        r#","receiver":{},"next":{},"reopened":{}"#,
++        tla::esc(&actor), next, reopened,
++    );
++    tla::emit_generic(
++        "Subscribe", t0, t1, &actor, &extra,
++        tail_pos, rx_cnt, closed, waiter_count, num_tx,
++    );
+ 
+     Receiver { shared, next }
+ }
+@@ -990,7 +1075,7 @@ impl<'a, T> WaitersList<'a, T> {
+ }
+ 
+ impl<T> Shared<T> {
+-    fn notify_rx<'a, 'b: 'a>(&'b self, mut tail: MutexGuard<'a, Tail>) {
++    fn notify_rx<'a, 'b: 'a>(&'b self, mut tail: MutexGuard<'a, Tail>, triggered_by: &str) {
+         // It is critical for `GuardedLinkedList` safety that the guard node is
+         // pinned in memory and is not dropped until the guarded list is dropped.
+         let guard = Waiter::new();
+@@ -1006,11 +1091,18 @@ impl<T> Shared<T> {
+         //   guard node after this function returns / panics.
+         let mut list = WaitersList::new(std::mem::take(&mut tail.waiters), guard.as_ref(), self);
+ 
++        let trig_extra = format!(r#","triggeredBy":{}"#, tla::esc(triggered_by));
++
+         let mut wakers = WakeList::new();
++        // Per-batch list of (actor_id) for the wakers we extracted, to emit
++        // NotifyRx_WakeOne events after wake_all.
++        let mut extracted: Vec<String> = Vec::new();
++        let num_tx = self.num_tx.load(Acquire);
+         'outer: loop {
+             while wakers.can_push() {
+                 match list.pop_back_locked(&mut tail) {
+                     Some(waiter) => {
++                        let waiter_actor;
+                         unsafe {
+                             // Safety: accessing `waker` is safe because
+                             // the tail lock is held.
+@@ -1025,8 +1117,21 @@ impl<T> Shared<T> {
+                             // `Release` is needed to synchronize with `Recv::drop`.
+                             // It is critical to set this variable **after** waker
+                             // is extracted, otherwise we may data race with `Recv::drop`.
++                            let t0 = tla::now();
+                             queued.store(false, Release);
++                            let t1 = tla::now();
++                            waiter_actor = tla::lookup_waiter(waiter.as_ptr() as usize);
++                            tla::forget_waiter(waiter.as_ptr() as usize);
++                            let extra = format!(
++                                r#","receiver":{}{}"#,
++                                tla::esc(&waiter_actor), trig_extra,
++                            );
++                            tla::emit_generic(
++                                "NotifyRx_DrainStep_Take", t0, t1, &waiter_actor, &extra,
++                                tail.pos, tail.rx_cnt, tail.closed, 0usize, num_tx,
++                            );
+                         }
++                        extracted.push(waiter_actor);
+                     }
+                     None => {
+                         break 'outer;
+@@ -1034,31 +1139,82 @@ impl<T> Shared<T> {
+                 }
+             }
+ 
++            let t_pre_drop = tla::now();
+             // Release the lock before waking.
+             drop(tail);
++            let t_post_drop = tla::now();
++            // Snapshot of state captured *after* tail drop is risky (other
++            // threads may modify); we just emit triggeredBy with last known
++            // values. Use 0 placeholders; the wrapper validates only triggered.
++            tla::emit_generic(
++                "NotifyRx_DropTail", t_pre_drop, t_post_drop,
++                &format!("notify_{}", triggered_by), &trig_extra,
++                0, 0, false, 0, num_tx,
++            );
+ 
+             // Before we acquire the lock again all sorts of things can happen:
+             // some waiters may remove themselves from the list and new waiters
+             // may be added. This is fine since at worst we will unnecessarily
+             // wake up waiters which will then queue themselves again.
+ 
++            for w in extracted.drain(..) {
++                let t = tla::now();
++                let extra = format!(r#","receiver":{}{}"#, tla::esc(&w), trig_extra);
++                tla::emit_generic(
++                    "NotifyRx_WakeOne", t, t, &w, &extra,
++                    0, 0, false, 0, num_tx,
++                );
++            }
+             wakers.wake_all();
+ 
+             // Acquire the lock again.
+             tail = self.tail.lock();
+         }
+ 
++        let t_pre_drop = tla::now();
+         // Release the lock before waking.
+         drop(tail);
++        let t_post_drop = tla::now();
++        tla::emit_generic(
++            "NotifyRx_DropTail", t_pre_drop, t_post_drop,
++            &format!("notify_{}", triggered_by), &trig_extra,
++            0, 0, false, 0, num_tx,
++        );
+ 
++        for w in extracted.drain(..) {
++            let t = tla::now();
++            let extra = format!(r#","receiver":{}{}"#, tla::esc(&w), trig_extra);
++            tla::emit_generic(
++                "NotifyRx_WakeOne", t, t, &w, &extra,
++                0, 0, false, 0, num_tx,
++            );
++        }
+         wakers.wake_all();
++
++        let t_finish = tla::now();
++        tla::emit_generic(
++            "NotifyRx_Finish", t_finish, t_finish,
++            &format!("notify_{}", triggered_by), &trig_extra,
++            0, 0, false, 0, num_tx,
++        );
+     }
+ }
+ 
+ impl<T> Clone for Sender<T> {
+     fn clone(&self) -> Sender<T> {
+         let shared = self.shared.clone();
+-        shared.num_tx.fetch_add(1, Relaxed);
++        let actor = tla::actor();
++        let t0 = tla::now();
++        let prev = shared.num_tx.fetch_add(1, Relaxed);
++        let t1 = tla::now();
++        let num_tx_after = prev + 1;
++        let tail = shared.tail.lock();
++        let extra_clone = format!(r#","numTxAfter":{}"#, num_tx_after);
++        tla::emit_send(
++            "TxClone", t0, t1, &actor, &extra_clone,
++            tail.pos, tail.rx_cnt, tail.closed, 0usize, num_tx_after,
++        );
++        drop(tail);
+ 
+         Sender { shared }
+     }
+@@ -1066,8 +1222,38 @@ impl<T> Clone for Sender<T> {
+ 
+ impl<T> Drop for Sender<T> {
+     fn drop(&mut self) {
+-        if 1 == self.shared.num_tx.fetch_sub(1, AcqRel) {
++        let actor = tla::actor();
++        let t0 = tla::now();
++        let prev = self.shared.num_tx.fetch_sub(1, AcqRel);
++        let t1 = tla::now();
++        let num_tx_after = prev.saturating_sub(1);
++        let was_last = prev == 1;
++        let extra_fs = format!(
++            r#","numTxAfter":{},"wasLast":{}"#,
++            num_tx_after, was_last,
++        );
++        // Capture tail snapshot for state validation.
++        let (tp, trx, tc, tw) = {
++            let t = self.shared.tail.lock();
++            (t.pos, t.rx_cnt, t.closed, 0usize)
++        };
++        tla::emit_send(
++            "TxDrop_FetchSub", t0, t1, &actor, &extra_fs,
++            tp, trx, tc, tw, num_tx_after,
++        );
++        if was_last {
+             self.close_channel();
++            let t_after = tla::now();
++            tla::emit_send(
++                "TxDrop_AfterClose", t_after, t_after, &actor, "",
++                0, 0, false, 0, num_tx_after,
++            );
++        } else {
++            let t_finish = tla::now();
++            tla::emit_send(
++                "TxDrop_Finish", t_finish, t_finish, &actor, "",
++                tp, trx, tc, tw, num_tx_after,
++            );
+         }
+     }
+ }
+@@ -1224,12 +1410,23 @@ impl<T> Receiver<T> {
+         &mut self,
+         waiter: Option<(&UnsafeCell<Waiter>, &Waker)>,
+     ) -> Result<RecvGuard<'_, T>, TryRecvError> {
++        let actor = tla::actor();
++        let num_tx = self.shared.num_tx.load(Acquire);
+         let idx = (self.next & self.shared.mask as u64) as usize;
+ 
++        let t0 = tla::now();
+         // The slot holding the next value to read
+         let mut slot = self.shared.buffer[idx].lock();
++        let t1 = tla::now();
++        // Snapshot under slot lock — tail not held here, capture best-effort.
++        let extra_lsf = format!(r#","idx":{}"#, idx);
++        tla::emit_recv(
++            "Recv_LockSlotFirst", t0, t1, &actor, &extra_lsf,
++            0, 0, false, 0, num_tx, false, self.next,
++        );
+ 
+         if slot.pos != self.next {
++            let t_drop_a = tla::now();
+             // Release the `slot` lock before attempting to acquire the `tail`
+             // lock. This is required because `send2` acquires the tail lock
+             // first followed by the slot lock. Acquiring the locks in reverse
+@@ -1238,13 +1435,34 @@ impl<T> Receiver<T> {
+             // while `send2` acquired the `tail` lock and attempts to acquire
+             // the slot lock.
+             drop(slot);
++            let t_drop_b = tla::now();
++            let extra_dst = format!(r#","idx":{}"#, idx);
++            tla::emit_recv(
++                "Recv_DropSlotForTail", t_drop_a, t_drop_b, &actor, &extra_dst,
++                0, 0, false, 0, num_tx, false, self.next,
++            );
+ 
+             let mut old_waker = None;
+ 
++            let t_lt_a = tla::now();
+             let mut tail = self.shared.tail.lock();
+-
++            let t_lt_b = tla::now();
++            tla::emit_recv(
++                "Recv_LockTail", t_lt_a, t_lt_b, &actor, "",
++                tail.pos, tail.rx_cnt, tail.closed, 0usize, num_tx,
++                false, self.next,
++            );
++
++            let t_rs_a = tla::now();
+             // Acquire slot lock again
+             slot = self.shared.buffer[idx].lock();
++            let t_rs_b = tla::now();
++            let extra_rs = format!(r#","idx":{}"#, idx);
++            tla::emit_recv(
++                "Recv_RelockSlot", t_rs_a, t_rs_b, &actor, &extra_rs,
++                tail.pos, tail.rx_cnt, tail.closed, 0usize, num_tx,
++                false, self.next,
++            );
+ 
+             // Make sure the position did not change. This could happen in the
+             // unlikely event that the buffer is wrapped between dropping the
+@@ -1257,6 +1475,13 @@ impl<T> Receiver<T> {
+                     // it's been closed, then that's what we return, otherwise we
+                     // set a waker and return empty.
+                     if tail.closed {
++                        let t_ec = tla::now();
++                        let extra_ec = format!(r#","idx":{}"#, idx);
++                        tla::emit_recv(
++                            "Recv_EmptyClosed", t_ec, t_ec, &actor, &extra_ec,
++                            tail.pos, tail.rx_cnt, tail.closed, 0usize, num_tx,
++                            false, self.next,
++                        );
+                         return Err(TryRecvError::Closed);
+                     }
+ 
+@@ -1284,12 +1509,24 @@ impl<T> Receiver<T> {
+                                     // `Relaxed` order suffices: all the readers will
+                                     // synchronize with this write through the tail lock.
+                                     (*ptr).queued.store(true, Relaxed);
++                                    tla::register_waiter(ptr as usize, &actor);
+                                     tail.waiters.push_front(NonNull::new_unchecked(&mut *ptr));
+                                 }
+                             });
+                         }
+                     }
+ 
++                    let t_park = tla::now();
++                    let extra_park = format!(
++                        r#","idx":{},"parkedAtPos":{}"#,
++                        idx, tail.pos,
++                    );
++                    tla::emit_recv(
++                        "Recv_ParkAsWaiter", t_park, t_park, &actor, &extra_park,
++                        tail.pos, tail.rx_cnt, tail.closed, 0usize, num_tx,
++                        true, self.next,
++                    );
++
+                     // Drop the old waker after releasing the locks.
+                     drop(slot);
+                     drop(tail);
+@@ -1306,6 +1543,10 @@ impl<T> Receiver<T> {
+                 let next = tail.pos.wrapping_sub(self.shared.buffer.len() as u64);
+ 
+                 let missed = next.wrapping_sub(self.next);
++                let _tail_pos_snap = tail.pos;
++                let _tail_rx_cnt_snap = tail.rx_cnt;
++                let _tail_closed_snap = tail.closed;
++                let _tail_waiters_snap = 0usize;
+ 
+                 drop(tail);
+ 
+@@ -1313,17 +1554,61 @@ impl<T> Receiver<T> {
+                 if missed == 0 {
+                     self.next = self.next.wrapping_add(1);
+ 
++                    let t_lff = tla::now();
++                    let extra_lff = format!(
++                        r#","idx":{},"missed":0,"nextAfter":{}"#,
++                        idx, self.next,
++                    );
++                    tla::emit_recv(
++                        "Recv_LaggedFastForward", t_lff, t_lff, &actor, &extra_lff,
++                        _tail_pos_snap, _tail_rx_cnt_snap, _tail_closed_snap,
++                        _tail_waiters_snap, num_tx, false, self.next,
++                    );
+                     return Ok(RecvGuard { slot });
+                 }
+ 
+                 self.next = next;
+ 
++                let t_lff = tla::now();
++                let extra_lff = format!(
++                    r#","idx":{},"missed":{},"nextAfter":{}"#,
++                    idx, missed, self.next,
++                );
++                tla::emit_recv(
++                    "Recv_LaggedFastForward", t_lff, t_lff, &actor, &extra_lff,
++                    _tail_pos_snap, _tail_rx_cnt_snap, _tail_closed_snap,
++                    _tail_waiters_snap, num_tx, false, self.next,
++                );
+                 return Err(TryRecvError::Lagged(missed));
++            } else {
++                // Recheck succeeded — slot.pos == self.next now. Emit
++                // Recv_RecheckMatch (treated as a fast-path hit).
++                let next_after = self.next.wrapping_add(1);
++                let t_rm = tla::now();
++                let extra_rm = format!(
++                    r#","idx":{},"nextAfter":{}"#,
++                    idx, next_after,
++                );
++                tla::emit_recv(
++                    "Recv_RecheckMatch", t_rm, t_rm, &actor, &extra_rm,
++                    tail.pos, tail.rx_cnt, tail.closed, 0usize, num_tx,
++                    false, next_after,
++                );
+             }
+         }
+ 
+         self.next = self.next.wrapping_add(1);
+ 
++        let t_hit = tla::now();
++        let extra_hit = format!(
++            r#","idx":{},"nextAfter":{}"#,
++            idx, self.next,
++        );
++        tla::emit_recv(
++            "Recv_HitFastPath", t_hit, t_hit, &actor, &extra_hit,
++            0, 0, false, 0, num_tx, false, self.next,
++        );
++
+         Ok(RecvGuard { slot })
+     }
+ 
+@@ -1547,6 +1832,16 @@ impl<T: Clone> Receiver<T> {
+ 
+ impl<T> Drop for Receiver<T> {
+     fn drop(&mut self) {
++        let actor = tla::actor();
++        let num_tx = self.shared.num_tx.load(Acquire);
++
++        let t_begin = tla::now();
++        tla::emit_recv(
++            "RxDrop_Begin", t_begin, t_begin, &actor, "",
++            0, 0, false, 0, num_tx, false, self.next,
++        );
++
++        let t_lock_a = tla::now();
+         let mut tail = self.shared.tail.lock();
+ 
+         tail.rx_cnt -= 1;
+@@ -1557,20 +1852,70 @@ impl<T> Drop for Receiver<T> {
+             self.shared.notify_last_rx_drop.notify_waiters();
+             tail.closed = true;
+         }
++        let t_lock_b = tla::now();
++        let extra_dec = format!(
++            r#","rxCntAfter":{},"closedAfter":{},"until":{}"#,
++            tail.rx_cnt, tail.closed, until,
++        );
++        tla::emit_recv(
++            "RxDrop_LockTailDecCnt", t_lock_a, t_lock_b, &actor, &extra_dec,
++            tail.pos, tail.rx_cnt, tail.closed, 0usize, num_tx,
++            false, self.next,
++        );
+ 
++        let t_drop_a = tla::now();
+         drop(tail);
++        let t_drop_b = tla::now();
++        tla::emit_recv(
++            "RxDrop_DropTail", t_drop_a, t_drop_b, &actor, "",
++            0, 0, false, 0, num_tx, false, self.next,
++        );
+ 
++        let mask = self.shared.mask;
+         while self.next < until {
+-            match self.recv_ref(None) {
+-                Ok(_) => {}
+-                // The channel is closed
+-                Err(TryRecvError::Closed) => break,
+-                // Ignore lagging, we will catch up
+-                Err(TryRecvError::Lagged(..)) => {}
+-                // Can't be empty
+-                Err(TryRecvError::Empty) => panic!("unexpected empty broadcast channel"),
++            let prev_next = self.next;
++            let kind: &str;
++            let do_break;
++            {
++                let r = self.recv_ref(None);
++                match r {
++                    Ok(_g) => {
++                        kind = "hit";
++                        do_break = false;
++                        // _g dropped at end of this block, releasing borrow.
++                    }
++                    Err(TryRecvError::Closed) => {
++                        do_break = true;
++                        kind = "closed";
++                    }
++                    Err(TryRecvError::Lagged(..)) => {
++                        do_break = false;
++                        kind = "lag";
++                    }
++                    Err(TryRecvError::Empty) => panic!("unexpected empty broadcast channel"),
++                }
++            }
++            if do_break {
++                break;
+             }
++            let next_after = self.next;
++            let idx_step = (prev_next & mask as u64) as usize;
++            let t_step = tla::now();
++            let extra_step = format!(
++                r#","idx":{},"kind":"{}","nextAfter":{}"#,
++                idx_step, kind, next_after,
++            );
++            tla::emit_recv(
++                "RxDrop_DrainStep", t_step, t_step, &actor, &extra_step,
++                0, 0, false, 0, num_tx, false, next_after,
++            );
+         }
++
++        let t_fin = tla::now();
++        tla::emit_recv(
++            "RxDrop_Finish", t_fin, t_fin, &actor, "",
++            0, 0, false, 0, num_tx, false, self.next,
++        );
+     }
+ }
+ 
+@@ -1609,6 +1954,13 @@ where
+     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<T, RecvError>> {
+         ready!(crate::trace::trace_leaf(cx));
+ 
++        let actor = tla::actor();
++        let t_poll = tla::now();
++        tla::emit_recv(
++            "Recv_PollEnter", t_poll, t_poll, &actor, "",
++            0, 0, false, 0, 0, false, 0,
++        );
++
+         let (receiver, waiter) = self.project();
+ 
+         let guard = match receiver.recv_ref(Some((waiter, cx.waker()))) {
+@@ -1624,41 +1976,76 @@ where
+ 
+ impl<'a, T> Drop for Recv<'a, T> {
+     fn drop(&mut self) {
++        let actor = tla::actor();
++        let t_begin = tla::now();
++        tla::emit_recv(
++            "RecvDrop_Begin", t_begin, t_begin, &actor, "",
++            0, 0, false, 0, 0, false, 0,
++        );
++
+         // Safety: `waiter.queued` is atomic.
+         // Acquire ordering is required to synchronize with
+         // `Shared::notify_rx` before we drop the object.
++        let t_la_a = tla::now();
+         let queued = self
+             .waiter
+             .0
+             .with(|ptr| unsafe { (*ptr).queued.load(Acquire) });
++        let t_la_b = tla::now();
++        let extra_la = format!(r#","loaded":{}"#, queued);
++        tla::emit_recv(
++            "RecvDrop_LoadQueued_Acquire", t_la_a, t_la_b, &actor, &extra_la,
++            0, 0, false, 0, 0, queued, 0,
++        );
+ 
+         // If the waiter is queued, we need to unlink it from the waiters list.
+         // If not, no further synchronization is required, since the waiter
+         // is not in the list and, as such, is not shared with any other threads.
+         if queued {
++            let t_lt_a = tla::now();
+             // Acquire the tail lock. This is required for safety before accessing
+             // the waiter node.
+             let mut tail = self.receiver.shared.tail.lock();
++            let t_lt_b = tla::now();
++            tla::emit_recv(
++                "RecvDrop_LockTail_Reread", t_lt_a, t_lt_b, &actor, "",
++                tail.pos, tail.rx_cnt, tail.closed, 0usize, 0,
++                queued, 0,
++            );
+ 
+             // Safety: tail lock is held.
+             // `Relaxed` order suffices because we hold the tail lock.
+-            let queued = self
++            let queued2 = self
+                 .waiter
+                 .0
+                 .with_mut(|ptr| unsafe { (*ptr).queued.load(Relaxed) });
+ 
+-            if queued {
++            if queued2 {
+                 // Remove the node
+                 //
+                 // safety: tail lock is held and the wait node is verified to be in
+                 // the list.
+                 unsafe {
+                     self.waiter.0.with_mut(|ptr| {
++                        tla::forget_waiter(ptr as usize);
+                         tail.waiters.remove((&mut *ptr).into());
+                     });
+                 }
+             }
++            let t_unlink = tla::now();
++            let extra_unlink = format!(r#","wasQueued":{}"#, queued2);
++            tla::emit_recv(
++                "RecvDrop_RereadAndUnlink", t_unlink, t_unlink, &actor, &extra_unlink,
++                tail.pos, tail.rx_cnt, tail.closed, 0usize, 0,
++                false, 0,
++            );
+         }
++
++        let t_finish = tla::now();
++        tla::emit_recv(
++            "RecvDrop_FinishIdle", t_finish, t_finish, &actor, "",
++            0, 0, false, 0, 0, false, 0,
++        );
+     }
+ }
+ 
+diff --git a/tokio/src/sync/mod.rs b/tokio/src/sync/mod.rs
+index 52bf6509..aafb8533 100644
+--- a/tokio/src/sync/mod.rs
++++ b/tokio/src/sync/mod.rs
+@@ -460,6 +460,8 @@ cfg_sync! {
+ 
+     pub mod broadcast;
+ 
++    pub mod tla_trace;
++
+     pub mod mpsc;
+ 
+     mod mutex;
