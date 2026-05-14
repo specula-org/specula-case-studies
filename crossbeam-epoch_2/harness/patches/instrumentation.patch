@@ -1,0 +1,413 @@
+diff --git a/crossbeam-epoch/src/epoch.rs b/crossbeam-epoch/src/epoch.rs
+index 154875f..a7a0949 100644
+--- a/crossbeam-epoch/src/epoch.rs
++++ b/crossbeam-epoch/src/epoch.rs
+@@ -84,6 +84,12 @@ impl Epoch {
+             data: self.data.wrapping_add(2),
+         }
+     }
++
++    /// Returns the raw `data` field — used by the TLA+ trace harness only.
++    #[inline]
++    pub(crate) fn raw_data(self) -> u64 {
++        self.data as u64
++    }
+ }
+ 
+ /// An atomic value that holds an `Epoch`.
+diff --git a/crossbeam-epoch/src/internal.rs b/crossbeam-epoch/src/internal.rs
+index 9abc113..08b60cb 100644
+--- a/crossbeam-epoch/src/internal.rs
++++ b/crossbeam-epoch/src/internal.rs
+@@ -124,11 +124,34 @@ impl Default for Bag {
+ 
+ impl Drop for Bag {
+     fn drop(&mut self) {
++        let bag_len = self.len;
+         // Call all deferred functions.
+-        for deferred in &mut self.deferreds[..self.len] {
++        for (idx, deferred) in self.deferreds[..self.len].iter_mut().enumerate() {
++            #[cfg(feature = "std")]
++            let s = crate::tla_trace::rdtsc();
+             let no_op = Deferred::NO_OP;
+             let owned_deferred = mem::replace(deferred, no_op);
++            // Suppress trace emission inside the deferred body so that
++            // re-entrant pin()/unpin() do not appear in the trace; the spec
++            // models reentrant pin via silent InDeferCallbackPin steps.
++            #[cfg(feature = "std")]
++            let prev = crate::tla_trace::enter_suppress();
+             owned_deferred.call();
++            #[cfg(feature = "std")]
++            crate::tla_trace::leave_suppress(prev);
++            #[cfg(feature = "std")]
++            {
++                let e = crate::tla_trace::rdtsc();
++                let obj = crate::tla_trace::take_bag_drop_obj();
++                crate::tla_trace::emit_bag_drop(s, e, idx + 1, obj);
++            }
++        }
++        // Final BagDrop step matching the spec's "finalize" branch.
++        #[cfg(feature = "std")]
++        if bag_len > 0 {
++            let s = crate::tla_trace::rdtsc();
++            let e = crate::tla_trace::rdtsc();
++            crate::tla_trace::emit_bag_drop(s, e, bag_len + 1, 0);
+         }
+     }
+ }
+@@ -194,7 +217,19 @@ impl Global {
+         atomic::fence(Ordering::SeqCst);
+ 
+         let epoch = self.epoch.load(Ordering::Relaxed);
++        #[cfg(feature = "std")]
++        let s = crate::tla_trace::rdtsc();
+         self.queue.push(bag.seal(epoch), guard);
++        #[cfg(feature = "std")]
++        {
++            let len_after = crate::tla_trace::SEALED_BAGS_LEN
++                .fetch_add(1, Ordering::Relaxed)
++                + 1;
++            let e = crate::tla_trace::rdtsc();
++            let seal_value =
++                crate::tla_trace::global_epoch_spec_value(epoch.raw_data());
++            crate::tla_trace::emit_push_bag(s, e, seal_value, len_after);
++        }
+     }
+ 
+     /// Collects several bags from the global queue and executes deferred functions in them.
+@@ -215,10 +250,32 @@ impl Global {
+         };
+ 
+         for _ in 0..steps {
+-            match self.queue.try_pop_if(
++            #[cfg(feature = "std")]
++            let s = crate::tla_trace::rdtsc();
++            // Suppress trace emission during try_pop_if. The MS-queue's
++            // pop calls `guard.defer_destroy(head)` to retire the dequeued
++            // node — that's queue-internal bookkeeping the spec does not
++            // model. Without suppression, we get spurious Defer events
++            // sandwiched into the CollectScan flow.
++            #[cfg(feature = "std")]
++            let _suppress = crate::tla_trace::enter_suppress();
++            let result = self.queue.try_pop_if(
+                 |sealed_bag: &SealedBag| sealed_bag.is_expired(global_epoch),
+                 guard,
+-            ) {
++            );
++            #[cfg(feature = "std")]
++            crate::tla_trace::leave_suppress(_suppress);
++            #[cfg(feature = "std")]
++            {
++                let popped = result.is_some();
++                if popped {
++                    crate::tla_trace::SEALED_BAGS_LEN
++                        .fetch_sub(1, Ordering::Relaxed);
++                }
++                let e = crate::tla_trace::rdtsc();
++                crate::tla_trace::emit_collect_scan(s, e, popped);
++            }
++            match result {
+                 None => break,
+                 Some(sealed_bag) => drop(sealed_bag),
+             }
+@@ -235,7 +292,18 @@ impl Global {
+     /// `try_advance()` is annotated `#[cold]` because it is rarely called.
+     #[cold]
+     pub(crate) fn try_advance(&self, guard: &Guard) -> Epoch {
++        #[cfg(feature = "std")]
++        let s_load = crate::tla_trace::rdtsc();
+         let global_epoch = self.epoch.load(Ordering::Relaxed);
++        #[cfg(feature = "std")]
++        {
++            let e_load = crate::tla_trace::rdtsc();
++            crate::tla_trace::emit_try_adv_load_global(
++                s_load,
++                e_load,
++                crate::tla_trace::global_epoch_spec_value(global_epoch.raw_data()),
++            );
++        }
+         atomic::fence(Ordering::SeqCst);
+ 
+         // For ThreadSanitizer that does not understand fences, we simulate the equivalent effect.
+@@ -247,11 +315,20 @@ impl Global {
+         // easy to implement in a lock-free manner. However, traversal can be slow due to cache
+         // misses and data dependencies. We should experiment with other data structures as well.
+         for local in self.locals.iter(guard) {
++            #[cfg(feature = "std")]
++            let s_iter = crate::tla_trace::rdtsc();
+             match local {
+                 Err(IterError::Stalled) => {
+                     // A concurrent thread stalled this iteration. That thread might also try to
+                     // advance the epoch, in which case we leave the job to it. Otherwise, the
+                     // epoch will not be advanced.
++                    #[cfg(feature = "std")]
++                    {
++                        let e_iter = crate::tla_trace::rdtsc();
++                        crate::tla_trace::emit_try_adv_iter(
++                            s_iter, e_iter, "", -1, false, "stalled",
++                        );
++                    }
+                     return global_epoch;
+                 }
+                 Ok(local) => {
+@@ -260,9 +337,38 @@ impl Global {
+                     // If the participant was pinned in a different epoch, we cannot advance the
+                     // global epoch just yet.
+                     if local_epoch.is_pinned() && local_epoch.unpinned() != global_epoch {
++                        #[cfg(feature = "std")]
++                        {
++                            let e_iter = crate::tla_trace::rdtsc();
++                            crate::tla_trace::emit_try_adv_iter(
++                                s_iter,
++                                e_iter,
++                                "",
++                                crate::tla_trace::local_epoch_spec_value(
++                                    local_epoch.raw_data(),
++                                ),
++                                local_epoch.is_pinned(),
++                                "different_epoch",
++                            );
++                        }
+                         return global_epoch;
+                     }
+ 
++                    #[cfg(feature = "std")]
++                    {
++                        let e_iter = crate::tla_trace::rdtsc();
++                        crate::tla_trace::emit_try_adv_iter(
++                            s_iter,
++                            e_iter,
++                            "",
++                            crate::tla_trace::local_epoch_spec_value(
++                                local_epoch.raw_data(),
++                            ),
++                            local_epoch.is_pinned(),
++                            "none",
++                        );
++                    }
++
+                     #[cfg(crossbeam_sanitize_thread)]
+                     locals.push(local);
+                 }
+@@ -283,7 +389,18 @@ impl Global {
+         // called from a thread that was pinned in `global_epoch`, and the global epoch cannot be
+         // advanced two steps ahead of it.
+         let new_epoch = global_epoch.successor();
++        #[cfg(feature = "std")]
++        let s_store = crate::tla_trace::rdtsc();
+         self.epoch.store(new_epoch, Ordering::Release);
++        #[cfg(feature = "std")]
++        {
++            let e_store = crate::tla_trace::rdtsc();
++            crate::tla_trace::emit_try_adv_finish_store(
++                s_store,
++                e_store,
++                crate::tla_trace::global_epoch_spec_value(new_epoch.raw_data()),
++            );
++        }
+         new_epoch
+     }
+ }
+@@ -380,21 +497,43 @@ impl Local {
+     ///
+     /// It should be safe for another thread to execute the given function.
+     pub(crate) unsafe fn defer(&self, mut deferred: Deferred, guard: &Guard) {
++        #[cfg(feature = "std")]
++        let s = crate::tla_trace::rdtsc();
+         let bag = self.bag.with_mut(|b| unsafe { &mut *b });
+ 
+         while let Err(d) = unsafe { bag.try_push(deferred) } {
+             self.global().push_bag(bag, guard);
+             deferred = d;
+         }
++        #[cfg(feature = "std")]
++        {
++            let e = crate::tla_trace::rdtsc();
++            let bag_len_after = bag.len;
++            let obj = crate::tla_trace::take_defer_obj();
++            crate::tla_trace::emit_defer(s, e, obj, bag_len_after);
++        }
+     }
+ 
+     pub(crate) fn flush(&self, guard: &Guard) {
+         let bag = self.bag.with_mut(|b| unsafe { &mut *b });
+ 
++        // PushBag emission happens first (if bag was non-empty). Then we
++        // emit Flush *before* `collect()` so the spec sees Flush before any
++        // TryAdv* events. The spec's `Flush` action atomically handles both
++        // push and transition into the PinCollect path; since the impl
++        // already pushed above, spec's Flush takes its "bag-empty" branch
++        // and simply transitions pc=Idle → pc=PinCollect.
+         if !bag.is_empty() {
+             self.global().push_bag(bag, guard);
+         }
+ 
++        #[cfg(feature = "std")]
++        {
++            let s = crate::tla_trace::rdtsc();
++            let e = crate::tla_trace::rdtsc();
++            crate::tla_trace::emit_flush(s, e);
++        }
++
+         self.global().collect(guard);
+     }
+ 
+@@ -403,13 +542,41 @@ impl Local {
+     pub(crate) fn pin(&self) -> Guard {
+         let guard = Guard { local: self };
+ 
++        // -- PinIncGuardCount --
++        #[cfg(feature = "std")]
++        let s_inc = crate::tla_trace::rdtsc();
+         let guard_count = self.guard_count.get();
+         self.guard_count.set(guard_count.checked_add(1).unwrap());
++        #[cfg(feature = "std")]
++        {
++            let e_inc = crate::tla_trace::rdtsc();
++            crate::tla_trace::emit_pin_inc_guard_count(
++                s_inc,
++                e_inc,
++                self.guard_count.get(),
++            );
++        }
+ 
+         if guard_count == 0 {
++            // -- PinLoadGlobal --
++            #[cfg(feature = "std")]
++            let s_load = crate::tla_trace::rdtsc();
+             let global_epoch = self.global().epoch.load(Ordering::Relaxed);
++            #[cfg(feature = "std")]
++            {
++                let e_load = crate::tla_trace::rdtsc();
++                crate::tla_trace::emit_pin_load_global(
++                    s_load,
++                    e_load,
++                    crate::tla_trace::global_epoch_spec_value(global_epoch.raw_data()),
++                );
++            }
+             let new_epoch = global_epoch.pinned();
+ 
++            // -- PinPublish (covers store + SC fence) --
++            #[cfg(feature = "std")]
++            let s_pub = crate::tla_trace::rdtsc();
++
+             // Now we must store `new_epoch` into `self.epoch` and execute a `SeqCst` fence.
+             // The fence makes sure that any future loads from `Atomic`s will not happen before
+             // this store.
+@@ -446,14 +613,39 @@ impl Local {
+                 self.epoch.store(new_epoch, Ordering::Relaxed);
+                 atomic::fence(Ordering::SeqCst);
+             }
++            #[cfg(feature = "std")]
++            {
++                let e_pub = crate::tla_trace::rdtsc();
++                let local = self.epoch.load(Ordering::Relaxed);
++                crate::tla_trace::emit_pin_publish(
++                    s_pub,
++                    e_pub,
++                    crate::tla_trace::local_epoch_spec_value(local.raw_data()),
++                );
++            }
+ 
++            // -- PinMaybeCollect --
++            #[cfg(feature = "std")]
++            let s_mc = crate::tla_trace::rdtsc();
+             // Increment the pin counter.
+             let count = self.pin_count.get();
+             self.pin_count.set(count + Wrapping(1));
+ 
++            let triggered = count.0 % Self::PINNINGS_BETWEEN_COLLECT == 0;
++            #[cfg(feature = "std")]
++            {
++                let e_mc = crate::tla_trace::rdtsc();
++                crate::tla_trace::emit_pin_maybe_collect(
++                    s_mc,
++                    e_mc,
++                    self.pin_count.get().0,
++                    triggered,
++                );
++            }
++
+             // After every `PINNINGS_BETWEEN_COLLECT` try advancing the epoch and collecting
+             // some garbage.
+-            if count.0 % Self::PINNINGS_BETWEEN_COLLECT == 0 {
++            if triggered {
+                 self.global().collect(&guard);
+             }
+         }
+@@ -464,11 +656,27 @@ impl Local {
+     /// Unpins the `Local`.
+     #[inline]
+     pub(crate) fn unpin(&self) {
++        // -- UnpinDec --
++        #[cfg(feature = "std")]
++        let s_dec = crate::tla_trace::rdtsc();
+         let guard_count = self.guard_count.get();
+         self.guard_count.set(guard_count - 1);
++        #[cfg(feature = "std")]
++        {
++            let e_dec = crate::tla_trace::rdtsc();
++            crate::tla_trace::emit_unpin_dec(s_dec, e_dec, self.guard_count.get());
++        }
+ 
+         if guard_count == 1 {
++            // -- UnpinPublish --
++            #[cfg(feature = "std")]
++            let s_pub = crate::tla_trace::rdtsc();
+             self.epoch.store(Epoch::starting(), Ordering::Release);
++            #[cfg(feature = "std")]
++            {
++                let e_pub = crate::tla_trace::rdtsc();
++                crate::tla_trace::emit_unpin_publish(s_pub, e_pub);
++            }
+ 
+             if self.handle_count.get() == 0 {
+                 unsafe {
+@@ -481,8 +689,13 @@ impl Local {
+     /// Unpins and then pins the `Local`.
+     #[inline]
+     pub(crate) fn repin(&self) {
++        // -- Repin --
++        #[cfg(feature = "std")]
++        let s = crate::tla_trace::rdtsc();
+         let guard_count = self.guard_count.get();
+ 
++        let mut was_no_op = guard_count != 1;
++
+         // Update the local epoch only if there's only one guard.
+         if guard_count == 1 {
+             let epoch = self.epoch.load(Ordering::Relaxed);
+@@ -497,8 +710,21 @@ impl Local {
+                 // However, we don't need a following `SeqCst` fence, because it is safe for memory
+                 // accesses from the new epoch to be executed before updating the local epoch. At
+                 // worse, other threads will see the new epoch late and delay GC slightly.
++            } else {
++                was_no_op = true;
+             }
+         }
++        #[cfg(feature = "std")]
++        {
++            let e = crate::tla_trace::rdtsc();
++            let local = self.epoch.load(Ordering::Relaxed);
++            crate::tla_trace::emit_repin(
++                s,
++                e,
++                crate::tla_trace::local_epoch_spec_value(local.raw_data()),
++                was_no_op,
++            );
++        }
+     }
+ 
+     /// Increments the handle count.
+diff --git a/crossbeam-epoch/src/lib.rs b/crossbeam-epoch/src/lib.rs
+index 97d46f6..240b275 100644
+--- a/crossbeam-epoch/src/lib.rs
++++ b/crossbeam-epoch/src/lib.rs
+@@ -185,3 +185,7 @@ mod sealed {
+ mod default;
+ #[cfg(feature = "std")]
+ pub use crate::default::{default_collector, is_pinned, pin};
++
++#[cfg(feature = "std")]
++#[allow(missing_docs)]
++pub mod tla_trace;
