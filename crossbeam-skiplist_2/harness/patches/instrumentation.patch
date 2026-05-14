@@ -1,0 +1,1281 @@
+diff --git a/crossbeam-skiplist/Cargo.toml b/crossbeam-skiplist/Cargo.toml
+index 1c5fbc05..221a6ae9 100644
+--- a/crossbeam-skiplist/Cargo.toml
++++ b/crossbeam-skiplist/Cargo.toml
+@@ -37,6 +37,10 @@ std = ["alloc", "crossbeam-epoch/std", "crossbeam-utils/std"]
+ # NOTE: Disabling both `std` *and* `alloc` features is not supported yet.
+ alloc = ["crossbeam-epoch/alloc"]
+ 
++# Trace harness for TLA+ trace validation. Emits per-thread NDJSON events
++# (Category B / timebox). Off by default; enable with `--features tla-trace`.
++tla-trace = ["std"]
++
+ [dependencies]
+ crossbeam-epoch = { version = "0.9.17", path = "../crossbeam-epoch", default-features = false }
+ crossbeam-utils = { version = "0.8.18", path = "../crossbeam-utils", default-features = false }
+diff --git a/crossbeam-skiplist/src/base.rs b/crossbeam-skiplist/src/base.rs
+index afa2df7a..74ab9225 100644
+--- a/crossbeam-skiplist/src/base.rs
++++ b/crossbeam-skiplist/src/base.rs
+@@ -20,6 +20,9 @@ use crate::{
+     comparator::{BasicComparator, Comparator},
+ };
+ 
++#[cfg(feature = "tla-trace")]
++use crate::tla_trace as tt;
++
+ /// Number of bits needed to store height.
+ const HEIGHT_BITS: usize = 5;
+ 
+@@ -572,6 +575,8 @@ where
+         Q: ?Sized,
+     {
+         self.check_guard(guard);
++        // The Get trace event itself is emitted from the test wrapper which
++        // owns the typed key. Here we just run the real lookup.
+         let n = self.search_bound(Bound::Included(key), false, guard)?;
+         if !self.comparator.equivalent(&n.key, key) {
+             return None;
+@@ -1032,7 +1037,19 @@ where
+ 
+             // First try searching for the key.
+             // Note that the `Ord` implementation for `K` may panic during the search.
++            #[cfg(feature = "tla-trace")]
++            let __t_begin_start = tt::read_tsc();
+             let mut search = self.search_position(&key, guard);
++            #[cfg(feature = "tla-trace")]
++            {
++                let end = tt::read_tsc();
++                let len_now = self.hot_data.len.load(Ordering::Relaxed);
++                let found_id = match search.found {
++                    Some(r) => tt::node_id(r.ptr.as_ptr() as usize),
++                    None => 0,
++                };
++                tt::emit_insert_begin(__t_begin_start, end, len_now, found_id);
++            }
+             if let Some(r) = search.found {
+                 let replace = replace(&r.value);
+                 if !replace {
+@@ -1073,6 +1090,8 @@ where
+ 
+                 // Try installing the new node into the skip list (at level 0).
+                 // TODO(Amanieu): can we use release ordering here?
++                #[cfg(feature = "tla-trace")]
++                let __t_cas_start = tt::read_tsc();
+                 if search.left[0]
+                     .get_level(0)
+                     .compare_exchange(
+@@ -1084,11 +1103,61 @@ where
+                     )
+                     .is_ok()
+                 {
++                    #[cfg(feature = "tla-trace")]
++                    {
++                        let end = tt::read_tsc();
++                        let n_id = tt::node_id(n.ptr.as_ptr() as usize);
++                        let len_now = self.hot_data.len.load(Ordering::Relaxed);
++                        let rc_now =
++                            n.refs_and_height.load(Ordering::Relaxed) >> HEIGHT_BITS;
++                        tt::emit_insert_alloc_cas_level0(
++                            __t_cas_start,
++                            end,
++                            n_id,
++                            len_now,
++                            rc_now,
++                            height,
++                        );
++                    }
+                     // This node has been abandoned
++                    #[cfg(feature = "tla-trace")]
++                    let __t_mark_start = tt::read_tsc();
+                     if let Some(r) = search.found {
+-                        if r.mark_tower() {
++                        let mark_won = r.mark_tower();
++                        if mark_won {
+                             self.hot_data.len.fetch_sub(1, Ordering::Relaxed);
+                         }
++                        #[cfg(feature = "tla-trace")]
++                        {
++                            let end = tt::read_tsc();
++                            let r_id = tt::node_id(r.ptr.as_ptr() as usize);
++                            let len_now = self.hot_data.len.load(Ordering::Relaxed);
++                            let marked0 = r.is_removed();
++                            tt::emit_insert_mark_old(
++                                __t_mark_start,
++                                end,
++                                r_id,
++                                mark_won,
++                                len_now,
++                                marked0,
++                            );
++                        }
++                    } else {
++                        // No old node — spec still steps through MarkOld as a no-op.
++                        // Emit a "no-op" MarkOld event so the trace cursor advances.
++                        #[cfg(feature = "tla-trace")]
++                        {
++                            let end = tt::read_tsc();
++                            let len_now = self.hot_data.len.load(Ordering::Relaxed);
++                            tt::emit_insert_mark_old(
++                                __t_mark_start,
++                                end,
++                                0,
++                                false,
++                                len_now,
++                                false,
++                            );
++                        }
+                     }
+                     break;
+                 }
+@@ -1133,6 +1202,8 @@ where
+             };
+ 
+             // Build the rest of the tower above level 0.
++            #[cfg(feature = "tla-trace")]
++            let mut __early_break = false;
+             'build: for level in 1..height {
+                 loop {
+                     // Obtain the predecessor and successor at the current level.
+@@ -1141,12 +1212,30 @@ where
+ 
+                     // Load the current value of the pointer in the tower at this level.
+                     // TODO(Amanieu): can we use relaxed ordering here?
++                    #[cfg(feature = "tla-trace")]
++                    let __t_build_start = tt::read_tsc();
+                     let next = n.get_level(level).load(Ordering::SeqCst, guard);
+ 
+                     // If the current pointer is marked, that means another thread is already
+                     // removing the node we've just inserted. In that case, let's just stop
+                     // building the tower.
+                     if next.tag() == 1 {
++                        #[cfg(feature = "tla-trace")]
++                        {
++                            let end = tt::read_tsc();
++                            let n_id = tt::node_id(n.ptr.as_ptr() as usize);
++                            let rc_now =
++                                n.refs_and_height.load(Ordering::Relaxed) >> HEIGHT_BITS;
++                            tt::emit_insert_build_level(
++                                __t_build_start,
++                                end,
++                                n_id,
++                                level,
++                                rc_now,
++                                "early_break",
++                            );
++                            __early_break = true;
++                        }
+                         break 'build;
+                     }
+ 
+@@ -1199,6 +1288,21 @@ where
+                         .compare_exchange(succ, node, Ordering::SeqCst, Ordering::SeqCst, guard)
+                         .is_ok()
+                     {
++                        #[cfg(feature = "tla-trace")]
++                        {
++                            let end = tt::read_tsc();
++                            let n_id = tt::node_id(n.ptr.as_ptr() as usize);
++                            let rc_now =
++                                n.refs_and_height.load(Ordering::Relaxed) >> HEIGHT_BITS;
++                            tt::emit_insert_build_level(
++                                __t_build_start,
++                                end,
++                                n_id,
++                                level,
++                                rc_now,
++                                "installed",
++                            );
++                        }
+                         // Success! Continue on the next level.
+                         break;
+                     }
+@@ -1217,6 +1321,28 @@ where
+                 }
+             }
+ 
++            // Terminator BuildLevel emit: matches the spec's final BuildLevel call
++            // that transitions the step machine to PostBuildCheck. Skipped if we
++            // already emitted an early_break event (that one IS the terminator).
++            #[cfg(feature = "tla-trace")]
++            {
++                if !__early_break {
++                    let __t_blt_start = tt::read_tsc();
++                    let end = tt::read_tsc();
++                    let n_id = tt::node_id(n.ptr.as_ptr() as usize);
++                    let rc_now =
++                        n.refs_and_height.load(Ordering::Relaxed) >> HEIGHT_BITS;
++                    tt::emit_insert_build_level(
++                        __t_blt_start,
++                        end,
++                        n_id,
++                        height,
++                        rc_now,
++                        "completed",
++                    );
++                }
++            }
++
+             // If any pointer in the tower is marked, that means our node is in the process of
+             // removal or already removed. It is possible that another thread (either partially or
+             // completely) removed the new node while we were building the tower, and just after
+@@ -1224,9 +1350,19 @@ where
+             // installation, we must repeat the search, which will unlink the new node at that
+             // level.
+             // TODO(Amanieu): can we use relaxed ordering here?
+-            if n.get_level(height - 1).load(Ordering::SeqCst, guard).tag() == 1 {
++            #[cfg(feature = "tla-trace")]
++            let __t_pbc_start = tt::read_tsc();
++            let __top_marked =
++                n.get_level(height - 1).load(Ordering::SeqCst, guard).tag() == 1;
++            if __top_marked {
+                 self.search_bound(Bound::Included(&n.key), false, guard);
+             }
++            #[cfg(feature = "tla-trace")]
++            {
++                let end = tt::read_tsc();
++                let n_id = tt::node_id(n.ptr.as_ptr() as usize);
++                tt::emit_insert_post_build_check(__t_pbc_start, end, n_id, __top_marked);
++            }
+ 
+             // Finally, return the new entry.
+             entry
+@@ -1282,32 +1418,97 @@ where
+ 
+             loop {
+                 // Try searching for the key.
++                #[cfg(feature = "tla-trace")]
++                let __t_rb_start = tt::read_tsc();
+                 let search = self.search_position(key, guard);
+ 
++                #[cfg(feature = "tla-trace")]
++                {
++                    let end = tt::read_tsc();
++                    let len_now = self.hot_data.len.load(Ordering::Relaxed);
++                    let target_id = match search.found {
++                        Some(r) => tt::node_id(r.ptr.as_ptr() as usize),
++                        None => 0,
++                    };
++                    tt::emit_remove_begin(
++                        __t_rb_start,
++                        end,
++                        tt::current_key(),
++                        target_id,
++                        len_now,
++                    );
++                }
++
+                 let n = search.found?;
+ 
+                 // First try incrementing the reference count because we have to return the node as
+                 // an entry. If this fails, repeat the search.
++                #[cfg(feature = "tla-trace")]
++                let __t_acq_start = tt::read_tsc();
+                 let entry = match RefEntry::try_acquire(self, n) {
+-                    Some(e) => e,
+-                    None => continue,
++                    Some(e) => {
++                        #[cfg(feature = "tla-trace")]
++                        {
++                            let end = tt::read_tsc();
++                            let n_id = tt::node_id(n.ptr.as_ptr() as usize);
++                            let rc_now =
++                                n.refs_and_height.load(Ordering::Relaxed) >> HEIGHT_BITS;
++                            tt::emit_remove_acquire(__t_acq_start, end, n_id, true, rc_now);
++                        }
++                        e
++                    }
++                    None => {
++                        #[cfg(feature = "tla-trace")]
++                        {
++                            let end = tt::read_tsc();
++                            let n_id = tt::node_id(n.ptr.as_ptr() as usize);
++                            tt::emit_remove_acquire(__t_acq_start, end, n_id, false, 0);
++                        }
++                        continue;
++                    }
+                 };
+ 
+                 // Try removing the node by marking its tower.
+-                if n.mark_tower() {
++                #[cfg(feature = "tla-trace")]
++                let __t_mt_start = tt::read_tsc();
++                let __mark_won = n.mark_tower();
++                if __mark_won {
+                     // Success! Decrement `len`.
+                     self.hot_data.len.fetch_sub(1, Ordering::Relaxed);
+ 
++                    #[cfg(feature = "tla-trace")]
++                    {
++                        let end = tt::read_tsc();
++                        let n_id = tt::node_id(n.ptr.as_ptr() as usize);
++                        let len_now = self.hot_data.len.load(Ordering::Relaxed);
++                        let rc_now =
++                            n.refs_and_height.load(Ordering::Relaxed) >> HEIGHT_BITS;
++                        let marked0 = n.is_removed();
++                        tt::emit_remove_mark_tower(
++                            __t_mt_start,
++                            end,
++                            n_id,
++                            true,
++                            len_now,
++                            rc_now,
++                            marked0,
++                        );
++                    }
++
+                     // Unlink the node at each level of the skip list. We could do this by simply
+                     // repeating the search, but it's usually faster to unlink it manually using
+                     // the `left` and `right` lists.
++                    #[cfg(feature = "tla-trace")]
++                    let mut __ul_failed = false;
+                     for level in (0..n.height()).rev() {
+                         // TODO(Amanieu): can we use relaxed ordering here?
+                         let succ = n.get_level(level).load(Ordering::SeqCst, guard).with_tag(0);
+ 
+                         // Try linking the predecessor and successor at this level.
+                         // TODO(Amanieu): can we use release ordering here?
+-                        if search.left[level]
++                        #[cfg(feature = "tla-trace")]
++                        let __t_ul_start = tt::read_tsc();
++                        let __cas_ok = search.left[level]
+                             .get_level(level)
+                             .compare_exchange(
+                                 Shared::from(n.ptr.as_ptr() as *const Node<K, V>),
+@@ -1316,20 +1517,89 @@ where
+                                 Ordering::SeqCst,
+                                 guard,
+                             )
+-                            .is_ok()
+-                        {
++                            .is_ok();
++                        if __cas_ok {
+                             // Success! Decrement the reference count.
+                             n.decrement(guard);
++                            #[cfg(feature = "tla-trace")]
++                            {
++                                let end = tt::read_tsc();
++                                let n_id = tt::node_id(n.ptr.as_ptr() as usize);
++                                let rc_now =
++                                    n.refs_and_height.load(Ordering::Relaxed) >> HEIGHT_BITS;
++                                tt::emit_remove_unlink_level(
++                                    __t_ul_start,
++                                    end,
++                                    n_id,
++                                    level,
++                                    true,
++                                    rc_now,
++                                );
++                            }
+                         } else {
++                            #[cfg(feature = "tla-trace")]
++                            {
++                                let end = tt::read_tsc();
++                                let n_id = tt::node_id(n.ptr.as_ptr() as usize);
++                                let rc_now =
++                                    n.refs_and_height.load(Ordering::Relaxed) >> HEIGHT_BITS;
++                                tt::emit_remove_unlink_level(
++                                    __t_ul_start,
++                                    end,
++                                    n_id,
++                                    level,
++                                    false,
++                                    rc_now,
++                                );
++                                __ul_failed = true;
++                            }
+                             // Failed! Just repeat the search to completely unlink the node.
+                             self.search_bound(Bound::Included(key), false, guard);
+                             break;
+                         }
+                     }
++                    // Terminator UnlinkLevel: matches the spec's lvl<0 transition
++                    // to Done. Skipped if a CAS failure already terminated us.
++                    #[cfg(feature = "tla-trace")]
++                    {
++                        if !__ul_failed {
++                            let __t_ult_start = tt::read_tsc();
++                            let end = tt::read_tsc();
++                            let n_id = tt::node_id(n.ptr.as_ptr() as usize);
++                            let rc_now =
++                                n.refs_and_height.load(Ordering::Relaxed) >> HEIGHT_BITS;
++                            tt::emit_remove_unlink_level(
++                                __t_ult_start,
++                                end,
++                                n_id,
++                                0,
++                                true,
++                                rc_now,
++                            );
++                        }
++                    }
+                     return Some(entry);
+                 } else {
+                     // The node has already been marked.
+                     n.decrement(guard);
++                    #[cfg(feature = "tla-trace")]
++                    {
++                        let end = tt::read_tsc();
++                        let n_id = tt::node_id(n.ptr.as_ptr() as usize);
++                        let len_now = self.hot_data.len.load(Ordering::Relaxed);
++                        let rc_now =
++                            n.refs_and_height.load(Ordering::Relaxed) >> HEIGHT_BITS;
++                        let marked0 = n.is_removed();
++                        tt::emit_remove_mark_tower(
++                            __t_mt_start,
++                            end,
++                            n_id,
++                            false,
++                            len_now,
++                            rc_now,
++                            marked0,
++                        );
++                    }
+                     return None;
+                 }
+             }
+@@ -1508,6 +1778,13 @@ impl<'a: 'g, 'g, K: 'a, V: 'a, C> Entry<'a, 'g, K, V, C> {
+         self.parent
+     }
+ 
++    /// Trace-only accessor for the harness. Returns the raw node pointer.
++    #[cfg(feature = "tla-trace")]
++    #[doc(hidden)]
++    pub fn tla_trace_node_addr(&self) -> usize {
++        self.node.ptr.as_ptr() as usize
++    }
++
+     /// Attempts to pin the entry with a reference count, ensuring that it
+     /// remains accessible even after the `Guard` is dropped.
+     ///
+@@ -1650,6 +1927,15 @@ impl<'a, K: 'a, V: 'a, C: 'a> RefEntry<'a, K, V, C> {
+         self.parent
+     }
+ 
++    /// Trace-only accessor: returns the raw node pointer as a `usize` so
++    /// the harness can map it to a stable TLA+ NodeId. Available only when
++    /// the `tla-trace` feature is enabled.
++    #[cfg(feature = "tla-trace")]
++    #[doc(hidden)]
++    pub fn tla_trace_node_addr(&self) -> usize {
++        self.node.ptr.as_ptr() as usize
++    }
++
+     /// Releases the reference on the entry.
+     pub fn release(self, guard: &Guard) {
+         self.parent.check_guard(guard);
+diff --git a/crossbeam-skiplist/src/lib.rs b/crossbeam-skiplist/src/lib.rs
+index 5337e3d2..32633b06 100644
+--- a/crossbeam-skiplist/src/lib.rs
++++ b/crossbeam-skiplist/src/lib.rs
+@@ -252,6 +252,9 @@ mod alloc_helper;
+ #[cfg(all(feature = "alloc", target_has_atomic = "ptr"))]
+ pub mod base;
+ 
++#[cfg(feature = "tla-trace")]
++pub mod tla_trace;
++
+ #[cfg(all(feature = "alloc", target_has_atomic = "ptr"))]
+ #[doc(inline)]
+ pub use crate::base::SkipList;
+diff --git a/crossbeam-skiplist/src/tla_trace.rs b/crossbeam-skiplist/src/tla_trace.rs
+new file mode 100644
+index 00000000..40cc7bc7
+--- /dev/null
++++ b/crossbeam-skiplist/src/tla_trace.rs
+@@ -0,0 +1,518 @@
++#![allow(
++    clippy::std_instead_of_alloc,
++    clippy::std_instead_of_core,
++    clippy::alloc_instead_of_core,
++    missing_docs
++)]
++//! TLA+ trace emission for crossbeam-skiplist (Category B / timebox).
++//!
++//! Each thread writes its own NDJSON file at `$CROSSBEAM_SKIPLIST_TRACE_DIR/thread_<tid>.ndjson`.
++//! Events carry `[start, end]` rdtsc intervals so TLC can search legal interleavings
++//! with the OmniLink-style `ViablePIDs` constraint in `Trace.tla`.
++//!
++//! Activated by the `tla-trace` Cargo feature. When the feature is off the
++//! emitter functions are stub no-ops, the source compiles unchanged, and there
++//! is zero runtime overhead.
++
++extern crate std;
++
++use std::cell::RefCell;
++use std::collections::HashMap;
++use std::fs::{create_dir_all, File};
++use std::io::{BufWriter, Write};
++use std::path::PathBuf;
++use std::string::String;
++use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
++use std::sync::{Mutex, OnceLock};
++use std::{format, thread_local, write};
++
++static TRACE_DIR: OnceLock<Option<PathBuf>> = OnceLock::new();
++static THREAD_COUNTER: AtomicU32 = AtomicU32::new(0);
++static NODE_COUNTER: AtomicU64 = AtomicU64::new(0);
++static NODE_REGISTRY: OnceLock<Mutex<HashMap<usize, u64>>> = OnceLock::new();
++static ITER_COUNTER: AtomicU64 = AtomicU64::new(0);
++
++thread_local! {
++    static TID_CELL: RefCell<Option<u32>> = const { RefCell::new(None) };
++    static WRITER: RefCell<Option<BufWriter<File>>> = const { RefCell::new(None) };
++    static NODE_CACHE: RefCell<HashMap<usize, u64>> = RefCell::new(HashMap::new());
++
++    static CUR_KEY: RefCell<i64> = const { RefCell::new(0) };
++    static CUR_VALUE: RefCell<i64> = const { RefCell::new(0) };
++
++    static ITER_KIND: RefCell<&'static str> = const { RefCell::new("iter") };
++    static ITER_PREV_STATE: RefCell<&'static str> = const { RefCell::new("Fresh") };
++    static ITER_ID: RefCell<u64> = const { RefCell::new(0) };
++}
++
++fn dir() -> Option<&'static PathBuf> {
++    TRACE_DIR
++        .get_or_init(|| {
++            std::env::var("CROSSBEAM_SKIPLIST_TRACE_DIR").ok().map(|s| {
++                let pb = PathBuf::from(&s);
++                let _ = create_dir_all(&pb);
++                pb
++            })
++        })
++        .as_ref()
++}
++
++#[inline]
++pub fn enabled() -> bool {
++    dir().is_some()
++}
++
++fn tid() -> u32 {
++    TID_CELL.with(|t| {
++        if let Some(v) = *t.borrow() {
++            return v;
++        }
++        let v = THREAD_COUNTER.fetch_add(1, Ordering::Relaxed) + 1;
++        *t.borrow_mut() = Some(v);
++        v
++    })
++}
++
++fn ensure_writer() {
++    WRITER.with(|w| {
++        if w.borrow().is_some() {
++            return;
++        }
++        if let Some(d) = dir() {
++            let id = tid();
++            let path = d.join(format!("thread_{}.ndjson", id));
++            if let Ok(f) = File::create(&path) {
++                *w.borrow_mut() = Some(BufWriter::new(f));
++            }
++        }
++    });
++}
++
++/// Read the time-stamp counter on x86_64 (with mfence). Falls back to a
++/// monotonic clock on other architectures.
++#[inline(always)]
++pub fn read_tsc() -> u64 {
++    #[cfg(target_arch = "x86_64")]
++    unsafe {
++        core::arch::x86_64::_mm_mfence();
++        let lo: u32;
++        let hi: u32;
++        core::arch::asm!("rdtsc", out("eax") lo, out("edx") hi, options(nomem, nostack));
++        ((hi as u64) << 32) | (lo as u64)
++    }
++    #[cfg(not(target_arch = "x86_64"))]
++    {
++        use std::time::SystemTime;
++        SystemTime::now()
++            .duration_since(std::time::UNIX_EPOCH)
++            .unwrap()
++            .as_nanos() as u64
++    }
++}
++
++/// Map a raw node pointer to a stable, sequential id (1-indexed).
++/// Returns 0 for null.
++pub fn node_id(ptr: usize) -> u64 {
++    if ptr == 0 {
++        return 0;
++    }
++    NODE_CACHE.with(|cache| {
++        if let Some(&id) = cache.borrow().get(&ptr) {
++            return id;
++        }
++        let registry = NODE_REGISTRY.get_or_init(|| Mutex::new(HashMap::new()));
++        let id = {
++            let mut m = registry.lock().unwrap();
++            *m.entry(ptr).or_insert_with(|| {
++                NODE_COUNTER.fetch_add(1, Ordering::Relaxed) + 1
++            })
++        };
++        cache.borrow_mut().insert(ptr, id);
++        id
++    })
++}
++
++/// Set the typed key/value of the current operation. The test harness calls
++/// this BEFORE invoking insert/get/remove so the generic body of
++/// `insert_internal` etc. can include the key/value in trace events.
++pub fn set_current_op(k: i64, v: i64) {
++    CUR_KEY.with(|c| *c.borrow_mut() = k);
++    CUR_VALUE.with(|c| *c.borrow_mut() = v);
++}
++
++pub fn current_key() -> i64 {
++    CUR_KEY.with(|c| *c.borrow())
++}
++pub fn current_value() -> i64 {
++    CUR_VALUE.with(|c| *c.borrow())
++}
++
++/// Allocate a fresh iterator id for the current thread.
++pub fn new_iter_id() -> u64 {
++    let id = ITER_COUNTER.fetch_add(1, Ordering::Relaxed) + 1;
++    ITER_ID.with(|c| *c.borrow_mut() = id);
++    ITER_PREV_STATE.with(|c| *c.borrow_mut() = "Fresh");
++    id
++}
++
++pub fn set_iter_kind(k: &'static str) {
++    ITER_KIND.with(|c| *c.borrow_mut() = k);
++}
++pub fn iter_kind() -> &'static str {
++    ITER_KIND.with(|c| *c.borrow())
++}
++
++pub fn iter_prev_state() -> &'static str {
++    ITER_PREV_STATE.with(|c| *c.borrow())
++}
++pub fn set_iter_prev_state(s: &'static str) {
++    ITER_PREV_STATE.with(|c| *c.borrow_mut() = s);
++}
++pub fn current_iter_id() -> u64 {
++    ITER_ID.with(|c| *c.borrow())
++}
++
++#[inline]
++fn write_line(line: &str) {
++    if !enabled() {
++        return;
++    }
++    ensure_writer();
++    WRITER.with(|w| {
++        if let Some(ref mut writer) = *w.borrow_mut() {
++            let _ = writer.write_all(line.as_bytes());
++            let _ = writer.write_all(b"\n");
++        }
++    });
++}
++
++/// Flush this thread's writer. Tests call this at the end of each scenario
++/// because cargo test does not always flush per-thread BufWriters.
++pub fn flush_writer() {
++    WRITER.with(|w| {
++        if let Some(ref mut writer) = *w.borrow_mut() {
++            let _ = writer.flush();
++        }
++    });
++}
++
++// =========================================================================
++// Per-event emit helpers. JSON is hand-formatted; the per-event field shapes
++// are defined in instrumentation-spec.md (Section 1).
++// =========================================================================
++
++#[inline]
++fn envelope_open(buf: &mut String, name: &str, start: u64, end: u64) {
++    use std::fmt::Write;
++    let _ = write!(
++        buf,
++        "{{\"tag\":\"trace\",\"event\":\"{}\",\"thread\":\"t{}\",\"start\":{},\"end\":{}",
++        name,
++        tid(),
++        start,
++        end
++    );
++}
++
++pub fn emit_insert_begin(start: u64, end: u64, len: usize, found_node: u64) {
++    if !enabled() {
++        return;
++    }
++    let mut buf = String::with_capacity(160);
++    envelope_open(&mut buf, "Insert_Begin", start, end);
++    use std::fmt::Write;
++    let _ = write!(
++        buf,
++        ",\"state\":{{\"len\":{}}},\"key\":{},\"value\":{},\"found_node\":{}}}",
++        len,
++        current_key(),
++        current_value(),
++        found_node
++    );
++    write_line(&buf);
++}
++
++pub fn emit_insert_alloc_cas_level0(
++    start: u64,
++    end: u64,
++    node: u64,
++    len: usize,
++    refcount: usize,
++    height: usize,
++) {
++    if !enabled() {
++        return;
++    }
++    let mut buf = String::with_capacity(180);
++    envelope_open(&mut buf, "Insert_AllocCASLevel0", start, end);
++    use std::fmt::Write;
++    let _ = write!(
++        buf,
++        ",\"state\":{{\"len\":{},\"refcount\":{}}},\"node\":{},\"height\":{}}}",
++        len, refcount, node, height
++    );
++    write_line(&buf);
++}
++
++pub fn emit_insert_mark_old(
++    start: u64,
++    end: u64,
++    node: u64,
++    mark_won: bool,
++    len: usize,
++    marked0: bool,
++) {
++    if !enabled() {
++        return;
++    }
++    let mut buf = String::with_capacity(180);
++    envelope_open(&mut buf, "Insert_MarkOld", start, end);
++    use std::fmt::Write;
++    let _ = write!(
++        buf,
++        ",\"state\":{{\"len\":{},\"marked0\":{}}},\"node\":{},\"mark_won\":{}}}",
++        len, marked0, node, mark_won
++    );
++    write_line(&buf);
++}
++
++pub fn emit_insert_build_level(
++    start: u64,
++    end: u64,
++    node: u64,
++    level: usize,
++    refcount: usize,
++    result: &str,
++) {
++    if !enabled() {
++        return;
++    }
++    let mut buf = String::with_capacity(180);
++    envelope_open(&mut buf, "Insert_BuildLevel", start, end);
++    use std::fmt::Write;
++    let _ = write!(
++        buf,
++        ",\"state\":{{\"refcount\":{}}},\"node\":{},\"level\":{},\"result\":\"{}\"}}",
++        refcount, node, level, result
++    );
++    write_line(&buf);
++}
++
++pub fn emit_insert_post_build_check(
++    start: u64,
++    end: u64,
++    node: u64,
++    top_level_marked: bool,
++) {
++    if !enabled() {
++        return;
++    }
++    let mut buf = String::with_capacity(160);
++    envelope_open(&mut buf, "Insert_PostBuildCheck", start, end);
++    use std::fmt::Write;
++    let _ = write!(
++        buf,
++        ",\"state\":{{}},\"node\":{},\"top_level_marked\":{}}}",
++        node, top_level_marked
++    );
++    write_line(&buf);
++}
++
++pub fn emit_insert_done(start: u64, end: u64, node: u64, refcount: usize) {
++    if !enabled() {
++        return;
++    }
++    let mut buf = String::with_capacity(160);
++    envelope_open(&mut buf, "Insert_Done", start, end);
++    use std::fmt::Write;
++    let _ = write!(
++        buf,
++        ",\"state\":{{\"refcount\":{}}},\"node\":{}}}",
++        refcount, node
++    );
++    write_line(&buf);
++}
++
++pub fn emit_get(start: u64, end: u64, key: i64, result_node: u64, len: usize) {
++    if !enabled() {
++        return;
++    }
++    let mut buf = String::with_capacity(160);
++    envelope_open(&mut buf, "Get", start, end);
++    use std::fmt::Write;
++    let result = if result_node == 0 { "none" } else { "some" };
++    let _ = write!(
++        buf,
++        ",\"state\":{{\"len\":{}}},\"key\":{},\"result\":\"{}\",\"node\":{}}}",
++        len, key, result, result_node
++    );
++    write_line(&buf);
++}
++
++pub fn emit_remove_begin(start: u64, end: u64, key: i64, target_node: u64, len: usize) {
++    if !enabled() {
++        return;
++    }
++    let mut buf = String::with_capacity(160);
++    envelope_open(&mut buf, "Remove_Begin", start, end);
++    use std::fmt::Write;
++    let _ = write!(
++        buf,
++        ",\"state\":{{\"len\":{}}},\"key\":{},\"target_node\":{}}}",
++        len, key, target_node
++    );
++    write_line(&buf);
++}
++
++pub fn emit_remove_acquire(
++    start: u64,
++    end: u64,
++    node: u64,
++    acquired: bool,
++    refcount: usize,
++) {
++    if !enabled() {
++        return;
++    }
++    let mut buf = String::with_capacity(160);
++    envelope_open(&mut buf, "Remove_Acquire", start, end);
++    use std::fmt::Write;
++    let _ = write!(
++        buf,
++        ",\"state\":{{\"refcount\":{}}},\"node\":{},\"acquired\":{}}}",
++        refcount, node, acquired
++    );
++    write_line(&buf);
++}
++
++pub fn emit_remove_mark_tower(
++    start: u64,
++    end: u64,
++    node: u64,
++    mark_won: bool,
++    len: usize,
++    refcount: usize,
++    marked0: bool,
++) {
++    if !enabled() {
++        return;
++    }
++    let mut buf = String::with_capacity(200);
++    envelope_open(&mut buf, "Remove_MarkTower", start, end);
++    use std::fmt::Write;
++    let _ = write!(
++        buf,
++        ",\"state\":{{\"len\":{},\"refcount\":{},\"marked0\":{}}},\"node\":{},\"mark_won\":{}}}",
++        len, refcount, marked0, node, mark_won
++    );
++    write_line(&buf);
++}
++
++pub fn emit_remove_unlink_level(
++    start: u64,
++    end: u64,
++    node: u64,
++    level: usize,
++    cas_ok: bool,
++    refcount: usize,
++) {
++    if !enabled() {
++        return;
++    }
++    let mut buf = String::with_capacity(180);
++    envelope_open(&mut buf, "Remove_UnlinkLevel", start, end);
++    use std::fmt::Write;
++    let _ = write!(
++        buf,
++        ",\"state\":{{\"refcount\":{}}},\"node\":{},\"level\":{},\"cas_ok\":{}}}",
++        refcount, node, level, cas_ok
++    );
++    write_line(&buf);
++}
++
++pub fn emit_remove_done(start: u64, end: u64, node: u64, refcount: usize, found: bool) {
++    if !enabled() {
++        return;
++    }
++    let mut buf = String::with_capacity(160);
++    envelope_open(&mut buf, "Remove_Done", start, end);
++    use std::fmt::Write;
++    let result = if found { "some" } else { "none" };
++    let _ = write!(
++        buf,
++        ",\"state\":{{\"refcount\":{}}},\"node\":{},\"result\":\"{}\"}}",
++        refcount, node, result
++    );
++    write_line(&buf);
++}
++
++pub fn emit_iter_begin(start: u64, end: u64, kind: &str, iter_id: u64) {
++    if !enabled() {
++        return;
++    }
++    let mut buf = String::with_capacity(160);
++    envelope_open(&mut buf, "Iter_Begin", start, end);
++    use std::fmt::Write;
++    let _ = write!(
++        buf,
++        ",\"state\":{{}},\"iter_kind\":\"{}\",\"iter_id\":{}}}",
++        kind, iter_id
++    );
++    write_line(&buf);
++}
++
++pub fn emit_iter_next(
++    start: u64,
++    end: u64,
++    iter_id: u64,
++    yielded_node: u64,
++    prev_state: &str,
++    refcount: Option<usize>,
++) {
++    if !enabled() {
++        return;
++    }
++    let mut buf = String::with_capacity(180);
++    envelope_open(&mut buf, "Iter_Next", start, end);
++    use std::fmt::Write;
++    let result = if yielded_node == 0 { "none" } else { "some" };
++    if let Some(rc) = refcount {
++        let _ = write!(
++            buf,
++            ",\"state\":{{\"refcount\":{}}},\"iter_id\":{},\"node\":{},\"result\":\"{}\",\"prev_state\":\"{}\"}}",
++            rc, iter_id, yielded_node, result, prev_state
++        );
++    } else {
++        let _ = write!(
++            buf,
++            ",\"state\":{{}},\"iter_id\":{},\"node\":{},\"result\":\"{}\",\"prev_state\":\"{}\"}}",
++            iter_id, yielded_node, result, prev_state
++        );
++    }
++    write_line(&buf);
++}
++
++pub fn emit_iter_drop(
++    start: u64,
++    end: u64,
++    iter_id: u64,
++    head_decremented: bool,
++    tail_decremented: bool,
++    head_refcount: Option<usize>,
++    tail_refcount: Option<usize>,
++) {
++    if !enabled() {
++        return;
++    }
++    let mut buf = String::with_capacity(220);
++    envelope_open(&mut buf, "Iter_Drop", start, end);
++    use std::fmt::Write;
++    let head_rc = head_refcount.map(|x| x as i64).unwrap_or(-1);
++    let tail_rc = tail_refcount.map(|x| x as i64).unwrap_or(-1);
++    let _ = write!(
++        buf,
++        ",\"state\":{{}},\"iter_id\":{},\"head_decremented\":{},\"tail_decremented\":{},\"head_refcount\":{},\"tail_refcount\":{}}}",
++        iter_id, head_decremented, tail_decremented, head_rc, tail_rc
++    );
++    write_line(&buf);
++}
+diff --git a/crossbeam-skiplist/tests/tla_scenarios.rs b/crossbeam-skiplist/tests/tla_scenarios.rs
+new file mode 100644
+index 00000000..2d8c66e8
+--- /dev/null
++++ b/crossbeam-skiplist/tests/tla_scenarios.rs
+@@ -0,0 +1,271 @@
++//! Trace harness scenarios for crossbeam-skiplist.
++//!
++//! Each `#[test]` function below is one scenario. The scenarios are designed
++//! to be run one-at-a-time via cargo test --features tla-trace, with the
++//! environment variable `CROSSBEAM_SKIPLIST_TRACE_DIR` pointing to a fresh
++//! per-scenario directory. Each thread writes `thread_<tid>.ndjson` files
++//! into that directory.
++//!
++//! Key/value space is restricted to {1,2,3} so the preprocessor can map them
++//! to TLA+ constants `k1,k2,k3` and `v1,v2,v3`. Total distinct nodes are kept
++//! under MaxNodes (= 8 in Trace.cfg).
++
++#![cfg(feature = "tla-trace")]
++
++use std::sync::{Arc, Barrier};
++use std::thread;
++
++use crossbeam_epoch as epoch;
++use crossbeam_skiplist::SkipList;
++use crossbeam_skiplist::tla_trace as tt;
++
++/// Insert wrapper that stashes the typed key/value in thread-local before
++/// calling into `insert`, so the generic `insert_internal` can include them
++/// in the `Insert_Begin` event.
++fn traced_insert<C: crossbeam_skiplist::comparator::Comparator<i32>>(
++    s: &SkipList<i32, i32, C>,
++    k: i32,
++    v: i32,
++    guard: &epoch::Guard,
++) {
++    tt::set_current_op(k as i64, v as i64);
++    let entry = s.insert(k, v, guard);
++    let node_addr = entry.tla_trace_node_addr();
++    let s_dn = tt::read_tsc();
++    entry.release(guard);
++    let s_up = tt::read_tsc();
++    // post-drop refcount: read via the registered node id; we have no easy
++    // handle so just record 1 (the dec_ref decrement may free the node).
++    // The validator's ValidateRefcount falls back to TRUE if the node is
++    // already cleaned up — see Trace.tla.
++    let nid = tt::node_id(node_addr);
++    tt::emit_insert_done(s_dn, s_up, nid, 1);
++}
++
++fn traced_get<C: crossbeam_skiplist::comparator::Comparator<i32>>(
++    s: &SkipList<i32, i32, C>,
++    k: i32,
++    guard: &epoch::Guard,
++) {
++    tt::set_current_op(k as i64, 0);
++    let start = tt::read_tsc();
++    let res = s.get(&k, guard);
++    let end = tt::read_tsc();
++    let len = s.len();
++    let node_id = match &res {
++        Some(e) => tt::node_id(e.tla_trace_node_addr()),
++        None => 0,
++    };
++    tt::emit_get(start, end, k as i64, node_id, len);
++}
++
++fn traced_remove<C: crossbeam_skiplist::comparator::Comparator<i32>>(
++    s: &SkipList<i32, i32, C>,
++    k: i32,
++    guard: &epoch::Guard,
++) where
++    C: crossbeam_skiplist::comparator::Comparator<i32>,
++{
++    tt::set_current_op(k as i64, 0);
++    let entry_opt = s.remove(&k, guard);
++    let s_dn = tt::read_tsc();
++    let (node_id, refcount, found) = match entry_opt {
++        Some(entry) => {
++            let addr = entry.tla_trace_node_addr();
++            entry.release(guard);
++            (tt::node_id(addr), 1usize, true)
++        }
++        None => (0u64, 0usize, false),
++    };
++    let s_up = tt::read_tsc();
++    tt::emit_remove_done(s_dn, s_up, node_id, refcount, found);
++}
++
++/// Iterate over all entries via the (lifetimed) iterator and emit
++/// Iter_Begin/Iter_Next/Iter_Drop events. Uses ref_iter so we can capture
++/// refcount on each yield.
++fn traced_ref_iter_all<C: crossbeam_skiplist::comparator::Comparator<i32>>(
++    s: &SkipList<i32, i32, C>,
++    guard: &epoch::Guard,
++) {
++    let s0 = tt::read_tsc();
++    let mut it = s.ref_iter();
++    let s1 = tt::read_tsc();
++    let iter_id = tt::new_iter_id();
++    tt::set_iter_kind("ref_iter");
++    tt::emit_iter_begin(s0, s1, "ref_iter", iter_id);
++
++    loop {
++        let prev = tt::iter_prev_state();
++        let n0 = tt::read_tsc();
++        let nx = it.next(guard);
++        let n1 = tt::read_tsc();
++        match nx {
++            Some(e) => {
++                let addr = e.tla_trace_node_addr();
++                let nid = tt::node_id(addr);
++                tt::emit_iter_next(n0, n1, iter_id, nid, prev, Some(2));
++                tt::set_iter_prev_state("Yielded");
++                e.release(guard);
++            }
++            None => {
++                tt::emit_iter_next(n0, n1, iter_id, 0, prev, None);
++                tt::set_iter_prev_state("Exhausted");
++                break;
++            }
++        }
++    }
++
++    let d0 = tt::read_tsc();
++    drop(it);
++    let d1 = tt::read_tsc();
++    tt::emit_iter_drop(d0, d1, iter_id, false, false, None, None);
++}
++
++#[test]
++fn scenario_single_thread_basic() {
++    let s = SkipList::<i32, i32>::new(epoch::default_collector().clone());
++    let guard = &epoch::pin();
++
++    traced_insert(&s, 1, 1, guard);
++    traced_insert(&s, 2, 2, guard);
++    traced_insert(&s, 3, 3, guard);
++
++    traced_get(&s, 1, guard);
++    traced_get(&s, 2, guard);
++    traced_get(&s, 3, guard);
++
++    traced_remove(&s, 2, guard);
++    traced_get(&s, 2, guard);
++
++    traced_ref_iter_all(&s, guard);
++
++    tt::flush_writer();
++}
++
++/// Replace path: inserting an existing key drives `Insert_MarkOld` because
++/// `insert_internal` is called with `replace = TRUE`.
++#[test]
++fn scenario_insert_replace() {
++    let s = SkipList::<i32, i32>::new(epoch::default_collector().clone());
++    let guard = &epoch::pin();
++
++    traced_insert(&s, 1, 1, guard); // first insert: search.found = None
++    traced_insert(&s, 1, 2, guard); // replace: search.found = Some -> mark_old
++    traced_insert(&s, 1, 3, guard); // replace again
++    traced_get(&s, 1, guard);
++    traced_remove(&s, 1, guard);
++    traced_get(&s, 1, guard);
++
++    tt::flush_writer();
++}
++
++/// Drives `Insert_BuildLevel` by issuing enough inserts that the
++/// Xorshift-seeded `random_height` draws a height >= 2 at least once. The
++/// 7th call to `random_height` returns 2 with the default seed = 1, so we
++/// need >= 7 inserts. Re-inserting the same key (replace path) keeps the
++/// distinct node count low: 7 inserts → 7 nodes, under MaxNodes = 8.
++#[test]
++fn scenario_height_growth() {
++    let s = SkipList::<i32, i32>::new(epoch::default_collector().clone());
++    let guard = &epoch::pin();
++
++    // 7 inserts into the same key. Each replace allocates one new node and
++    // marks the old one (drives Insert_MarkOld). The 7th draws height=2
++    // (drives Insert_BuildLevel).
++    for _ in 0..7 {
++        traced_insert(&s, 1, 1, guard);
++    }
++    traced_get(&s, 1, guard);
++    traced_remove(&s, 1, guard);
++
++    tt::flush_writer();
++}
++
++#[test]
++fn scenario_two_threads_distinct_keys() {
++    let s = Arc::new(SkipList::<i32, i32>::new(epoch::default_collector().clone()));
++    let barrier = Arc::new(Barrier::new(2));
++
++    let mut handles = vec![];
++    for i in 0..2 {
++        let s = s.clone();
++        let b = barrier.clone();
++        handles.push(thread::spawn(move || {
++            b.wait();
++            let guard = &epoch::pin();
++            // Thread 0 inserts keys {1, 2}. Thread 1 inserts key {3}.
++            // Distinct keys → no level-0 CAS retry across threads.
++            if i == 0 {
++                traced_insert(&s, 1, 1, guard);
++                traced_insert(&s, 2, 2, guard);
++            } else {
++                traced_insert(&s, 3, 3, guard);
++            }
++            // Both read all keys.
++            traced_get(&s, 1, guard);
++            traced_get(&s, 2, guard);
++            traced_get(&s, 3, guard);
++            tt::flush_writer();
++        }));
++    }
++    for h in handles {
++        h.join().unwrap();
++    }
++
++    let guard = &epoch::pin();
++    traced_ref_iter_all(&s, guard);
++    tt::flush_writer();
++}
++
++#[test]
++fn scenario_insert_remove_race() {
++    let s = Arc::new(SkipList::<i32, i32>::new(epoch::default_collector().clone()));
++    let barrier = Arc::new(Barrier::new(3));
++
++    let mut handles = vec![];
++
++    // Inserter thread.
++    {
++        let s = s.clone();
++        let b = barrier.clone();
++        handles.push(thread::spawn(move || {
++            b.wait();
++            let guard = &epoch::pin();
++            traced_insert(&s, 1, 1, guard);
++            traced_insert(&s, 2, 2, guard);
++            traced_insert(&s, 3, 3, guard);
++            tt::flush_writer();
++        }));
++    }
++    // Remover thread.
++    {
++        let s = s.clone();
++        let b = barrier.clone();
++        handles.push(thread::spawn(move || {
++            b.wait();
++            let guard = &epoch::pin();
++            // Remove may return None if not yet inserted.
++            traced_remove(&s, 1, guard);
++            traced_remove(&s, 2, guard);
++            tt::flush_writer();
++        }));
++    }
++    // Reader thread.
++    {
++        let s = s.clone();
++        let b = barrier.clone();
++        handles.push(thread::spawn(move || {
++            b.wait();
++            let guard = &epoch::pin();
++            traced_get(&s, 1, guard);
++            traced_get(&s, 2, guard);
++            traced_get(&s, 3, guard);
++            tt::flush_writer();
++        }));
++    }
++
++    for h in handles {
++        h.join().unwrap();
++    }
++}
