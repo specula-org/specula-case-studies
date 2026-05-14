@@ -1,0 +1,1475 @@
+diff --git a/consensus/safety-rules/src/lib.rs b/consensus/safety-rules/src/lib.rs
+index a335bafa..5573d9ed 100644
+--- a/consensus/safety-rules/src/lib.rs
++++ b/consensus/safety-rules/src/lib.rs
+@@ -13,6 +13,9 @@ mod process;
+ mod remote_service;
+ mod safety_rules;
+ mod safety_rules_2chain;
++
++#[cfg(any(test, feature = "testing"))]
++pub mod tla_trace;
+ pub mod safety_rules_manager;
+ mod serializer;
+ mod t_safety_rules;
+diff --git a/consensus/safety-rules/src/safety_rules.rs b/consensus/safety-rules/src/safety_rules.rs
+index 9b9b979e..e2d34173 100644
+--- a/consensus/safety-rules/src/safety_rules.rs
++++ b/consensus/safety-rules/src/safety_rules.rs
+@@ -302,6 +302,22 @@ impl SafetyRules {
+                     0,
+                 ))?;
+ 
++                #[cfg(any(test, feature = "testing"))]
++                if crate::tla_trace::is_active() {
++                    let nid = crate::tla_trace::active_nid();
++                    if let Ok(sd) = self.persistent_storage.safety_data() {
++                        let state = crate::tla_trace::safety_state(&sd);
++                        crate::tla_trace::emit_event(
++                            "EpochChange",
++                            &nid,
++                            0,
++                            sd.epoch,
++                            state,
++                            None,
++                        );
++                    }
++                }
++
+                 info!(SafetyLogSchema::new(LogEntry::Epoch, LogEvent::Update)
+                     .epoch(epoch_state.epoch));
+             },
+@@ -414,6 +430,24 @@ impl SafetyRules {
+ 
+         let signature = self.sign(&new_ledger_info)?;
+ 
++        #[cfg(any(test, feature = "testing"))]
++        if crate::tla_trace::is_active() {
++            let nid = crate::tla_trace::active_nid();
++            let sd  = self.persistent_storage.safety_data().ok();
++            let mut state = sd.as_ref().map(crate::tla_trace::safety_state).unwrap_or_else(|| serde_json::json!({}));
++            if let Some(obj) = state.as_object_mut() {
++                obj.insert("epoch".into(), serde_json::json!(new_ledger_info.epoch()));
++            }
++            crate::tla_trace::emit_event(
++                "SignCommitVote",
++                &nid,
++                new_ledger_info.commit_info().round(),
++                new_ledger_info.epoch(),
++                state,
++                None,
++            );
++        }
++
+         Ok(signature)
+     }
+ }
+diff --git a/consensus/safety-rules/src/safety_rules_2chain.rs b/consensus/safety-rules/src/safety_rules_2chain.rs
+index 1210936e..554e0cce 100644
+--- a/consensus/safety-rules/src/safety_rules_2chain.rs
++++ b/consensus/safety-rules/src/safety_rules_2chain.rs
+@@ -44,9 +44,23 @@ impl SafetyRules {
+             self.verify_and_update_last_vote_round(timeout.round(), &mut safety_data)?;
+         }
+         self.update_highest_timeout_round(timeout, &mut safety_data);
+-        self.persistent_storage.set_safety_data(safety_data)?;
++        self.persistent_storage.set_safety_data(safety_data.clone())?;
+ 
+         let signature = self.sign(&timeout.signing_format())?;
++
++        #[cfg(any(test, feature = "testing"))]
++        if crate::tla_trace::is_active() {
++            let nid = crate::tla_trace::active_nid();
++            let state = crate::tla_trace::safety_state(&safety_data);
++            crate::tla_trace::emit_event(
++                "SignTimeout",
++                &nid,
++                timeout.round(),
++                safety_data.epoch,
++                state,
++                None,
++            );
++        }
+         Ok(signature)
+     }
+ 
+@@ -89,7 +103,36 @@ impl SafetyRules {
+         let vote = Vote::new_with_signature(vote_data, author, ledger_info, signature);
+ 
+         safety_data.last_vote = Some(vote.clone());
+-        self.persistent_storage.set_safety_data(safety_data)?;
++
++        #[cfg(any(test, feature = "testing"))]
++        if crate::tla_trace::is_active() {
++            let nid = crate::tla_trace::active_nid();
++            let state = crate::tla_trace::safety_state(&safety_data);
++            crate::tla_trace::emit_event(
++                "SignVote",
++                &nid,
++                proposed_block.round(),
++                safety_data.epoch,
++                state,
++                None,
++            );
++        }
++
++        self.persistent_storage.set_safety_data(safety_data.clone())?;
++
++        #[cfg(any(test, feature = "testing"))]
++        if crate::tla_trace::is_active() {
++            let nid = crate::tla_trace::active_nid();
++            let state = crate::tla_trace::safety_state(&safety_data);
++            crate::tla_trace::emit_event(
++                "CompletePersistVote",
++                &nid,
++                proposed_block.round(),
++                safety_data.epoch,
++                state,
++                None,
++            );
++        }
+ 
+         Ok(vote)
+     }
+@@ -114,7 +157,22 @@ impl SafetyRules {
+             LedgerInfo::new(order_vote_proposal.block_info().clone(), HashValue::zero());
+         let signature = self.sign(&ledger_info)?;
+         let order_vote = OrderVote::new_with_signature(author, ledger_info.clone(), signature);
+-        self.persistent_storage.set_safety_data(safety_data)?;
++        self.persistent_storage.set_safety_data(safety_data.clone())?;
++
++        #[cfg(any(test, feature = "testing"))]
++        if crate::tla_trace::is_active() {
++            let nid = crate::tla_trace::active_nid();
++            let state = crate::tla_trace::safety_state(&safety_data);
++            crate::tla_trace::emit_event(
++                "SignOrderVote",
++                &nid,
++                proposed_block.round(),
++                safety_data.epoch,
++                state,
++                None,
++            );
++        }
++
+         Ok(order_vote)
+     }
+ 
+diff --git a/consensus/safety-rules/src/tests/mod.rs b/consensus/safety-rules/src/tests/mod.rs
+index 1edadcdd..f301a508 100644
+--- a/consensus/safety-rules/src/tests/mod.rs
++++ b/consensus/safety-rules/src/tests/mod.rs
+@@ -4,8 +4,12 @@
+ extern crate claims;
+ mod local;
+ mod networking;
++mod repro_bugs;
+ mod safety_rules;
+ mod serializer;
+ mod suite;
+ mod thread;
+ mod vault;
++
++#[cfg(any(test, feature = "testing"))]
++mod tla_trace_scenario;
+diff --git a/consensus/safety-rules/src/tests/repro_bugs.rs b/consensus/safety-rules/src/tests/repro_bugs.rs
+new file mode 100644
+index 00000000..ca489c81
+--- /dev/null
++++ b/consensus/safety-rules/src/tests/repro_bugs.rs
+@@ -0,0 +1,346 @@
++// Reproduction tests for bugs surfaced by the aptosbft_2 model-checking round.
++//
++// Bug 1 / Bug 2: Sign-before-persist + Byzantine equivocating proposer enables
++//                a double vote at the same round across a crash window
++//                (Family 1, MC-1; cf. Issue #18298).
++//
++// Bug 3: `sign_commit_vote` does not call `verify_epoch(new_ledger_info.epoch(), ...)`
++//        (Family 3, MC-5). We check whether the real implementation's
++//        `match_ordered_only` + signature verification chain actually prevents
++//        the cross-epoch commit vote that the spec admits, so we can classify
++//        the MC counterexample correctly (false positive vs real bug).
++
++use crate::{
++    persistent_safety_storage::PersistentSafetyStorage, test_utils, Error, SafetyRules,
++    TSafetyRules,
++};
++use aptos_consensus_types::{
++    block::{block_test_utils::random_payload, Block},
++    common::Payload,
++    quorum_cert::QuorumCert,
++    vote_proposal::VoteProposal,
++};
++use aptos_crypto::hash::ACCUMULATOR_PLACEHOLDER_HASH;
++use aptos_secure_storage::{InMemoryStorage, Storage};
++use aptos_types::{
++    aggregate_signature::AggregateSignature,
++    block_info::BlockInfo,
++    ledger_info::{LedgerInfo, LedgerInfoWithSignatures},
++    validator_signer::ValidatorSigner,
++};
++
++/// Build two structurally distinct VoteProposals at the same round, with the same QC
++/// (the genesis QC). The Byzantine equivocating proposer in the threat model produces
++/// two valid BlockData at the same round with the same parent QC but different payloads;
++/// here the SAME signer signs both, which is exactly how an equivocating Byzantine proposer
++/// looks to honest peers (two distinct signatures over two distinct BlockData with the
++/// same proposer identity).
++fn make_two_proposals_same_round(
++    round: u64,
++    genesis_qc: &QuorumCert,
++    signer: &ValidatorSigner,
++) -> (VoteProposal, VoteProposal) {
++    // Use random_payload to get two semantically distinct blocks.
++    let p1 = test_utils::make_proposal_with_qc_and_proof(
++        random_payload(8),
++        round,
++        test_utils::empty_proof(),
++        genesis_qc.clone(),
++        signer,
++    );
++    let p2 = test_utils::make_proposal_with_qc_and_proof(
++        random_payload(8),
++        round,
++        test_utils::empty_proof(),
++        genesis_qc.clone(),
++        signer,
++    );
++    assert_eq!(p1.block().round(), p2.block().round());
++    assert_ne!(p1.block().id(), p2.block().id());
++    (p1, p2)
++}
++
++/// Build a fresh PersistentSafetyStorage with a clean (epoch=1, last_voted_round=0)
++/// state — the state a validator would have on disk *before* it has voted at round 1.
++fn fresh_storage(signer: &ValidatorSigner) -> PersistentSafetyStorage {
++    test_utils::test_storage(signer)
++}
++
++fn initialize(safety_rules: &mut SafetyRules, signer: &ValidatorSigner) {
++    let (proof, _genesis_qc) = test_utils::make_genesis(signer);
++    safety_rules.initialize(&proof).unwrap();
++}
++
++/// Test reproduces Bug 1 and Bug 2 together: sign-before-persist (Family 1, MC-1).
++///
++/// Scenario:
++///   1. Honest validator s has fresh on-disk state: last_voted_round = 0.
++///   2. Byzantine proposer issues conflicting proposals p1 and p2 at round 1.
++///   3. s receives p1 first and signs a vote v1; SafetyRules has just executed
++///      `self.sign(...)` (safety_rules_2chain.rs:102) but the
++///      `self.persistent_storage.set_safety_data(...)` (line 121) has NOT
++///      durably committed yet (e.g. OnDiskStorage::write performs `rename`
++///      without `fsync`, so a power failure between the rename and the kernel
++///      flushing buffers would lose the write).
++///   4. s crashes. On restart the persistent state has last_voted_round = 0
++///      (because the crash lost the persist).
++///   5. s now receives p2 (the Byzantine proposer's other proposal) and
++///      runs SafetyRules at round 1 again.
++///
++/// Buggy outcome (this test verifies): SafetyRules signs a *second* vote v2
++/// at the same round 1, for a different proposal. v1 and v2 are two
++/// distinct, valid votes by an honest validator at the same (epoch, round) —
++/// safety invariant `NoDoubleVote` is broken.
++///
++/// Correct outcome would be: the second SafetyRules call rejects with
++/// `IncorrectLastVotedRound`. That requires the persist to have survived
++/// the crash, i.e. the storage backend must be synchronously durable.
++#[test]
++fn repro_bug1_2_double_vote_after_crash_window() {
++    let signer = ValidatorSigner::from_int(0);
++    let (_proof, genesis_qc) = test_utils::make_genesis(&signer);
++
++    let (p1, p2) = make_two_proposals_same_round(1, &genesis_qc, &signer);
++
++    // First boot: storage starts at last_voted_round=0 (fresh disk).
++    let storage_a = fresh_storage(&signer);
++    let mut sr_a = SafetyRules::new(storage_a, /* skip_sig_verify = */ false);
++    initialize(&mut sr_a, &signer);
++
++    let v1 = sr_a
++        .construct_and_sign_vote_two_chain(&p1, None)
++        .expect("first vote should succeed");
++    assert_eq!(v1.vote_data().proposed().round(), 1);
++
++    // Crash window between sign() and set_safety_data().
++    // We simulate the lost persist by instantiating a SECOND, INDEPENDENT
++    // PersistentSafetyStorage with the same (pre-crash) state — i.e. the
++    // disk still has last_voted_round=0. This is what a validator backed
++    // by a non-fsyncing storage (OnDiskStorage at on_disk.rs:64-70) would
++    // see after a power loss between the sign and the persisted set.
++    drop(sr_a);
++
++    let storage_b = fresh_storage(&signer);
++    let mut sr_b = SafetyRules::new(storage_b, /* skip_sig_verify = */ false);
++    initialize(&mut sr_b, &signer);
++
++    // Same validator now votes on the OTHER Byzantine-equivocating proposal at the same round.
++    let v2_res = sr_b.construct_and_sign_vote_two_chain(&p2, None);
++
++    match v2_res {
++        Ok(v2) => {
++            // Both votes succeeded → double vote.
++            assert_eq!(v2.vote_data().proposed().round(), 1);
++            assert_ne!(
++                v1.vote_data().proposed().id(),
++                v2.vote_data().proposed().id(),
++                "the two votes must be for distinct proposals"
++            );
++            assert_ne!(
++                v1.ledger_info().consensus_data_hash(),
++                v2.ledger_info().consensus_data_hash(),
++                "the two votes' signed payloads must differ"
++            );
++            println!(
++                "REPRO SUCCESS: NoDoubleVote violated — v1.id={} v2.id={} both at round=1",
++                v1.vote_data().proposed().id(),
++                v2.vote_data().proposed().id()
++            );
++        },
++        Err(e) => panic!(
++            "Expected double-vote to succeed (demonstrating the bug); got Err: {:?}",
++            e
++        ),
++    }
++}
++
++/// Counter-test: if the persistent state DID survive the crash (i.e. the
++/// backend is properly fsyncing), the second sign call at the same round
++/// must NOT produce a different vote. SafetyRules has two layers of guard:
++///
++///   1. `safety_data.last_vote` dedup at safety_rules_2chain.rs:84-88 —
++///      if a vote at the same round already exists, return it (don't re-sign).
++///   2. `verify_and_update_last_vote_round` at safety_rules.rs:213-232 —
++///      `round <= last_voted_round` is rejected.
++///
++/// With persistent state surviving, layer (1) returns the EXISTING vote.
++/// The buggy crash-window path loses *both* layers (because both fields
++/// live in the same SafetyData), so layer (2)'s check passes against the
++/// stale last_voted_round=0 and a brand-new vote gets signed.
++#[test]
++fn counter_durable_persist_blocks_double_vote() {
++    let signer = ValidatorSigner::from_int(0);
++    let (proof, genesis_qc) = test_utils::make_genesis(&signer);
++
++    let (p1, p2) = make_two_proposals_same_round(1, &genesis_qc, &signer);
++
++    // Single storage instance: the persist DOES survive across the two operations,
++    // modelling a synchronously-durable backend.
++    let storage = fresh_storage(&signer);
++    let mut sr = SafetyRules::new(storage, /* skip_sig_verify = */ false);
++    sr.initialize(&proof).unwrap();
++
++    let v1 = sr
++        .construct_and_sign_vote_two_chain(&p1, None)
++        .expect("first vote should succeed");
++
++    // Same SafetyRules, same persisted state. last_voted_round=1, last_vote=Some(v1).
++    // The dedup at safety_rules_2chain.rs:84-88 returns v1 instead of signing a new vote.
++    let v2 = sr
++        .construct_and_sign_vote_two_chain(&p2, None)
++        .expect("dedup should return previous vote, not re-sign");
++    assert_eq!(
++        v1.vote_data().proposed().id(),
++        v2.vote_data().proposed().id(),
++        "durable persist must return the SAME vote — not a new signature for p2"
++    );
++    println!(
++        "CORRECT: durable persist returns previous vote v1 via last_vote dedup; \
++         the validator does NOT produce two distinct signed votes at round 1."
++    );
++}
++
++/// Test for Bug 3 (Family 3, MC-5): `sign_commit_vote` does not call
++/// `verify_epoch(new_ledger_info.epoch(), &safety_data)`.
++///
++/// The MC spec produced a counterexample where a validator with
++/// `safety_data.epoch = 1` signs a commit vote whose new_ledger_info has
++/// epoch = 2. The aim of this test is to determine whether the real
++/// implementation's `match_ordered_only` + signature verification chain
++/// already prevents that scenario (in which case Bug 3 is a false positive
++/// produced by the spec's abstraction over signatures).
++///
++/// What we try:
++///   - Build a valid `old_ledger_info` whose `commit_info.epoch = 1`.
++///   - Build a `new_ledger_info` whose `commit_info.epoch = 2` (everything else copied).
++///   - Try to sign the commit vote.
++///
++/// `match_ordered_only` enforces `self.epoch == executed_block_info.epoch`
++/// (block_info.rs:197). If the implementation rejects, then the spec's
++/// "no verify_epoch" gap is closed by `match_ordered_only` at the commit_info
++/// level, and Bug 3 is a false positive.
++#[test]
++fn test_bug3_sign_commit_vote_cross_epoch_blocked_by_match_ordered_only() {
++    let signer = ValidatorSigner::from_int(0);
++    let (proof, genesis_qc) = test_utils::make_genesis(&signer);
++
++    let mut safety_rules = SafetyRules::new(test_utils::test_storage(&signer), false);
++    safety_rules.initialize(&proof).unwrap();
++
++    // Construct a chain genesis -> a1 -> a2 -> a3 (same recipe as test_sign_commit_vote).
++    let round = genesis_qc.certified_block().round();
++    let a1 = test_utils::make_proposal_with_qc(round + 1, genesis_qc, &signer);
++    let a2 = test_utils::make_proposal_with_parent(Payload::empty(false), round + 2, &a1, None, &signer);
++    let a3 = test_utils::make_proposal_with_parent(Payload::empty(false), round + 3, &a2, Some(&a1), &signer);
++
++    let ledger_info_with_sigs = a3.block().quorum_cert().ledger_info().clone();
++    let new_ledger_info = ledger_info_with_sigs.ledger_info().clone();
++
++    // Sanity check that the well-formed (matching epoch) case succeeds.
++    safety_rules
++        .sign_commit_vote(ledger_info_with_sigs.clone(), new_ledger_info.clone())
++        .expect("matching epoch commit vote should succeed");
++
++    // Now try a cross-epoch commit vote: keep the old_ledger_info at epoch=1,
++    // but rebuild new_ledger_info with a commit_info whose epoch=2.
++    let real_commit_info = new_ledger_info.commit_info().clone();
++    let mut bad_commit_info_fields = (
++        real_commit_info.epoch() + 1, // <- the cross-epoch attempt: 2 instead of 1
++        real_commit_info.round(),
++        real_commit_info.id(),
++        real_commit_info.executed_state_id(),
++        real_commit_info.version(),
++        real_commit_info.timestamp_usecs(),
++        real_commit_info.next_epoch_state().cloned(),
++    );
++    let _ = &mut bad_commit_info_fields;
++    let bad_commit_info = BlockInfo::new(
++        bad_commit_info_fields.0,
++        bad_commit_info_fields.1,
++        bad_commit_info_fields.2,
++        bad_commit_info_fields.3,
++        bad_commit_info_fields.4,
++        bad_commit_info_fields.5,
++        bad_commit_info_fields.6,
++    );
++    let bad_new_ledger_info =
++        LedgerInfo::new(bad_commit_info, new_ledger_info.consensus_data_hash());
++
++    let result = safety_rules.sign_commit_vote(ledger_info_with_sigs, bad_new_ledger_info);
++
++    match result {
++        Err(Error::InconsistentExecutionResult(_, _)) => {
++            println!(
++                "CORRECT (Bug 3 false positive): cross-epoch sign_commit_vote blocked by \
++                 match_ordered_only (`InconsistentExecutionResult`). \
++                 Spec's missing-verify_epoch finding is closed by the BlockInfo.epoch comparison."
++            );
++        },
++        Err(other) => panic!(
++            "Expected InconsistentExecutionResult from match_ordered_only; got {:?}",
++            other
++        ),
++        Ok(_) => panic!(
++            "Cross-epoch sign_commit_vote unexpectedly succeeded — Bug 3 is REAL after all"
++        ),
++    }
++}
++
++/// Show that `WrappedLedgerInfo::verify` (line 90-108) does not verify the
++/// `vote_data` field. A Byzantine relay can rewrite `vote_data.proposed.round`
++/// in transit and `verify` still passes — provided no consumer of `vote_data`
++/// re-verifies the binding. This test only documents the implementation gap;
++/// downstream consumers (`certified_block(order_vote_enabled=false)` and
++/// `into_quorum_cert(order_vote_enabled=false)`) DO call `verify_consensus_data_hash`,
++/// so this is defense-in-depth only — Tier C.
++#[test]
++fn doc_wrapped_ledger_info_vote_data_unsigned() {
++    use aptos_consensus_types::{vote_data::VoteData, wrapped_ledger_info::WrappedLedgerInfo};
++    use aptos_types::validator_verifier::generate_validator_verifier;
++
++    let signer = ValidatorSigner::from_int(0);
++    let verifier = generate_validator_verifier(std::slice::from_ref(&signer));
++
++    let (_, genesis_qc) = test_utils::make_genesis(&signer);
++
++    // Real signed LedgerInfo at round 0 (genesis): WrappedLedgerInfo::verify
++    // short-circuits round-0 anyway, so we use an empty round-0 wrapper.
++    let genesis_li = genesis_qc.ledger_info();
++    let real_vote_data =
++        VoteData::new(BlockInfo::empty(), BlockInfo::empty());
++    let wrapped_real =
++        WrappedLedgerInfo::new(real_vote_data.clone(), genesis_li.clone());
++
++    assert!(wrapped_real.verify(&verifier).is_ok());
++
++    // Rebind vote_data to a wildly different BlockInfo — verify() still passes
++    // (only round-0 short-circuit triggers + signature verification on the
++    // already-signed inner ledger_info).
++    let attacker_proposed = BlockInfo::new(
++        42, // arbitrary epoch
++        99, // arbitrary round
++        aptos_crypto::HashValue::random(),
++        *ACCUMULATOR_PLACEHOLDER_HASH,
++        0,
++        0,
++        None,
++    );
++    let attacker_vote_data = VoteData::new(attacker_proposed, BlockInfo::empty());
++    let wrapped_tampered = WrappedLedgerInfo::new(attacker_vote_data, genesis_li.clone());
++    assert!(
++        wrapped_tampered.verify(&verifier).is_ok(),
++        "tampered vote_data should still pass WrappedLedgerInfo::verify"
++    );
++
++    println!(
++        "DOC: WrappedLedgerInfo::verify does not check vote_data binding — \
++         relies on consumer-side `verify_consensus_data_hash` via \
++         `certified_block(order_vote_enabled=false)`."
++    );
++    // Silence the unused-binding lint on the LedgerInfoWithSignatures import.
++    let _: LedgerInfoWithSignatures = genesis_li.clone();
++    let _: AggregateSignature = AggregateSignature::empty();
++    let _ = InMemoryStorage::new();
++    let _: Storage = Storage::from(InMemoryStorage::new());
++    let _ = Block::make_genesis_block();
++}
+diff --git a/consensus/safety-rules/src/tests/tla_trace_scenario.rs b/consensus/safety-rules/src/tests/tla_trace_scenario.rs
+new file mode 100644
+index 00000000..d6fac4d1
+--- /dev/null
++++ b/consensus/safety-rules/src/tests/tla_trace_scenario.rs
+@@ -0,0 +1,754 @@
++//! TLA+ trace scenarios for Aptos BFT (round 2).
++//!
++//! This file is copied into
++//! `consensus/safety-rules/src/tests/tla_trace_scenario.rs` by
++//! `apply.sh`.  It builds N parallel SafetyRules instances (one per
++//! validator s1..sN), drives them through realistic 2-chain HotStuff /
++//! Jolteon flows, and emits a trace that exercises each spec action
++//! the Trace.tla validator recognises.
++//!
++//! Why this design:
++//!   * The bug families in the modeling brief live inside
++//!     `safety_rules.rs` / `safety_rules_2chain.rs` — exactly what the
++//!     prior round could not split-instrument.  Driving SafetyRules
++//!     directly lets the harness observe the sign-vs-persist window in
++//!     Family 1, the missing last_voted_round interlock in Family 2,
++//!     the missing epoch / extension check in Family 3, etc.
++//!   * Each "validator" is a real `SafetyRules` instance with its own
++//!     PersistentSafetyStorage and its own SafetyData.  All four share
++//!     signer_0's identity (skip_sig_verify is on in LocalClient mode,
++//!     so the four can vote on each other's proposals).  The spec only
++//!     reasons over per-nid state transitions, so the test driver tags
++//!     each instance with a distinct nid (s1..s4).
++//!   * Round-manager-level events (Propose, ReceiveProposal,
++//!     ReceiveVote, FormQC, ReceiveOrderVote, FormOrderingCert, etc.)
++//!     are emitted directly from the test driver at the protocol
++//!     boundaries that round_manager.rs would normally hit.
++
++use crate::{
++    test_utils::{
++        self, make_genesis, make_proposal_with_parent, make_proposal_with_qc, make_timeout_cert,
++        test_storage,
++    },
++    tla_trace, SafetyRules, TSafetyRules,
++};
++use aptos_consensus_types::{
++    order_vote_proposal::OrderVoteProposal,
++    timeout_2chain::TwoChainTimeout,
++    vote_proposal::VoteProposal,
++};
++use aptos_crypto::hash::{HashValue, ACCUMULATOR_PLACEHOLDER_HASH};
++use aptos_types::validator_signer::ValidatorSigner;
++use serde_json::json;
++use std::collections::HashMap;
++use std::env;
++use std::sync::Arc;
++
++const N_VALIDATORS: usize = 4;
++
++/// Map a block round to the spec's abstract value name.
++/// Cycles through v1, v2, v3 — matching Trace.cfg's `Values`.
++fn value_for_round(round: u64) -> String {
++    let names = ["v1", "v2", "v3"];
++    names[(round.saturating_sub(1) as usize) % names.len()].to_string()
++}
++
++/// Per-validator harness: an instrumented `SafetyRules` plus its
++/// stable sid ("s1"/"s2"/...).
++struct Validator {
++    sid: String,
++    rules: SafetyRules,
++    /// Most recently observed round_manager-level fields kept by the
++    /// test driver (so the round-manager-level emits carry the right
++    /// `currentRound`, `highestQCRound`, etc.).
++    current_round: u64,
++    highest_qc_round: u64,
++    highest_ordered_round: u64,
++    committed_round: u64,
++}
++
++impl Validator {
++    fn safety_state(&mut self) -> serde_json::Value {
++        let sd = self
++            .rules
++            .persistent_storage
++            .safety_data()
++            .expect("safety_data should be readable");
++        tla_trace::safety_state(&sd)
++    }
++}
++
++fn build_validators(signer: &ValidatorSigner) -> Vec<Validator> {
++    let mut out = Vec::with_capacity(N_VALIDATORS);
++    for i in 0..N_VALIDATORS {
++        let storage = test_storage(signer);
++        // skip_sig_verify = true so we can drive any validator with
++        // proposals signed by `signer` regardless of which sid they
++        // play in the trace.
++        let rules = SafetyRules::new(storage, true);
++        out.push(Validator {
++            sid: format!("s{}", i + 1),
++            rules,
++            current_round: 0,
++            highest_qc_round: 0,
++            highest_ordered_round: 0,
++            committed_round: 0,
++        });
++    }
++    out
++}
++
++/// Initialize the trace file path + sid mapping.  Called at the start
++/// of every test scenario so each scenario can write its own file.
++fn init_tracing(trace_path: &str) {
++    if tla_trace::is_active() {
++        return;
++    }
++    let mut map = HashMap::new();
++    for i in 0..N_VALIDATORS {
++        map.insert(format!("validator{}", i), format!("s{}", i + 1));
++    }
++    tla_trace::init(trace_path, map);
++    let sids: Vec<String> = (1..=N_VALIDATORS).map(|i| format!("s{}", i)).collect();
++    tla_trace::emit_config(&sids);
++}
++
++fn scenario_path(name: &str) -> String {
++    env::var("TLA_TRACE_FILE").unwrap_or_else(|_| {
++        format!(
++            "{}/../../../../.specula-output/traces/{}.ndjson",
++            env!("CARGO_MANIFEST_DIR"),
++            name
++        )
++    })
++}
++
++/// Emit the round-manager-level events that surround a `SignVote` /
++/// `CompletePersistVote` at every validator that votes on the given
++/// proposal.
++///
++/// The pattern:
++///   1. proposer emits Propose with the proposal's round/value.
++///   2. every validator emits ReceiveProposal.
++///   3. every validator calls SafetyRules — this triggers the
++///      instrumented SignVote and CompletePersistVote inside the impl.
++///   4. every OTHER validator emits ReceiveVote for each per-sender
++///      pair.
++///   5. once 2f+1 distinct senders are recorded, the receiver emits
++///      FormQC.
++fn drive_propose_and_vote(
++    validators: &mut Vec<Validator>,
++    proposer_idx: usize,
++    proposal: &VoteProposal,
++    tc: Option<&aptos_consensus_types::timeout_2chain::TwoChainTimeoutCertificate>,
++) -> Vec<String> {
++    let round = proposal.block().round();
++    let epoch = proposal.block().epoch();
++    let value = value_for_round(round);
++    let proposer_sid = validators[proposer_idx].sid.clone();
++
++    // 1. Propose
++    {
++        let v = &mut validators[proposer_idx];
++        v.current_round = round;
++        tla_trace::emit_event(
++            "Propose",
++            &v.sid,
++            round,
++            epoch,
++            json!({
++                "currentRound": round,
++                "proposalValue": value,
++            }),
++            None,
++        );
++    }
++
++    // 2. ReceiveProposal at every validator (including the proposer's
++    //    local-self).
++    for v in validators.iter_mut() {
++        v.current_round = round;
++        tla_trace::emit_event(
++            "ReceiveProposal",
++            &v.sid,
++            round,
++            epoch,
++            json!({
++                "currentRound": round,
++            }),
++            Some(json!({
++                "source": proposer_sid,
++                "round":  round,
++                "epoch":  epoch,
++                "value":  value,
++            })),
++        );
++    }
++
++    // 3. SafetyRules sign vote.  Instrumentation inside
++    //    guarded_construct_and_sign_vote_two_chain emits SignVote then
++    //    CompletePersistVote.
++    let mut signers = Vec::with_capacity(validators.len());
++    for v in validators.iter_mut() {
++        tla_trace::set_active_nid(&v.sid);
++        match v.rules.construct_and_sign_vote_two_chain(proposal, tc) {
++            Ok(_vote) => signers.push(v.sid.clone()),
++            Err(e) => eprintln!(
++                "scenario: validator {} could not vote on round {}: {:?}",
++                v.sid, round, e
++            ),
++        }
++        tla_trace::clear_active_nid();
++    }
++
++    // 4. ReceiveVote: every receiver hears every signer (modulo self).
++    let receivers_view: Vec<String> =
++        validators.iter().map(|v| v.sid.clone()).collect();
++    for v in validators.iter_mut() {
++        for src in signers.iter() {
++            tla_trace::emit_event(
++                "ReceiveVote",
++                &v.sid,
++                round,
++                epoch,
++                json!({}),
++                Some(json!({
++                    "source": src,
++                    "round":  round,
++                    "epoch":  epoch,
++                    "value":  value,
++                })),
++            );
++        }
++        // 5. Once 2f+1 distinct authors have voted, the receiver forms
++        //    a QC.  We model 2f+1 = 3 of 4 (Quorum=3 in Trace.cfg).
++        if signers.len() >= 3 {
++            v.highest_qc_round = round.max(v.highest_qc_round);
++            // Two-chain commit rule: if round(B0) + 1 = round(B1),
++            // commit B0.  We track the previous round's qc presence
++            // implicitly via highest_qc_round monotonicity.
++            if round > 1 && v.committed_round + 1 < round {
++                v.committed_round = round - 1;
++            }
++            let _ = receivers_view; // keep linker happy
++            tla_trace::emit_event(
++                "FormQC",
++                &v.sid,
++                round,
++                epoch,
++                json!({
++                    "highestQCRound":      v.highest_qc_round,
++                    "highestOrderedRound": v.highest_ordered_round,
++                    "committedRound":      v.committed_round,
++                    "currentRound":        round + 1,
++                }),
++                None,
++            );
++            v.current_round = round + 1;
++        }
++    }
++
++    signers
++}
++
++/// Drive `construct_and_sign_order_vote` across all validators for a
++/// given OrderVoteProposal and emit the surrounding ReceiveOrderVote /
++/// FormOrderingCert / ExecuteBlock / SignCommitVote /
++/// ReceiveCommitVote / AggregateCommitVotes / PersistBlock events.
++fn drive_order_vote(
++    validators: &mut Vec<Validator>,
++    proposer_idx: usize,
++    proposal: &OrderVoteProposal,
++) {
++    let round = proposal.block().round();
++    let epoch = proposal.block().epoch();
++    let value = value_for_round(round);
++    let _ = proposer_idx;
++
++    // SignOrderVote (instrumented inside the impl).
++    let mut signers = Vec::new();
++    for v in validators.iter_mut() {
++        tla_trace::set_active_nid(&v.sid);
++        match v.rules.construct_and_sign_order_vote(proposal) {
++            Ok(_vote) => signers.push(v.sid.clone()),
++            Err(e) => eprintln!(
++                "scenario: validator {} could not order-vote on round {}: {:?}",
++                v.sid, round, e
++            ),
++        }
++        tla_trace::clear_active_nid();
++    }
++
++    // ReceiveOrderVote at every receiver from every signer.
++    for v in validators.iter_mut() {
++        for src in signers.iter() {
++            tla_trace::emit_event(
++                "ReceiveOrderVote",
++                &v.sid,
++                round,
++                epoch,
++                json!({}),
++                Some(json!({
++                    "source": src,
++                    "round":  round,
++                    "epoch":  epoch,
++                    "value":  value,
++                })),
++            );
++        }
++        // FormOrderingCert once 2f+1 signers were collected.
++        if signers.len() >= 3 {
++            v.highest_ordered_round = round.max(v.highest_ordered_round);
++            tla_trace::emit_event(
++                "FormOrderingCert",
++                &v.sid,
++                round,
++                epoch,
++                json!({
++                    "highestQCRound":      v.highest_qc_round,
++                    "highestOrderedRound": v.highest_ordered_round,
++                    "proposalValue":       value,
++                }),
++                None,
++            );
++            // Pipeline: ExecuteBlock → SignCommitVote → ReceiveCommitVote →
++            // AggregateCommitVotes → PersistBlock.
++            tla_trace::emit_event(
++                "ExecuteBlock",
++                &v.sid,
++                round,
++                epoch,
++                json!({}),
++                None,
++            );
++        }
++    }
++
++    // SignCommitVote at every validator that ordered the block.
++    // We synthesize the event at the driver level rather than calling
++    // the real `sign_commit_vote`, because the latter requires us to
++    // hand-build a LedgerInfoWithSignatures whose `commit_info()`
++    // matches the round we want — non-trivial without a proper
++    // pipeline driver.  The source-level instrumentation in
++    // safety_rules.rs is still in place for production observation.
++    if signers.len() >= 3 {
++        for v in validators.iter_mut() {
++            let state = v.safety_state();
++            tla_trace::emit_event(
++                "SignCommitVote",
++                &v.sid,
++                round,
++                epoch,
++                tla_trace::merge_state(state, json!({"epoch": epoch})),
++                None,
++            );
++        }
++
++        // ReceiveCommitVote at every receiver from every signer.
++        for v in validators.iter_mut() {
++            for src in signers.iter() {
++                tla_trace::emit_event(
++                    "ReceiveCommitVote",
++                    &v.sid,
++                    round,
++                    epoch,
++                    json!({}),
++                    Some(json!({
++                        "source": src,
++                        "round":  round,
++                        "epoch":  epoch,
++                        "value":  value,
++                    })),
++                );
++            }
++            tla_trace::emit_event(
++                "AggregateCommitVotes",
++                &v.sid,
++                round,
++                epoch,
++                json!({}),
++                None,
++            );
++            v.committed_round = round.max(v.committed_round);
++            tla_trace::emit_event(
++                "PersistBlock",
++                &v.sid,
++                round,
++                epoch,
++                json!({
++                    "committedRound": v.committed_round,
++                }),
++                None,
++            );
++        }
++    }
++}
++
++/// Drive `sign_timeout_with_qc` across all validators.
++fn drive_timeout(
++    validators: &mut Vec<Validator>,
++    timeout_round: u64,
++    epoch: u64,
++    qc: aptos_consensus_types::quorum_cert::QuorumCert,
++    tc: Option<&aptos_consensus_types::timeout_2chain::TwoChainTimeoutCertificate>,
++) {
++    let to = TwoChainTimeout::new(epoch, timeout_round, qc);
++    // SignTimeout (instrumented in the impl).
++    let mut signers = Vec::new();
++    for v in validators.iter_mut() {
++        tla_trace::set_active_nid(&v.sid);
++        match v.rules.sign_timeout_with_qc(&to, tc) {
++            Ok(_sig) => signers.push(v.sid.clone()),
++            Err(e) => eprintln!(
++                "scenario: validator {} could not sign timeout on round {}: {:?}",
++                v.sid, timeout_round, e
++            ),
++        }
++        tla_trace::clear_active_nid();
++    }
++
++    // ReceiveTimeout at every receiver from every signer.
++    for v in validators.iter_mut() {
++        for src in signers.iter() {
++            tla_trace::emit_event(
++                "ReceiveTimeout",
++                &v.sid,
++                timeout_round,
++                epoch,
++                json!({}),
++                Some(json!({
++                    "source": src,
++                    "round":  timeout_round,
++                    "epoch":  epoch,
++                    "value":  "",
++                })),
++            );
++        }
++        // FormTC once 2f+1 signers are recorded.
++        if signers.len() >= 3 {
++            v.current_round = (timeout_round + 1).max(v.current_round);
++            tla_trace::emit_event(
++                "FormTC",
++                &v.sid,
++                timeout_round,
++                epoch,
++                json!({
++                    "currentRound": v.current_round,
++                }),
++                None,
++            );
++        }
++    }
++}
++
++// ---------------------------------------------------------------------------
++// Scenarios
++// ---------------------------------------------------------------------------
++
++/// Normal happy-path: 4 rounds of regular vote → QC → order-vote →
++/// ordering cert → commit at every validator.
++#[test]
++fn tla_trace_normal_flow() {
++    let trace_path = scenario_path("normal");
++    init_tracing(&trace_path);
++
++    let signer = ValidatorSigner::from_int(0);
++    let (proof, genesis_qc) = make_genesis(&signer);
++    let mut validators = build_validators(&signer);
++
++    // Initialize every SafetyRules instance.  We do NOT emit a
++    // synthetic Recover event here: in the spec, Recover requires a
++    // prior Crash, and SilentCrash in Trace.tla picks an arbitrary
++    // alive validator — so a string of Recover-bootstraps confuses
++    // TLC's search.  The spec's Init already matches the post-init
++    // SafetyData layout, so we can move straight to round-level
++    // events.
++    for v in validators.iter_mut() {
++        v.rules.initialize(&proof).expect("initialize");
++    }
++
++    // Build a four-round chain: genesis → a1 → a2 → a3 → a4
++    let base_round = genesis_qc.certified_block().round();
++    let a1 = make_proposal_with_qc(base_round + 1, genesis_qc.clone(), &signer);
++    let a2 = make_proposal_with_parent(
++        aptos_consensus_types::common::Payload::empty(false),
++        base_round + 2,
++        &a1,
++        None,
++        &signer,
++    );
++    let a3 = make_proposal_with_parent(
++        aptos_consensus_types::common::Payload::empty(false),
++        base_round + 3,
++        &a2,
++        Some(&a1),
++        &signer,
++    );
++    let a4 = make_proposal_with_parent(
++        aptos_consensus_types::common::Payload::empty(false),
++        base_round + 4,
++        &a3,
++        Some(&a2),
++        &signer,
++    );
++
++    // Round 1: validator 0 proposes a1, all vote.
++    drive_propose_and_vote(&mut validators, 0, &a1, None);
++    // Round 2: validator 1 proposes a2, all vote.
++    drive_propose_and_vote(&mut validators, 1, &a2, None);
++    // Round 3: validator 2 proposes a3, all vote.
++    drive_propose_and_vote(&mut validators, 2, &a3, None);
++    // Round 4: validator 3 proposes a4, all vote.
++    drive_propose_and_vote(&mut validators, 3, &a4, None);
++
++    // Order-vote on a1 (so the 2-chain ordering cert exists for round
++    // base_round + 1).
++    let ov1 = OrderVoteProposal::new(
++        a1.block().clone(),
++        a2.block().quorum_cert().certified_block().clone(),
++        Arc::new(a2.block().quorum_cert().clone()),
++    );
++    drive_order_vote(&mut validators, 0, &ov1);
++
++    let ov2 = OrderVoteProposal::new(
++        a2.block().clone(),
++        a3.block().quorum_cert().certified_block().clone(),
++        Arc::new(a3.block().quorum_cert().clone()),
++    );
++    drive_order_vote(&mut validators, 1, &ov2);
++}
++
++/// Timeout flow: round 2 times out, every validator signs a 2-chain
++/// timeout (which exercises the canonical persist-then-sign order at
++/// safety_rules_2chain.rs:47-49).
++#[test]
++fn tla_trace_timeout_flow() {
++    let trace_path = scenario_path("timeout");
++    init_tracing(&trace_path);
++
++    let signer = ValidatorSigner::from_int(0);
++    let (proof, genesis_qc) = make_genesis(&signer);
++    let mut validators = build_validators(&signer);
++
++    for v in validators.iter_mut() {
++        v.rules.initialize(&proof).expect("initialize");
++    }
++
++    let base_round = genesis_qc.certified_block().round();
++
++    // Round 1 times out: every validator signs a TwoChainTimeout for
++    // round 1 with the genesis QC (qc_round = 0, so safe_to_timeout's
++    // `round == next_round(qc_round)` check passes).  This exercises
++    // sign_timeout_with_qc → persist → sign → SignTimeout emit.
++    drive_timeout(
++        &mut validators,
++        base_round + 1,
++        1,
++        genesis_qc.clone(),
++        None,
++    );
++
++    // Round 2 times out using a TC for round 1.
++    let tc1 = make_timeout_cert(base_round + 1, &genesis_qc, &signer);
++    drive_timeout(
++        &mut validators,
++        base_round + 2,
++        1,
++        genesis_qc.clone(),
++        Some(&tc1),
++    );
++
++    // After two consecutive timeouts the spec's SignVote precondition
++    // (`r = NextRound(tcRound) /\ qcRound >= tcRound`) is unsatisfiable
++    // without an interleaving QC, so we do NOT try to vote at round 3
++    // — the impl's own `safe_to_vote` uses a different qc_round source
++    // and would accept it, but the spec's model is the abstract
++    // round-2-chain check.  Document the gap rather than fabricate
++    // a vote that the spec cannot replay.
++
++    // EchoTimeout: re-broadcast the current round's timeout without
++    // changing persisted state.  The spec's EchoTimeout action uses
++    // currentRound[s] as the round; after FormTC fired at round 2,
++    // currentRound[s] = 3 (FormTC advances it).  EchoTimeout emits
++    // a TimeoutMsg at round 3 in the spec — but no SignTimeout happens.
++    for v in validators.iter_mut() {
++        let state = v.safety_state();
++        tla_trace::emit_event(
++            "EchoTimeout",
++            &v.sid,
++            base_round + 3,
++            1,
++            tla_trace::merge_state(state, json!({"currentRound": base_round + 3})),
++            None,
++        );
++    }
++}
++
++/// Optimistic-proposal flow (Family 7): exercises ProposeOpt.
++#[test]
++fn tla_trace_opt_flow() {
++    let trace_path = scenario_path("opt");
++    init_tracing(&trace_path);
++
++    let signer = ValidatorSigner::from_int(0);
++    let (proof, genesis_qc) = make_genesis(&signer);
++    let mut validators = build_validators(&signer);
++
++    for v in validators.iter_mut() {
++        v.rules.initialize(&proof).expect("initialize");
++    }
++
++    let base_round = genesis_qc.certified_block().round();
++    let a1 = make_proposal_with_qc(base_round + 1, genesis_qc.clone(), &signer);
++    let a2 = make_proposal_with_parent(
++        aptos_consensus_types::common::Payload::empty(false),
++        base_round + 2,
++        &a1,
++        None,
++        &signer,
++    );
++
++    // Round 1: optimistic propose by s1.  We emit ONLY ProposeOpt
++    // (not Propose) for round 1 — the spec has a `roundProposer[r] =
++    // Nil` precondition that would block both from firing.  We still
++    // run drive_propose_and_vote-like flow manually to capture the
++    // ReceiveProposal + SignVote + CompletePersistVote + ReceiveVote +
++    // FormQC events on the optimistic block.
++    let value = value_for_round(base_round + 1);
++    let proposer_sid = validators[0].sid.clone();
++    {
++        let v = &mut validators[0];
++        v.current_round = base_round + 1;
++        tla_trace::emit_event(
++            "ProposeOpt",
++            &v.sid,
++            base_round + 1,
++            1,
++            json!({
++                "currentRound":  base_round + 1,
++                "proposalValue": value.clone(),
++            }),
++            None,
++        );
++    }
++    // ReceiveProposal for every validator.
++    for v in validators.iter_mut() {
++        v.current_round = base_round + 1;
++        tla_trace::emit_event(
++            "ReceiveProposal",
++            &v.sid,
++            base_round + 1,
++            1,
++            json!({"currentRound": base_round + 1}),
++            Some(json!({
++                "source": proposer_sid,
++                "round":  base_round + 1,
++                "epoch":  1,
++                "value":  value,
++            })),
++        );
++    }
++    // Real SafetyRules signs the opt block — the path is identical to
++    // a regular vote (the spec's ProposeOpt is followed by the same
++    // SignVote/CompletePersistVote events).
++    let mut signers = Vec::new();
++    for v in validators.iter_mut() {
++        tla_trace::set_active_nid(&v.sid);
++        if v.rules
++            .construct_and_sign_vote_two_chain(&a1, None)
++            .is_ok()
++        {
++            signers.push(v.sid.clone());
++        }
++        tla_trace::clear_active_nid();
++    }
++    for v in validators.iter_mut() {
++        for src in signers.iter() {
++            tla_trace::emit_event(
++                "ReceiveVote",
++                &v.sid,
++                base_round + 1,
++                1,
++                json!({}),
++                Some(json!({
++                    "source": src,
++                    "round":  base_round + 1,
++                    "epoch":  1,
++                    "value":  value,
++                })),
++            );
++        }
++        if signers.len() >= 3 {
++            v.highest_qc_round = (base_round + 1).max(v.highest_qc_round);
++            tla_trace::emit_event(
++                "FormQC",
++                &v.sid,
++                base_round + 1,
++                1,
++                json!({
++                    "highestQCRound":      v.highest_qc_round,
++                    "highestOrderedRound": v.highest_ordered_round,
++                    "committedRound":      v.committed_round,
++                    "currentRound":        base_round + 2,
++                }),
++                None,
++            );
++            v.current_round = base_round + 2;
++        }
++    }
++
++    // Round 2: regular Propose to balance the trace.
++    drive_propose_and_vote(&mut validators, 1, &a2, None);
++}
++
++/// Epoch-change flow (Family 4): every validator re-initializes after
++/// a new epoch boundary, exercising the
++/// `Ordering::Less` branch at safety_rules.rs:294-303.
++#[test]
++fn tla_trace_epoch_change_flow() {
++    let trace_path = scenario_path("epoch_change");
++    init_tracing(&trace_path);
++
++    let signer = ValidatorSigner::from_int(0);
++    let (proof, genesis_qc) = make_genesis(&signer);
++    let mut validators = build_validators(&signer);
++
++    for v in validators.iter_mut() {
++        v.rules.initialize(&proof).expect("initialize");
++    }
++
++    let base_round = genesis_qc.certified_block().round();
++    let a1 = make_proposal_with_qc(base_round + 1, genesis_qc.clone(), &signer);
++    drive_propose_and_vote(&mut validators, 0, &a1, None);
++
++    // Synthesize epoch change by emitting an EpochChange event for
++    // each validator.  The impl's
++    // guarded_initialize::Ordering::Less branch is what the spec
++    // models; we can't drive that branch directly from a test (it
++    // requires a higher-epoch ledger info), so we synthesize the event
++    // post-hoc with the expected state.
++    for v in validators.iter_mut() {
++        let state = json!({
++            "epoch":               2,
++            "lastVotedRound":      0,
++            "preferredRound":      0,
++            "oneChainRound":       0,
++            "highestTimeoutRound": 0,
++            "lastVote":            "",
++            "currentRound":        1,
++        });
++        tla_trace::emit_event("EpochChange", &v.sid, 0, 2, state, None);
++        v.current_round = 1;
++        v.highest_qc_round = 0;
++        v.highest_ordered_round = 0;
++        v.committed_round = 0;
++    }
++}
++
++// Keep the build happy if some helper imports aren't used in all
++// scenarios.
++#[allow(dead_code)]
++fn _unused(_: HashValue) {
++    let _ = ACCUMULATOR_PLACEHOLDER_HASH;
++    let _ = test_utils::empty_proof;
++}
+diff --git a/consensus/safety-rules/src/tla_trace.rs b/consensus/safety-rules/src/tla_trace.rs
+new file mode 100644
+index 00000000..aabc7abf
+--- /dev/null
++++ b/consensus/safety-rules/src/tla_trace.rs
+@@ -0,0 +1,183 @@
++//! TLA+ trace emission for Aptos BFT (round 2).
++//!
++//! Single-file NDJSON writer used by the round-2 trace harness.  Every
++//! emitted line carries `"tag":"trace"` so Trace.tla can filter on it.
++//!
++//! Lifecycle:
++//!   1. Test scenario calls `tla_trace::init(path, server_map)` once.
++//!   2. Before driving a particular validator through SafetyRules,
++//!      the test calls `set_active_nid("sN")`.  Instrumented code
++//!      inside `safety_rules.rs` / `safety_rules_2chain.rs` reads
++//!      `active_nid()` so each emit is tagged with the right server.
++//!   3. Test driver also calls `emit_event` directly for round-manager
++//!      level events (Propose, ReceiveProposal, ReceiveVote, FormQC,
++//!      ReceiveOrderVote, FormOrderingCert, ReceiveTimeout, FormTC,
++//!      ReceiveCommitVote, ExecuteBlock, AggregateCommitVotes,
++//!      PersistBlock, ResetPipeline, EchoTimeout, Recover).
++//!
++//! Trace envelope (matches `Trace.tla`):
++//!   {"tag":"trace","ts":<u64-millis>,
++//!    "event":{"name":"<action>","nid":"<sid>","epoch":<e>,"round":<r>,
++//!             "state":{...}, "msg":{...}?}}
++
++use aptos_consensus_types::safety_data::SafetyData;
++use serde_json::{json, Value};
++use std::cell::RefCell;
++use std::collections::HashMap;
++use std::fs::OpenOptions;
++use std::io::{BufWriter, Write};
++use std::sync::{Mutex, OnceLock};
++use std::time::{SystemTime, UNIX_EPOCH};
++
++static WRITER: OnceLock<Mutex<TraceWriter>> = OnceLock::new();
++/// Maps `format!("{:x}", PeerId)` → TLA+ sid ("s1" / "s2" / ...).
++static SERVER_MAP: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
++
++thread_local! {
++    /// The TLA+ sid the next emit should be tagged with.  Set by the
++    /// test driver before each SafetyRules call.
++    static ACTIVE_NID: RefCell<Option<String>> = const { RefCell::new(None) };
++}
++
++struct TraceWriter {
++    file: BufWriter<std::fs::File>,
++}
++
++/// Open the trace file.  Idempotent after the first successful call.
++pub fn init(path: &str, server_map: HashMap<String, String>) {
++    let file = OpenOptions::new()
++        .create(true)
++        .truncate(true)
++        .write(true)
++        .open(path)
++        .unwrap_or_else(|e| panic!("tla_trace: cannot open {}: {}", path, e));
++    let _ = WRITER.set(Mutex::new(TraceWriter {
++        file: BufWriter::new(file),
++    }));
++    let _ = SERVER_MAP.set(Mutex::new(server_map));
++}
++
++pub fn is_active() -> bool {
++    WRITER.get().is_some()
++}
++
++/// Look up the sid for a PeerId hex string.  Returns the hex unchanged
++/// if no mapping is registered.
++pub fn nid(author_hex: &str) -> String {
++    SERVER_MAP
++        .get()
++        .and_then(|m| m.lock().ok().and_then(|g| g.get(author_hex).cloned()))
++        .unwrap_or_else(|| author_hex.to_string())
++}
++
++/// Set the active nid for this thread.  The next `safety_rules`
++/// instrumentation point that fires will tag its emit with this sid.
++pub fn set_active_nid<S: Into<String>>(sid: S) {
++    ACTIVE_NID.with(|c| *c.borrow_mut() = Some(sid.into()));
++}
++
++/// Clear the active nid.  Call after the SafetyRules call returns so
++/// no stray events get misattributed.
++pub fn clear_active_nid() {
++    ACTIVE_NID.with(|c| *c.borrow_mut() = None);
++}
++
++/// Read the active nid (returns `"unknown"` if unset).
++pub fn active_nid() -> String {
++    ACTIVE_NID.with(|c| c.borrow().clone().unwrap_or_else(|| "unknown".to_string()))
++}
++
++/// Build the `state` JSON object for safety-data-driven events.
++///
++/// We deliberately do NOT emit a JSON null for the missing-lastVote
++/// case — the TLC Json deserializer rejects raw nulls.  We emit the
++/// sentinel string "" instead (the spec's `TraceValue` normalises both
++/// "" and "null" to `Nil`).
++pub fn safety_state(sd: &SafetyData) -> Value {
++    let lv = sd
++        .last_vote
++        .as_ref()
++        .map(|v| {
++            json!({
++                "round": v.vote_data().proposed().round(),
++                "value": format!("{}", v.vote_data().proposed().id()),
++            })
++        })
++        .unwrap_or_else(|| json!(""));
++    json!({
++        "epoch":               sd.epoch,
++        "lastVotedRound":      sd.last_voted_round,
++        "preferredRound":      sd.preferred_round,
++        "oneChainRound":       sd.one_chain_round,
++        "highestTimeoutRound": sd.highest_timeout_round,
++        "lastVote":            lv,
++    })
++}
++
++/// Merge extra fields into a state object.
++pub fn merge_state(mut base: Value, extra: Value) -> Value {
++    if let (Some(b), Some(e)) = (base.as_object_mut(), extra.as_object()) {
++        for (k, v) in e {
++            b.insert(k.clone(), v.clone());
++        }
++    }
++    base
++}
++
++/// Emit one event line.  The envelope adds `"tag":"trace"`.
++pub fn emit_event(
++    name: &str,
++    nid: &str,
++    round: u64,
++    epoch: u64,
++    state: Value,
++    msg: Option<Value>,
++) {
++    let mut ev = json!({
++        "name":  name,
++        "nid":   nid,
++        "epoch": epoch,
++        "round": round,
++        "state": state,
++    });
++    if let Some(m) = msg {
++        ev["msg"] = m;
++    }
++    let line = json!({
++        "tag":   "trace",
++        "ts":    now_ms(),
++        "event": ev,
++    });
++    write_line(&line);
++}
++
++/// Emit a config line (`"tag":"config"`).  Trace.tla ignores it because
++/// the tag filter only matches "trace"; useful as a header for humans.
++pub fn emit_config(servers: &[String]) {
++    let line = json!({
++        "tag": "config",
++        "ts":  now_ms(),
++        "config": {
++            "servers": servers,
++            "round2":  true,
++        },
++    });
++    write_line(&line);
++}
++
++fn now_ms() -> u64 {
++    SystemTime::now()
++        .duration_since(UNIX_EPOCH)
++        .map(|d| d.as_millis() as u64)
++        .unwrap_or(0)
++}
++
++fn write_line(value: &Value) {
++    if let Some(w) = WRITER.get() {
++        if let Ok(mut guard) = w.lock() {
++            let _ = serde_json::to_writer(&mut guard.file, value);
++            let _ = guard.file.write_all(b"\n");
++            let _ = guard.file.flush();
++        }
++    }
++}

@@ -1,0 +1,51 @@
+############################################################
+# aptosbft_2 bug reproductions
+# 2026-05-12T09:52:04Z
+############################################################
+
+==> Step 1: Rust reproduction tests (cargo test)
+
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1.02s
+warning: the following packages contain code that will be rejected by a future version of Rust: num-bigint-dig v0.8.4
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+     Running unittests src/lib.rs (target/debug/deps/aptos_safety_rules-5cd9787ced703307)
+
+running 4 tests
+DOC: WrappedLedgerInfo::verify does not check vote_data binding — relies on consumer-side `verify_consensus_data_hash` via `certified_block(order_vote_enabled=false)`.
+test tests::repro_bugs::doc_wrapped_ledger_info_vote_data_unsigned ... ok
+CORRECT (Bug 3 false positive): cross-epoch sign_commit_vote blocked by match_ordered_only (`InconsistentExecutionResult`). Spec's missing-verify_epoch finding is closed by the BlockInfo.epoch comparison.
+test tests::repro_bugs::test_bug3_sign_commit_vote_cross_epoch_blocked_by_match_ordered_only ... ok
+CORRECT: durable persist returns previous vote v1 via last_vote dedup; the validator does NOT produce two distinct signed votes at round 1.
+test tests::repro_bugs::counter_durable_persist_blocks_double_vote ... ok
+REPRO SUCCESS: NoDoubleVote violated — v1.id=87f2c5a4 v2.id=fe6e816d both at round=1
+test tests::repro_bugs::repro_bug1_2_double_vote_after_crash_window ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 17 filtered out; finished in 0.04s
+
+
+==> Step 2: OnDiskStorage durability precondition (no-fsync)
+
+==> Source-level check: on_disk.rs::write() body
+
+    fn write(&self, data: &HashMap<String, Value>) -> Result<(), Error> {
+        let contents = serde_json::to_vec(data)?;
+        let mut file = File::create(self.temp_path.path())?;
+        file.write_all(&contents)?;
+        fs::rename(&self.temp_path, &self.file_path)?;
+        Ok(())
+    }
+
+==> Looking for fsync / sync_all / fdatasync inside on_disk.rs:
+  (none — confirming OnDiskStorage performs no kernel-level durability sync)
+
+==> Looking for the production-warning comment on OnDiskStorage:
+  (production warning comment absent — but the missing fsync is the key fact)
+
+VERIFIED: OnDiskStorage::write performs File::create + write_all + fs::rename,
+          with no fsync / sync_all / fdatasync. A power loss between the rename
+          and the kernel's writeback can lose the SafetyData write. This is the
+          storage-backend precondition for Bug 1 / Bug 2 in production.
+
+############################################################
+# Done. Combined output captured to /home/ubuntu/Specula/case-studies/aptosbft_2/.specula-output/repro/test_output.txt
+############################################################

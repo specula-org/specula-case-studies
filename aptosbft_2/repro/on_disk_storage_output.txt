@@ -1,0 +1,20 @@
+==> Source-level check: on_disk.rs::write() body
+
+    fn write(&self, data: &HashMap<String, Value>) -> Result<(), Error> {
+        let contents = serde_json::to_vec(data)?;
+        let mut file = File::create(self.temp_path.path())?;
+        file.write_all(&contents)?;
+        fs::rename(&self.temp_path, &self.file_path)?;
+        Ok(())
+    }
+
+==> Looking for fsync / sync_all / fdatasync inside on_disk.rs:
+  (none — confirming OnDiskStorage performs no kernel-level durability sync)
+
+==> Looking for the production-warning comment on OnDiskStorage:
+  (production warning comment absent — but the missing fsync is the key fact)
+
+VERIFIED: OnDiskStorage::write performs File::create + write_all + fs::rename,
+          with no fsync / sync_all / fdatasync. A power loss between the rename
+          and the kernel's writeback can lose the SafetyData write. This is the
+          storage-backend precondition for Bug 1 / Bug 2 in production.
