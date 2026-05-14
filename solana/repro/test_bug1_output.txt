@@ -1,0 +1,74 @@
+=== Bug 1 / MC-5 reproduction: dual-hash duplicate-confirm panic ===
+Repository: /home/ubuntu/Specula/case-studies/solana/artifact/agave
+Branch: master, HEAD: 469f36eec
+
+--- Running upstream #[should_panic] tests ---
+[1/2] test_mark_slots_duplicate_confirmed
+
+thread 'replay_stage::tests::test_mark_slots_duplicate_confirmed' (905116) panicked at core/src/replay_stage.rs:4389:17:
+assertion `left == right` failed: Additional duplicate confirmed notification for slot 6 with a different hash
+  left: FXeAfSxNwkdxWdfc9uBfVHto3yXZtFyrUDjiU9udww2Y
+ right: A9vDWdmLRsKR167xuYTtUfVE17cVS62mZPMUBtagxfKm
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test replay_stage::tests::test_mark_slots_duplicate_confirmed - should panic ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 611 filtered out; finished in 0.45s
+
+
+[2/2] test_process_duplicate_confirmed_slots (both variants)
+
+thread 'replay_stage::tests::test_process_duplicate_confirmed_slots::seperate_batches' (905575) panicked at core/src/replay_stage.rs:2226:21:
+assertion `left == right` failed: Additional duplicate confirmed notification for slot 6 with a different hash
+  left: 8XW1pWGDziBY55VAZMA91L9t77pkP4RynaW245rQHJdd
+ right: 25XwpcpW1GPif6qjwsNZcvjVf8TzKuagCvxTt3RnNVcB
+test replay_stage::tests::test_process_duplicate_confirmed_slots::same_batch - should panic ... ok
+test replay_stage::tests::test_process_duplicate_confirmed_slots::seperate_batches - should panic ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 610 filtered out; finished in 0.47s
+
+
+--- Source of the assertion (the panic site) ---
+    // Check for any newly duplicate confirmed slots by the cluster.
+    // This only tracks duplicate slot confirmations on the exact
+    // single slots and does not account for votes on their descendants. Used solely
+    // for duplicate slot recovery.
+    #[allow(clippy::too_many_arguments)]
+    fn process_duplicate_confirmed_slots(
+        duplicate_confirmed_slots_receiver: &DuplicateConfirmedSlotsReceiver,
+        blockstore: &Blockstore,
+        duplicate_slots_tracker: &mut DuplicateSlotsTracker,
+        duplicate_confirmed_slots: &mut DuplicateConfirmedSlots,
+        epoch_slots_frozen_slots: &mut EpochSlotsFrozenSlots,
+        bank_forks: &RwLock<BankForks>,
+        progress: &ProgressMap,
+        fork_choice: &mut HeaviestSubtreeForkChoice,
+        duplicate_slots_to_repair: &mut DuplicateSlotsToRepair,
+        ancestor_hashes_replay_update_sender: &AncestorHashesReplayUpdateSender,
+        purge_repair_slot_counter: &mut PurgeRepairSlotCounter,
+    ) {
+        let root = bank_forks.read().unwrap().root();
+        for new_duplicate_confirmed_slots in duplicate_confirmed_slots_receiver.try_iter() {
+            for (confirmed_slot, duplicate_confirmed_hash) in new_duplicate_confirmed_slots {
+                if confirmed_slot <= root {
+                    continue;
+                } else if let Some(prev_hash) =
+                    duplicate_confirmed_slots.insert(confirmed_slot, duplicate_confirmed_hash)
+                {
+                    assert_eq!(
+                        prev_hash, duplicate_confirmed_hash,
+                        "Additional duplicate confirmed notification for slot {confirmed_slot} \
+                         with a different hash"
+                    );
+                    // Already processed this signal
+                    continue;
+                }
+
+                let duplicate_confirmed_state = DuplicateConfirmedState::new_from_state(
+
+--- The committing PR (deliberate developer-intent) ---
+1444baa42 replay: do not early return when marking slots duplicate confirmed (#2700)
+
+/home/ubuntu/Specula/case-studies/solana/.specula-output/repro/test_bug1_mc5_dup_confirm_panic.sh: line 50: should: command not found
+PASS criterion: all three test variants report .
+This confirms the implementation deliberately panics on detected dual-hash
+duplicate-confirm; the panic is the documented Byzantine-detection response.

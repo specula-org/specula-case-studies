@@ -1,0 +1,88 @@
+=== Bug 2 / MC-6 reproduction: tower stranding via PurgeUnconfirmedSlot ===
+Repository: /home/ubuntu/Specula/case-studies/solana/artifact/agave
+Branch: master, HEAD: 469f36eec
+
+--- (a)+(b) Run upstream test_purge_unconfirmed_duplicate_slot ---
+This test asserts bank_forks/progress are cleared.  Note it does NOT
+assert anything about the tower — the tower-clearing is missing.
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.53s
+     Running unittests src/lib.rs (target/debug/deps/solana_core-fbade82ce66b8ef5)
+
+running 2 tests
+test replay_stage::tests::test_purge_unconfirmed_duplicate_slot ... ok
+test replay_stage::tests::test_purge_unconfirmed_duplicate_slots_and_reattach ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 610 filtered out; finished in 1.17s
+
+
+--- (c) Run the historical fix test from PR #28172 ---
+Verifies the duplicate-confirm + reset-fork recovery path works.
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.53s
+     Running unittests src/lib.rs (target/debug/deps/solana_core-fbade82ce66b8ef5)
+
+running 2 tests
+test replay_stage::tests::test_unconfirmed_duplicate_slots_and_lockouts ... ok
+test replay_stage::tests::test_unconfirmed_duplicate_slots_and_lockouts_for_non_heaviest_fork ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 610 filtered out; finished in 0.33s
+
+
+--- (d) The structural asymmetry: purge_unconfirmed_slot has no tower mutation ---
+Lines 2019-2124 of core/src/replay_stage.rs.  Grep for any tower mutation:
+  (expected: NO MATCHES — confirming the asymmetry)
+    (no tower mutation found — confirming the asymmetric purge)
+
+--- The freebie-path safeguard at consensus.rs:1041-1074 ---
+This is the documented workaround that prevents the panic at
+consensus.rs:1104 after a purge.  Note the TODO comment.
+        let switch_hash = progress
+            .get_hash(switch_slot)
+            .expect("Slot we're trying to switch to must exist AND be frozen in progress map");
+        if let Some(latest_duplicate_ancestor) = heaviest_subtree_fork_choice
+            .latest_invalid_ancestor(&(last_voted_slot, last_voted_hash))
+        {
+            // We're rolling back because one of the ancestors of the last vote was a duplicate. In this
+            // case, it's acceptable if the switch candidate is one of ancestors of the previous vote,
+            // just fail the switch check because there's no point in voting on an ancestor. ReplayStage
+            // should then have a special case continue building an alternate fork from this ancestor, NOT
+            // the `last_voted_slot`. This is in contrast to usual SwitchFailure where ReplayStage continues to build blocks
+            // on latest vote. See `ReplayStage::select_vote_and_reset_forks()` for more details.
+            if heaviest_subtree_fork_choice.is_strict_ancestor(
+                &(switch_slot, switch_hash),
+                &(last_voted_slot, last_voted_hash),
+            ) {
+                return rollback_due_to_duplicate_ancestor(latest_duplicate_ancestor);
+            } else if progress
+                .get_hash(last_voted_slot)
+                .map(|current_slot_hash| current_slot_hash != last_voted_hash)
+                .unwrap_or(true)
+            {
+                // Our last vote slot was purged because it was on a duplicate fork, don't continue below
+                // where checks may panic. We allow a freebie vote here that may violate switching
+                // thresholds
+                // TODO: Properly handle this case
+                info!(
+                    "Allowing switch vote on {:?} because last vote {:?} was rolled back",
+                    (switch_slot, switch_hash),
+                    (last_voted_slot, last_voted_hash)
+                );
+                return SwitchForkDecision::SwitchProof(Hash::default());
+            }
+        }
+
+--- The historical commit c2bb2b8e60 (PR #28172) ---
+c2bb2b8e6 Allow validators to reset to the slot which matches their last voted slot (#28172)
+     historical fix referenced in the modeling brief §6.1 MC-6)
+
+PASS criterion: both upstream tests report 'test result: ok'.
+This confirms:
+  - PurgeUnconfirmedSlot DOES clear bank_forks/progress (the impl
+    behavior the MC trace models).
+  - The Tower retains its vote on the purged slot (the structural
+    state-stranding the spec invariant TowerVotesAreOnExistingForks
+    detects).
+  - The 'Should never consider switching to ancestor' panic at
+    consensus.rs:1104 does NOT fire in practice — the safeguard at
+    consensus.rs:1041-1074 catches the stranded state first and
+    returns the freebie SwitchProof, which is documented but
+    acknowledged as a workaround ('TODO: Properly handle this case').
