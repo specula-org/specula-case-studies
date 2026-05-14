@@ -1,0 +1,178 @@
+diff --git a/src/MuxPort.cpp b/src/MuxPort.cpp
+index 59337a6..e42c310 100644
+--- a/src/MuxPort.cpp
++++ b/src/MuxPort.cpp
+@@ -37,6 +37,7 @@
+ #include "common/MuxLogger.h"
+ #include "link_prober/LinkProberStateMachineActiveActive.h"
+ #include "link_prober/LinkProberStateMachineActiveStandby.h"
++#include "tla_trace.h"
+ 
+ namespace mux
+ {
+@@ -162,6 +163,8 @@ void MuxPort::handleLinkState(const std::string &linkState)
+         label = link_state::LinkState::Label::Up;
+     }
+ 
++    TLA_TRACE_LINK_CHANGE(mMuxPortConfig.getPortName(), label);
++
+     boost::asio::post(mStrand, boost::bind(
+         &link_manager::LinkManagerStateMachineBase::handleSwssLinkStateNotification,
+         mLinkManagerStateMachinePtr.get(),
+diff --git a/src/link_manager/LinkManagerStateMachineActiveActive.cpp b/src/link_manager/LinkManagerStateMachineActiveActive.cpp
+index 2a8fe14..be46667 100644
+--- a/src/link_manager/LinkManagerStateMachineActiveActive.cpp
++++ b/src/link_manager/LinkManagerStateMachineActiveActive.cpp
+@@ -21,6 +21,7 @@
+ #include "common/MuxException.h"
+ #include "MuxPort.h"
+ #include <chrono>
++#include "tla_trace.h"
+ 
+ std::chrono::time_point<std::chrono::high_resolution_clock> global_start;
+ std::chrono::time_point<std::chrono::high_resolution_clock> global_end;
+@@ -208,6 +209,8 @@ void ActiveActiveStateMachine::handleMuxStateNotification(mux_state::MuxState::L
+     mLastMuxNotificationType = LastMuxNotificationType::MuxNotificationFromToggle;
+     mLastMuxStateNotification = label;
+ 
++    TLA_TRACE_MUX_NOTIFICATION(mMuxPortConfig.getPortName(), label, mLastMuxStateNotification, "toggle");
++
+     if (mComponentInitState.all()) {
+         if (mMuxStateMachine.getWaitStateCause() != mux_state::WaitState::WaitStateCause::SwssUpdate) {
+             MUXLOGWARNING(boost::format("%s: Received unsolicited MUX state change notification!") % mMuxPortConfig.getPortName());
+@@ -268,6 +271,10 @@ void ActiveActiveStateMachine::handleMuxConfigNotification(const common::MuxPort
+ {
+     MUXLOGWARNING(boost::format("%s: mux config mode: %s") % mMuxPortConfig.getPortName() % mode);
+ 
++    {
++        common::MuxPortConfig::Mode oldMode = mMuxPortConfig.getMode();
++        TLA_TRACE_MODE_CHANGE(mMuxPortConfig.getPortName(), mode, oldMode);
++    }
+     mMuxPortConfig.setMode(mode);
+     if (mComponentInitState.all()) {
+         CompositeState nextState = mCompositeState;
+@@ -311,6 +318,8 @@ void ActiveActiveStateMachine::handleProbeMuxStateNotification(mux_state::MuxSta
+         mDeadlineTimer.cancel();
+     }
+ 
++    TLA_TRACE_MUX_NOTIFICATION(mMuxPortConfig.getPortName(), label, label, "probe");
++
+     if (mComponentInitState.all()) {
+         if (mMuxStateMachine.getWaitStateCause() != mux_state::WaitState::WaitStateCause::DriverUpdate) {
+             MUXLOGWARNING(
+@@ -451,6 +460,7 @@ void ActiveActiveStateMachine::handleUseWellKnownMacAddressNotification()
+ void ActiveActiveStateMachine::startAdminForwardingStateSyncUpTimer()
+ {
+     MUXLOGDEBUG(mMuxPortConfig.getPortName());
++    TLA_TRACE_SOC_RESTART(mMuxPortConfig.getPortName(), mPeerMuxState, mPeerLinkProberState);
+     mResyncTimer.expires_from_now(boost::posix_time::milliseconds(
+         mMuxPortConfig.getAdminForwardingStateSyncUpInterval()
+     ));
+@@ -465,7 +475,9 @@ void ActiveActiveStateMachine::handleAdminForwardingStateSyncUp(boost::system::e
+ {
+     MUXLOGDEBUG(mMuxPortConfig.getPortName());
+ 
+-    if (!mWaitMux) 
++    TLA_TRACE_RESYNC_TIMEOUT(mMuxPortConfig.getPortName(), mWaitMux);
++
++    if (!mWaitMux)
+     {
+         probeMuxState();
+     }
+@@ -539,6 +551,9 @@ void ActiveActiveStateMachine::handleStateChange(
+         mStateTransitionHandler[ps(nextState)][ms(nextState)][ls(nextState)](nextState);
+         LOGWARNING_MUX_STATE_TRANSITION(mMuxPortConfig.getPortName(), mCompositeState, nextState);
+         mCompositeState = nextState;
++        TLA_TRACE_PROCESS_EVENT(mMuxPortConfig.getPortName(),
++            ps(mCompositeState), ms(mCompositeState), ls(mCompositeState),
++            mPeerMuxState, mPeerLinkProberState, mMuxProbeBackoffFactor, "lp", "handleStateChange_LP");
+     }
+ 
+     updateMuxLinkmgrState();
+@@ -566,6 +581,9 @@ void ActiveActiveStateMachine::handleStateChange(
+         mStateTransitionHandler[ps(nextState)][ms(nextState)][ls(nextState)](nextState);
+         LOGINFO_MUX_STATE_TRANSITION(mMuxPortConfig.getPortName(), mCompositeState, nextState);
+         mCompositeState = nextState;
++        TLA_TRACE_PROCESS_EVENT(mMuxPortConfig.getPortName(),
++            ps(mCompositeState), ms(mCompositeState), ls(mCompositeState),
++            mPeerMuxState, mPeerLinkProberState, mMuxProbeBackoffFactor, "mux", "handleStateChange_Mux");
+     }
+ 
+     updateMuxLinkmgrState();
+@@ -600,6 +618,9 @@ void ActiveActiveStateMachine::handleStateChange(
+         }
+         LOGWARNING_MUX_STATE_TRANSITION(mMuxPortConfig.getPortName(), mCompositeState, nextState);
+         mCompositeState = nextState;
++        TLA_TRACE_PROCESS_EVENT(mMuxPortConfig.getPortName(),
++            ps(mCompositeState), ms(mCompositeState), ls(mCompositeState),
++            mPeerMuxState, mPeerLinkProberState, mMuxProbeBackoffFactor, "link", "handleStateChange_Link");
+     }
+ 
+     updateMuxLinkmgrState();
+@@ -638,6 +659,9 @@ void ActiveActiveStateMachine::handlePeerStateChange(
+                 break;
+             }
+         }
++        TLA_TRACE_PROCESS_EVENT(mMuxPortConfig.getPortName(),
++            ps(mCompositeState), ms(mCompositeState), ls(mCompositeState),
++            mPeerMuxState, mPeerLinkProberState, mMuxProbeBackoffFactor, "peer_lp", "handlePeerStateChange");
+     }
+ }
+ 
+@@ -1237,6 +1261,7 @@ void ActiveActiveStateMachine::handleMuxProbeTimeout(boost::system::error_code e
+     MUXLOGDEBUG(boost::format("%s: Mux Probe Timeout") % mMuxPortConfig.getPortName());
+     stopWaitMux();
+     if (errorCode == boost::system::errc::success) {
++        TLA_TRACE_MUX_PROBE_TIMEOUT(mMuxPortConfig.getPortName(), mMuxProbeBackoffFactor, ms(mCompositeState));
+         if (ms(mCompositeState) == mux_state::MuxState::Label::Unknown ||
+             ms(mCompositeState) == mux_state::MuxState::Label::Error ||
+             ms(mCompositeState) == mux_state::MuxState::Label::Wait) {
+@@ -1279,6 +1304,12 @@ void ActiveActiveStateMachine::handleMuxWaitTimeout(boost::system::error_code er
+ 
+     stopWaitMux();
+     if (errorCode == boost::system::errc::success) {
++        {
++            const char* cause = "unknown";
++            if (mMuxStateMachine.getWaitStateCause() == mux_state::WaitState::WaitStateCause::SwssUpdate) cause = "SwssUpdate";
++            else if (mMuxStateMachine.getWaitStateCause() == mux_state::WaitState::WaitStateCause::DriverUpdate) cause = "DriverUpdate";
++            TLA_TRACE_MUX_WAIT_TIMEOUT(mMuxPortConfig.getPortName(), cause);
++        }
+         if (mMuxStateMachine.getWaitStateCause() == mux_state::WaitState::WaitStateCause::SwssUpdate) {
+             MUXLOGTIMEOUT(mMuxPortConfig.getPortName(), "orchagent timed out responding to linkmgrd", mCompositeState);
+         } else if (mMuxStateMachine.getWaitStateCause() == mux_state::WaitState::WaitStateCause::DriverUpdate) {
+@@ -1313,6 +1344,7 @@ void ActiveActiveStateMachine::startPeerMuxWaitTimer(uint32_t factor)
+ //
+ void ActiveActiveStateMachine::handlePeerMuxWaitTimeout(boost::system::error_code errorCode)
+ {
++    TLA_TRACE_PEER_WAIT_TIMEOUT(mMuxPortConfig.getPortName(), mLastSetPeerMuxState);
+     if (errorCode == boost::system::errc::success) {
+         MUXLOGWARNING(
+             boost::format("%s: %s, current peer mux state: %s") %
+@@ -1340,6 +1372,7 @@ void ActiveActiveStateMachine::handleDefaultRouteStateNotification(const Default
+ 
+     DefaultRoute oldRouteState = mDefaultRouteState;
+     mDefaultRouteState = routeState;
++    TLA_TRACE_DEFAULT_ROUTE_CHANGE(mMuxPortConfig.getPortName(), routeState, oldRouteState);
+     shutdownOrRestartLinkProberOnDefaultRoute();
+ 
+     if (mComponentInitState.all() &&
+diff --git a/src/link_prober/LinkProberStateMachineBase.cpp b/src/link_prober/LinkProberStateMachineBase.cpp
+index ea44cde..6dc826f 100644
+--- a/src/link_prober/LinkProberStateMachineBase.cpp
++++ b/src/link_prober/LinkProberStateMachineBase.cpp
+@@ -20,6 +20,7 @@
+ #include "common/MuxLogger.h"
+ #include "link_manager/LinkManagerStateMachineBase.h"
+ #include "link_prober/LinkProberState.h"
++#include "tla_trace.h"
+ 
+ namespace link_prober
+ {
+@@ -200,6 +201,7 @@ void LinkProberStateMachineBase::processEvent(T &t)
+         );
+     } else {
+         if (nextLinkProberState != currentLinkProberState) {
++            TLA_TRACE_HEARTBEAT(mMuxPortConfig.getPortName(), nextLinkProberState->getStateLabel());
+             postLinkManagerEvent(nextLinkProberState);
+         }
+         setCurrentState(nextLinkProberState);
