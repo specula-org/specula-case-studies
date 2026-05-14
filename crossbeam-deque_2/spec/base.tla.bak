@@ -1,0 +1,980 @@
+---- MODULE base ----
+(***************************************************************************)
+(* TLA+ specification of crossbeam-deque (Chase-Lev work-stealing deque).  *)
+(*                                                                         *)
+(* Source: crossbeam-deque/src/deque.rs                                    *)
+(*                                                                         *)
+(* Category B (concurrent / lock-free).                                   *)
+(*                                                                        *)
+(* Bug Families (from modeling-brief.md):                                 *)
+(*   A — Buffer-Resize / Generation Race (CVE-2021-32810 family)          *)
+(*       deque.rs:670, 816, 863, 1061, 1083, 1121 (re-check sites)        *)
+(*   B — Memory Ordering across Worker/Stealer boundary                   *)
+(*       deque.rs:418-432 (push fence/store), 489-528 (lifo pop dekker),  *)
+(*       643-657 (steal acquire/fence), 674/820/867/1086/1125 (CAS SeqCst)*)
+(*   C — Adversarial Caller Harness (Stealer::clone, Worker drop)         *)
+(*       deque.rs:1181-1188 (Stealer Clone), 208 (Worker !Sync marker)    *)
+(*   D — CAS-Weak Spurious Failure (hypothetical on Worker LIFO last CAS) *)
+(*       deque.rs:518 (LIFO last-task CAS — strong by design)             *)
+(*   F — Empty / Non-Empty Race in Steal-Batch LIFO loop                  *)
+(*       deque.rs:1080-1162 (steal_batch_with_limit_and_pop Lifo loop)    *)
+(*                                                                        *)
+(* Previous coverage (kept):                                              *)
+(*   F1 — Steal-Resize buffer race (= Family A, CVE-2021-32810)           *)
+(*   F3 — Epoch lifecycle / premature reclamation                         *)
+(*   F4 — FIFO Pop Rollback transient over-advance                       *)
+(*                                                                        *)
+(* Out of scope (deferred — reason in coverage block):                    *)
+(*   E — Injector block-lifecycle (READ/DESTROY bits) — separate MPMC    *)
+(*       deque.rs:1284-1301, 1726-1739, 1935-1948 — would require        *)
+(*       a full Injector model; flagged for future iteration.            *)
+(***************************************************************************)
+
+EXTENDS Integers, Sequences, FiniteSets, TLC
+
+\* ========================================================================
+\* Constants
+\* ========================================================================
+
+CONSTANTS
+    Stealer,            \* Set of stealer thread IDs (initial set; can grow via Stealer::clone)
+    MaxVal,             \* Max distinct push values (bounds state)
+    BufferCap,          \* Initial buffer capacity (deque.rs:18, MIN_CAP=64)
+    MaxBatch,           \* Max batch size (deque.rs:20, MAX_BATCH=32)
+    MaxResize,          \* Max number of resizes (bounds bufferID growth)
+    MaxBatchIters       \* Max LIFO batch loop iterations (Family F bound)
+
+Worker == "worker"
+Thread == Stealer \cup {Worker}
+Val == 1..MaxVal
+NullVal == 0
+
+ASSUME BufferCap >= 2
+ASSUME MaxBatch >= 1
+ASSUME MaxVal >= 1
+ASSUME MaxResize >= 0
+ASSUME MaxBatchIters >= 0
+
+\* ========================================================================
+\* Variables
+\* ========================================================================
+
+\* --- Core deque state (deque.rs:114-123 Inner<T>) ---
+VARIABLES
+    front,              \* AtomicIsize (deque.rs:116)
+    back,               \* AtomicIsize (deque.rs:119)
+    bufferID            \* current buffer generation (Family A, advances on resize)
+
+\* --- Per-buffer contents ---
+\* bufContent[id] = function 1..BufferCap -> Val \cup {NullVal}
+\* Old buffers retained after resize (epoch-deferred); freed buffers absent.
+VARIABLES
+    bufContent
+
+\* --- Per-stealer steal-protocol state ---
+VARIABLES
+    sPC,                \* sPC[s] \in {"Idle","LoadedFront","Pinned","ReadTask",
+                        \*             "PreCAS","BatchLoop","Done"}
+    sCachedFront,       \* front captured at start of steal
+    sCachedBack,        \* back captured at start of steal (for empty test)
+    sCachedBuf,         \* bufferID captured (Family A: pinned generation)
+    sReadVal,           \* speculatively-read value
+    sStolenCount,       \* items reserved by a single CAS (1=single, n=batch)
+    sStealSite,         \* CAS site label (Family A asymmetry, Family D)
+    sBatchN,            \* total batch size requested (Family F)
+    sBatchIter,         \* current iteration index in LIFO batch loop (Family F)
+    sFenceDone          \* SeqCst fence executed yet? (Family B)
+
+\* --- Worker state ---
+VARIABLES
+    wPC,                \* "Idle" | "FIFORollback" | "PushSlotWritten" | "LIFODecrFenced"
+    nextPush,           \* monotonic next push value
+    flavor,             \* "FIFO" | "LIFO" (set at Init, deque.rs:148-155)
+    wAlive              \* Family C: FALSE after Worker::drop disables further worker actions
+
+\* --- Epoch / buffer reclamation (Family A, F3) ---
+VARIABLES
+    pinned,             \* pinned[s] \in BOOLEAN — stealer holds an epoch guard
+    retired,            \* set of buffer IDs deferred for reclamation
+    freed               \* set of buffer IDs actually deallocated
+
+\* --- Active stealer set (Family C) ---
+\* The Stealer constant is the maximum population. activeStealers tracks which
+\* stealer threads have been "spawned" by `Stealer::clone` adversary. Stealers
+\* not in this set are inert (no steal actions enabled).
+VARIABLES
+    activeStealers
+
+\* --- Fault-injection flags (Families A, B, C, D) ---
+VARIABLES
+    skipRecheck,         \* [site -> BOOLEAN] — whether re-check is omitted (Family A / MC-1)
+    prematureReclaim,    \* BOOLEAN — allow reclaim while pinned (Family A/F3)
+    weakLIFOLastCAS,     \* BOOLEAN — model worker LIFO last-task CAS as weak (Family D)
+    relaxBackStore,      \* BOOLEAN — Family B: drop the Release fence so back becomes
+                         \*   visible to stealers BEFORE the slot write
+    skipStealerFence     \* BOOLEAN — Family B: stealer omits its conditional SeqCst fence
+
+\* --- History for safety invariants ---
+VARIABLES
+    pushed,             \* sequence of pushed values (push order)
+    consumed,           \* set of consumed values
+    consumeCount,       \* count of consume ops (catches double-pop)
+    pushSlotVisible     \* [bufferID -> set of slot positions] — pushed slots
+                        \* whose write is visible to stealers (Family B).
+                        \* When relaxBackStore allows, back is bumped without
+                        \* the slot write being visible.
+
+\* Variable groupings for UNCHANGED clauses
+coreVars     == <<front, back, bufferID>>
+bufVars      == <<bufContent, pushSlotVisible>>
+stealerVars  == <<sPC, sCachedFront, sCachedBack, sCachedBuf, sReadVal,
+                  sStolenCount, sStealSite, sBatchN, sBatchIter, sFenceDone>>
+workerVars   == <<wPC, nextPush, flavor, wAlive>>
+epochVars    == <<pinned, retired, freed>>
+harnessVars  == <<activeStealers>>
+faultVars    == <<skipRecheck, prematureReclaim, weakLIFOLastCAS,
+                  relaxBackStore, skipStealerFence>>
+historyVars  == <<pushed, consumed, consumeCount>>
+
+vars == <<coreVars, bufVars, stealerVars, workerVars, epochVars,
+          harnessVars, faultVars, historyVars>>
+
+\* ========================================================================
+\* Helpers
+\* ========================================================================
+
+\* Circular buffer slot (1-based): position mod cap (deque.rs:69 wrap)
+SlotIdx(pos) == (pos % BufferCap) + 1
+
+\* Empty buffer
+EmptyBuf == [i \in 1..BufferCap |-> NullVal]
+
+\* Read from a buffer by ID. Freed buffers return NullVal (UAF marker for F3).
+ReadBuf(id, pos) ==
+    IF id \in DOMAIN bufContent /\ id \notin freed
+    THEN bufContent[id][SlotIdx(pos)]
+    ELSE NullVal
+
+ReadCurrent(pos) == ReadBuf(bufferID, pos)
+
+\* Write to buffer (deque.rs:78-90 Buffer::write on MaybeUninit)
+WriteBuf(id, pos, val) ==
+    [bufContent EXCEPT ![id][SlotIdx(pos)] = val]
+
+\* Number of items logically in the deque
+QLen == back - front
+
+\* Mark a slot as visible to stealers (Family B handshake — deque.rs:418-432).
+\* Under normal ordering, the Release fence makes the slot visible before back
+\* is incremented. Under relaxBackStore, this can be deferred.
+MarkVisible(id, pos) ==
+    IF id \in DOMAIN pushSlotVisible
+    THEN [pushSlotVisible EXCEPT ![id] = @ \cup {pos}]
+    ELSE pushSlotVisible @@ (id :> {pos})
+
+\* Whether a slot is observed-as-visible by stealers (Family B precondition for
+\* a successful steal: a relaxed `back` may report an item present whose write
+\* has not yet propagated).
+SlotVisible(id, pos) ==
+    /\ id \in DOMAIN pushSlotVisible
+    /\ pos \in pushSlotVisible[id]
+
+Consume(val) ==
+    /\ consumed' = consumed \cup {val}
+    /\ consumeCount' = consumeCount + 1
+
+ConsumeSet(vals) ==
+    /\ consumed' = consumed \cup vals
+    /\ consumeCount' = consumeCount + Cardinality(vals)
+
+\* Stealer is "live" iff in the active set (Family C: clone adversary)
+LiveStealer(s) == s \in activeStealers
+
+\* ========================================================================
+\* Init
+\* ========================================================================
+
+Init ==
+    \* Core deque (deque.rs:226-240 Worker::new_*)
+    /\ front = 0
+    /\ back = 0
+    /\ bufferID = 1
+    /\ bufContent = (1 :> EmptyBuf)
+    /\ pushSlotVisible = (1 :> {})
+    \* Stealer state — all idle
+    /\ sPC = [s \in Stealer |-> "Idle"]
+    /\ sCachedFront = [s \in Stealer |-> 0]
+    /\ sCachedBack = [s \in Stealer |-> 0]
+    /\ sCachedBuf = [s \in Stealer |-> 0]
+    /\ sReadVal = [s \in Stealer |-> NullVal]
+    /\ sStolenCount = [s \in Stealer |-> 0]
+    /\ sStealSite = [s \in Stealer |-> "single"]
+    /\ sBatchN = [s \in Stealer |-> 0]
+    /\ sBatchIter = [s \in Stealer |-> 0]
+    /\ sFenceDone = [s \in Stealer |-> FALSE]
+    \* Worker
+    /\ wPC = "Idle"
+    /\ nextPush = 1
+    /\ flavor \in {"FIFO", "LIFO"}
+    /\ wAlive = TRUE
+    \* Epoch
+    /\ pinned = [s \in Stealer |-> FALSE]
+    /\ retired = {}
+    /\ freed = {}
+    \* Caller harness — start with at most one stealer active; Stealer::clone
+    \* spawns the rest. Configurable via initial value.
+    /\ activeStealers \subseteq Stealer
+    /\ activeStealers /= {}
+    \* Fault-injection: defaults match production code. Per-site re-check:
+    \*   single, batchFIFO, batchLIFOLoop  → re-check PRESENT  (skipRecheck=FALSE)
+    \*   batchLIFOFirst                    → re-check ABSENT   (skipRecheck=TRUE,
+    \*                                                          deque.rs:1083)
+    /\ skipRecheck = ("single"          :> FALSE)
+                     @@ ("batchFIFO"     :> FALSE)
+                     @@ ("batchLIFOFirst":> TRUE)
+                     @@ ("batchLIFOLoop" :> FALSE)
+    /\ prematureReclaim = FALSE
+    /\ weakLIFOLastCAS  = FALSE
+    /\ relaxBackStore   = FALSE
+    /\ skipStealerFence = FALSE
+    \* History
+    /\ pushed = <<>>
+    /\ consumed = {}
+    /\ consumeCount = 0
+
+\* ========================================================================
+\* Worker Actions
+\* ========================================================================
+
+\* ------------------------------------------------------------------------
+\* PushWriteSlot (deque.rs:399-419)
+\* Worker phase 1: load b/f, maybe resize, write task into slot.
+\* Slot is NOT yet marked visible — that happens at PushStoreBack via Release
+\* fence + back.store. (Family B: separate atomic-step actions.)
+\* ------------------------------------------------------------------------
+PushWriteSlot ==
+    /\ wAlive
+    /\ wPC = "Idle"
+    /\ nextPush <= MaxVal
+    /\ QLen < BufferCap                      \* deque.rs:409 (no resize this step)
+    /\ LET b == back
+           val == nextPush
+       IN
+       /\ bufContent' = WriteBuf(bufferID, b, val)        \* deque.rs:418-419
+       /\ wPC' = "PushSlotWritten"
+       /\ pushed' = Append(pushed, val)
+       /\ nextPush' = nextPush + 1
+    /\ UNCHANGED <<front, back, bufferID, pushSlotVisible,
+                   stealerVars, flavor, wAlive, epochVars,
+                   harnessVars, faultVars, consumed, consumeCount>>
+
+\* ------------------------------------------------------------------------
+\* PushStoreBack (deque.rs:422-432)
+\* Worker phase 2: Release fence + back.store.
+\* Under normal ordering, the slot becomes visible BEFORE back advances.
+\* Under relaxBackStore (Family B fault), back may be bumped without the
+\* slot becoming visible — stealers can see new back, read NullVal slot.
+\* ------------------------------------------------------------------------
+PushStoreBack ==
+    /\ wAlive
+    /\ wPC = "PushSlotWritten"
+    /\ LET b == back
+           pos == b
+       IN
+       /\ back' = b + 1                                    \* deque.rs:432
+       /\ IF relaxBackStore
+            \* Fault: slot write deferred, but back advances. Slot not yet visible.
+            THEN pushSlotVisible' = pushSlotVisible
+            \* Normal: Release fence at deque.rs:424 makes slot write visible
+            \* before back is observed. Model this as marking visibility now.
+            ELSE pushSlotVisible' = MarkVisible(bufferID, pos)
+       /\ wPC' = "Idle"
+    /\ UNCHANGED <<front, bufferID, bufContent, stealerVars, nextPush, flavor,
+                   wAlive, epochVars, harnessVars, faultVars,
+                   pushed, consumed, consumeCount>>
+
+\* ------------------------------------------------------------------------
+\* PublishDeferredSlot (Family B liveness companion)
+\* If a push was committed under relaxBackStore, eventually the Release fence
+\* reaches global memory and the slot becomes visible. This action models
+\* that delayed propagation. Without it, the bug-injection state would be
+\* permanent and falsify liveness — we want the bug window to be transient.
+\* ------------------------------------------------------------------------
+PublishDeferredSlot ==
+    /\ \E gen \in DOMAIN bufContent, pos \in 0..(back - 1) :
+         /\ pos >= 0
+         /\ ~SlotVisible(gen, pos)
+         /\ ReadBuf(gen, pos) /= NullVal
+         /\ pushSlotVisible' = MarkVisible(gen, pos)
+    /\ UNCHANGED <<coreVars, bufContent, stealerVars, workerVars, epochVars,
+                   harnessVars, faultVars, historyVars>>
+
+\* ------------------------------------------------------------------------
+\* ResizeGrow (deque.rs:289-322)
+\* Worker grows the buffer; old buffer is retired (Family A: bufferID++).
+\* Index-preservation: slot at logical pos N stays at SlotIdx(N) in new gen.
+\* ------------------------------------------------------------------------
+ResizeGrow ==
+    /\ wAlive
+    /\ wPC = "Idle"
+    /\ QLen > 0
+    /\ bufferID - 1 < MaxResize                  \* state-space bound
+    /\ LET oldBuf == bufferID
+           newBuf == bufferID + 1
+           b == back
+           f == front
+           \* deque.rs:298-303: copy old[i mod cap] -> new[i mod cap]
+           copiedContent ==
+               [i \in 1..BufferCap |->
+                   IF \E pos \in f..(b-1) : SlotIdx(pos) = i
+                   THEN bufContent[oldBuf][i]
+                   ELSE NullVal]
+           copiedVisible == { pos \in f..(b-1) : SlotVisible(oldBuf, pos) }
+       IN
+       /\ bufferID' = newBuf                              \* deque.rs:308-312
+       /\ bufContent' = (newBuf :> copiedContent) @@ bufContent
+       /\ pushSlotVisible' =
+              (newBuf :> copiedVisible) @@ pushSlotVisible
+       /\ retired' = retired \cup {oldBuf}                \* deque.rs:315
+    /\ UNCHANGED <<front, back, stealerVars, workerVars,
+                   pinned, freed, harnessVars, faultVars, historyVars>>
+
+\* ------------------------------------------------------------------------
+\* LIFOPop (deque.rs:490-544)
+\* Modeled at the granularity of two interleavable steps: (1) decrement back
+\* and SeqCst fence + load front (Dekker); (2) decide path.
+\* ------------------------------------------------------------------------
+LIFOPopDecrFence ==
+    /\ wAlive
+    /\ wPC = "Idle"
+    /\ flavor = "LIFO"
+    /\ QLen > 0
+    /\ LET b == back - 1                          \* deque.rs:492
+       IN
+       /\ back' = b                                \* deque.rs:493 (Relaxed store)
+       /\ wPC' = "LIFODecrFenced"                  \* SeqCst fence + load done
+                                                   \*  in this combined step
+    /\ UNCHANGED <<front, bufferID, bufVars, stealerVars, nextPush, flavor,
+                   wAlive, epochVars, harnessVars, faultVars, historyVars>>
+
+LIFOPopDecide ==
+    /\ wAlive
+    /\ wPC = "LIFODecrFenced"
+    /\ flavor = "LIFO"
+    /\ LET b == back                               \* already decremented above
+           f == front                              \* deque.rs:498
+           len == b - f
+       IN
+       IF len < 0 THEN
+         \* deque.rs:503-506: empty after decrement, restore back
+         /\ back' = b + 1
+         /\ wPC' = "Idle"
+         /\ UNCHANGED <<front, bufContent, pushSlotVisible, consumed,
+                        consumeCount>>
+       ELSE IF len = 0 THEN
+         \* deque.rs:512-531: last task — CAS contention with stealers
+         LET val == ReadCurrent(b) IN
+         \* CAS at deque.rs:515-524 is SeqCst on success.
+         \* If weakLIFOLastCAS = TRUE (Family D fault), spurious-fail path
+         \* is allowed — task is dropped (deque.rs:527 task.take()) and back
+         \* restored. This would lose the popped value silently.
+         \/ /\ ~weakLIFOLastCAS                   \* path A: CAS succeeds
+            /\ front = f                          \* CAS expected match
+            /\ front' = f + 1
+            /\ back' = b + 1                      \* deque.rs:531
+            /\ Consume(val)
+            /\ wPC' = "Idle"
+            /\ UNCHANGED <<bufContent, pushSlotVisible>>
+         \/ /\ front = f                          \* path B: spurious fail (Family D)
+            /\ weakLIFOLastCAS                    \* — only enabled under fault
+            /\ back' = b + 1                      \* task dropped (deque.rs:527)
+            /\ wPC' = "Idle"
+            /\ UNCHANGED <<front, bufContent, pushSlotVisible, consumed,
+                           consumeCount>>
+         \/ /\ front /= f                          \* path C: real CAS contention
+            /\ back' = b + 1
+            /\ wPC' = "Idle"
+            /\ UNCHANGED <<front, bufContent, pushSlotVisible, consumed,
+                           consumeCount>>
+       ELSE
+         \* deque.rs:507-510, 532-538: multiple tasks — safe pop (no CAS)
+         LET val == ReadCurrent(b) IN
+         /\ Consume(val)
+         /\ wPC' = "Idle"
+         /\ UNCHANGED <<front, back, bufContent, pushSlotVisible>>
+    /\ UNCHANGED <<bufferID, stealerVars, nextPush, flavor, wAlive,
+                   epochVars, harnessVars, faultVars, pushed>>
+
+\* ------------------------------------------------------------------------
+\* FIFOPopAttempt (deque.rs:465-486; F4)
+\* fetch_add on front then conditional rollback if over-advanced.
+\* ------------------------------------------------------------------------
+FIFOPopAttempt ==
+    /\ wAlive
+    /\ wPC = "Idle"
+    /\ flavor = "FIFO"
+    /\ QLen > 0
+    /\ LET f == front                              \* before increment
+           b == back
+       IN
+       /\ front' = f + 1                           \* deque.rs:467 fetch_add SeqCst
+       /\ IF b - (f + 1) < 0 THEN
+            \* deque.rs:470-472: actually empty → roll back next
+            /\ wPC' = "FIFORollback"
+            /\ UNCHANGED <<bufContent, pushSlotVisible, consumed, consumeCount>>
+          ELSE
+            \* deque.rs:475-478: success — read & return
+            LET val == ReadCurrent(f) IN
+            /\ Consume(val)
+            /\ UNCHANGED <<wPC, bufContent, pushSlotVisible>>
+    /\ UNCHANGED <<back, bufferID, stealerVars, nextPush, flavor, wAlive,
+                   epochVars, harnessVars, faultVars, pushed>>
+
+FIFOPopRollback ==
+    /\ wPC = "FIFORollback"
+    /\ front' = front - 1                          \* deque.rs:471
+    /\ wPC' = "Idle"
+    /\ UNCHANGED <<back, bufferID, bufVars, stealerVars, nextPush, flavor,
+                   wAlive, epochVars, harnessVars, faultVars, historyVars>>
+
+\* ========================================================================
+\* Caller-Harness Actions (Family C)
+\* ========================================================================
+
+\* ------------------------------------------------------------------------
+\* StealerCloneAdv (deque.rs:1181-1188)
+\* Adversarial caller invokes Stealer::clone to add a fresh stealer thread.
+\* Documented contract is "one Worker, many Stealers"; cloning is just
+\* Arc::clone (synchronization-free). Risk: more N-way races.
+\* ------------------------------------------------------------------------
+StealerCloneAdv(s) ==
+    /\ s \in Stealer
+    /\ s \notin activeStealers
+    /\ activeStealers' = activeStealers \cup {s}
+    \* Newly-cloned stealers start idle with default state (already in Init).
+    /\ UNCHANGED <<coreVars, bufVars, stealerVars, workerVars, epochVars,
+                   faultVars, historyVars>>
+
+\* ------------------------------------------------------------------------
+\* WorkerDropAdv (deque.rs:Worker drop semantics — Inner survives via Arc)
+\* Worker is dropped while Stealers still hold their Arc. Worker actions
+\* halt; Stealers continue. Inner is reclaimed only when refcount == 0.
+\* ------------------------------------------------------------------------
+WorkerDropAdv ==
+    /\ wAlive
+    /\ wPC = "Idle"          \* don't drop mid-operation
+    /\ wAlive' = FALSE
+    /\ UNCHANGED <<coreVars, bufVars, stealerVars, wPC, nextPush, flavor,
+                   epochVars, harnessVars, faultVars, historyVars>>
+
+\* ========================================================================
+\* Stealer Actions
+\* ========================================================================
+\*
+\* Modeling per the Modeling Brief Family A: split steal into 5+ atomic steps
+\* matching the code's separate atomic operations. Per-stealer state machine:
+\*
+\*   Idle      → LoadedFront     [StealLoadFront / StealLoadFront_Batch]
+\*   LoadedFront → Pinned         [StealPin (issues SeqCst fence if needed)]
+\*   Pinned    → ReadTask         [StealLoadBuffer]
+\*   ReadTask  → PreCAS           [StealReadSlot]
+\*   PreCAS    → BatchLoop / Idle [StealRecheckCAS]
+\*   BatchLoop → BatchLoop / Done [StealLIFOBatchIter]      (Family F)
+\*   Done      → Idle             [StealBatchFinish]
+\*
+\* CAS sites:
+\*   "single"          deque.rs:670-679  (re-check PRESENT)
+\*   "batchFIFO"       deque.rs:1061-1075 (re-check PRESENT)
+\*   "batchLIFOFirst"  deque.rs:1083-1091 (re-check ABSENT — MC-1)
+\*   "batchLIFOLoop"   deque.rs:1121-1136 (re-check PRESENT, looped)
+\*
+
+\* ------------------------------------------------------------------------
+\* StealLoadFront (deque.rs:643)
+\* Per-stealer: load front (Acquire). Caller-harness: must be live.
+\* ------------------------------------------------------------------------
+StealLoadFront(s, site, batchN) ==
+    /\ LiveStealer(s)
+    /\ sPC[s] = "Idle"
+    /\ ~pinned[s]
+    /\ LET f == front
+       IN
+       /\ sPC' = [sPC EXCEPT ![s] = "LoadedFront"]
+       /\ sCachedFront' = [sCachedFront EXCEPT ![s] = f]
+       /\ sStealSite' = [sStealSite EXCEPT ![s] = site]
+       /\ sBatchN' = [sBatchN EXCEPT ![s] = batchN]
+       /\ sBatchIter' = [sBatchIter EXCEPT ![s] = 0]
+       /\ sFenceDone' = [sFenceDone EXCEPT ![s] = FALSE]
+       \* Reset cached buffer / back / read value from any prior steal
+       \* (a fresh `let` scope in the implementation).
+       /\ sCachedBuf' = [sCachedBuf EXCEPT ![s] = 0]
+       /\ sCachedBack' = [sCachedBack EXCEPT ![s] = 0]
+       /\ sReadVal' = [sReadVal EXCEPT ![s] = NullVal]
+       /\ UNCHANGED <<sStolenCount>>
+    /\ UNCHANGED <<coreVars, bufVars, workerVars, epochVars,
+                   harnessVars, faultVars, historyVars>>
+
+\* StealLoadFront variants for the three entry sites.
+\* These pre-set sStealSite which determines:
+\*   - whether the loop iteration is enabled (Lifo only)
+\*   - which CAS bound is used (1 vs n)
+\*   - whether re-check is enabled (skipRecheck[site])
+StealLoadFront_Single(s) == StealLoadFront(s, "single", 1)
+
+StealLoadFront_BatchFifo(s) ==
+    /\ flavor = "FIFO"
+    /\ \E n \in 1..MaxBatch : StealLoadFront(s, "batchFIFO", n)
+
+StealLoadFront_BatchLifo(s) ==
+    /\ flavor = "LIFO"
+    /\ \E n \in 1..MaxBatch : StealLoadFront(s, "batchLIFOFirst", n)
+
+\* ------------------------------------------------------------------------
+\* StealPin (deque.rs:650-654)
+\* SeqCst fence (conditional on epoch::is_pinned) + epoch::pin().
+\* Family B: skipStealerFence allows omitting the fence (only valid if the
+\* pin call would have issued a SeqCst fence — modeled non-deterministically
+\* via the disjunction in StealRecheckCAS where back-load may be stale).
+\* ------------------------------------------------------------------------
+StealPin(s) ==
+    /\ LiveStealer(s)
+    /\ sPC[s] = "LoadedFront"
+    /\ pinned' = [pinned EXCEPT ![s] = TRUE]
+    /\ sFenceDone' = [sFenceDone EXCEPT ![s] = ~skipStealerFence]
+    /\ sPC' = [sPC EXCEPT ![s] = "Pinned"]
+    /\ UNCHANGED <<coreVars, bufVars, sCachedFront, sCachedBack, sCachedBuf,
+                   sReadVal, sStolenCount, sStealSite, sBatchN, sBatchIter,
+                   workerVars, retired, freed, harnessVars, faultVars,
+                   historyVars>>
+
+\* ------------------------------------------------------------------------
+\* StealLoadBack (deque.rs:657)
+\* Acquire-load of back. Test for empty (deque.rs:660-662).
+\* If sFenceDone = FALSE (Family B): may observe a stale `back` — model this
+\* by allowing back to be read as either current `back` or `back-1`/`back-2`
+\* nondeterministically.
+\* ------------------------------------------------------------------------
+StealLoadBack(s) ==
+    /\ LiveStealer(s)
+    /\ sPC[s] = "Pinned"
+    /\ \E observedBack \in IF sFenceDone[s]
+                           THEN {back}
+                           ELSE { v \in 0..back : v >= 0 } :
+       LET f == sCachedFront[s]
+           empty == observedBack - f <= 0
+       IN
+       /\ sCachedBack' = [sCachedBack EXCEPT ![s] = observedBack]
+       /\ IF empty
+          THEN \* deque.rs:660-662: return Steal::Empty
+               /\ sPC' = [sPC EXCEPT ![s] = "Idle"]
+               /\ pinned' = [pinned EXCEPT ![s] = FALSE]
+          ELSE
+               /\ sPC' = [sPC EXCEPT ![s] = "ReadTask"]
+               /\ UNCHANGED pinned
+    /\ UNCHANGED <<coreVars, bufVars, sCachedFront, sCachedBuf, sReadVal,
+                   sStolenCount, sStealSite, sBatchN, sBatchIter, sFenceDone,
+                   workerVars, retired, freed, harnessVars, faultVars,
+                   historyVars>>
+
+\* ------------------------------------------------------------------------
+\* StealLoadBuffer (deque.rs:665)
+\* Acquire-load of buffer pointer (under epoch guard).
+\* This pins the generation that StealReadSlot will read from.
+\* ------------------------------------------------------------------------
+StealLoadBuffer(s) ==
+    /\ LiveStealer(s)
+    /\ sPC[s] = "ReadTask"
+    /\ sCachedBuf[s] = 0                  \* not yet loaded
+    /\ sCachedBuf' = [sCachedBuf EXCEPT ![s] = bufferID]   \* deque.rs:665
+    /\ UNCHANGED <<coreVars, bufVars, sPC, sCachedFront, sCachedBack, sReadVal,
+                   sStolenCount, sStealSite, sBatchN, sBatchIter, sFenceDone,
+                   workerVars, epochVars, harnessVars, faultVars, historyVars>>
+
+\* ------------------------------------------------------------------------
+\* StealReadSlot (deque.rs:666 / 1034 / 1117)
+\* Speculatively read task at sCachedFront from cached buffer.
+\* Family A: if buffer is reclaimed (freed) prematurely, returns NullVal.
+\* Family B: if slot not yet visible (relaxBackStore window), returns NullVal.
+\* ------------------------------------------------------------------------
+StealReadSlot(s) ==
+    /\ LiveStealer(s)
+    /\ sPC[s] = "ReadTask"
+    /\ sCachedBuf[s] /= 0
+    /\ LET cb == sCachedBuf[s]
+           f == sCachedFront[s]
+           visible == SlotVisible(cb, f)
+           rawVal == ReadBuf(cb, f)
+           \* Memory-ordering aware read:
+           \*   - If slot visible to this stealer → real value
+           \*   - If not visible (B fault) → NullVal (uninitialized read)
+           obs == IF visible THEN rawVal ELSE NullVal
+       IN
+       /\ sReadVal' = [sReadVal EXCEPT ![s] = obs]
+       /\ sPC' = [sPC EXCEPT ![s] = "PreCAS"]
+       /\ sStolenCount' = [sStolenCount EXCEPT ![s] = 1]
+    /\ UNCHANGED <<coreVars, bufVars, sCachedFront, sCachedBack, sCachedBuf,
+                   sStealSite, sBatchN, sBatchIter, sFenceDone, workerVars,
+                   epochVars, harnessVars, faultVars, historyVars>>
+
+\* ------------------------------------------------------------------------
+\* StealRecheckCAS (deque.rs:670-679 / 1061-1075 / 1083-1091 / 1121-1136)
+\* Generic commit step: re-check buffer (unless site lacks it) + CAS on front.
+\*
+\* Per-site re-check defaults (cited):
+\*   single             → re-check PRESENT (deque.rs:670)
+\*   batchFIFO          → re-check PRESENT (deque.rs:1061)
+\*   batchLIFOFirst     → re-check ABSENT  (deque.rs:1083) ← MC-1 finding
+\*   batchLIFOLoop      → re-check PRESENT (deque.rs:1121)
+\*
+\* MC fault: skipRecheck[site] = TRUE forces the re-check to be skipped at
+\* that site (reproduces CVE-2021-32810 for sites whose code has the check;
+\* models the MC-1 finding for batchLIFOFirst).
+\* ------------------------------------------------------------------------
+StealRecheckCAS(s) ==
+    /\ LiveStealer(s)
+    /\ sPC[s] = "PreCAS"
+    /\ LET site       == sStealSite[s]
+           f          == sCachedFront[s]
+           cb         == sCachedBuf[s]
+           bufChanged == (cb /= bufferID)
+           recheckDetects == bufChanged /\ ~skipRecheck[site]
+           n          == sStolenCount[s]
+           batchSize  == sBatchN[s]
+       IN
+       IF recheckDetects THEN
+         \* deque.rs:670: re-check fires → return Steal::Retry
+         /\ sPC' = [sPC EXCEPT ![s] = "Idle"]
+         /\ pinned' = [pinned EXCEPT ![s] = FALSE]
+         /\ UNCHANGED <<coreVars, bufVars, sCachedFront, sCachedBack,
+                        sCachedBuf, sReadVal, sStolenCount, sStealSite,
+                        sBatchN, sBatchIter, sFenceDone, workerVars,
+                        retired, freed, harnessVars, faultVars, historyVars>>
+       ELSE IF front /= f THEN
+         \* CAS expected match fails → Steal::Retry (deque.rs:675)
+         /\ sPC' = [sPC EXCEPT ![s] = "Idle"]
+         /\ pinned' = [pinned EXCEPT ![s] = FALSE]
+         /\ UNCHANGED <<coreVars, bufVars, sCachedFront, sCachedBack,
+                        sCachedBuf, sReadVal, sStolenCount, sStealSite,
+                        sBatchN, sBatchIter, sFenceDone, workerVars,
+                        retired, freed, harnessVars, faultVars, historyVars>>
+       ELSE
+         \* CAS succeeds. Behavior depends on site:
+         \*   single       → consume sReadVal, terminate
+         \*   batchFIFO    → consume n=batchSize+1 items at once, terminate
+         \*   batchLIFOFirst → consume sReadVal (n=1), enter BatchLoop with
+         \*                    iter=0, target original_batch_size iters
+         \*   batchLIFOLoop  → consume sReadVal (n=1), continue BatchLoop
+         /\ front' = f + n
+         /\ Consume(sReadVal[s])
+         /\ IF site = "batchLIFOFirst" /\ batchSize > 1 THEN
+              \* deque.rs:1093-1094: f++, enter loop
+              /\ sPC' = [sPC EXCEPT ![s] = "BatchLoop"]
+              /\ UNCHANGED <<pinned>>
+            ELSE IF site = "batchLIFOLoop" /\ sBatchIter[s] + 1 < batchSize THEN
+              /\ sPC' = [sPC EXCEPT ![s] = "BatchLoop"]
+              /\ UNCHANGED <<pinned>>
+            ELSE
+              \* terminate
+              /\ sPC' = [sPC EXCEPT ![s] = "Idle"]
+              /\ pinned' = [pinned EXCEPT ![s] = FALSE]
+         /\ UNCHANGED <<back, bufferID, bufVars, sCachedFront, sCachedBack,
+                        sCachedBuf, sReadVal, sStolenCount, sStealSite,
+                        sBatchN, sFenceDone,
+                        workerVars, retired, freed, harnessVars, faultVars,
+                        pushed>>
+         /\ sBatchIter' = [sBatchIter EXCEPT
+                           ![s] = IF site = "batchLIFOFirst" THEN 1
+                                  ELSE sBatchIter[s] + 1]
+
+\* ------------------------------------------------------------------------
+\* StealLIFOBatchIter (deque.rs:1102-1146, Family F)
+\* In-loop body: SeqCst fence (deque.rs:1105) + back load (deque.rs:1108) +
+\* slot read (deque.rs:1117) + buffer recheck + CAS (deque.rs:1121-1131).
+\* Each iteration is interleavable with worker actions.
+\* When loop exits (empty observed or CAS fails), drop pin and finish.
+\* ------------------------------------------------------------------------
+StealLIFOBatchIter(s) ==
+    /\ LiveStealer(s)
+    /\ sPC[s] = "BatchLoop"
+    /\ sBatchIter[s] <= MaxBatchIters
+    /\ LET cb == sCachedBuf[s]
+           f  == sCachedFront[s] + sBatchIter[s]    \* logical f after prior iters
+           bufChanged == (cb /= bufferID)
+           iter == sBatchIter[s]
+           n == sBatchN[s]
+       IN
+       \* deque.rs:1108-1114: re-load back; if empty, exit loop
+       \/ /\ back - f <= 0
+          /\ sPC' = [sPC EXCEPT ![s] = "Idle"]
+          /\ pinned' = [pinned EXCEPT ![s] = FALSE]
+          /\ UNCHANGED <<coreVars, bufVars, sCachedFront, sCachedBack,
+                         sCachedBuf, sReadVal, sStolenCount, sStealSite,
+                         sBatchN, sBatchIter, sFenceDone, workerVars,
+                         retired, freed, harnessVars, faultVars, historyVars>>
+       \* deque.rs:1117-1136: read+recheck+CAS branches
+       \/ /\ back - f > 0
+          /\ \* re-check the buffer (deque.rs:1121)
+             IF bufChanged /\ ~skipRecheck["batchLIFOLoop"]
+             THEN \* re-check fires
+                  /\ sPC' = [sPC EXCEPT ![s] = "Idle"]
+                  /\ pinned' = [pinned EXCEPT ![s] = FALSE]
+                  /\ UNCHANGED <<coreVars, bufVars, sCachedFront, sCachedBack,
+                                 sCachedBuf, sReadVal, sStolenCount,
+                                 sStealSite, sBatchN, sBatchIter, sFenceDone,
+                                 workerVars, retired, freed, harnessVars,
+                                 faultVars, historyVars>>
+             ELSE \* attempt CAS
+                  IF front /= f THEN \* CAS contention loss
+                       /\ sPC' = [sPC EXCEPT ![s] = "Idle"]
+                       /\ pinned' = [pinned EXCEPT ![s] = FALSE]
+                       /\ UNCHANGED <<coreVars, bufVars, sCachedFront,
+                                      sCachedBack, sCachedBuf, sReadVal,
+                                      sStolenCount, sStealSite, sBatchN,
+                                      sBatchIter, sFenceDone, workerVars,
+                                      retired, freed, harnessVars, faultVars,
+                                      historyVars>>
+                  ELSE
+                       \* CAS success: consume slot value
+                       LET val == IF SlotVisible(cb, f) THEN ReadBuf(cb, f)
+                                                       ELSE NullVal
+                       IN
+                       /\ front' = f + 1
+                       /\ Consume(val)
+                       /\ IF iter + 1 < n
+                          THEN /\ sPC' = [sPC EXCEPT ![s] = "BatchLoop"]
+                               /\ pinned' = pinned     \* loop continues; keep pin
+                          ELSE
+                            /\ sPC' = [sPC EXCEPT ![s] = "Idle"]
+                            /\ pinned' = [pinned EXCEPT ![s] = FALSE]
+                       /\ sBatchIter' = [sBatchIter EXCEPT ![s] = iter + 1]
+                       /\ UNCHANGED <<back, bufferID, bufVars, sCachedFront,
+                                      sCachedBack, sCachedBuf, sReadVal,
+                                      sStolenCount, sStealSite, sBatchN,
+                                      sFenceDone, workerVars, retired, freed,
+                                      harnessVars, faultVars, pushed>>
+
+\* ========================================================================
+\* Epoch / Reclamation Actions (Family A / F3)
+\* ========================================================================
+
+\* ------------------------------------------------------------------------
+\* EpochReclaim (deque.rs:315 + crossbeam_epoch::Guard::defer_unchecked)
+\* Reclaims a retired buffer. Normally must wait for all pinned guards;
+\* prematureReclaim adversary skips that guard.
+\* ------------------------------------------------------------------------
+EpochReclaim ==
+    /\ retired /= {}
+    /\ \E buf \in retired :
+         LET anyPinned == \E s \in Stealer : pinned[s]
+                          /\ \E s2 \in activeStealers : sCachedBuf[s2] = buf
+         IN
+         /\ prematureReclaim \/ ~anyPinned
+         /\ freed' = freed \cup {buf}
+         /\ retired' = retired \ {buf}
+    /\ UNCHANGED <<coreVars, bufVars, stealerVars, workerVars, pinned,
+                   harnessVars, faultVars, historyVars>>
+
+\* ========================================================================
+\* Memory-Ordering Adversary (Family B)
+\* ========================================================================
+\* These actions are bounded fault-injection that toggles the corresponding
+\* fault flag on. They are wrapped in MC.tla under counter limits.
+
+EnableRelaxBackStore ==
+    /\ ~relaxBackStore
+    /\ relaxBackStore' = TRUE
+    /\ UNCHANGED <<coreVars, bufVars, stealerVars, workerVars, epochVars,
+                   harnessVars, skipRecheck, prematureReclaim, weakLIFOLastCAS,
+                   skipStealerFence, historyVars>>
+
+EnableSkipStealerFence ==
+    /\ ~skipStealerFence
+    /\ skipStealerFence' = TRUE
+    /\ UNCHANGED <<coreVars, bufVars, stealerVars, workerVars, epochVars,
+                   harnessVars, skipRecheck, prematureReclaim, weakLIFOLastCAS,
+                   relaxBackStore, historyVars>>
+
+\* Family D: enable the weak-CAS spurious-fail branch on the worker's
+\* LIFO last-task CAS (deque.rs:515-524, currently strong by design).
+EnableWeakLIFOLastCAS ==
+    /\ ~weakLIFOLastCAS
+    /\ weakLIFOLastCAS' = TRUE
+    /\ UNCHANGED <<coreVars, bufVars, stealerVars, workerVars, epochVars,
+                   harnessVars, skipRecheck, prematureReclaim,
+                   relaxBackStore, skipStealerFence, historyVars>>
+
+\* Family A: per-site re-check toggle. The default Init has
+\* skipRecheck["batchLIFOFirst"] = TRUE (matching code). Hunting configs may
+\* want to also set skipRecheck["single"] / skipRecheck["batchFIFO"] to
+\* reproduce the historical CVE-2021-32810 (where the re-check was missing
+\* at all sites). This action models the hypothetical regression.
+EnableSkipRecheck(site) ==
+    /\ site \in DOMAIN skipRecheck
+    /\ ~skipRecheck[site]
+    /\ skipRecheck' = [skipRecheck EXCEPT ![site] = TRUE]
+    /\ UNCHANGED <<coreVars, bufVars, stealerVars, workerVars, epochVars,
+                   harnessVars, prematureReclaim, weakLIFOLastCAS,
+                   relaxBackStore, skipStealerFence, historyVars>>
+
+\* Family A: enable premature reclamation (epoch GC ignores pinned guards).
+EnablePrematureReclaim ==
+    /\ ~prematureReclaim
+    /\ prematureReclaim' = TRUE
+    /\ UNCHANGED <<coreVars, bufVars, stealerVars, workerVars, epochVars,
+                   harnessVars, skipRecheck, weakLIFOLastCAS,
+                   relaxBackStore, skipStealerFence, historyVars>>
+
+\* ========================================================================
+\* Next State Relation
+\* ========================================================================
+
+WorkerAction ==
+    \/ PushWriteSlot
+    \/ PushStoreBack
+    \/ PublishDeferredSlot
+    \/ ResizeGrow
+    \/ LIFOPopDecrFence
+    \/ LIFOPopDecide
+    \/ FIFOPopAttempt
+    \/ FIFOPopRollback
+
+StealerAction(s) ==
+    \/ StealLoadFront_Single(s)
+    \/ StealLoadFront_BatchFifo(s)
+    \/ StealLoadFront_BatchLifo(s)
+    \/ StealPin(s)
+    \/ StealLoadBack(s)
+    \/ StealLoadBuffer(s)
+    \/ StealReadSlot(s)
+    \/ StealRecheckCAS(s)
+    \/ StealLIFOBatchIter(s)
+
+CallerHarness ==
+    \/ \E s \in Stealer : StealerCloneAdv(s)
+    \/ WorkerDropAdv
+
+FaultInjection ==
+    \/ EnableRelaxBackStore
+    \/ EnableSkipStealerFence
+    \/ EnableWeakLIFOLastCAS
+    \/ EnablePrematureReclaim
+    \/ \E site \in DOMAIN skipRecheck : EnableSkipRecheck(site)
+
+Next ==
+    \/ WorkerAction
+    \/ \E s \in Stealer : StealerAction(s)
+    \/ EpochReclaim
+    \/ CallerHarness
+    \/ FaultInjection
+
+Spec == Init /\ [][Next]_vars
+
+\* ========================================================================
+\* Invariants
+\* ========================================================================
+
+PushedSet == {pushed[i] : i \in 1..Len(pushed)}
+
+\* ----- Standard safety -----
+
+\* Every consumed value was actually pushed.
+ConsumedWasPushed ==
+    consumed \subseteq PushedSet \cup {NullVal}
+
+\* No value consumed more than once. Since `consumed` is a set, double-consume
+\* is detected when consumeCount exceeds Cardinality(consumed).
+NoDoublePop ==
+    consumeCount = Cardinality(consumed \ {NullVal})
+
+\* Stealer never returns garbage (NullVal) — would mean a Steal::Success
+\* delivered an uninitialized read.
+NoGarbageSteal ==
+    NullVal \notin consumed
+
+\* ----- Family A: Buffer-Resize / Generation -----
+
+\* Stealer in PreCAS phase, with a still-current cached buffer, must have
+\* read a real value (not garbage from freed/uninit slot).
+StealReturnsValid ==
+    \A s \in activeStealers :
+        (sPC[s] = "PreCAS" /\ sCachedBuf[s] = bufferID)
+            => sReadVal[s] \in PushedSet \cup {NullVal}
+
+\* No stealer reads after free (UAF). A freed buffer can still be referenced
+\* by a stealer cache only if prematureReclaim allowed reclaim while pinned.
+NoUseAfterFree ==
+    \A s \in activeStealers :
+        sPC[s] \in {"ReadTask", "PreCAS", "BatchLoop"}
+            => sCachedBuf[s] \notin freed
+
+\* Current buffer is never reclaimed.
+CurrentBufferAlive ==
+    bufferID \notin freed
+
+\* ----- Family B: Memory Ordering -----
+
+\* If a stealer is in BatchLoop / PreCAS and committed sReadVal as
+\* a result, that read must correspond to a slot that was visible at the
+\* time of the read (modeled by `pushSlotVisible`). Violation indicates the
+\* fence/store relaxation lost synchronization.
+PreCASReadIsVisible ==
+    \A s \in activeStealers :
+        (sPC[s] = "PreCAS" /\ sReadVal[s] /= NullVal)
+            => SlotVisible(sCachedBuf[s], sCachedFront[s])
+
+\* ----- Family C: Caller Harness -----
+
+\* Worker actions only fire when the worker is alive.
+WorkerExclusive ==
+    wAlive = FALSE => wPC = "Idle"
+
+\* Active stealers all in domain.
+StealerDomainOK ==
+    activeStealers \subseteq Stealer
+
+\* ----- Family D: CAS_weak -----
+
+\* Under default (no fault), spurious LIFO last-task CAS fail cannot drop
+\* a popped value. We assert that consumeCount tracks pushed-minus-residual.
+\* (When weakLIFOLastCAS is enabled, this invariant is expected to be
+\* violatable — that is the bug demonstration.)
+NoLostPopUnderStrongCAS ==
+    weakLIFOLastCAS \/
+        (\A i \in 1..Len(pushed) :
+            LET v == pushed[i] IN
+            v \in consumed \/
+            \E pos \in front..(back - 1) : ReadCurrent(pos) = v
+            \/ wPC \in {"PushSlotWritten", "FIFORollback", "LIFODecrFenced"})
+
+\* ----- Family F: Batch loop -----
+
+\* Batch iteration counter is bounded by sBatchN[s] always.
+BatchIterBounded ==
+    \A s \in Stealer :
+        sBatchIter[s] <= sBatchN[s] + 1
+
+\* ----- Structural -----
+
+\* Pushed values are all distinct (we use monotonic nextPush).
+PushedDistinct ==
+    \A i, j \in 1..Len(pushed) : i # j => pushed[i] # pushed[j]
+
+\* nextPush tracks push count (one increment per push).
+PushCountConsistency ==
+    nextPush = Len(pushed) + 1
+
+\* DequeConsistency: front <= back except in transient FIFO rollback or
+\* LIFO post-decrement window.
+DequeConsistency ==
+    wPC \notin {"FIFORollback", "LIFODecrFenced"} => front <= back
+
+\* No element loss: every pushed value is either consumed, in deque, or in
+\* a transient writer window.
+NoElementLoss ==
+    (wPC = "Idle") =>
+    \A i \in 1..Len(pushed) :
+        LET v == pushed[i] IN
+        v \in consumed \/
+        \E pos \in front..(back - 1) : ReadCurrent(pos) = v
+
+====
