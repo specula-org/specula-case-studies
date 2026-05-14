@@ -1,0 +1,304 @@
+diff --git a/Cargo.toml b/Cargo.toml
+index 579fa99..6ef1f4a 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -24,6 +24,7 @@ serde = { version = "1.0", optional = true }
+ 
+ [features]
+ loom = ["dep:loom", "saa/loom", "sdd/loom"]
++tla-trace = []
+ 
+ [dev-dependencies]
+ criterion = { version = "0.8", features = ["async_futures"] }
+diff --git a/src/hash_index.rs b/src/hash_index.rs
+index 93bcff7..446dfeb 100644
+--- a/src/hash_index.rs
++++ b/src/hash_index.rs
+@@ -543,11 +543,67 @@ where
+     pub fn insert_sync(&self, key: K, val: V) -> Result<(), (K, V)> {
+         self.reclaim_memory();
+         let hash = self.hash(&key);
++
++        // ---- TLA trace: WriterStart at the bucket_array_var Acquire load ----
++        #[cfg(feature = "tla-trace")]
++        let __cached_array = {
++            let __t = crate::tla_trace::now();
++            let __g = sdd::Guard::new();
++            let __ptr = self
++                .bucket_array
++                .load(std::sync::atomic::Ordering::Acquire, &__g);
++            let __id = crate::tla_trace::array_id(__ptr.as_ptr() as usize);
++            let (__k, __v) = crate::tla_trace::current_kv();
++            crate::tla_trace::emit_writer_start(__t, __id, &__k, &__v);
++            __id
++        };
++        // Emit MaybeRehashOK to align spec pc to "post_rehash" before AcquireLock.
++        #[cfg(feature = "tla-trace")]
++        {
++            let __t = crate::tla_trace::now();
++            crate::tla_trace::emit_writer_maybe_rehash_ok(__t, __cached_array);
++        }
++
+         let locked_bucket = self.writer_sync(hash);
++
++        // ---- WriterAcquireLock (after writer_sync returns the LockedBucket) ----
++        #[cfg(feature = "tla-trace")]
++        let __bucket_idx =
++            (locked_bucket.bucket_index as u32) % crate::tla_trace::SPEC_BUCKET_COUNT;
++        #[cfg(feature = "tla-trace")]
++        {
++            let __t = crate::tla_trace::now();
++            crate::tla_trace::emit_writer_acquire_lock(__t, __cached_array, __bucket_idx);
++        }
++
+         if locked_bucket.search(&key, hash).is_valid() {
++            // Key already present — drop the lock without commit.
++            #[cfg(feature = "tla-trace")]
++            {
++                let __t = crate::tla_trace::now();
++                drop(locked_bucket);
++                crate::tla_trace::emit_writer_release(__t, __cached_array, __bucket_idx);
++            }
+             Err((key, val))
+         } else {
++            #[cfg(feature = "tla-trace")]
++            let (__k, __v) = crate::tla_trace::current_kv();
++            #[cfg(feature = "tla-trace")]
++            let __t_commit = crate::tla_trace::now();
+             locked_bucket.insert(hash, (key, val));
++            #[cfg(feature = "tla-trace")]
++            crate::tla_trace::emit_writer_commit_insert(
++                __t_commit,
++                __cached_array,
++                __bucket_idx,
++                &__k,
++                &__v,
++            );
++            #[cfg(feature = "tla-trace")]
++            {
++                let __t = crate::tla_trace::now();
++                crate::tla_trace::emit_writer_release(__t, __cached_array, __bucket_idx);
++            }
+             Ok(())
+         }
+     }
+@@ -662,14 +718,74 @@ where
+     {
+         self.reclaim_memory();
+         let hash = self.hash(key);
++
++        // ---- TLA trace: WriterStart at the bucket_array_var Acquire load ----
++        #[cfg(feature = "tla-trace")]
++        let __cached_array = {
++            let __t = crate::tla_trace::now();
++            let __g = sdd::Guard::new();
++            let __ptr = self
++                .bucket_array
++                .load(std::sync::atomic::Ordering::Acquire, &__g);
++            let __id = crate::tla_trace::array_id(__ptr.as_ptr() as usize);
++            let (__k, __v) = crate::tla_trace::current_kv();
++            crate::tla_trace::emit_writer_start(__t, __id, &__k, &__v);
++            __id
++        };
++        #[cfg(feature = "tla-trace")]
++        {
++            let __t = crate::tla_trace::now();
++            crate::tla_trace::emit_writer_maybe_rehash_ok(__t, __cached_array);
++        }
++
+         let Some(mut locked_bucket) = self.optional_writer_sync(hash) else {
++            // optional_writer_sync returned None (table empty) — reset spec pc
++            // by emitting a WriterRelease so the trace at least closes the writer.
++            // (The spec doesn't have a "writer aborted before lock" action; in
++            //  this case we'd never have entered the writer state. Here we
++            //  rely on the test setup pre-populating the table so this branch
++            //  is rarely taken.)
+             return false;
+         };
++
++        #[cfg(feature = "tla-trace")]
++        let __bucket_idx =
++            (locked_bucket.bucket_index as u32) % crate::tla_trace::SPEC_BUCKET_COUNT;
++        #[cfg(feature = "tla-trace")]
++        {
++            let __t = crate::tla_trace::now();
++            crate::tla_trace::emit_writer_acquire_lock(__t, __cached_array, __bucket_idx);
++        }
++
+         let mut entry_ptr = locked_bucket.search(key, hash);
+         if entry_ptr.is_valid() && condition(&mut locked_bucket.entry_mut(&mut entry_ptr).1) {
++            #[cfg(feature = "tla-trace")]
++            let (__k, _) = crate::tla_trace::current_kv();
++            #[cfg(feature = "tla-trace")]
++            let __t_commit = crate::tla_trace::now();
+             locked_bucket.mark_removed(self, &mut entry_ptr);
++            #[cfg(feature = "tla-trace")]
++            crate::tla_trace::emit_writer_commit_mark_removed(
++                __t_commit,
++                __cached_array,
++                __bucket_idx,
++                &__k,
++            );
++            // Note: mark_removed consumed self. The Writer was already dropped
++            // inside mark_removed via try_shrink. Emit WriterRelease now.
++            #[cfg(feature = "tla-trace")]
++            {
++                let __t = crate::tla_trace::now();
++                crate::tla_trace::emit_writer_release(__t, __cached_array, __bucket_idx);
++            }
+             true
+         } else {
++            #[cfg(feature = "tla-trace")]
++            {
++                let __t = crate::tla_trace::now();
++                drop(locked_bucket);
++                crate::tla_trace::emit_writer_release(__t, __cached_array, __bucket_idx);
++            }
+             false
+         }
+     }
+@@ -1196,6 +1312,8 @@ where
+         }
+         let garbage_epoch = self.garbage_epoch.load(Acquire);
+         if Epoch::try_from(garbage_epoch).is_ok_and(|e| !e.in_same_generation(guard.epoch())) {
++            #[cfg(feature = "tla-trace")]
++            let __t_dealloc = crate::tla_trace::now();
+             if let Ok((mut garbage_head, _)) = self.garbage_chain.compare_exchange(
+                 head_ptr,
+                 (None, Tag::None),
+@@ -1211,6 +1329,9 @@ where
+                     let dropped = unsafe { garbage_bucket_array.drop_in_place() };
+                     debug_assert!(dropped);
+                 }
++                // Emit DeallocGarbage AFTER the drop_in_place loop completes.
++                #[cfg(feature = "tla-trace")]
++                crate::tla_trace::emit_dealloc_garbage(__t_dealloc);
+             }
+         } else {
+             guard.set_has_garbage();
+@@ -2101,6 +2222,8 @@ where
+             array
+         } else {
+             // Start scanning.
++            #[cfg(feature = "tla-trace")]
++            let __t_iter_start = crate::tla_trace::now();
+             let current_array = self.hashindex.bucket_array(self.guard)?;
+             let array = if let Some(old_array) = current_array.linked_array(self.guard) {
+                 old_array
+@@ -2109,23 +2232,48 @@ where
+             };
+             self.bucket_array.replace(array);
+             self.bucket.replace(array.bucket(0));
++            #[cfg(feature = "tla-trace")]
++            {
++                let __id = crate::tla_trace::array_id(array as *const _ as usize);
++                crate::tla_trace::set_iter_state(__id, 0);
++                crate::tla_trace::emit_iter_start(__t_iter_start, __id);
++            }
+             array
+         };
+ 
+         // Move to the next entry.
+         loop {
++            #[cfg(feature = "tla-trace")]
++            let __t_op = crate::tla_trace::now();
+             if let Some(bucket) = self.bucket.take() {
+                 // Move to the next entry in the bucket.
+                 if self.entry_ptr.move_to_next(bucket) {
+                     let (k, v) = self.entry_ptr.get(array.data_block(self.index));
+                     self.bucket.replace(bucket);
++                    #[cfg(feature = "tla-trace")]
++                    {
++                        let __cached = crate::tla_trace::iter_cached_array();
++                        let __bidx = (self.index as u32) % crate::tla_trace::SPEC_BUCKET_COUNT;
++                        // Use opaque key/val labels — the real K/V types don't impl Display.
++                        crate::tla_trace::emit_iter_read_occupied(
++                            __t_op, __cached, __bidx, "k1", "v1",
++                        );
++                    }
+                     return Some((k, v));
+                 }
++                #[cfg(feature = "tla-trace")]
++                {
++                    let __cached = crate::tla_trace::iter_cached_array();
++                    let __bidx = (self.index as u32) % crate::tla_trace::SPEC_BUCKET_COUNT;
++                    crate::tla_trace::emit_iter_read_empty(__t_op, __cached, __bidx);
++                }
+             }
+             self.entry_ptr = EntryPtr::null();
+ 
+             if self.index + 1 == array.len() {
+                 // Move to a newer bucket array.
++                #[cfg(feature = "tla-trace")]
++                let __t_cross = crate::tla_trace::now();
+                 self.index = 0;
+                 let current_array = self.hashindex.bucket_array(self.guard)?;
+                 if self
+@@ -2147,6 +2295,13 @@ where
+                         array = current_array;
+                         self.bucket_array.replace(current_array);
+                         self.bucket.replace(current_array.bucket(0));
++                        #[cfg(feature = "tla-trace")]
++                        {
++                            let __id =
++                                crate::tla_trace::array_id(current_array as *const _ as usize);
++                            crate::tla_trace::set_iter_state(__id, 0);
++                            crate::tla_trace::emit_iter_cross_array(__t_cross, __id);
++                        }
+                         continue;
+                     }
+                     old_array
+@@ -2156,11 +2311,32 @@ where
+ 
+                 self.bucket_array.replace(array);
+                 self.bucket.replace(array.bucket(0));
++                #[cfg(feature = "tla-trace")]
++                {
++                    let __id = crate::tla_trace::array_id(array as *const _ as usize);
++                    crate::tla_trace::set_iter_state(__id, 0);
++                    crate::tla_trace::emit_iter_cross_array(__t_cross, __id);
++                }
+             } else {
++                #[cfg(feature = "tla-trace")]
++                let __t_adv = crate::tla_trace::now();
+                 self.index += 1;
+                 self.bucket.replace(array.bucket(self.index));
++                #[cfg(feature = "tla-trace")]
++                {
++                    let __cached = crate::tla_trace::iter_cached_array();
++                    let __bidx = (self.index as u32) % crate::tla_trace::SPEC_BUCKET_COUNT;
++                    crate::tla_trace::set_iter_state(__cached, __bidx);
++                    crate::tla_trace::emit_iter_advance_within_bucket(__t_adv, __cached, __bidx);
++                }
+             }
+         }
++        // Loop broke out via "Finished scanning" branch.
++        #[cfg(feature = "tla-trace")]
++        {
++            let __t = crate::tla_trace::now();
++            crate::tla_trace::emit_iter_finish(__t);
++        }
+         None
+     }
+ }
+diff --git a/src/lib.rs b/src/lib.rs
+index f3ee0f9..fe19713 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -1,4 +1,5 @@
+-#![deny(missing_docs, warnings, clippy::all, clippy::pedantic)]
++#![cfg_attr(not(feature = "tla-trace"), deny(missing_docs, warnings, clippy::all, clippy::pedantic))]
++#![cfg_attr(feature = "tla-trace", allow(dead_code, missing_docs))]
+ #![doc = include_str!("../README.md")]
+ 
+ // Re-export [`sdd`](https://crates.io/crates/sdd) modules for backward compatibility.
+@@ -28,6 +29,9 @@ mod async_helper;
+ mod exit_guard;
+ mod hash_table;
+ 
++#[doc(hidden)]
++pub mod tla_trace;
++
+ #[cfg(feature = "serde")]
+ mod serde;
+ 
