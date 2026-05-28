@@ -1,0 +1,1213 @@
+diff --git a/blocksync/pool.go b/blocksync/pool.go
+index 2e7e228..128c460 100644
+--- a/blocksync/pool.go
++++ b/blocksync/pool.go
+@@ -284,6 +284,7 @@ func (pool *BlockPool) PopRequest() {
+ 
+ 	// Re-evaluate maxPeerHeight: peers whose pruned base was just beyond the previous pool.height may now be able to contribute
+ 	pool.updateMaxPeerHeight()
++	pool.emitAdvancePoolHeight()
+ 
+ 	// Notify the next minBlocksForSingleRequest requesters about new height, so
+ 	// they can potentially request a block from the second peer.
+@@ -442,6 +443,7 @@ func (pool *BlockPool) SetPeerRange(peerID p2p.ID, base int64, height int64) {
+ 	}
+ 
+ 	pool.updateMaxPeerHeight()
++	pool.emitSetPeerRange(peerID, base, height)
+ }
+ 
+ // RemovePeer removes the peer with peerID from the pool. If there's no peer
+@@ -749,6 +751,7 @@ func (bpr *bpRequester) setBlock(block *types.Block, extCommit *types.ExtendedCo
+ 	case bpr.gotBlockCh <- struct{}{}:
+ 	default:
+ 	}
++	bpr.emitDeliverBlock(peerID, "block")
+ 	return true
+ }
+ 
+diff --git a/blocksync/tlatrace_init_test.go b/blocksync/tlatrace_init_test.go
+new file mode 100644
+index 0000000..ab89342
+--- /dev/null
++++ b/blocksync/tlatrace_init_test.go
+@@ -0,0 +1,17 @@
++package blocksync
++
++import (
++	"os"
++
++	tlatrace "github.com/cometbft/cometbft/libs/tla_trace"
++)
++
++// init opens the trace file (if TLA_TRACE_FILE is set) before any test runs.
++// Building this file under "_test.go" keeps the dependency confined to the
++// test binary so production binaries do nothing extra.
++func init() {
++	tlatrace.InitFromEnv()
++	if v := os.Getenv("TLA_TRACE_LOCAL_NID"); v != "" {
++		SetTraceNodeID(v)
++	}
++}
+diff --git a/blocksync/trace_scenario_test.go b/blocksync/trace_scenario_test.go
+new file mode 100644
+index 0000000..885ee4a
+--- /dev/null
++++ b/blocksync/trace_scenario_test.go
+@@ -0,0 +1,135 @@
++package blocksync
++
++import (
++	"testing"
++	"time"
++
++	"github.com/stretchr/testify/require"
++
++	"github.com/cometbft/cometbft/libs/log"
++	tlatrace "github.com/cometbft/cometbft/libs/tla_trace"
++	"github.com/cometbft/cometbft/p2p"
++)
++
++// TestScenarioBlockPoolBasic drives the BlockPool through a small height
++// range (1..4) that fits inside the TLA+ spec's MaxFetchHeight bound.
++//
++// Three honest peers plus one Byzantine peer all advertising heights inside
++// [1, 4]. We drive blocks until the pool pops up to height 4.
++//
++// Exercises: SetPeerRange, ByzPeerAdvertiseRange, HonestPeerDeliverBlock,
++// ByzPeerDeliverBlock, AdvancePoolHeight.
++func TestScenarioBlockPoolBasic(t *testing.T) {
++	defer tlatrace.ClearByzPeers()
++
++	start := int64(1)
++	target := int64(4)
++
++	peerInfo := []struct {
++		id     p2p.ID
++		base   int64
++		height int64
++		byz    bool
++	}{
++		{"p1", 1, 4, false},
++		{"p2", 1, 4, false},
++		{"p3", 1, 4, false},
++		{"byz", 1, 4, true},
++	}
++	peers := make(testPeers, len(peerInfo))
++	for _, info := range peerInfo {
++		peers[info.id] = &testPeer{
++			id:        info.id,
++			base:      info.base,
++			height:    info.height,
++			inputChan: make(chan inputData, 10),
++		}
++		if info.byz {
++			tlatrace.MarkPeerByz(string(info.id))
++		}
++	}
++
++	requestsCh := make(chan BlockRequest)
++	errorsCh := make(chan peerError)
++	pool := NewBlockPool(start, requestsCh, errorsCh)
++	pool.SetLogger(log.TestingLogger())
++	require.NoError(t, pool.Start())
++	t.Cleanup(func() { _ = pool.Stop() })
++
++	peers.start()
++	defer peers.stop()
++
++	// Introduce each peer — triggers SetPeerRange / ByzPeerAdvertiseRange.
++	go func() {
++		for _, peer := range peers {
++			pool.SetPeerRange(peer.id, peer.base, peer.height)
++		}
++	}()
++
++	// Goroutine pulls blocks (triggers AdvancePoolHeight via PopRequest).
++	go func() {
++		for {
++			if !pool.IsRunning() {
++				return
++			}
++			first, second, _ := pool.PeekTwoBlocks()
++			if first != nil && second != nil {
++				pool.PopRequest()
++			} else {
++				time.Sleep(50 * time.Millisecond)
++			}
++		}
++	}()
++
++	timeout := time.After(15 * time.Second)
++	tick := time.NewTicker(50 * time.Millisecond)
++	defer tick.Stop()
++	for {
++		select {
++		case err := <-errorsCh:
++			t.Logf("peer error: %v", err)
++		case request := <-requestsCh:
++			t.Logf("request height=%d peer=%s pool=%d", request.Height, request.PeerID, pool.Height())
++			peers[request.PeerID].inputChan <- inputData{t, pool, request}
++		case <-tick.C:
++			if pool.Height() >= target {
++				return
++			}
++		case <-timeout:
++			t.Fatalf("timed out (pool height: %d)", pool.Height())
++		}
++	}
++}
++
++// TestScenarioBlockPoolBan exercises the "base > height" branch of
++// SetPeerRange that bans the peer — the trace records bannedCount > 0.
++func TestScenarioBlockPoolBan(t *testing.T) {
++	defer tlatrace.ClearByzPeers()
++
++	requestsCh := make(chan BlockRequest, 50)
++	errorsCh := make(chan peerError, 50)
++	pool := NewBlockPool(1, requestsCh, errorsCh)
++	pool.SetLogger(log.TestingLogger())
++	require.NoError(t, pool.Start())
++	t.Cleanup(func() { _ = pool.Stop() })
++
++	go func() {
++		for {
++			select {
++			case <-requestsCh:
++			case <-errorsCh:
++			case <-time.After(1 * time.Second):
++				return
++			}
++		}
++	}()
++
++	pool.SetPeerRange("p1", 1, 4)
++	pool.SetPeerRange("p2", 1, 4)
++	// Misbehaving peer reports base > height — banned.
++	pool.SetPeerRange("p3", 9, 4)
++	// Banned peer reintroducing itself — silently dropped, no bump in bannedCount.
++	pool.SetPeerRange("p3", 1, 4)
++
++	time.Sleep(50 * time.Millisecond)
++}
+diff --git a/blocksync/tracehooks.go b/blocksync/tracehooks.go
+new file mode 100644
+index 0000000..cf246e9
+--- /dev/null
++++ b/blocksync/tracehooks.go
+@@ -0,0 +1,87 @@
++package blocksync
++
++import (
++	"os"
++
++	tlatrace "github.com/cometbft/cometbft/libs/tla_trace"
++	"github.com/cometbft/cometbft/p2p"
++)
++
++// localServerID is the TLA+ ID for the node owning the BlockPool. Test scenarios
++// call SetTraceNodeID to bind the pool to a server slot before exercising it.
++//
++// We can't pull it off the pool itself (the pool is a sub-component shared by
++// many tests), so a package-global keeps the patches one-liners.
++var localServerID = func() string {
++	if v := os.Getenv("TLA_TRACE_LOCAL_NID"); v != "" {
++		return v
++	}
++	return "s1"
++}()
++
++// SetTraceNodeID overrides the server ID baked into emitted events.
++func SetTraceNodeID(id string) { localServerID = id }
++
++// TraceNodeID returns the current local server ID.
++func TraceNodeID() string { return localServerID }
++
++// emitSetPeerRange fires after pool.updateMaxPeerHeight returns. The state
++// snapshot captures the pool's post-call view of pool height, max peer height,
++// and number of banned peers.
++func (pool *BlockPool) emitSetPeerRange(peerID p2p.ID, base int64, height int64) {
++	if !tlatrace.IsEnabled() {
++		return
++	}
++	st := tlatrace.NewState().
++		Set("poolHeight", pool.height).
++		Set("maxPeerHeight", pool.maxPeerHeight).
++		Set("bannedCount", len(pool.bannedPeers))
++	pr := tlatrace.NewPeer().
++		Set("id", string(peerID)).
++		Set("base", base).
++		Set("height", height)
++	name := "SetPeerRange"
++	if tlatrace.IsPeerByz(string(peerID)) {
++		name = "ByzPeerAdvertiseRange"
++	}
++	tlatrace.EmitPeer(name, localServerID, st, pr)
++}
++
++// emitAdvancePoolHeight fires after pool.height++ and updateMaxPeerHeight.
++func (pool *BlockPool) emitAdvancePoolHeight() {
++	if !tlatrace.IsEnabled() {
++		return
++	}
++	st := tlatrace.NewState().
++		Set("poolHeight", pool.height).
++		Set("maxPeerHeight", pool.maxPeerHeight)
++	tlatrace.EmitState("AdvancePoolHeight", localServerID, st)
++}
++
++// emitDeliverBlock fires after the first block delivery for a requester.
++// CONTRACT: called from setBlock with no locks held; pool.mtx may be held by
++// the AddBlock caller. We must NOT call methods that re-acquire pool.mtx —
++// hence we read pool fields directly without locking (the values may be
++// slightly stale but that is acceptable for a trace snapshot).
++func (bpr *bpRequester) emitDeliverBlock(peerID p2p.ID, blockTag string) {
++	if !tlatrace.IsEnabled() {
++		return
++	}
++	pr := tlatrace.NewPeer().
++		Set("id", string(peerID)).
++		Set("height", bpr.height).
++		Set("block", blockTag)
++	name := "HonestPeerDeliverBlock"
++	if tlatrace.IsPeerByz(string(peerID)) {
++		name = "ByzPeerDeliverBlock"
++	}
++	st := tlatrace.NewState().
++		Set("poolHeight", bpr.pool.height).
++		Set("maxPeerHeight", bpr.pool.maxPeerHeight)
++	tlatrace.Emit(tlatrace.Event{
++		Name:  name,
++		Nid:   localServerID,
++		State: st,
++		Peer:  pr,
++	})
++}
+diff --git a/consensus/reactor.go b/consensus/reactor.go
+index d0973bb..d5aee66 100644
+--- a/consensus/reactor.go
++++ b/consensus/reactor.go
+@@ -134,10 +134,13 @@ func (conR *Reactor) SwitchToConsensus(state sm.State, skipWAL bool) {
+ 		// NOTE: The line below causes broadcastNewRoundStepRoutine() to broadcast a
+ 		// NewRoundStepMessage.
+ 		conR.conS.updateToState(state)
++		conR.emitSwitchStep("SwitchToConsensus_AcquireAndReset", "blocksync", conR.waitSync.Load(), conR.conS.IsRunning())
+ 	}()
++	conR.emitSwitchStep("SwitchToConsensus_ReleaseCSMtx", "blocksync", conR.waitSync.Load(), conR.conS.IsRunning())
+ 
+ 	// stop waiting for syncing to finish
+ 	conR.waitSync.Store(false)
++	conR.emitSwitchStep("SwitchToConsensus_ClearWaitSync", "blocksync", conR.waitSync.Load(), conR.conS.IsRunning())
+ 
+ 	if skipWAL {
+ 		conR.conS.doWALCatchup = false
+@@ -154,6 +157,7 @@ conS:
+ conR:
+ %+v`, err, conR.conS, conR))
+ 	}
++	conR.emitSwitchStep("SwitchToConsensus_Start", "consensus", conR.waitSync.Load(), conR.conS.IsRunning())
+ }
+ 
+ // GetChannels implements Reactor
+@@ -440,6 +444,7 @@ func (conR *Reactor) subscribeToBroadcastEvents() {
+ 			conR.updateRoundState(&rs)
+ 
+ 			conR.broadcastNewRoundStepMessage(&rs)
++			conR.emitEventNewRoundStepUpdate(rs.Height, rs.Height, rs.Round, rs.Step)
+ 		},
+ 	)
+ 	if err != nil {
+@@ -467,6 +472,8 @@ func (conR *Reactor) subscribeToBroadcastEvents() {
+ 		types.EventVote,
+ 		func(data cmtevents.EventData) {
+ 			conR.broadcastHasVoteMessage(data.(*types.Vote))
++			vote := data.(*types.Vote)
++			conR.emitEventVoteBroadcast(vote.Height, vote.Round, vote.Type.String(), vote.ValidatorIndex)
+ 
+ 			// update reactor's view of round state
+ 			// NOTE this is safe to do without locking cs because the eventBus is
+@@ -474,6 +481,7 @@ func (conR *Reactor) subscribeToBroadcastEvents() {
+ 			// instead
+ 			rs := conR.conS.getRoundState()
+ 			conR.updateRoundState(&rs)
++			conR.emitEventVoteUpdateCachedRS(rs.Height)
+ 		},
+ 	)
+ 	if err != nil {
+diff --git a/consensus/state.go b/consensus/state.go
+index c16c357..ccb47ee 100644
+--- a/consensus/state.go
++++ b/consensus/state.go
+@@ -1373,6 +1373,7 @@ func (cs *State) enterPrevote(height int64, round int32) {
+ 		// Done enterPrevote:
+ 		cs.updateRoundStep(round, cstypes.RoundStepPrevote)
+ 		cs.newStep()
++		cs.emitEnter("EnterPrevote")
+ 	}()
+ 
+ 	logger.Debug("entering prevote step", "current", log.NewLazySprintf("%v/%v/%v", cs.Height, cs.Round, cs.Step))
+@@ -1498,6 +1499,7 @@ func (cs *State) enterPrecommit(height int64, round int32) {
+ 		// Done enterPrecommit:
+ 		cs.updateRoundStep(round, cstypes.RoundStepPrecommit)
+ 		cs.newStep()
++		cs.emitEnter("EnterPrecommit")
+ 	}()
+ 
+ 	// check for a polka
+@@ -1655,6 +1657,7 @@ func (cs *State) enterCommit(height int64, commitRound int32) {
+ 		cs.CommitRound = commitRound
+ 		cs.CommitTime = cmttime.Now()
+ 		cs.newStep()
++		cs.emitEnter("EnterCommit")
+ 
+ 		// Maybe finalize immediately.
+ 		cs.tryFinalizeCommit(height)
+diff --git a/consensus/tlatrace_init_test.go b/consensus/tlatrace_init_test.go
+new file mode 100644
+index 0000000..e5d7c10
+--- /dev/null
++++ b/consensus/tlatrace_init_test.go
+@@ -0,0 +1,15 @@
++package consensus
++
++import (
++	"os"
++
++	tlatrace "github.com/cometbft/cometbft/libs/tla_trace"
++)
++
++// init opens the trace file (if TLA_TRACE_FILE is set) before any test runs.
++func init() {
++	tlatrace.InitFromEnv()
++	if v := os.Getenv("TLA_TRACE_LOCAL_NID"); v != "" {
++		SetTraceNodeID(v)
++	}
++}
+diff --git a/consensus/tracehooks.go b/consensus/tracehooks.go
+new file mode 100644
+index 0000000..9a91d9b
+--- /dev/null
++++ b/consensus/tracehooks.go
+@@ -0,0 +1,124 @@
++package consensus
++
++import (
++	"os"
++	"strings"
++
++	cstypes "github.com/cometbft/cometbft/consensus/types"
++	tlatrace "github.com/cometbft/cometbft/libs/tla_trace"
++)
++
++var localServerID = func() string {
++	if v := os.Getenv("TLA_TRACE_LOCAL_NID"); v != "" {
++		return v
++	}
++	return "s1"
++}()
++
++// SetTraceNodeID overrides the local server ID baked into emitted events.
++func SetTraceNodeID(id string) { localServerID = id }
++
++// TraceNodeID returns the local server ID.
++func TraceNodeID() string { return localServerID }
++
++func stepName(s cstypes.RoundStepType) string {
++	switch s {
++	case cstypes.RoundStepNewHeight:
++		return "StepNewHeight"
++	case cstypes.RoundStepNewRound:
++		return "StepNewRound"
++	case cstypes.RoundStepPropose:
++		return "StepPropose"
++	case cstypes.RoundStepPrevote:
++		return "StepPrevote"
++	case cstypes.RoundStepPrevoteWait:
++		return "StepPrevoteWait"
++	case cstypes.RoundStepPrecommit:
++		return "StepPrecommit"
++	case cstypes.RoundStepPrecommitWait:
++		return "StepPrecommitWait"
++	case cstypes.RoundStepCommit:
++		return "StepCommit"
++	default:
++		// fall back to the impl string with a "Step" prefix matching MC.cfg
++		return "Step" + strings.TrimPrefix(s.String(), "RoundStep")
++	}
++}
++
++// emitEnter fires after a round-step transition (cs.Step has been mutated).
++// CONTRACT: caller holds cs.mtx (the receiveRoutine loop is single-threaded).
++func (cs *State) emitEnter(name string) {
++	if !tlatrace.IsEnabled() {
++		return
++	}
++	st := tlatrace.NewState().
++		Set("height", cs.Height).
++		Set("round", int(cs.Round)).
++		Set("step", stepName(cs.Step))
++	tlatrace.EmitState(name, localServerID, st)
++}
++
++// ----- F1.7 SwitchToConsensus four-step split --------------------------------
++
++func (conR *Reactor) emitSwitchStep(name string, mode string, waitSync, consensusStarted bool) {
++	if !tlatrace.IsEnabled() {
++		return
++	}
++	st := tlatrace.NewState().
++		Set("mode", mode).
++		Set("waitSync", waitSync).
++		Set("consensusStarted", consensusStarted)
++	tlatrace.EmitState(name, localServerID, st)
++}
++
++// ----- F3 Reactor cached round-state events ----------------------------------
++
++func (conR *Reactor) emitEventVoteBroadcast(vh int64, vr int32, vt string, idx int32) {
++	if !tlatrace.IsEnabled() {
++		return
++	}
++	msg := tlatrace.NewMsg().
++		Set("height", vh).
++		Set("round", int(vr)).
++		Set("voteType", vt).
++		Set("idx", int(idx))
++	st := tlatrace.NewState().Set("pendingRSUpdate", true)
++	tlatrace.EmitMsg("EventVote_Broadcast", localServerID, st, msg)
++}
++
++func (conR *Reactor) emitEventVoteUpdateCachedRS(cachedHeight int64) {
++	if !tlatrace.IsEnabled() {
++		return
++	}
++	st := tlatrace.NewState().
++		Set("cachedHeight", cachedHeight).
++		Set("pendingRSUpdate", false)
++	tlatrace.EmitState("EventVote_UpdateCachedRS", localServerID, st)
++}
++
++func (conR *Reactor) emitEventNewRoundStepUpdate(cachedHeight int64, h int64, r int32, step cstypes.RoundStepType) {
++	if !tlatrace.IsEnabled() {
++		return
++	}
++	st := tlatrace.NewState().
++		Set("cachedHeight", cachedHeight).
++		Set("height", h).
++		Set("round", int(r)).
++		Set("step", stepName(step))
++	tlatrace.EmitState("EventNewRoundStep_Update", localServerID, st)
++}
++
++// ----- MempoolEnable shim ----------------------------------------------------
++
++// EmitMempoolEnable is exported so node/setup.go can fire it without depending
++// on consensus internals (instrumentation point is in node, not consensus).
++func EmitMempoolEnable(nid string, enabled, consensusStarted bool, mode string) {
++	if !tlatrace.IsEnabled() {
++		return
++	}
++	st := tlatrace.NewState().
++		Set("mempoolEnabled", enabled).
++		Set("mode", mode).
++		Set("consensusStarted", consensusStarted)
++	tlatrace.EmitState("MempoolEnable", nid, st)
++}
+diff --git a/libs/tla_trace/helpers.go b/libs/tla_trace/helpers.go
+new file mode 100644
+index 0000000..8cb38b0
+--- /dev/null
++++ b/libs/tla_trace/helpers.go
+@@ -0,0 +1,50 @@
++package tla_trace
++
++// State is a thin builder around the spec's per-server state map.
++//
++// Callers do not need to memorise the exact JSON keys (mode, waitSync,
++// poolHeight, ...); they call Set("poolHeight", 3) and the resulting map
++// is consumed by the *IfLogged wrappers in Trace.tla.
++type State map[string]interface{}
++
++// NewState returns an empty State map.
++func NewState() State { return State{} }
++
++// Set adds a key/value (chainable).
++func (s State) Set(k string, v interface{}) State {
++	s[k] = v
++	return s
++}
++
++// SetIf adds k=v only when the boolean cond is true. Useful when a capture
++// is conditional (e.g., mode field only known for nodes that have a reactor).
++func (s State) SetIf(cond bool, k string, v interface{}) State {
++	if cond {
++		s[k] = v
++	}
++	return s
++}
++
++// Msg is the analogous builder for the event.msg field.
++type Msg map[string]interface{}
++
++// NewMsg returns an empty Msg map.
++func NewMsg() Msg { return Msg{} }
++
++// Set adds a key/value (chainable).
++func (m Msg) Set(k string, v interface{}) Msg {
++	m[k] = v
++	return m
++}
++
++// Peer is the analogous builder for the event.peer field.
++type Peer map[string]interface{}
++
++// NewPeer returns an empty Peer map.
++func NewPeer() Peer { return Peer{} }
++
++// Set adds a key/value (chainable).
++func (p Peer) Set(k string, v interface{}) Peer {
++	p[k] = v
++	return p
++}
+diff --git a/libs/tla_trace/trace.go b/libs/tla_trace/trace.go
+new file mode 100644
+index 0000000..e64c872
+--- /dev/null
++++ b/libs/tla_trace/trace.go
+@@ -0,0 +1,187 @@
++// Package tla_trace emits NDJSON trace events from instrumented CometBFT code
++// for TLA+ trace validation against the round-3 spec (cometbft_3).
++//
++// The package is shimmed into the artifact via the harness apply script. It
++// is intentionally dependency-free (only standard library) so it can be
++// dropped into any sub-package without import-cycle pain.
++package tla_trace
++
++import (
++	"encoding/hex"
++	"encoding/json"
++	"fmt"
++	"os"
++	"sync"
++	"sync/atomic"
++	"time"
++)
++
++// Event is the on-wire shape of an instrumented action.
++type Event struct {
++	Name  string                 `json:"name"`
++	Nid   string                 `json:"nid"`
++	State map[string]interface{} `json:"state,omitempty"`
++	Msg   map[string]interface{} `json:"msg,omitempty"`
++	Peer  map[string]interface{} `json:"peer,omitempty"`
++}
++
++type envelope struct {
++	Tag   string `json:"tag"`
++	TS    int64  `json:"ts"`
++	Event Event  `json:"event"`
++}
++
++type configEnvelope struct {
++	Tag    string                 `json:"tag"`
++	TS     int64                  `json:"ts"`
++	Config map[string]interface{} `json:"config"`
++}
++
++var (
++	mu       sync.Mutex
++	file     *os.File
++	enc      *json.Encoder
++	disabled atomic.Bool
++
++	peerMu        sync.RWMutex
++	byzPeers      = map[string]struct{}{}
++)
++
++// Init opens the trace file. Subsequent emits write to it.
++// If path is empty or open fails, tracing is disabled silently.
++func Init(path string) error {
++	mu.Lock()
++	defer mu.Unlock()
++	if path == "" {
++		disabled.Store(true)
++		return nil
++	}
++	f, err := os.OpenFile(path, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0644)
++	if err != nil {
++		disabled.Store(true)
++		return err
++	}
++	file = f
++	enc = json.NewEncoder(f)
++	disabled.Store(false)
++	return nil
++}
++
++// InitFromEnv looks at TLA_TRACE_FILE; falls back to TRACE_FILE.
++// When neither is set, tracing remains disabled.
++func InitFromEnv() {
++	for _, k := range []string{"TLA_TRACE_FILE", "TRACE_FILE"} {
++		if p := os.Getenv(k); p != "" {
++			_ = Init(p)
++			return
++		}
++	}
++	disabled.Store(true)
++}
++
++// Close flushes and closes the trace file.
++func Close() {
++	mu.Lock()
++	defer mu.Unlock()
++	if file != nil {
++		_ = file.Sync()
++		_ = file.Close()
++		file = nil
++		enc = nil
++	}
++	disabled.Store(true)
++}
++
++// IsEnabled reports whether emit calls will do work.
++func IsEnabled() bool {
++	return !disabled.Load()
++}
++
++func tsNow() int64 { return time.Now().UnixNano() }
++
++// EmitConfig writes the leading config record. Should be called once after
++// Init, before any Event.
++func EmitConfig(cfg map[string]interface{}) {
++	if !IsEnabled() {
++		return
++	}
++	mu.Lock()
++	defer mu.Unlock()
++	if enc == nil {
++		return
++	}
++	_ = enc.Encode(configEnvelope{Tag: "config", TS: tsNow(), Config: cfg})
++}
++
++// Emit writes one event line.
++func Emit(ev Event) {
++	if !IsEnabled() {
++		return
++	}
++	mu.Lock()
++	defer mu.Unlock()
++	if enc == nil {
++		return
++	}
++	_ = enc.Encode(envelope{Tag: "trace", TS: tsNow(), Event: ev})
++}
++
++// EmitState is a convenience for state-only events.
++func EmitState(name, nid string, state map[string]interface{}) {
++	Emit(Event{Name: name, Nid: nid, State: state})
++}
++
++// EmitMsg is a convenience for events that take a message field.
++func EmitMsg(name, nid string, state, msg map[string]interface{}) {
++	Emit(Event{Name: name, Nid: nid, State: state, Msg: msg})
++}
++
++// EmitPeer is a convenience for events that take a peer field.
++func EmitPeer(name, nid string, state, peer map[string]interface{}) {
++	Emit(Event{Name: name, Nid: nid, State: state, Peer: peer})
++}
++
++// ----- Byzantine peer registration --------------------------------------------
++
++// MarkPeerByz lets a test harness flag a peer as Byzantine. Action wrappers
++// consult IsPeerByz to decide between honest and Byz event variants.
++func MarkPeerByz(id string) {
++	peerMu.Lock()
++	defer peerMu.Unlock()
++	byzPeers[id] = struct{}{}
++}
++
++// ClearByzPeers wipes the Byzantine registry (for clean test setup).
++func ClearByzPeers() {
++	peerMu.Lock()
++	defer peerMu.Unlock()
++	byzPeers = map[string]struct{}{}
++}
++
++// IsPeerByz returns true iff MarkPeerByz was called for id.
++func IsPeerByz(id string) bool {
++	peerMu.RLock()
++	defer peerMu.RUnlock()
++	_, ok := byzPeers[id]
++	return ok
++}
++
++// ----- helpers for encoding implementation values ---------------------------
++
++// HexOrNil hex-encodes a byte slice, returning "nil" if empty. Useful for
++// validator addresses and block hashes that get mapped to s1/v1 in
++// post-processing.
++func HexOrNil(b []byte) string {
++	if len(b) == 0 {
++		return "nil"
++	}
++	return hex.EncodeToString(b)
++}
++
++// FmtPeer returns the canonical string for a peer ID.
++func FmtPeer(id interface{}) string {
++	if id == nil {
++		return "nil"
++	}
++	return fmt.Sprint(id)
++}
+diff --git a/node/node.go b/node/node.go
+index dc3f619..00e0a3f 100644
+--- a/node/node.go
++++ b/node/node.go
+@@ -461,6 +461,7 @@ func NewNodeWithContext(
+ 	if err != nil {
+ 		panic(fmt.Sprintf("failed to reset the offline state sync height %s", err))
+ 	}
++	emitClearOfflineMarker()
+ 	// Set up state sync reactor, and schedule a sync if requested.
+ 	// FIXME The way we do phased startups (e.g. replay -> block sync -> consensus) is very messy,
+ 	// we should clean this whole thing up. See:
+diff --git a/node/setup.go b/node/setup.go
+index ba4f82d..36725c1 100644
+--- a/node/setup.go
++++ b/node/setup.go
+@@ -626,12 +626,14 @@ func (n *Node) performStateSync() error {
+ 			logger.Error("Failed to bootstrap node with new state", "err", err)
+ 			return
+ 		}
++		emitBootstrap(state.LastBlockHeight)
+ 
+ 		err = n.blockStore.SaveSeenCommit(state.LastBlockHeight, commit)
+ 		if err != nil {
+ 			logger.Error("Failed to store last seen commit", "err", err)
+ 			return
+ 		}
++		emitSaveSeenCommit(state.LastBlockHeight)
+ 
+ 		// Adaptive sync ingests blocks through consensus internals, so consensus
+ 		// must be switched out of wait-sync mode before blocksync is enabled.
+@@ -639,6 +641,7 @@ func (n *Node) performStateSync() error {
+ 			n.consensusReactor.SwitchToConsensus(state, true)
+ 			if mempoolReactor != nil {
+ 				mempoolReactor.EnableInOutTxs()
++				emitMempoolEnable(true)
+ 			}
+ 		}
+ 
+@@ -646,6 +649,7 @@ func (n *Node) performStateSync() error {
+ 			logger.Error("Failed to switch to block sync", "err", err)
+ 			return
+ 		}
++		emitEnableBlockSync(n.blockStore.Height())
+ 	}()
+ 
+ 	return nil
+diff --git a/node/tracehooks.go b/node/tracehooks.go
+new file mode 100644
+index 0000000..fbf69a6
+--- /dev/null
++++ b/node/tracehooks.go
+@@ -0,0 +1,70 @@
++package node
++
++import (
++	"os"
++
++	tlatrace "github.com/cometbft/cometbft/libs/tla_trace"
++)
++
++var localServerID = func() string {
++	if v := os.Getenv("TLA_TRACE_LOCAL_NID"); v != "" {
++		return v
++	}
++	return "s1"
++}()
++
++// SetTraceNodeID overrides the local server ID baked into emitted events.
++func SetTraceNodeID(id string) { localServerID = id }
++
++// TraceNodeID returns the local server ID.
++func TraceNodeID() string { return localServerID }
++
++func emitBootstrap(persistedH int64) {
++	if !tlatrace.IsEnabled() {
++		return
++	}
++	st := tlatrace.NewState().
++		Set("persistStage", "stateOnly").
++		Set("persistedStateH", persistedH)
++	tlatrace.EmitState("PerformStateSync_Bootstrap", localServerID, st)
++}
++
++func emitSaveSeenCommit(seenH int64) {
++	if !tlatrace.IsEnabled() {
++		return
++	}
++	st := tlatrace.NewState().
++		Set("persistStage", "commitSaved").
++		Set("seenCommitHeight", seenH)
++	tlatrace.EmitState("PerformStateSync_SaveSeenCommit", localServerID, st)
++}
++
++func emitEnableBlockSync(storeH int64) {
++	if !tlatrace.IsEnabled() {
++		return
++	}
++	st := tlatrace.NewState().
++		Set("persistStage", "enabled").
++		Set("blockStoreHeight", storeH).
++		Set("mode", "blocksync")
++	tlatrace.EmitState("PerformStateSync_EnableBlockSync", localServerID, st)
++}
++
++func emitClearOfflineMarker() {
++	if !tlatrace.IsEnabled() {
++		return
++	}
++	st := tlatrace.NewState().Set("offlineMarker", 0)
++	tlatrace.EmitState("ClearOfflineMarker", localServerID, st)
++}
++
++func emitMempoolEnable(enabled bool) {
++	if !tlatrace.IsEnabled() {
++		return
++	}
++	st := tlatrace.NewState().
++		Set("mempoolEnabled", enabled).
++		Set("mode", "consensus").
++		Set("consensusStarted", true)
++	tlatrace.EmitState("MempoolEnable", localServerID, st)
++}
+diff --git a/statesync/snapshots.go b/statesync/snapshots.go
+index 1c749b4..8571a81 100644
+--- a/statesync/snapshots.go
++++ b/statesync/snapshots.go
+@@ -114,6 +114,8 @@ func (p *snapshotPool) Add(peer p2p.Peer, snapshot *snapshot) (bool, error) {
+ 	}
+ 	p.heightIndex[snapshot.Height][key] = true
+ 
++	emitByzOrHonestSnapshotAdd(peer.ID(), snapshot)
++
+ 	return true, nil
+ }
+ 
+diff --git a/statesync/syncer.go b/statesync/syncer.go
+index e1e6682..ea20833 100644
+--- a/statesync/syncer.go
++++ b/statesync/syncer.go
+@@ -344,6 +344,8 @@ func (s *syncer) offerSnapshot(snapshot *snapshot) error {
+ 	case abci.ResponseOfferSnapshot_ACCEPT:
+ 		s.logger.Info("Snapshot accepted, restoring", "height", snapshot.Height,
+ 			"format", snapshot.Format, "hash", log.NewLazySprintf("%X", snapshot.Hash))
++		// Trace: snapshot accepted by the ABCI app.
++		emitOfferSnapshot("", snapshot)
+ 		return nil
+ 	case abci.ResponseOfferSnapshot_ABORT:
+ 		return errAbort
+@@ -377,6 +379,7 @@ func (s *syncer) applyChunks(chunks *chunkQueue) error {
+ 		if err != nil {
+ 			return fmt.Errorf("failed to apply chunk %v: %w", chunk.Index, err)
+ 		}
++		emitApplyChunk(chunk)
+ 		s.logger.Info("Applied snapshot chunk to ABCI app", "height", chunk.Height,
+ 			"format", chunk.Format, "chunk", chunk.Index, "total", chunks.Size())
+ 
+@@ -505,6 +508,7 @@ func (s *syncer) verifyApp(snapshot *snapshot, appVersion uint64) error {
+ 		s.logger.Error("appHash verification failed",
+ 			"expected", fmt.Sprintf("%X", snapshot.trustedAppHash),
+ 			"actual", fmt.Sprintf("%X", resp.LastBlockAppHash))
++		emitVerifyAppFails()
+ 		return errVerifyFailed
+ 	}
+ 	if uint64(resp.LastBlockHeight) != snapshot.Height {
+@@ -513,6 +517,7 @@ func (s *syncer) verifyApp(snapshot *snapshot, appVersion uint64) error {
+ 			"expected", snapshot.Height,
+ 			"actual", resp.LastBlockHeight,
+ 		)
++		emitVerifyAppFails()
+ 		return errVerifyFailed
+ 	}
+ 
+diff --git a/statesync/tlatrace_init_test.go b/statesync/tlatrace_init_test.go
+new file mode 100644
+index 0000000..561e9bd
+--- /dev/null
++++ b/statesync/tlatrace_init_test.go
+@@ -0,0 +1,15 @@
++package statesync
++
++import (
++	"os"
++
++	tlatrace "github.com/cometbft/cometbft/libs/tla_trace"
++)
++
++// init opens the trace file (if TLA_TRACE_FILE is set) before any test runs.
++func init() {
++	tlatrace.InitFromEnv()
++	if v := os.Getenv("TLA_TRACE_LOCAL_NID"); v != "" {
++		SetTraceNodeID(v)
++	}
++}
+diff --git a/statesync/tracehooks.go b/statesync/tracehooks.go
+new file mode 100644
+index 0000000..8c6b12d
+--- /dev/null
++++ b/statesync/tracehooks.go
+@@ -0,0 +1,80 @@
++package statesync
++
++import (
++	"os"
++
++	tlatrace "github.com/cometbft/cometbft/libs/tla_trace"
++	"github.com/cometbft/cometbft/p2p"
++)
++
++var localServerID = func() string {
++	if v := os.Getenv("TLA_TRACE_LOCAL_NID"); v != "" {
++		return v
++	}
++	return "s1"
++}()
++
++// SetTraceNodeID overrides the local server ID baked into emitted events.
++func SetTraceNodeID(id string) { localServerID = id }
++
++// TraceNodeID returns the local server ID.
++func TraceNodeID() string { return localServerID }
++
++// emitOfferSnapshot fires after offerSnapshot returned ACCEPT for a snapshot.
++func emitOfferSnapshot(peerID p2p.ID, snap *snapshot) {
++	if !tlatrace.IsEnabled() || snap == nil {
++		return
++	}
++	pr := tlatrace.NewPeer().
++		Set("id", string(peerID)).
++		Set("height", int64(snap.Height)).
++		Set("hash", tlatrace.HexOrNil(snap.Hash))
++	st := tlatrace.NewState().
++		Set("persistStage", "none").
++		Set("acceptedSnapshot", true)
++	tlatrace.EmitPeer("OfferSnapshot", localServerID, st, pr)
++}
++
++// emitApplyChunk fires after a chunk has been applied. Variant depends on
++// whether the chunk's sender is tagged Byzantine.
++func emitApplyChunk(chunk *chunk) {
++	if !tlatrace.IsEnabled() || chunk == nil {
++		return
++	}
++	pr := tlatrace.NewPeer().
++		Set("id", string(chunk.Sender)).
++		Set("idx", int(chunk.Index)).
++		Set("bytes", len(chunk.Chunk))
++	name := "ApplyChunk"
++	if tlatrace.IsPeerByz(string(chunk.Sender)) {
++		name = "ByzCorruptChunk"
++	}
++	tlatrace.EmitPeer(name, localServerID, nil, pr)
++}
++
++// emitVerifyAppFails fires when verifyApp returned an error.
++func emitVerifyAppFails() {
++	if !tlatrace.IsEnabled() {
++		return
++	}
++	st := tlatrace.NewState().
++		Set("persistStage", "none").
++		Set("acceptedSnapshot", nil)
++	tlatrace.EmitState("VerifyAppFails", localServerID, st)
++}
++
++// emitByzOrHonestSnapshotAdd fires after the snapshot pool accepted an offer.
++// Emits ByzOfferBogusSnapshot only when the sender is tagged as Byzantine.
++func emitByzOrHonestSnapshotAdd(peerID p2p.ID, snap *snapshot) {
++	if !tlatrace.IsEnabled() || snap == nil {
++		return
++	}
++	if !tlatrace.IsPeerByz(string(peerID)) {
++		return
++	}
++	pr := tlatrace.NewPeer().
++		Set("id", string(peerID)).
++		Set("height", int64(snap.Height)).
++		Set("hash", tlatrace.HexOrNil(snap.Hash))
++	tlatrace.EmitPeer("ByzOfferBogusSnapshot", localServerID, nil, pr)
++}
+diff --git a/types/tlatrace_init_test.go b/types/tlatrace_init_test.go
+new file mode 100644
+index 0000000..52ed5f0
+--- /dev/null
++++ b/types/tlatrace_init_test.go
+@@ -0,0 +1,15 @@
++package types
++
++import (
++	"os"
++
++	tlatrace "github.com/cometbft/cometbft/libs/tla_trace"
++)
++
++// init opens the trace file (if TLA_TRACE_FILE is set) before any test runs.
++func init() {
++	tlatrace.InitFromEnv()
++	if v := os.Getenv("TLA_TRACE_LOCAL_NID"); v != "" {
++		SetTraceNodeID(v)
++	}
++}
+diff --git a/types/tracehooks.go b/types/tracehooks.go
+new file mode 100644
+index 0000000..1d28ef5
+--- /dev/null
++++ b/types/tracehooks.go
+@@ -0,0 +1,68 @@
++package types
++
++import (
++	"os"
++
++	tlatrace "github.com/cometbft/cometbft/libs/tla_trace"
++)
++
++var localServerID = func() string {
++	if v := os.Getenv("TLA_TRACE_LOCAL_NID"); v != "" {
++		return v
++	}
++	return "s1"
++}()
++
++// SetTraceNodeID overrides the local server ID baked into emitted events.
++func SetTraceNodeID(id string) { localServerID = id }
++
++// TraceNodeID returns the local server ID.
++func TraceNodeID() string { return localServerID }
++
++// emitVerifyCommitTrustingEarly fires when the trusting verifier returned nil
++// via the early-exit path. validCount is the number of verified sigs that
++// reached threshold; forgedCount is the number of trailing un-verified sigs.
++func emitVerifyCommitTrustingEarly(height int64, validCount, forgedCount int) {
++	if !tlatrace.IsEnabled() {
++		return
++	}
++	msg := tlatrace.NewMsg().
++		Set("height", height).
++		Set("validCount", validCount).
++		Set("forgedCount", forgedCount)
++	tlatrace.EmitMsg("VerifyCommit_TrustingEarly", localServerID, nil, msg)
++}
++
++// emitVerifyCommitAllSignatures fires when the strict path returned nil.
++func emitVerifyCommitAllSignatures(height int64, validCount int) {
++	if !tlatrace.IsEnabled() {
++		return
++	}
++	msg := tlatrace.NewMsg().
++		Set("height", height).
++		Set("validCount", validCount)
++	tlatrace.EmitMsg("VerifyCommit_AllSignatures", localServerID, nil, msg)
++}
++
++// emitByzCommitFlood fires when a commit's signature count exceeds a
++// conservative threshold (2*ValidatorSet size).
++func emitByzCommitFlood(source string, height int64, numForged int) {
++	if !tlatrace.IsEnabled() {
++		return
++	}
++	msg := tlatrace.NewMsg().
++		Set("source", source).
++		Set("height", height).
++		Set("numForged", numForged)
++	tlatrace.EmitMsg("ByzCommitFlood", localServerID, nil, msg)
++}
++
++// emitIncrementProposerPriorityClip fires when safeAddClip/safeSubClip
++// saturated. validator is the validator address whose priority hit the clip.
++func emitIncrementProposerPriorityClip(validator string) {
++	if !tlatrace.IsEnabled() {
++		return
++	}
++	msg := tlatrace.NewMsg().Set("validator", validator)
++	tlatrace.EmitMsg("IncrementProposerPriority_Clip", localServerID, nil, msg)
++}
+diff --git a/types/validation.go b/types/validation.go
+index 4211903..7154146 100644
+--- a/types/validation.go
++++ b/types/validation.go
+@@ -212,6 +212,14 @@ func verifyCommitLightTrustingInternal(
+ 		return errors.New("nil commit")
+ 	}
+ 
++	// Trace: detect ByzCommitFlood — signature count well above the local validator set size.
++	if vals != nil && commit != nil {
++		valSize := len(vals.Validators)
++		if valSize > 0 && len(commit.Signatures) > 2*valSize {
++			emitByzCommitFlood("", commit.Height, len(commit.Signatures))
++		}
++	}
++
+ 	// safely calculate voting power needed.
+ 	totalVotingPowerMulByNumerator, overflow := safeMul(vals.TotalVotingPower(), int64(trustLevel.Numerator))
+ 	if overflow {
+@@ -228,14 +236,24 @@ func verifyCommitLightTrustingInternal(
+ 	// attempt to batch verify commit. As the validator set doesn't necessarily
+ 	// correspond with the validator set that signed the block we need to look
+ 	// up by address rather than index.
++	var err error
+ 	if shouldBatchVerify(vals, commit) {
+-		return verifyCommitBatch(chainID, vals, commit,
++		err = verifyCommitBatch(chainID, vals, commit,
+ 			votingPowerNeeded, ignore, count, countAllSignatures, false, nil, verifiedSignatureCache)
++	} else {
++		// attempt with single verification
++		err = verifyCommitSingle(chainID, vals, commit, votingPowerNeeded,
++			ignore, count, countAllSignatures, false, verifiedSignatureCache)
+ 	}
+-
+-	// attempt with single verification
+-	return verifyCommitSingle(chainID, vals, commit, votingPowerNeeded,
+-		ignore, count, countAllSignatures, false, verifiedSignatureCache)
++	if err == nil {
++		validCount := len(commit.Signatures)
++		if countAllSignatures {
++			emitVerifyCommitAllSignatures(commit.Height, validCount)
++		} else {
++			emitVerifyCommitTrustingEarly(commit.Height, validCount, 0)
++		}
++	}
++	return err
+ }
+ 
+ // ValidateHash returns an error if the hash is not empty, but its
+diff --git a/types/validator_set.go b/types/validator_set.go
+index d241433..cc1f95d 100644
+--- a/types/validator_set.go
++++ b/types/validator_set.go
+@@ -182,12 +182,19 @@ func (vals *ValidatorSet) incrementProposerPriority() *Validator {
+ 	for _, val := range vals.Validators {
+ 		// Check for overflow for sum.
+ 		newPrio := safeAddClip(val.ProposerPriority, val.VotingPower)
++		if newPrio == math.MaxInt64 || newPrio == math.MinInt64 {
++			emitIncrementProposerPriorityClip(string(val.Address))
++		}
+ 		val.ProposerPriority = newPrio
+ 	}
+ 	// Decrement the validator with most ProposerPriority.
+ 	mostest := vals.getValWithMostPriority()
+ 	// Mind the underflow.
+-	mostest.ProposerPriority = safeSubClip(mostest.ProposerPriority, vals.TotalVotingPower())
++	newPrio := safeSubClip(mostest.ProposerPriority, vals.TotalVotingPower())
++	if newPrio == math.MaxInt64 || newPrio == math.MinInt64 {
++		emitIncrementProposerPriorityClip(string(mostest.Address))
++	}
++	mostest.ProposerPriority = newPrio
+ 
+ 	return mostest
+ }

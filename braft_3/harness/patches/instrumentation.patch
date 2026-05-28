@@ -1,0 +1,669 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 110daa3..0ffecff 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -9,6 +9,7 @@ INCLUDE(CPack)
+ #option(EXAMPLE_LINK_SO "Whether examples are linked dynamically" OFF)
+ option(BRPC_WITH_GLOG "With glog" OFF)
+ option(WITH_DEBUG_SYMBOLS "With debug symbols" ON)
++option(WITH_BRAFT_TRACE "Enable TLA+ trace instrumentation" OFF)
+ 
+ set(WITH_GLOG_VAL "0")
+ if(BRPC_WITH_GLOG)
+@@ -225,6 +226,10 @@ endmacro(use_cxx11)
+ 
+ use_cxx11()
+ 
++if(WITH_BRAFT_TRACE)
++    add_definitions(-DBRAFT_ENABLE_TRACE)
++endif()
++
+ add_subdirectory(src)
+ if(BUILD_UNIT_TESTS)
+     add_subdirectory(test)
+diff --git a/src/braft/ballot_box.cpp b/src/braft/ballot_box.cpp
+index 2b8471a..aa2385b 100644
+--- a/src/braft/ballot_box.cpp
++++ b/src/braft/ballot_box.cpp
+@@ -21,6 +21,7 @@
+ #include "braft/util.h"
+ #include "braft/fsm_caller.h"
+ #include "braft/closure_queue.h"
++#include "braft/trace_logger.h"
+ 
+ namespace braft {
+ 
+@@ -29,6 +30,7 @@ BallotBox::BallotBox()
+     , _closure_queue(NULL)
+     , _last_committed_index(0)
+     , _pending_index(0)
++    , _trace_term(0)
+ {
+ }
+ 
+@@ -89,6 +91,16 @@ int BallotBox::commit_at(
+    
+     _pending_index = last_committed_index + 1;
+     _last_committed_index.store(last_committed_index, butil::memory_order_relaxed);
++    BRAFT_TRACE_IF_ENABLED({
++        if (!_trace_nid.empty()) {
++            TraceState ts = TraceState::capture_commit(
++                _trace_term, STATE_LEADER, last_committed_index);
++            TraceEvent("AdvanceCommitIndex")
++                .node(_trace_nid)
++                .state(ts)
++                .emit();
++        }
++    });
+     lck.unlock();
+     // The order doesn't matter
+     _waiter->on_committed(last_committed_index);
+diff --git a/src/braft/ballot_box.h b/src/braft/ballot_box.h
+index 60132e5..000fd5f 100644
+--- a/src/braft/ballot_box.h
++++ b/src/braft/ballot_box.h
+@@ -90,14 +90,22 @@ public:
+ 
+     void get_status(BallotBoxStatus* ballot_box_status);
+ 
++    // Set trace context for AdvanceCommitIndex events.
++    void set_trace_context(const std::string& nid, int64_t term) {
++        _trace_nid = nid;
++        _trace_term = term;
++    }
++
+ private:
+ 
+     FSMCaller*                                      _waiter;
+-    ClosureQueue*                                   _closure_queue;                            
++    ClosureQueue*                                   _closure_queue;
+     raft_mutex_t                                    _mutex;
+     butil::atomic<int64_t>                          _last_committed_index;
+     int64_t                                         _pending_index;
+     std::deque<Ballot>                              _pending_meta_queue;
++    std::string                                     _trace_nid;
++    int64_t                                         _trace_term;
+ 
+ };
+ 
+diff --git a/src/braft/node.cpp b/src/braft/node.cpp
+index cd702f4..9b090f6 100644
+--- a/src/braft/node.cpp
++++ b/src/braft/node.cpp
+@@ -33,6 +33,7 @@
+ #include "braft/node_manager.h"
+ #include "braft/snapshot_executor.h"
+ #include "braft/errno.pb.h"
++#include "braft/trace_logger.h"
+ 
+ namespace braft {
+ 
+@@ -631,6 +632,9 @@ int NodeImpl::init(const NodeOptions& options) {
+               << " conf: " << _conf.conf
+               << " old_conf: " << _conf.old_conf;
+ 
++    // Initialize trace instrumentation (registers peers and opens trace file).
++    trace_init(_server_id, _conf.conf);
++
+     // start snapshot timer
+     if (_snapshot_executor && _options.snapshot_interval_s > 0) {
+         BRAFT_VLOG << "node " << _group_id << ":" << _server_id
+@@ -838,6 +842,18 @@ void NodeImpl::handle_stepdown_timeout() {
+     if (!_conf.old_conf.empty()) {
+         check_dead_nodes(_conf.old_conf, now);
+     }
++    BRAFT_TRACE_IF_ENABLED({
++        if (_state <= STATE_TRANSFERRING) {
++            TraceState ts = TraceState::capture(this);
++            LeaderLease::LeaseInfo ls;
++            _leader_lease.get_lease_info(&ls);
++            ts.leaderLeaseValid = (ls.state == LeaderLease::VALID);
++            TraceEvent("CheckLeaderLease")
++                .node(TraceServerMap::instance().register_peer(_server_id))
++                .state(ts)
++                .emit();
++        }
++    });
+ }
+ 
+ void NodeImpl::check_witness(const Configuration& conf) {
+@@ -849,6 +865,12 @@ void NodeImpl::check_witness(const Configuration& conf) {
+         butil::Status status;
+         status.set_error(ETRANSFERLEADERSHIP, "Witness becomes leader temporarily");
+         step_down(_current_term, true, status);
++        BRAFT_TRACE_IF_ENABLED(
++            TraceEvent("WitnessStepDownReactive")
++                .node(TraceServerMap::instance().register_peer(_server_id))
++                .state(TraceState::capture(this))
++                .emit()
++        );
+     }
+ }
+ 
+@@ -1427,6 +1449,16 @@ void NodeImpl::handle_request_vote_response(const PeerId& peer_id, const int64_t
+         status.set_error(EHIGHERTERMRESPONSE, "Raft node receives higher term "
+                 "request_vote_response.");
+         step_down(response.term(), false, status);
++        BRAFT_TRACE_IF_ENABLED(
++            TraceEvent("HandleRequestVoteResponse")
++                .node(TraceServerMap::instance().register_peer(_server_id))
++                .state(TraceState::capture(this))
++                .msg_field("from", TraceServerMap::instance().register_peer(peer_id))
++                .msg_field("to", TraceServerMap::instance().register_peer(_server_id))
++                .msg_field("term", response.term())
++                .msg_field("granted", response.granted())
++                .emit()
++        );
+         return;
+     }
+ 
+@@ -1435,6 +1467,16 @@ void NodeImpl::handle_request_vote_response(const PeerId& peer_id, const int64_t
+               << " term " << response.term() << " granted " << response.granted()
+               << " rejected_by_lease " << response.rejected_by_lease()
+               << " disrupted " << response.disrupted();
++    BRAFT_TRACE_IF_ENABLED(
++        TraceEvent("HandleRequestVoteResponse")
++            .node(TraceServerMap::instance().register_peer(_server_id))
++            .state(TraceState::capture(this))
++            .msg_field("from", TraceServerMap::instance().register_peer(peer_id))
++            .msg_field("to", TraceServerMap::instance().register_peer(_server_id))
++            .msg_field("term", response.term())
++            .msg_field("granted", response.granted())
++            .emit()
++    );
+     if (!response.granted() && !response.rejected_by_lease()) {
+         return;
+     }
+@@ -1536,6 +1578,16 @@ void NodeImpl::handle_pre_vote_response(const PeerId& peer_id, const int64_t ter
+         status.set_error(EHIGHERTERMRESPONSE, "Raft node receives higher term "
+                 "pre_vote_response.");
+         step_down(response.term(), false, status);
++        BRAFT_TRACE_IF_ENABLED(
++            TraceEvent("HandlePreVoteResponse")
++                .node(TraceServerMap::instance().register_peer(_server_id))
++                .state(TraceState::capture(this))
++                .msg_field("from", TraceServerMap::instance().register_peer(peer_id))
++                .msg_field("to", TraceServerMap::instance().register_peer(_server_id))
++                .msg_field("granted", response.granted())
++                .msg_field("disrupted", response.disrupted())
++                .emit()
++        );
+         return;
+     }
+ 
+@@ -1545,6 +1597,17 @@ void NodeImpl::handle_pre_vote_response(const PeerId& peer_id, const int64_t ter
+               << " rejected_by_lease " << response.rejected_by_lease()
+               << " disrupted " << response.disrupted();
+ 
++    BRAFT_TRACE_IF_ENABLED(
++        TraceEvent("HandlePreVoteResponse")
++            .node(TraceServerMap::instance().register_peer(_server_id))
++            .state(TraceState::capture(this))
++            .msg_field("from", TraceServerMap::instance().register_peer(peer_id))
++            .msg_field("to", TraceServerMap::instance().register_peer(_server_id))
++            .msg_field("granted", response.granted())
++            .msg_field("disrupted", response.disrupted())
++            .emit()
++    );
++
+     if (!response.granted() && !response.rejected_by_lease()) {
+         return;
+     }
+@@ -1642,6 +1705,12 @@ void NodeImpl::pre_vote(std::unique_lock<raft_mutex_t>* lck, bool triggered) {
+     }
+ 
+     _pre_vote_ctx.init(this, triggered);
++    BRAFT_TRACE_IF_ENABLED(
++        TraceEvent("PreVote")
++            .node(TraceServerMap::instance().register_peer(_server_id))
++            .state(TraceState::capture(this))
++            .emit()
++    );
+     std::set<PeerId> peers;
+     _conf.list_peers(&peers);
+ 
+@@ -1705,6 +1774,12 @@ void NodeImpl::elect_self(std::unique_lock<raft_mutex_t>* lck,
+     _state = STATE_CANDIDATE;
+     _current_term++;
+     _voted_id = _server_id;
++    BRAFT_TRACE_IF_ENABLED(
++        TraceEvent("BecomeCandidate")
++            .node(TraceServerMap::instance().register_peer(_server_id))
++            .state(TraceState::capture(this))
++            .emit()
++    );
+ 
+     BRAFT_VLOG << "node " << _group_id << ":" << _server_id
+                << " term " << _current_term << " start vote_timer";
+@@ -1744,8 +1819,20 @@ void NodeImpl::elect_self(std::unique_lock<raft_mutex_t>* lck,
+         // reset _voted_id to avoid inconsistent cases
+         // return immediately without granting _vote_ctx
+         _voted_id.reset();
++        BRAFT_TRACE_IF_ENABLED(
++            TraceEvent("CompletePersistTerm")
++                .node(TraceServerMap::instance().register_peer(_server_id))
++                .state(TraceState::capture(this))
++                .emit()
++        );
+         return;
+     }
++    BRAFT_TRACE_IF_ENABLED(
++        TraceEvent("CompletePersistTerm")
++            .node(TraceServerMap::instance().register_peer(_server_id))
++            .state(TraceState::capture(this))
++            .emit()
++    );
+     grant_self(&_vote_ctx, lck);
+ }
+ 
+@@ -1948,6 +2035,12 @@ void NodeImpl::become_leader() {
+     _replicator_group.reset_term(_current_term);
+     _follower_lease.reset();
+     _leader_lease.on_leader_start(_current_term);
++    BRAFT_TRACE_IF_ENABLED(
++        TraceEvent("BecomeLeader")
++            .node(TraceServerMap::instance().register_peer(_server_id))
++            .state(TraceState::capture(this))
++            .emit()
++    );
+ 
+     std::set<PeerId> peers;
+     _conf.list_peers(&peers);
+@@ -1966,6 +2059,11 @@ void NodeImpl::become_leader() {
+ 
+     // init commit manager
+     _ballot_box->reset_pending_index(_log_manager->last_log_index() + 1);
++    BRAFT_TRACE_IF_ENABLED(
++        _ballot_box->set_trace_context(
++            TraceServerMap::instance().register_peer(_server_id),
++            _current_term)
++    );
+ 
+     // Register _conf_ctx to reject configuration changing before the first log
+     // is committed.
+@@ -2169,6 +2267,18 @@ int NodeImpl::handle_pre_vote_request(const RequestVoteRequest* request,
+     response->set_rejected_by_lease(rejected_by_lease);
+     response->set_disrupted(_state == STATE_LEADER);
+     response->set_previous_term(_current_term);
++    BRAFT_TRACE_IF_ENABLED(
++        TraceEvent("HandlePreVoteRequest")
++            .node(TraceServerMap::instance().register_peer(_server_id))
++            .state(TraceState::capture(this))
++            .msg_field("from", TraceServerMap::instance().register_peer(candidate_id))
++            .msg_field("to", TraceServerMap::instance().register_peer(_server_id))
++            .msg_field("term", request->term())
++            .msg_field("granted", granted)
++            .msg_field("rejectedByLease", rejected_by_lease)
++            .msg_field("disrupted", _state == STATE_LEADER)
++            .emit()
++    );
+ 
+     return 0;
+ }
+@@ -2275,8 +2385,14 @@ int NodeImpl::handle_request_vote_request(const RequestVoteRequest* request,
+                            << " because failed to set_votedfor it, error: "
+                            << status;
+                 // reset _voted_id to response set_granted(false)
+-                _voted_id.reset(); 
++                _voted_id.reset();
+             }
++            BRAFT_TRACE_IF_ENABLED(
++                TraceEvent("CompletePersistTerm")
++                    .node(TraceServerMap::instance().register_peer(_server_id))
++                    .state(TraceState::capture(this))
++                    .emit()
++            );
+         }
+     } while (0);
+ 
+@@ -2285,6 +2401,18 @@ int NodeImpl::handle_request_vote_request(const RequestVoteRequest* request,
+     response->set_term(_current_term);
+     response->set_granted(request->term() == _current_term && _voted_id == candidate_id);
+     response->set_rejected_by_lease(rejected_by_lease);
++    BRAFT_TRACE_IF_ENABLED(
++        TraceEvent("HandleRequestVoteRequest")
++            .node(TraceServerMap::instance().register_peer(_server_id))
++            .state(TraceState::capture(this))
++            .msg_field("from", TraceServerMap::instance().register_peer(candidate_id))
++            .msg_field("to", TraceServerMap::instance().register_peer(_server_id))
++            .msg_field("term", request->term())
++            .msg_field("granted", response->granted())
++            .msg_field("rejectedByLease", rejected_by_lease)
++            .msg_field("disrupted", disrupted)
++            .emit()
++    );
+     return 0;
+ }
+ 
+@@ -2495,10 +2623,24 @@ void NodeImpl::handle_append_entries_request(brpc::Controller* cntl,
+         response->set_success(false);
+         response->set_term(_current_term);
+         response->set_last_log_index(last_index);
++        BRAFT_TRACE_IF_ENABLED(
++            TraceEvent("HandleAppendEntriesRequest")
++                .node(TraceServerMap::instance().register_peer(_server_id))
++                .state(TraceState::capture(this))
++                .msg_field("from", TraceServerMap::instance().register_peer(server_id))
++                .msg_field("to", TraceServerMap::instance().register_peer(_server_id))
++                .msg_field("term", request->term())
++                .msg_field("prevLogIndex", request->prev_log_index())
++                .msg_field("prevLogTerm", request->prev_log_term())
++                .msg_field("entriesSize", (int64_t)request->entries_size())
++                .msg_field("commitIndex", request->committed_index())
++                .msg_field("success", false)
++                .emit()
++        );
+         lck.unlock();
+         if (local_prev_log_term != 0) {
+             LOG(WARNING) << "node " << _group_id << ":" << _server_id
+-                         << " reject term_unmatched AppendEntries from " 
++                         << " reject term_unmatched AppendEntries from "
+                          << request->server_id()
+                          << " in term " << request->term()
+                          << " prev_log_index " << request->prev_log_index()
+@@ -2516,6 +2658,16 @@ void NodeImpl::handle_append_entries_request(brpc::Controller* cntl,
+         response->set_term(_current_term);
+         response->set_last_log_index(_log_manager->last_log_index());
+         response->set_readonly(_node_readonly);
++        BRAFT_TRACE_IF_ENABLED(
++            TraceEvent("HandleAppendEntriesRequest")
++                .node(TraceServerMap::instance().register_peer(_server_id))
++                .state(TraceState::capture(this))
++                .msg_field("from", TraceServerMap::instance().register_peer(server_id))
++                .msg_field("to", TraceServerMap::instance().register_peer(_server_id))
++                .msg_field("term", request->term())
++                .msg_field("commitIndex", request->committed_index())
++                .emit()
++        );
+         lck.unlock();
+         // see the comments at FollowerStableClosure::run()
+         _ballot_box->set_last_committed_index(
+@@ -2562,6 +2714,20 @@ void NodeImpl::handle_append_entries_request(brpc::Controller* cntl,
+ 
+     // check out-of-order cache
+     check_append_entries_cache(index);
++    BRAFT_TRACE_IF_ENABLED(
++        TraceEvent("HandleAppendEntriesRequest")
++            .node(TraceServerMap::instance().register_peer(_server_id))
++            .state(TraceState::capture(this))
++            .msg_field("from", TraceServerMap::instance().register_peer(server_id))
++            .msg_field("to", TraceServerMap::instance().register_peer(_server_id))
++            .msg_field("term", request->term())
++            .msg_field("prevLogIndex", request->prev_log_index())
++            .msg_field("prevLogTerm", request->prev_log_term())
++            .msg_field("entriesSize", (int64_t)request->entries_size())
++            .msg_field("commitIndex", request->committed_index())
++            .msg_field("success", true)
++            .emit()
++    );
+ 
+     FollowerStableClosure* c = new FollowerStableClosure(
+             cntl, request, response, done_guard.release(),
+@@ -2658,6 +2824,17 @@ void NodeImpl::handle_install_snapshot_request(brpc::Controller* cntl,
+         return;
+     }
+     clear_append_entries_cache();
++    BRAFT_TRACE_IF_ENABLED(
++        TraceEvent("HandleInstallSnapshotRequest")
++            .node(TraceServerMap::instance().register_peer(_server_id))
++            .state(TraceState::capture(this))
++            .msg_field("from", TraceServerMap::instance().register_peer(server_id))
++            .msg_field("to", TraceServerMap::instance().register_peer(_server_id))
++            .msg_field("term", request->term())
++            .msg_field("lastIncludedIndex", request->meta().last_included_index())
++            .msg_field("lastIncludedTerm", request->meta().last_included_term())
++            .emit()
++    );
+     lck.unlock();
+     LOG(INFO) << "node " << _group_id << ":" << _server_id
+               << " received InstallSnapshotRequest"
+diff --git a/src/braft/node.h b/src/braft/node.h
+index b9dd3e8..b3771a5 100644
+--- a/src/braft/node.h
++++ b/src/braft/node.h
+@@ -91,6 +91,8 @@ friend class RaftStatImpl;
+ friend class FollowerStableClosure;
+ friend class ConfigurationChangeDone;
+ friend class VoteBallotCtx;
++friend struct TraceState;
++friend class SnapshotExecutor;
+ public:
+     NodeImpl(const GroupId& group_id, const PeerId& peer_id);
+     NodeImpl();
+diff --git a/src/braft/replicator.cpp b/src/braft/replicator.cpp
+index cb3b75e..60a5a58 100644
+--- a/src/braft/replicator.cpp
++++ b/src/braft/replicator.cpp
+@@ -23,9 +23,10 @@
+ #include <brpc/reloadable_flags.h>               // BRPC_VALIDATE_GFLAG
+ #include "braft/replicator.h"
+ #include "braft/node.h"                          // NodeImpl
+-#include "braft/ballot_box.h"                    // BallotBox 
++#include "braft/ballot_box.h"                    // BallotBox
+ #include "braft/log_entry.h"                     // LogEntry
+ #include "braft/snapshot_throttle.h"             // SnapshotThrottle
++#include "braft/trace_logger.h"
+ 
+ namespace braft {
+ 
+@@ -337,6 +338,15 @@ void Replicator::_on_heartbeat_returned(
+     BRAFT_VLOG << ss.str() << " readonly " << readonly;
+     r->_update_last_rpc_send_timestamp(rpc_send_time);
+     r->_start_heartbeat_timer(start_time_us);
++    BRAFT_TRACE_IF_ENABLED(
++        TraceEvent("HandleHeartbeatResponse")
++            .node(TraceServerMap::instance().register_peer(r->_options.server_id))
++            .state(TraceState::capture_weak(r->_options.term, STATE_LEADER))
++            .msg_field("from", TraceServerMap::instance().register_peer(r->_options.peer_id))
++            .msg_field("to", TraceServerMap::instance().register_peer(r->_options.server_id))
++            .msg_field("term", response->term())
++            .emit()
++    );
+     NodeImpl* node_impl = NULL;
+     // Check if readonly config changed
+     if ((readonly && r->_readonly_index == 0) ||
+@@ -455,12 +465,24 @@ void Replicator::_on_rpc_returned(ReplicatorId id, brpc::Controller* cntl,
+                            << " log_index=" << r->_next_index << " mismatch";
+                 --r->_next_index;
+             } else {
+-                LOG(ERROR) << "Group " << r->_options.group_id 
++                LOG(ERROR) << "Group " << r->_options.group_id
+                            << " peer=" << r->_options.peer_id
+                            << " declares that log at index=0 doesn't match,"
+                               " which is not supposed to happen";
+             }
+         }
++        BRAFT_TRACE_IF_ENABLED(
++            TraceEvent("HandleReplicateResponse")
++                .node(TraceServerMap::instance().register_peer(r->_options.server_id))
++                .state(TraceState::capture_weak(r->_options.term, STATE_LEADER))
++                .msg_field("from", TraceServerMap::instance().register_peer(r->_options.peer_id))
++                .msg_field("to", TraceServerMap::instance().register_peer(r->_options.server_id))
++                .msg_field("term", response->term())
++                .msg_field("success", false)
++                .msg_field("matchIndex", response->last_log_index())
++                .msg_field("entriesSize", (int64_t)request->entries_size())
++                .emit()
++        );
+         // dummy_id is unlock in _send_heartbeat
+         r->_send_empty_entries(false);
+         return;
+@@ -516,6 +538,18 @@ void Replicator::_on_rpc_returned(ReplicatorId id, brpc::Controller* cntl,
+     }
+     r->_has_succeeded = true;
+     r->_notify_on_caught_up(0, false);
++    BRAFT_TRACE_IF_ENABLED(
++        TraceEvent("HandleReplicateResponse")
++            .node(TraceServerMap::instance().register_peer(r->_options.server_id))
++            .state(TraceState::capture_weak(r->_options.term, STATE_LEADER))
++            .msg_field("from", TraceServerMap::instance().register_peer(r->_options.peer_id))
++            .msg_field("to", TraceServerMap::instance().register_peer(r->_options.server_id))
++            .msg_field("term", response->term())
++            .msg_field("success", true)
++            .msg_field("matchIndex", rpc_last_log_index)
++            .msg_field("entriesSize", (int64_t)entries_size)
++            .emit()
++    );
+     // dummy_id is unlock in _send_entries
+     if (r->_timeout_now_index > 0 && r->_timeout_now_index < r->_min_flying_index()) {
+         r->_send_timeout_now(false, false);
+@@ -579,13 +613,26 @@ void Replicator::_send_empty_entries(bool is_heartbeat) {
+     }
+ 
+     BRAFT_VLOG << "node " << _options.group_id << ":" << _options.server_id
+-        << " send HeartbeatRequest to " << _options.peer_id 
++        << " send HeartbeatRequest to " << _options.peer_id
+         << " term " << _options.term
+         << " prev_log_index " << request->prev_log_index()
+         << " last_committed_index " << request->committed_index();
+ 
++    if (is_heartbeat) {
++        BRAFT_TRACE_IF_ENABLED(
++            TraceEvent("SendHeartbeat")
++                .node(TraceServerMap::instance().register_peer(_options.server_id))
++                .state(TraceState::capture_weak(_options.term, STATE_LEADER))
++                .msg_field("from", TraceServerMap::instance().register_peer(_options.server_id))
++                .msg_field("to", TraceServerMap::instance().register_peer(_options.peer_id))
++                .msg_field("term", _options.term)
++                .msg_field("commitIndex", request->committed_index())
++                .emit()
++        );
++    }
++
+     google::protobuf::Closure* done = brpc::NewCallback(
+-                is_heartbeat ? _on_heartbeat_returned : _on_rpc_returned, 
++                is_heartbeat ? _on_heartbeat_returned : _on_rpc_returned,
+                 _id.value, cntl.get(), request.get(), response.get(),
+                 butil::monotonic_time_ms());
+ 
+@@ -704,11 +751,24 @@ void Replicator::_send_entries() {
+     _st.st = APPENDING_ENTRIES;
+     _st.first_log_index = _min_flying_index();
+     _st.last_log_index = _next_index - 1;
++    BRAFT_TRACE_IF_ENABLED(
++        TraceEvent("SendReplicateEntries")
++            .node(TraceServerMap::instance().register_peer(_options.server_id))
++            .state(TraceState::capture_weak(_options.term, STATE_LEADER))
++            .msg_field("from", TraceServerMap::instance().register_peer(_options.server_id))
++            .msg_field("to", TraceServerMap::instance().register_peer(_options.peer_id))
++            .msg_field("term", _options.term)
++            .msg_field("prevLogIndex", request->prev_log_index())
++            .msg_field("prevLogTerm", request->prev_log_term())
++            .msg_field("entriesSize", (int64_t)request->entries_size())
++            .msg_field("commitIndex", request->committed_index())
++            .emit()
++    );
+     google::protobuf::Closure* done = brpc::NewCallback(
+-                _on_rpc_returned, _id.value, cntl.get(), 
++                _on_rpc_returned, _id.value, cntl.get(),
+                 request.get(), response.get(), butil::monotonic_time_ms());
+     RaftService_Stub stub(&_sending_channel);
+-    stub.append_entries(cntl.release(), request.release(), 
++    stub.append_entries(cntl.release(), request.release(),
+                         response.release(), done);
+     _wait_more_entries();
+ }
+@@ -851,6 +911,17 @@ void Replicator::_install_snapshot() {
+               << " send InstallSnapshotRequest to " << _options.peer_id
+               << " term " << _options.term << " last_included_term " << meta.last_included_term()
+               << " last_included_index " << meta.last_included_index() << " uri " << uri;
++    BRAFT_TRACE_IF_ENABLED(
++        TraceEvent("SendInstallSnapshot")
++            .node(TraceServerMap::instance().register_peer(_options.server_id))
++            .state(TraceState::capture_weak(_options.term, STATE_LEADER))
++            .msg_field("from", TraceServerMap::instance().register_peer(_options.server_id))
++            .msg_field("to", TraceServerMap::instance().register_peer(_options.peer_id))
++            .msg_field("term", _options.term)
++            .msg_field("lastIncludedIndex", meta.last_included_index())
++            .msg_field("lastIncludedTerm", meta.last_included_term())
++            .emit()
++    );
+ 
+     _install_snapshot_in_fly = cntl->call_id();
+     _install_snapshot_counter++;
+@@ -911,13 +982,26 @@ void Replicator::_on_install_snapshot_returned(
+             // Let heartbeat do step down
+             break;
+         }
+-        // Success 
++        // Success
+         r->_next_index = request->meta().last_included_index() + 1;
+         ss << " success.";
+         LOG(INFO) << ss.str();
+     } while (0);
+-
+-    // We don't retry installing the snapshot explicitly. 
++    if (!cntl->Failed()) {
++        BRAFT_TRACE_IF_ENABLED(
++            TraceEvent("HandleInstallSnapshotResponse")
++                .node(TraceServerMap::instance().register_peer(r->_options.server_id))
++                .state(TraceState::capture_weak(r->_options.term, STATE_LEADER))
++                .msg_field("from", TraceServerMap::instance().register_peer(r->_options.peer_id))
++                .msg_field("to", TraceServerMap::instance().register_peer(r->_options.server_id))
++                .msg_field("term", response->term())
++                .msg_field("success", succ)
++                .msg_field("lastIncludedIndex", request->meta().last_included_index())
++                .emit()
++        );
++    }
++
++    // We don't retry installing the snapshot explicitly.
+     // dummy_id is unlock in _send_entries
+     if (!succ) {
+         return r->_block(butil::gettimeofday_us(), cntl->ErrorCode());
+diff --git a/src/braft/snapshot_executor.cpp b/src/braft/snapshot_executor.cpp
+index e33ece8..4ebd0d6 100644
+--- a/src/braft/snapshot_executor.cpp
++++ b/src/braft/snapshot_executor.cpp
+@@ -19,6 +19,7 @@
+ #include "braft/node.h"
+ #include "braft/storage.h"
+ #include "braft/snapshot.h"
++#include "braft/trace_logger.h"
+ 
+ namespace braft {
+ 
+@@ -230,10 +231,22 @@ int SnapshotExecutor::on_snapshot_save_done(
+         _last_snapshot_term = meta.last_included_term();
+         lck.unlock();
+         ss << "snapshot_save_done, last_included_index=" << meta.last_included_index()
+-           << " last_included_term=" << meta.last_included_term(); 
++           << " last_included_term=" << meta.last_included_term();
+         LOG(INFO) << ss.str();
+         _log_manager->set_snapshot(&meta);
+         lck.lock();
++        BRAFT_TRACE_IF_ENABLED({
++            if (_node) {
++                std::unique_lock<raft_mutex_t> nlk(_node->_mutex);
++                TraceState ts = TraceState::capture(_node);
++                ts.lastSnapshotIndex = _last_snapshot_index;
++                ts.lastSnapshotTerm  = _last_snapshot_term;
++                TraceEvent("TakeSnapshot")
++                    .node(TraceServerMap::instance().register_peer(_node->_server_id))
++                    .state(ts)
++                    .emit();
++            }
++        });
+     }
+     if (ret == EIO) {
+         report_error(EIO, "Fail to save snapshot");
+@@ -255,6 +268,19 @@ void SnapshotExecutor::on_snapshot_load_done(const butil::Status& st) {
+         _last_snapshot_term = _loading_snapshot_meta.last_included_term();
+         _log_manager->set_snapshot(&_loading_snapshot_meta);
+     }
++    BRAFT_TRACE_IF_ENABLED({
++        if (_node) {
++            std::unique_lock<raft_mutex_t> nlk(_node->_mutex);
++            TraceState ts = TraceState::capture(_node);
++            ts.lastSnapshotIndex = _last_snapshot_index;
++            ts.lastSnapshotTerm  = _last_snapshot_term;
++            ts.installingSnapshot = "none";
++            TraceEvent("OnSnapshotLoadDone")
++                .node(TraceServerMap::instance().register_peer(_node->_server_id))
++                .state(ts)
++                .emit();
++        }
++    });
+     std::stringstream ss;
+     if (_node) {
+         ss << "node " << _node->node_id() << ' ';

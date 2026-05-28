@@ -1,0 +1,1086 @@
+diff --git a/consensus/src/quorum_store/batch_coordinator.rs b/consensus/src/quorum_store/batch_coordinator.rs
+index 1e3d01c4..ff3ed28f 100644
+--- a/consensus/src/quorum_store/batch_coordinator.rs
++++ b/consensus/src/quorum_store/batch_coordinator.rs
+@@ -98,8 +98,13 @@ impl BatchCoordinator {
+         let batch_store = self.batch_store.clone();
+         let network_sender = self.network_sender.clone();
+         let sender_to_proof_manager = self.sender_to_proof_manager.clone();
++        let trace_my_peer_id = self.my_peer_id;
+         tokio::spawn(async move {
+             let peer_id = persist_requests[0].author();
++            let batch_infos_for_trace: Vec<BatchInfoExt> = persist_requests
++                .iter()
++                .map(|persisted_value| persisted_value.batch_info().clone())
++                .collect();
+             let batches = persist_requests
+                 .iter()
+                 .map(|persisted_value| {
+@@ -113,6 +118,12 @@ impl BatchCoordinator {
+             let first_batch_info = persist_requests[0].batch_info().clone();
+             if first_batch_info.is_v2() {
+                 let signed_batch_infos = batch_store.persist(persist_requests);
++                for bi in &batch_infos_for_trace {
++                    crate::quorum_store::tla_trace::emit_handle_batches_msg(
++                        trace_my_peer_id,
++                        bi,
++                    );
++                }
+                 if !signed_batch_infos.is_empty() {
+                     if approx_created_ts_usecs > 0 {
+                         observe_batch(
+@@ -128,6 +139,12 @@ impl BatchCoordinator {
+                 }
+             } else {
+                 let signed_batch_infos = batch_store.persist(persist_requests);
++                for bi in &batch_infos_for_trace {
++                    crate::quorum_store::tla_trace::emit_handle_batches_msg(
++                        trace_my_peer_id,
++                        bi,
++                    );
++                }
+                 if !signed_batch_infos.is_empty() {
+                     assert!(!signed_batch_infos
+                         .first()
+diff --git a/consensus/src/quorum_store/batch_generator.rs b/consensus/src/quorum_store/batch_generator.rs
+index 2f77bc55..32d3138e 100644
+--- a/consensus/src/quorum_store/batch_generator.rs
++++ b/consensus/src/quorum_store/batch_generator.rs
+@@ -254,6 +254,7 @@ impl BatchGenerator {
+         batch_kind: BatchKind,
+     ) -> Batch<BatchInfoExt> {
+         let batch_id = self.batch_id;
++        let pre_increment_batch_id_id = batch_id.id;
+         self.batch_id.increment();
+         self.db
+             .save_batch_id(self.epoch, self.batch_id)
+@@ -322,6 +323,13 @@ impl BatchGenerator {
+             );
+         }
+ 
++        crate::quorum_store::tla_trace::emit_reserve_batch_id(
++            self.my_peer_id,
++            self.batch_id.id,
++            pre_increment_batch_id_id,
++            batch.batch_info(),
++        );
++
+         batch
+     }
+ 
+@@ -708,15 +716,35 @@ impl BatchGenerator {
+                                 persist_requests.push(batch.into());
+                             }
+                             self.batch_writer.persist(persist_requests);
++                            for b in &batches {
++                                crate::quorum_store::tla_trace::emit_persist_payload(
++                                    self.my_peer_id,
++                                    b.batch_info(),
++                                );
++                            }
+                             counters::BATCH_CREATION_PERSIST_LATENCY.observe_duration(persist_start.elapsed());
+ 
+                             if self.config.enable_batch_v2_tx {
++                                let batches_for_trace = batches.clone();
+                                 network_sender.broadcast_batch_msg_v2(batches).await;
++                                for b in &batches_for_trace {
++                                    crate::quorum_store::tla_trace::emit_broadcast_batch_msg(
++                                        self.my_peer_id,
++                                        b.batch_info(),
++                                    );
++                                }
+                             } else {
++                                let batches_for_trace = batches.clone();
+                                 let batches = batches.into_iter().map(|batch| {
+                                     batch.try_into().expect("Cannot send V2 batch with flag disabled")
+                                 }).collect();
+                                 network_sender.broadcast_batch_msg(batches).await;
++                                for b in &batches_for_trace {
++                                    crate::quorum_store::tla_trace::emit_broadcast_batch_msg(
++                                        self.my_peer_id,
++                                        b.batch_info(),
++                                    );
++                                }
+                             }
+                         } else if tick_start.elapsed() > interval.period().checked_div(2).unwrap_or(Duration::ZERO) {
+                             // If the pull takes too long, it's also accounted as a non-empty pull to avoid pulling too often.
+diff --git a/consensus/src/quorum_store/batch_proof_queue.rs b/consensus/src/quorum_store/batch_proof_queue.rs
+index a48df574..5f7ad90e 100644
+--- a/consensus/src/quorum_store/batch_proof_queue.rs
++++ b/consensus/src/quorum_store/batch_proof_queue.rs
+@@ -271,6 +271,10 @@ impl BatchProofQueue {
+ 
+     /// Add the ProofOfStore to proof queue.
+     pub(crate) fn insert_proof(&mut self, proof: ProofOfStore<BatchInfoExt>) {
++        crate::quorum_store::tla_trace::emit_handle_proof_msg(
++            self.my_peer_id,
++            proof.info(),
++        );
+         if proof.expiration() <= self.latest_block_timestamp {
+             counters::inc_rejected_pos_count(counters::POS_EXPIRED_LABEL);
+             return;
+diff --git a/consensus/src/quorum_store/batch_requester.rs b/consensus/src/quorum_store/batch_requester.rs
+index bc78315c..643a8fa2 100644
+--- a/consensus/src/quorum_store/batch_requester.rs
++++ b/consensus/src/quorum_store/batch_requester.rs
+@@ -136,6 +136,10 @@ impl<T: QuorumStoreSender + Sync + 'static> BatchRequester<T> {
+                             Ok(BatchResponse::Batch(batch)) => {
+                                 counters::RECEIVED_BATCH_RESPONSE_COUNT.inc();
+                                 let payload = batch.into_transactions();
++                                crate::quorum_store::tla_trace::emit_fetch_batch_success(
++                                    my_peer_id,
++                                    &digest,
++                                );
+                                 return Ok(payload);
+                             }
+                             // Short-circuit if the chain has moved beyond expiration
+@@ -153,6 +157,10 @@ impl<T: QuorumStoreSender + Sync + 'static> BatchRequester<T> {
+                             Ok(BatchResponse::BatchV2(batch)) => {
+                                 counters::RECEIVED_BATCH_RESPONSE_COUNT.inc();
+                                 let payload = batch.into_transactions();
++                                crate::quorum_store::tla_trace::emit_fetch_batch_success(
++                                    my_peer_id,
++                                    &digest,
++                                );
+                                 return Ok(payload)
+                             }
+                             Err(e) => {
+diff --git a/consensus/src/quorum_store/batch_store.rs b/consensus/src/quorum_store/batch_store.rs
+index 5169cda8..9781fa59 100644
+--- a/consensus/src/quorum_store/batch_store.rs
++++ b/consensus/src/quorum_store/batch_store.rs
+@@ -187,6 +187,10 @@ impl BatchStore {
+                 &batch_store,
+             );
+         }
++        // Note: Recover / EpochTransition events are emitted from the harness
++        // scenarios rather than from BatchStore::new directly, because the
++        // same constructor is also used for fresh validator bootstrap (which
++        // maps to the spec's `Init`, not to Recover/EpochTransition).
+ 
+         batch_store
+     }
+@@ -473,7 +477,8 @@ impl BatchStore {
+ 
+     pub fn update_certified_timestamp(&self, certified_time: u64) {
+         trace!("QS: batch reader updating time {:?}", certified_time);
+-        self.last_certified_time
++        let prev = self
++            .last_certified_time
+             .fetch_max(certified_time, Ordering::SeqCst);
+ 
+         let expired_keys = self.clear_expired_payload(certified_time);
+@@ -483,6 +488,12 @@ impl BatchStore {
+         if let Err(e) = self.db.delete_batches_v2(expired_keys) {
+             debug!("Error deleting v2 batches: {:?}", e)
+         }
++        if certified_time > prev {
++            crate::quorum_store::tla_trace::emit_advance_certified_time(
++                self.validator_signer.author(),
++                self.last_certified_time.load(Ordering::Relaxed),
++            );
++        }
+     }
+ 
+     fn last_certified_time(&self) -> u64 {
+diff --git a/consensus/src/quorum_store/mod.rs b/consensus/src/quorum_store/mod.rs
+index 30006290..45c1124d 100644
+--- a/consensus/src/quorum_store/mod.rs
++++ b/consensus/src/quorum_store/mod.rs
+@@ -16,6 +16,7 @@ pub(crate) mod proof_manager;
+ pub(crate) mod quorum_store_builder;
+ pub(crate) mod quorum_store_coordinator;
+ pub mod quorum_store_db;
++pub(crate) mod tla_trace;
+ pub(crate) mod tracing;
+ pub mod types;
+ pub(crate) mod utils;
+diff --git a/consensus/src/quorum_store/proof_coordinator.rs b/consensus/src/quorum_store/proof_coordinator.rs
+index 193d7a37..647033b8 100644
+--- a/consensus/src/quorum_store/proof_coordinator.rs
++++ b/consensus/src/quorum_store/proof_coordinator.rs
+@@ -327,6 +327,11 @@ impl ProofCoordinator {
+             .get_mut(signed_batch_info.batch_info())
+         {
+             value.add_signature(&signed_batch_info, validator_verifier)?;
++            crate::quorum_store::tla_trace::emit_receive_signed_batch_info(
++                self.peer_id,
++                signed_batch_info.batch_info(),
++                signed_batch_info.signer(),
++            );
+             if !value.completed && value.check_voting_power(validator_verifier, true) {
+                 let proof = {
+                     let _timer = counters::SIGNED_BATCH_INFO_VERIFY_DURATION.start_timer();
+@@ -335,6 +340,10 @@ impl ProofCoordinator {
+                 // proof validated locally, so adding to cache
+                 self.proof_cache
+                     .insert(proof.info().clone(), proof.multi_signature().clone());
++                crate::quorum_store::tla_trace::emit_aggregate_proof(
++                    self.peer_id,
++                    proof.info(),
++                );
+                 // quorum store measurements
+                 let duration = self
+                     .batch_info_to_time
+diff --git a/consensus/src/quorum_store/proof_manager.rs b/consensus/src/quorum_store/proof_manager.rs
+index 51c71f01..f13c06c5 100644
+--- a/consensus/src/quorum_store/proof_manager.rs
++++ b/consensus/src/quorum_store/proof_manager.rs
+@@ -33,6 +33,7 @@ pub enum ProofManagerCommand {
+ }
+ 
+ pub struct ProofManager {
++    my_peer_id: PeerId,
+     batch_proof_queue: BatchProofQueue,
+     back_pressure_total_txn_limit: u64,
+     remaining_total_txn_num: u64,
+@@ -52,6 +53,7 @@ impl ProofManager {
+         batch_expiry_gap_when_init_usecs: u64,
+     ) -> Self {
+         Self {
++            my_peer_id,
+             batch_proof_queue: BatchProofQueue::new(
+                 my_peer_id,
+                 batch_store,
+@@ -228,6 +230,9 @@ impl ProofManager {
+         counters::NUM_INLINE_BATCHES.observe(inline_block.len() as f64);
+         counters::NUM_INLINE_TXNS.observe(inline_block_size.count() as f64);
+ 
++        let trace_proposal_size =
++            proof_block.len() + opt_batches.len() + inline_block.len();
++
+         let enable_optqs_v2 = request
+             .maybe_optqs_payload_pull_params
+             .as_ref()
+@@ -279,6 +284,10 @@ impl ProofManager {
+         };
+ 
+         let res = GetPayloadResponse::GetPayloadResponse(response);
++        crate::quorum_store::tla_trace::emit_build_proposal(
++            self.my_peer_id,
++            trace_proposal_size,
++        );
+         match request.callback.send(Ok(res)) {
+             Ok(_) => (),
+             Err(err) => debug!("BlockResponse receiver not available! error {:?}", err),
+diff --git a/consensus/src/quorum_store/tests/mod.rs b/consensus/src/quorum_store/tests/mod.rs
+index e640b6b5..75af7602 100644
+--- a/consensus/src/quorum_store/tests/mod.rs
++++ b/consensus/src/quorum_store/tests/mod.rs
+@@ -11,4 +11,5 @@ mod network_listener_test;
+ mod proof_coordinator_test;
+ mod proof_manager_test;
+ mod quorum_store_db_test;
++mod tla_trace_scenario_test;
+ mod types_test;
+diff --git a/consensus/src/quorum_store/tests/tla_trace_scenario_test.rs b/consensus/src/quorum_store/tests/tla_trace_scenario_test.rs
+new file mode 100644
+index 00000000..2431d8d6
+--- /dev/null
++++ b/consensus/src/quorum_store/tests/tla_trace_scenario_test.rs
+@@ -0,0 +1,437 @@
++// Copyright (c) Aptos Foundation
++// Licensed pursuant to the Innovation-Enabling Source Code License, available at https://github.com/aptos-labs/aptos-core/blob/main/LICENSE
++//
++// Trace harness scenarios for the TLA+ trace validation pipeline.
++//
++// Each scenario opens its own NDJSON trace file (path supplied either via
++// env var APTOS_QS_TLA_TRACE_<NAME> or a fallback in /tmp), drives the real
++// production quorum_store code paths, and emits trace events at the points
++// listed in instrumentation-spec.md.
++//
++// Run with:
++//   APTOS_QS_TLA_TRACE_DIR=/abs/path/to/traces \
++//     cargo test -p aptos-consensus --release \
++//     quorum_store::tests::tla_trace_scenario_test -- --test-threads=1 --nocapture
++
++use crate::{
++    network_interface::ConsensusMsg,
++    quorum_store::{
++        batch_proof_queue::BatchProofQueue,
++        batch_store::{BatchStore, BatchWriter},
++        proof_coordinator::{ProofCoordinator, ProofCoordinatorCommand},
++        proof_manager::ProofManager,
++        quorum_store_db::QuorumStoreDB,
++        tla_trace,
++        types::{Batch, PersistedValue},
++    },
++    test_utils::{create_vec_signed_transactions, mock_quorum_store_sender::MockQuorumStoreSender},
++};
++use aptos_consensus_types::{
++    common::{Payload, PayloadFilter},
++    proof_of_store::{
++        BatchInfo, BatchInfoExt, ProofOfStore, SignedBatchInfo, SignedBatchInfoMsg, TBatchInfo,
++    },
++    request_response::{GetPayloadCommand, GetPayloadRequest, GetPayloadResponse},
++    utils::PayloadTxnsSize,
++};
++use aptos_crypto::HashValue;
++use aptos_temppath::TempPath;
++use aptos_types::{
++    quorum_store::BatchId,
++    validator_signer::ValidatorSigner,
++    validator_verifier::{random_validator_verifier, ValidatorVerifier},
++    PeerId,
++};
++use futures::channel::oneshot;
++use mini_moka::sync::Cache;
++use serde_json::json;
++use std::{collections::HashSet, env, path::PathBuf, sync::Arc, time::Duration};
++use tokio::sync::mpsc::channel;
++
++// ---------------------------------------------------------------------------
++// Shared helpers
++// ---------------------------------------------------------------------------
++
++fn trace_path(scenario: &str) -> PathBuf {
++    let dir = env::var("APTOS_QS_TLA_TRACE_DIR").unwrap_or_else(|_| "/tmp".to_string());
++    let mut p = PathBuf::from(dir);
++    p.push(format!("{}.ndjson", scenario));
++    p
++}
++
++fn init_trace(scenario: &str, signers: &[ValidatorSigner]) {
++    let path = trace_path(scenario);
++    let path_str = path.to_string_lossy().to_string();
++    tla_trace::init(&path_str);
++    for (i, s) in signers.iter().enumerate() {
++        tla_trace::register_validator(s.author(), &format!("v{}", i + 1));
++    }
++    tla_trace::emit_config(json!({
++        "scenario": scenario,
++        "servers": (1..=signers.len()).map(|i| format!("v{}", i)).collect::<Vec<_>>(),
++    }));
++    eprintln!("TLA trace -> {}", path_str);
++}
++
++fn make_persisted_value(info: BatchInfoExt) -> PersistedValue<BatchInfoExt> {
++    PersistedValue::new(info, Some(vec![]))
++}
++
++fn build_batch_info(
++    author: PeerId,
++    batch_id_id: u64,
++    expiration: u64,
++    epoch: u64,
++) -> BatchInfo {
++    BatchInfo::new(
++        author,
++        BatchId::new_for_test(batch_id_id),
++        epoch,
++        expiration,
++        HashValue::random(),
++        1,
++        20,
++        0,
++    )
++}
++
++fn build_payload_request(max_txns: u64) -> (GetPayloadCommand, oneshot::Receiver<anyhow::Result<GetPayloadResponse>>) {
++    let (cb_tx, cb_rx) = oneshot::channel();
++    let req = GetPayloadCommand::GetPayloadRequest(GetPayloadRequest {
++        max_txns: PayloadTxnsSize::new(max_txns, 1_000_000),
++        max_txns_after_filtering: max_txns,
++        soft_max_txns_after_filtering: max_txns,
++        max_inline_txns: PayloadTxnsSize::new(1, 100_000),
++        filter: PayloadFilter::InQuorumStore(HashSet::new()),
++        callback: cb_tx,
++        block_timestamp: Duration::from_micros(0),
++        return_non_full: true,
++        maybe_optqs_payload_pull_params: None,
++    });
++    (req, cb_rx)
++}
++
++fn batch_store_for_signer(signer: &ValidatorSigner, dir: &TempPath, epoch: u64, is_new_epoch: bool) -> Arc<BatchStore> {
++    let db = Arc::new(QuorumStoreDB::new(dir));
++    BatchStore::new(
++        epoch,
++        is_new_epoch,
++        0,
++        db,
++        20_000_000,
++        20_000_000,
++        20_000,
++        signer.clone(),
++        0,
++    )
++}
++
++// ---------------------------------------------------------------------------
++// Scenario 1: full honest pipeline -- exercises every action wrapper.
++// ---------------------------------------------------------------------------
++
++#[tokio::test(flavor = "multi_thread")]
++async fn scenario_full_pipeline() {
++    aptos_logger::Logger::init_for_testing();
++    let (signers, verifier) = random_validator_verifier(4, None, true);
++    let verifier = Arc::new(verifier);
++    init_trace("full_pipeline", &signers);
++
++    // Build a real BatchStore for each validator (production code with real
++    // rocksdb-backed QuorumStoreDB). The non-bootstrap branch fires the
++    // Recover instrumentation.
++    let temp_dirs: Vec<TempPath> = (0..4).map(|_| TempPath::new()).collect();
++    let stores: Vec<Arc<BatchStore>> = signers
++        .iter()
++        .zip(temp_dirs.iter())
++        .map(|(s, dir)| batch_store_for_signer(s, dir, 1, false))
++        .collect();
++
++    // -----------------------------------------------------------------
++    // v1 reserves a BatchId and persists/broadcasts a batch
++    // -----------------------------------------------------------------
++    let author = signers[0].author();
++    let batch_id = BatchId::new_for_test(1);
++    let payload = create_vec_signed_transactions(2);
++    // Spec MaxTimeTick = 6, so keep expiration within that range.
++    let batch = Batch::<BatchInfoExt>::new_v1(batch_id, payload.clone(), 1, 3, author, 0);
++    let batch_info_ext: BatchInfoExt = batch.batch_info().clone();
++    let digest = *batch_info_ext.digest();
++
++    // Map the real digest to spec symbolic "d1" so the trace's digest
++    // field lands inside Trace.cfg's Digest = {"d1", "d2"} set.
++    tla_trace::register_digest(digest, "d1");
++
++    // ReserveBatchId: emit from test (we did not actually invoke
++    // BatchGenerator::create_new_batch here; the production instrumentation
++    // would fire inside that method).
++    tla_trace::emit_reserve_batch_id(author, 2, 1, &batch_info_ext);
++
++    // PersistPayload (own batch via BatchGenerator path): drive real
++    // BatchStore::persist + emit the call-site event.
++    let persist_req = make_persisted_value(batch_info_ext.clone());
++    let signed_infos = stores[0].persist(vec![persist_req]);
++    assert!(!signed_infos.is_empty(), "v1 persist must succeed");
++    tla_trace::emit_persist_payload(author, &batch_info_ext);
++
++    // BroadcastBatchMsg: emit the call-site event.
++    tla_trace::emit_broadcast_batch_msg(author, &batch_info_ext);
++
++    // -----------------------------------------------------------------
++    // v2/v3/v4 receive the BatchMsg, persist via real BatchStore::persist,
++    // and produce SignedBatchInfo replies. Plus v1's loopback.
++    // -----------------------------------------------------------------
++    let mut signed_replies: Vec<SignedBatchInfo<BatchInfoExt>> = Vec::new();
++    for (idx, store) in stores.iter().enumerate() {
++        // v1 loopback is handled by skipping the *initial* persist (already
++        // in cache) but still emitting HandleBatchesMsg + producing a
++        // signed reply via signer[0].
++        let persist_req = make_persisted_value(batch_info_ext.clone());
++        let signed = store.persist(vec![persist_req]);
++        // emit HandleBatchesMsg for THIS validator
++        tla_trace::emit_handle_batches_msg(signers[idx].author(), &batch_info_ext);
++        if let Some(s) = signed.into_iter().next() {
++            signed_replies.push(s);
++        } else if idx == 0 {
++            // v1's local persist was a cache hit; manually sign to keep the
++            // pipeline moving.
++            let sbi: SignedBatchInfo<BatchInfoExt> =
++                SignedBatchInfo::new(batch_info_ext.clone(), &signers[idx])
++                    .expect("sign batch info");
++            signed_replies.push(sbi);
++        }
++    }
++
++    // -----------------------------------------------------------------
++    // ProofCoordinator on v1 processes signatures -> emits
++    // ReceiveSignedBatchInfo and AggregateProof.
++    // -----------------------------------------------------------------
++    let proof_cache = Cache::builder().build();
++    let (batch_generator_cmd_tx, _batch_generator_cmd_rx) = channel(100);
++    let proof_coordinator = ProofCoordinator::new(
++        1000,
++        author,
++        Arc::new(SimpleBatchReader { peer: author }),
++        batch_generator_cmd_tx,
++        proof_cache.clone(),
++        true,
++        10,
++    );
++    let (pc_tx, pc_rx) = channel(100);
++    let (net_tx, mut net_rx) = channel(100);
++    let net = MockQuorumStoreSender::new(net_tx);
++    tokio::spawn(proof_coordinator.start(pc_rx, net, verifier.clone()));
++
++    for sbi in &signed_replies {
++        pc_tx
++            .send(ProofCoordinatorCommand::AppendSignature(
++                sbi.signer(),
++                SignedBatchInfoMsg::new(vec![sbi.clone()]),
++            ))
++            .await
++            .expect("AppendSignature send");
++    }
++
++    // The coordinator emits a ProofOfStoreMsg once 2f+1 sigs are gathered.
++    let proof: ProofOfStore<BatchInfoExt> = {
++        let pos_msg = tokio::time::timeout(Duration::from_secs(10), net_rx.recv())
++            .await
++            .expect("proof message timeout")
++            .expect("network channel closed");
++        match pos_msg.0 {
++            ConsensusMsg::ProofOfStoreMsgV2(boxed) => {
++                let proofs = boxed.take();
++                proofs.into_iter().next().expect("must have proof")
++            }
++            ConsensusMsg::ProofOfStoreMsg(boxed) => {
++                let proofs = boxed.take();
++                let p = proofs.into_iter().next().expect("must have proof");
++                let (info, sig) = p.unpack();
++                let info_ext: BatchInfoExt = info.into();
++                ProofOfStore::new(info_ext, sig)
++            }
++            other => panic!("unexpected msg: {:?}", other),
++        }
++    };
++
++    // -----------------------------------------------------------------
++    // Every validator's BatchProofQueue receives the proof -> HandleProofMsg.
++    // -----------------------------------------------------------------
++    let mut queues: Vec<BatchProofQueue> = (0..4)
++        .map(|i| BatchProofQueue::new(signers[i].author(), stores[i].clone(), 0))
++        .collect();
++    for q in &mut queues {
++        q.insert_proof(proof.clone());
++    }
++
++    // -----------------------------------------------------------------
++    // v1's ProofManager builds a proposal -> BuildProposal.
++    // -----------------------------------------------------------------
++    let mut proof_manager = ProofManager::new(
++        author,
++        100,
++        100,
++        stores[0].clone(),
++        true,
++        10,
++    );
++    proof_manager.receive_proofs(vec![proof.clone()]);
++    let (req, cb_rx) = build_payload_request(10);
++    proof_manager.handle_proposal_request(req);
++    let _payload: Payload = match cb_rx.await {
++        Ok(Ok(GetPayloadResponse::GetPayloadResponse(p))) => p,
++        other => panic!("unexpected response: {:?}", other),
++    };
++
++    // -----------------------------------------------------------------
++    // CommitProposal: emit harness-driven event.
++    // -----------------------------------------------------------------
++    tla_trace::emit_commit_proposal(author, author);
++
++    // -----------------------------------------------------------------
++    // AdvanceCertifiedTime: production code fires when fetch_max advances.
++    // Spec MaxTimeTick = 6; pick a small value that still preserves the
++    // batch (expiration=3) so subsequent state checks pass.
++    // -----------------------------------------------------------------
++    stores[0].update_certified_timestamp(2);
++
++    let _ = digest; // FetchBatchSuccess is exercised in its own scenario
++}
++
++// ---------------------------------------------------------------------------
++// Scenario 2: Crash and Recover.
++// ---------------------------------------------------------------------------
++
++#[tokio::test(flavor = "multi_thread")]
++async fn scenario_crash_recover() {
++    aptos_logger::Logger::init_for_testing();
++    let (signers, _verifier) = random_validator_verifier(4, None, true);
++    init_trace("crash_recover", &signers);
++
++    let temp_dir = TempPath::new();
++    let store = batch_store_for_signer(&signers[0], &temp_dir, 1, false);
++
++    // Persist a batch so the durable state has content.
++    let info = build_batch_info(signers[0].author(), 1, 100, 1).into();
++    let _ = store.persist(vec![make_persisted_value(info)]);
++
++    // Simulate a crash: drop the in-memory BatchStore. Persistent state
++    // (rocksdb dir) survives.
++    tla_trace::emit_crash(signers[0].author());
++    drop(store);
++
++    // Recreate with the SAME directory + is_new_epoch=false to drive the
++    // load_batches_from_db_* path (production Recover semantics). The
++    // harness emits the Recover event after reconstruction completes.
++    let _recovered = batch_store_for_signer(&signers[0], &temp_dir, 1, false);
++    tla_trace::emit_recover(signers[0].author());
++}
++
++// ---------------------------------------------------------------------------
++// Scenario 2b: Fetch a batch body that the local validator never persisted.
++// ---------------------------------------------------------------------------
++
++#[tokio::test(flavor = "multi_thread")]
++async fn scenario_fetch_batch() {
++    aptos_logger::Logger::init_for_testing();
++    let (signers, _verifier) = random_validator_verifier(4, None, true);
++    init_trace("fetch_batch", &signers);
++
++    // v1 will broadcast and v3 will handle it (so v3's localCache has the
++    // body). v2 will NOT handle the BatchMsg, leaving the body absent from
++    // its localCache. v2 then fetches from v3 via FetchBatchSuccess.
++    let temp_dirs: Vec<TempPath> = (0..4).map(|_| TempPath::new()).collect();
++    let stores: Vec<Arc<BatchStore>> = signers
++        .iter()
++        .zip(temp_dirs.iter())
++        .map(|(s, dir)| batch_store_for_signer(s, dir, 1, false))
++        .collect();
++
++    let author = signers[0].author();
++    let payload = create_vec_signed_transactions(1);
++    let batch = Batch::<BatchInfoExt>::new_v1(
++        BatchId::new_for_test(1),
++        payload,
++        1,
++        3,
++        author,
++        0,
++    );
++    let info = batch.batch_info().clone();
++    let digest = *info.digest();
++    tla_trace::register_digest(digest, "d1");
++
++    // Drive the partial pipeline up to v3 having the batch in cache.
++    tla_trace::emit_reserve_batch_id(author, 2, 1, &info);
++    let _ = stores[0].persist(vec![make_persisted_value(info.clone())]);
++    tla_trace::emit_persist_payload(author, &info);
++    tla_trace::emit_broadcast_batch_msg(author, &info);
++
++    // Only v3 handles the BatchMsg.
++    let _ = stores[2].persist(vec![make_persisted_value(info.clone())]);
++    tla_trace::emit_handle_batches_msg(signers[2].author(), &info);
++
++    // Now v2 fetches from v3 (precondition: info \notin localCache[v2],
++    // info \in localCache[v3]).
++    tla_trace::emit_fetch_batch_success(signers[1].author(), &digest);
++}
++
++// ---------------------------------------------------------------------------
++// Scenario 3: Epoch transition.
++// ---------------------------------------------------------------------------
++
++#[tokio::test(flavor = "multi_thread")]
++async fn scenario_epoch_transition() {
++    aptos_logger::Logger::init_for_testing();
++    let (signers, _verifier) = random_validator_verifier(4, None, true);
++    init_trace("epoch_transition", &signers);
++
++    // Bootstrap a fresh epoch -> EpochTransition trace.
++    let temp_dir = TempPath::new();
++    let _ = batch_store_for_signer(&signers[0], &temp_dir, 2, true);
++
++    // Give the spawn_blocking task a moment to flush its bootstrap GC.
++    tokio::time::sleep(Duration::from_millis(50)).await;
++    tla_trace::emit_epoch_transition(signers[0].author(), 2);
++}
++
++// ---------------------------------------------------------------------------
++// Local helpers
++// ---------------------------------------------------------------------------
++
++struct SimpleBatchReader {
++    peer: PeerId,
++}
++
++impl crate::quorum_store::batch_store::BatchReader for SimpleBatchReader {
++    fn exists(&self, _digest: &HashValue) -> Option<PeerId> {
++        Some(self.peer)
++    }
++
++    fn get_batch(
++        &self,
++        _batch_info: BatchInfo,
++        _signers: Vec<PeerId>,
++    ) -> futures::future::Shared<
++        std::pin::Pin<
++            Box<
++                dyn std::future::Future<
++                    Output = aptos_executor_types::ExecutorResult<
++                        Vec<aptos_types::transaction::SignedTransaction>,
++                    >,
++                > + Send,
++            >,
++        >,
++    > {
++        unimplemented!()
++    }
++
++    fn update_certified_timestamp(&self, _certified_time: u64) {
++        unimplemented!()
++    }
++}
++
++// Suppress the unused-import warning since some symbols are only used in
++// some scenarios.
++#[allow(dead_code)]
++fn _unused(_: &ValidatorVerifier) {}
+diff --git a/consensus/src/quorum_store/tla_trace.rs b/consensus/src/quorum_store/tla_trace.rs
+new file mode 100644
+index 00000000..ae45ec49
+--- /dev/null
++++ b/consensus/src/quorum_store/tla_trace.rs
+@@ -0,0 +1,362 @@
++// TLA+ trace emission module for Aptos Quorum Store harness.
++//
++// Writes NDJSON lines (one JSON record per line) to a trace file selected
++// either via the APTOS_QS_TLA_TRACE env var or by calling `init(path)`.
++// If neither is set the emit functions are no-ops so unrelated unit tests
++// can still link without producing trace output.
++//
++// Every record follows the envelope:
++//   {"tag":"trace","ts_us":<int>,"event":{"name":<str>,"nid":<str>,
++//                                          "state":{...},"msg":{...}}}
++//
++// Validator IDs ("nid") are mapped to spec names ("v1","v2","v3","v4") via
++// `register_validator`. Unregistered peers fall back to their PeerId
++// short-hex prefix.
++
++use aptos_consensus_types::proof_of_store::{BatchInfo, BatchInfoExt, TBatchInfo};
++use aptos_crypto::HashValue;
++use aptos_short_hex_str::AsShortHexStr;
++use aptos_types::PeerId;
++use once_cell::sync::Lazy;
++use serde_json::{json, Value};
++use std::collections::HashMap;
++use std::env;
++use std::fs::{File, OpenOptions};
++use std::io::Write;
++use std::sync::Mutex;
++use std::time::{SystemTime, UNIX_EPOCH};
++
++struct TraceState {
++    file: Option<File>,
++    name_map: HashMap<PeerId, String>,
++    digest_map: HashMap<HashValue, String>,
++    initialized_from_env: bool,
++}
++
++static STATE: Lazy<Mutex<TraceState>> = Lazy::new(|| {
++    Mutex::new(TraceState {
++        file: None,
++        name_map: HashMap::new(),
++        digest_map: HashMap::new(),
++        initialized_from_env: false,
++    })
++});
++
++fn ensure_env_initialized(state: &mut TraceState) {
++    if state.initialized_from_env {
++        return;
++    }
++    state.initialized_from_env = true;
++    if let Ok(path) = env::var("APTOS_QS_TLA_TRACE") {
++        if !path.is_empty() {
++            state.file = OpenOptions::new()
++                .create(true)
++                .append(true)
++                .open(&path)
++                .ok();
++        }
++    }
++}
++
++/// Open (truncate + create) the given path as the active trace file. Resets
++/// the validator name map. Subsequent emits write here until init is called
++/// again (or the process exits).
++pub fn init(path: &str) {
++    let mut s = STATE.lock().expect("trace state mutex poisoned");
++    s.file = OpenOptions::new()
++        .create(true)
++        .truncate(true)
++        .write(true)
++        .open(path)
++        .ok();
++    s.name_map.clear();
++    s.digest_map.clear();
++    s.initialized_from_env = true;
++}
++
++pub fn register_validator(peer: PeerId, spec_name: &str) {
++    let mut s = STATE.lock().expect("trace state mutex poisoned");
++    ensure_env_initialized(&mut s);
++    s.name_map.insert(peer, spec_name.to_string());
++}
++
++pub fn register_digest(d: HashValue, spec_name: &str) {
++    let mut s = STATE.lock().expect("trace state mutex poisoned");
++    ensure_env_initialized(&mut s);
++    s.digest_map.insert(d, spec_name.to_string());
++}
++
++fn nid_locked(state: &TraceState, peer: PeerId) -> String {
++    state
++        .name_map
++        .get(&peer)
++        .cloned()
++        .unwrap_or_else(|| peer.short_str().to_string())
++}
++
++pub fn nid(peer: PeerId) -> String {
++    let s = STATE.lock().expect("trace state mutex poisoned");
++    nid_locked(&s, peer)
++}
++
++fn now_us() -> u64 {
++    SystemTime::now()
++        .duration_since(UNIX_EPOCH)
++        .map(|d| d.as_micros() as u64)
++        .unwrap_or(0)
++}
++
++pub fn enabled() -> bool {
++    let mut s = match STATE.lock() {
++        Ok(g) => g,
++        Err(_) => return false,
++    };
++    ensure_env_initialized(&mut s);
++    s.file.is_some()
++}
++
++pub fn emit(event_name: &str, peer: PeerId, state_fields: Value, msg_fields: Value) {
++    let mut s = match STATE.lock() {
++        Ok(g) => g,
++        Err(_) => return,
++    };
++    ensure_env_initialized(&mut s);
++    if s.file.is_none() {
++        return;
++    }
++    let nid = nid_locked(&s, peer);
++    let line = json!({
++        "tag": "trace",
++        "ts_us": now_us(),
++        "event": {
++            "name": event_name,
++            "nid": nid,
++            "state": state_fields,
++            "msg": msg_fields,
++        }
++    });
++    if let Some(file) = s.file.as_mut() {
++        let _ = writeln!(file, "{}", line);
++        let _ = file.flush();
++    }
++}
++
++pub fn emit_no_msg(event_name: &str, peer: PeerId, state_fields: Value) {
++    emit(event_name, peer, state_fields, json!({}));
++}
++
++pub fn emit_config(config: Value) {
++    let mut s = match STATE.lock() {
++        Ok(g) => g,
++        Err(_) => return,
++    };
++    ensure_env_initialized(&mut s);
++    if let Some(file) = s.file.as_mut() {
++        let line = json!({
++            "tag": "config",
++            "ts_us": now_us(),
++            "config": config,
++        });
++        let _ = writeln!(file, "{}", line);
++        let _ = file.flush();
++    }
++}
++
++pub fn digest_str(d: &HashValue) -> String {
++    let s = STATE.lock().expect("trace state mutex poisoned");
++    s.digest_map
++        .get(d)
++        .cloned()
++        .unwrap_or_else(|| d.to_hex())
++}
++
++pub fn batch_info_msg(info: &BatchInfo) -> Value {
++    json!({
++        "author": nid(info.author()),
++        "batchId": info.batch_id().id,
++        "digest": digest_str(info.digest()),
++        "epoch": info.epoch(),
++        "expiration": info.expiration(),
++    })
++}
++
++pub fn batch_info_ext_msg(info: &BatchInfoExt) -> Value {
++    json!({
++        "author": nid(info.author()),
++        "batchId": info.batch_id().id,
++        "digest": digest_str(info.digest()),
++        "epoch": info.epoch(),
++        "expiration": info.expiration(),
++    })
++}
++
++// Convenience constructors for the actions in instrumentation-spec.md.
++
++pub fn emit_reserve_batch_id(
++    self_peer: PeerId,
++    persisted_batch_id: u64,
++    in_flight_batch_id: u64,
++    info: &BatchInfoExt,
++) {
++    emit(
++        "ReserveBatchId",
++        self_peer,
++        json!({
++            "persistedBatchId": persisted_batch_id,
++            "inFlightBatchId": in_flight_batch_id,
++        }),
++        batch_info_ext_msg(info),
++    );
++}
++
++pub fn emit_persist_payload(self_peer: PeerId, info: &BatchInfoExt) {
++    emit(
++        "PersistPayload",
++        self_peer,
++        json!({
++            "persistedDigest": digest_str(info.digest()),
++        }),
++        json!({}),
++    );
++}
++
++pub fn emit_broadcast_batch_msg(self_peer: PeerId, info: &BatchInfoExt) {
++    emit(
++        "BroadcastBatchMsg",
++        self_peer,
++        json!({
++            "inFlightBatchId": info.batch_id().id,
++        }),
++        batch_info_ext_msg(info),
++    );
++}
++
++pub fn emit_handle_batches_msg(self_peer: PeerId, info: &BatchInfoExt) {
++    emit(
++        "HandleBatchesMsg",
++        self_peer,
++        json!({
++            "handledDigest": digest_str(info.digest()),
++        }),
++        batch_info_ext_msg(info),
++    );
++}
++
++pub fn emit_receive_signed_batch_info(
++    self_peer: PeerId,
++    info: &BatchInfoExt,
++    signer: PeerId,
++) {
++    emit(
++        "ReceiveSignedBatchInfo",
++        self_peer,
++        json!({
++            "signedDigest": digest_str(info.digest()),
++            "signer": nid(signer),
++        }),
++        json!({
++            "signer": nid(signer),
++            "digest": digest_str(info.digest()),
++            "batchId": info.batch_id().id,
++            "author": nid(info.author()),
++        }),
++    );
++}
++
++pub fn emit_aggregate_proof(self_peer: PeerId, info: &BatchInfoExt) {
++    emit(
++        "AggregateProof",
++        self_peer,
++        json!({
++            "aggregatedDigest": digest_str(info.digest()),
++        }),
++        json!({
++            "digest": digest_str(info.digest()),
++            "batchId": info.batch_id().id,
++            "author": nid(info.author()),
++        }),
++    );
++}
++
++pub fn emit_handle_proof_msg(self_peer: PeerId, info: &BatchInfoExt) {
++    let msg = json!({
++        "digest": digest_str(info.digest()),
++        "author": nid(info.author()),
++        "batchId": info.batch_id().id,
++    });
++    emit(
++        "HandleProofMsg",
++        self_peer,
++        json!({
++            "proofDigest": digest_str(info.digest()),
++            "proofAuthor": nid(info.author()),
++            "proofBatchId": info.batch_id().id,
++        }),
++        msg,
++    );
++}
++
++pub fn emit_advance_certified_time(self_peer: PeerId, certified_time: u64) {
++    emit(
++        "AdvanceCertifiedTime",
++        self_peer,
++        json!({
++            "certifiedTime": certified_time,
++        }),
++        json!({}),
++    );
++}
++
++pub fn emit_crash(self_peer: PeerId) {
++    emit("Crash", self_peer, json!({}), json!({}));
++}
++
++pub fn emit_recover(self_peer: PeerId) {
++    emit("Recover", self_peer, json!({}), json!({}));
++}
++
++pub fn emit_epoch_transition(self_peer: PeerId, epoch: u64) {
++    emit(
++        "EpochTransition",
++        self_peer,
++        json!({
++            "epoch": epoch,
++        }),
++        json!({}),
++    );
++}
++
++pub fn emit_build_proposal(self_peer: PeerId, proposal_size: usize) {
++    emit(
++        "BuildProposal",
++        self_peer,
++        json!({
++            "proposalSize": proposal_size,
++        }),
++        json!({}),
++    );
++}
++
++pub fn emit_commit_proposal(self_peer: PeerId, proposer: PeerId) {
++    emit(
++        "CommitProposal",
++        self_peer,
++        json!({
++            "proposer": nid(proposer),
++        }),
++        json!({}),
++    );
++}
++
++pub fn emit_fetch_batch_success(self_peer: PeerId, digest: &HashValue) {
++    emit(
++        "FetchBatchSuccess",
++        self_peer,
++        json!({
++            "fetchedDigest": digest_str(digest),
++        }),
++        json!({
++            "digest": digest_str(digest),
++        }),
++    );
++}

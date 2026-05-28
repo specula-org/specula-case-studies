@@ -1,0 +1,553 @@
+diff --git a/libgomp/config/linux/bar.c b/libgomp/config/linux/bar.c
+index bbdfc896391..b1746a1ad11 100644
+--- a/libgomp/config/linux/bar.c
++++ b/libgomp/config/linux/bar.c
+@@ -29,6 +29,7 @@
+ 
+ #include <limits.h>
+ #include "wait.h"
++#include "tla_trace.h"
+ 
+ 
+ void
+@@ -90,8 +91,12 @@ gomp_team_barrier_wait_end (gomp_barrier_t *bar, gomp_barrier_state_t state)
+ 
+       bar->awaited = bar->total;
+       team->work_share_cancelled = 0;
++      uint64_t _tla_s = tla_rdtsc ();
+       unsigned task_count
+ 	= __atomic_load_n (&team->task_count, MEMMODEL_ACQUIRE);
++      uint64_t _tla_e = tla_rdtsc ();
++      tla_emit_BarrierLastReadTaskCount (_tla_s, _tla_e, task_count,
++					 task_count ? "task" : "publish");
+       if (__builtin_expect (task_count, 0))
+ 	{
+ 	  gomp_barrier_handle_tasks (state);
+@@ -101,7 +106,10 @@ gomp_team_barrier_wait_end (gomp_barrier_t *bar, gomp_barrier_state_t state)
+ 	{
+ 	  state &= ~BAR_CANCELLED;
+ 	  state += BAR_INCR - BAR_WAS_LAST;
++	  uint64_t _tla_ps = tla_rdtsc ();
+ 	  __atomic_store_n (&bar->generation, state, MEMMODEL_RELEASE);
++	  uint64_t _tla_pe = tla_rdtsc ();
++	  tla_emit_BarrierPublishNoTask (_tla_ps, _tla_pe, state);
+ 	  futex_wake ((int *) &bar->generation, INT_MAX);
+ 	  return;
+ 	}
+@@ -112,12 +120,19 @@ gomp_team_barrier_wait_end (gomp_barrier_t *bar, gomp_barrier_state_t state)
+   do
+     {
+       do_wait ((int *) &bar->generation, generation);
++      uint64_t _tla_ls = tla_rdtsc ();
+       gen = __atomic_load_n (&bar->generation, MEMMODEL_ACQUIRE);
++      uint64_t _tla_le = tla_rdtsc ();
+       if (__builtin_expect (gen & BAR_TASK_PENDING, 0))
+ 	{
++	  tla_emit_BarrierWaitLoopAck (_tla_ls, _tla_le, gen, "handle_tasks");
+ 	  gomp_barrier_handle_tasks (state);
+ 	  gen = __atomic_load_n (&bar->generation, MEMMODEL_ACQUIRE);
+ 	}
++      else if (gomp_barrier_state_is_incremented (gen, state))
++	tla_emit_BarrierWaitLoopAck (_tla_ls, _tla_le, gen, "idle");
++      /* "stay" branch (spurious EAGAIN, gen unchanged) is silent per
++	 instrumentation-spec.md.  */
+       generation |= gen & BAR_WAITING_FOR_TASK;
+     }
+   while (!gomp_barrier_state_is_incremented (gen, state));
+@@ -126,13 +141,39 @@ gomp_team_barrier_wait_end (gomp_barrier_t *bar, gomp_barrier_state_t state)
+ void
+ gomp_team_barrier_wait (gomp_barrier_t *bar)
+ {
+-  gomp_team_barrier_wait_end (bar, gomp_barrier_wait_start (bar));
++  /* Ensure this team thread has its trace file open.  */
++  {
++    struct gomp_thread *_thr = gomp_thread ();
++    if (_thr && _thr->ts.team && !tla_tls.initialized)
++      tla_trace_team_thread_open (_thr->ts.team_id);
++  }
++  uint64_t _tla_s = tla_rdtsc ();
++  gomp_barrier_state_t _state = gomp_barrier_wait_start (bar);
++  uint64_t _tla_e = tla_rdtsc ();
++  unsigned int _awaited
++    = __atomic_load_n (&bar->awaited, MEMMODEL_ACQUIRE);
++  unsigned int _gen_raw
++    = __atomic_load_n (&bar->generation, MEMMODEL_ACQUIRE);
++  tla_emit_BarrierWaitStart (_tla_s, _tla_e, _gen_raw, _awaited,
++			     (_state & BAR_WAS_LAST) ? 1 : 0);
++  gomp_team_barrier_wait_end (bar, _state);
+ }
+ 
+ void
+ gomp_team_barrier_wait_final (gomp_barrier_t *bar)
+ {
++  {
++    struct gomp_thread *_thr = gomp_thread ();
++    if (_thr && _thr->ts.team && !tla_tls.initialized)
++      tla_trace_team_thread_open (_thr->ts.team_id);
++  }
++  uint64_t _tla_s = tla_rdtsc ();
+   gomp_barrier_state_t state = gomp_barrier_wait_final_start (bar);
++  uint64_t _tla_e = tla_rdtsc ();
++  unsigned int _awaited = __atomic_load_n (&bar->awaited_final, MEMMODEL_ACQUIRE);
++  unsigned int _gen_raw = __atomic_load_n (&bar->generation, MEMMODEL_ACQUIRE);
++  tla_emit_BarrierWaitStart (_tla_s, _tla_e, _gen_raw, _awaited,
++			     (state & BAR_WAS_LAST) ? 1 : 0);
+   if (__builtin_expect (state & BAR_WAS_LAST, 0))
+     bar->awaited_final = bar->total;
+   gomp_team_barrier_wait_end (bar, state);
+@@ -156,8 +197,12 @@ gomp_team_barrier_wait_cancel_end (gomp_barrier_t *bar,
+ 
+       bar->awaited = bar->total;
+       team->work_share_cancelled = 0;
++      uint64_t _tla_s = tla_rdtsc ();
+       unsigned task_count
+ 	= __atomic_load_n (&team->task_count, MEMMODEL_ACQUIRE);
++      uint64_t _tla_e = tla_rdtsc ();
++      tla_emit_BarrierLastReadTaskCount (_tla_s, _tla_e, task_count,
++					 task_count ? "task" : "publish");
+       if (__builtin_expect (task_count, 0))
+ 	{
+ 	  gomp_barrier_handle_tasks (state);
+@@ -166,7 +211,10 @@ gomp_team_barrier_wait_cancel_end (gomp_barrier_t *bar,
+       else
+ 	{
+ 	  state += BAR_INCR - BAR_WAS_LAST;
++	  uint64_t _tla_ps = tla_rdtsc ();
+ 	  __atomic_store_n (&bar->generation, state, MEMMODEL_RELEASE);
++	  uint64_t _tla_pe = tla_rdtsc ();
++	  tla_emit_BarrierPublishCancellableNoTask (_tla_ps, _tla_pe, state);
+ 	  futex_wake ((int *) &bar->generation, INT_MAX);
+ 	  return false;
+ 	}
+@@ -179,14 +227,22 @@ gomp_team_barrier_wait_cancel_end (gomp_barrier_t *bar,
+   do
+     {
+       do_wait ((int *) &bar->generation, generation);
++      uint64_t _tla_ls = tla_rdtsc ();
+       gen = __atomic_load_n (&bar->generation, MEMMODEL_ACQUIRE);
++      uint64_t _tla_le = tla_rdtsc ();
+       if (__builtin_expect (gen & BAR_CANCELLED, 0))
+-	return true;
++	{
++	  tla_emit_BarrierWaitLoopAck (_tla_ls, _tla_le, gen, "idle");
++	  return true;
++	}
+       if (__builtin_expect (gen & BAR_TASK_PENDING, 0))
+ 	{
++	  tla_emit_BarrierWaitLoopAck (_tla_ls, _tla_le, gen, "handle_tasks");
+ 	  gomp_barrier_handle_tasks (state);
+ 	  gen = __atomic_load_n (&bar->generation, MEMMODEL_ACQUIRE);
+ 	}
++      else if (gomp_barrier_state_is_incremented (gen, state))
++	tla_emit_BarrierWaitLoopAck (_tla_ls, _tla_le, gen, "idle");
+       generation |= gen & BAR_WAITING_FOR_TASK;
+     }
+   while (!gomp_barrier_state_is_incremented (gen, state));
+@@ -197,19 +253,57 @@ gomp_team_barrier_wait_cancel_end (gomp_barrier_t *bar,
+ bool
+ gomp_team_barrier_wait_cancel (gomp_barrier_t *bar)
+ {
+-  return gomp_team_barrier_wait_cancel_end (bar, gomp_barrier_wait_start (bar));
++  {
++    struct gomp_thread *_thr = gomp_thread ();
++    if (_thr && _thr->ts.team && !tla_tls.initialized)
++      tla_trace_team_thread_open (_thr->ts.team_id);
++  }
++  uint64_t _tla_s = tla_rdtsc ();
++  gomp_barrier_state_t _state = gomp_barrier_wait_start (bar);
++  uint64_t _tla_e = tla_rdtsc ();
++  unsigned int _awaited
++    = __atomic_load_n (&bar->awaited, MEMMODEL_ACQUIRE);
++  unsigned int _gen_raw
++    = __atomic_load_n (&bar->generation, MEMMODEL_ACQUIRE);
++  tla_emit_BarrierWaitCancelStart (_tla_s, _tla_e, _gen_raw, _awaited,
++				   (_state & BAR_WAS_LAST) ? 1 : 0);
++  return gomp_team_barrier_wait_cancel_end (bar, _state);
+ }
+ 
+ void
+ gomp_team_barrier_cancel (struct gomp_team *team)
+ {
++  {
++    struct gomp_thread *_thr = gomp_thread ();
++    if (_thr && _thr->ts.team && !tla_tls.initialized)
++      tla_trace_team_thread_open (_thr->ts.team_id);
++  }
++  uint64_t _tla_ls = tla_rdtsc ();
+   gomp_mutex_lock (&team->task_lock);
+-  if (team->barrier.generation & BAR_CANCELLED)
++  uint64_t _tla_le = tla_rdtsc ();
++  tla_emit_CancelLockAcquire (_tla_ls, _tla_le);
++
++  uint64_t _tla_lds = tla_rdtsc ();
++  unsigned int _tla_loaded = team->barrier.generation;
++  uint64_t _tla_lde = tla_rdtsc ();
++  tla_emit_CancelLoadGen (_tla_lds, _tla_lde, _tla_loaded);
++
++  if (_tla_loaded & BAR_CANCELLED)
+     {
+       gomp_mutex_unlock (&team->task_lock);
++      tla_emit_CancelStoreGen (_tla_lde, _tla_lde, _tla_loaded, 1);
++      tla_emit_CancelUnlockAndWake (_tla_lde, tla_rdtsc ());
+       return;
+     }
+-  team->barrier.generation |= BAR_CANCELLED;
++  uint64_t _tla_ss = tla_rdtsc ();
++  unsigned int _tla_new = _tla_loaded | BAR_CANCELLED;
++  team->barrier.generation = _tla_new;
++  uint64_t _tla_se = tla_rdtsc ();
++  tla_emit_CancelStoreGen (_tla_ss, _tla_se, _tla_new, 0);
++
++  uint64_t _tla_us = tla_rdtsc ();
+   gomp_mutex_unlock (&team->task_lock);
+   futex_wake ((int *) &team->barrier.generation, INT_MAX);
++  uint64_t _tla_ue = tla_rdtsc ();
++  tla_emit_CancelUnlockAndWake (_tla_us, _tla_ue);
+ }
+diff --git a/libgomp/libgomp.h b/libgomp/libgomp.h
+index 42f32439295..a580312d3a4 100644
+--- a/libgomp/libgomp.h
++++ b/libgomp/libgomp.h
+@@ -857,6 +857,11 @@ struct gomp_team
+   /* Number of tasks waiting for their completion event to be fulfilled.  */
+   unsigned int task_detach_count;
+ 
++  /* TLA+ trace shadow: monotonic region id, incremented on every
++     gomp_new_team call (fresh or cached reuse).  Used to label trace
++     events with the team-region (Family 4).  */
++  unsigned int trace_region_id;
++
+   /* This array contains structures for implicit tasks.  */
+   struct gomp_task implicit_task[];
+ };
+diff --git a/libgomp/parallel.c b/libgomp/parallel.c
+index 754745227e0..228663c3968 100644
+--- a/libgomp/parallel.c
++++ b/libgomp/parallel.c
+@@ -27,6 +27,7 @@
+ 
+ #include "libgomp.h"
+ #include <limits.h>
++#include "tla_trace.h"
+ 
+ 
+ /* Determine the number of threads to be launched for a PARALLEL construct.
+@@ -266,7 +267,15 @@ GOMP_cancel (int which, bool do_cancel)
+ 	}
+       return true;
+     }
++  uint64_t _tla_cr_s = tla_rdtsc ();
+   team->team_cancelled = 1;
++  uint64_t _tla_cr_e = tla_rdtsc ();
++  {
++    struct gomp_thread *_thr = gomp_thread ();
++    if (_thr && _thr->ts.team && !tla_tls.initialized)
++      tla_trace_team_thread_open (_thr->ts.team_id);
++  }
++  tla_emit_CancelRequest (_tla_cr_s, _tla_cr_e);
+   gomp_team_barrier_cancel (team);
+   return true;
+ }
+diff --git a/libgomp/task.c b/libgomp/task.c
+index cbba28516e3..c401c8ff9a8 100644
+--- a/libgomp/task.c
++++ b/libgomp/task.c
+@@ -31,6 +31,8 @@
+ #include <string.h>
+ #include <assert.h>
+ #include "gomp-constants.h"
++#define TLA_TRACE_IMPL
++#include "tla_trace.h"
+ 
+ typedef struct gomp_task_depend_entry *hash_entry_type;
+ 
+@@ -724,12 +726,21 @@ GOMP_task (void (*fn) (void *), void *data, void (*cpyfn) (void *, void *),
+ 			     /*adjust_parent_depends_on=*/false,
+ 			     task->parent_depends_on);
+ 
++      uint64_t _tla_eq_s = tla_rdtsc ();
+       ++team->task_count;
+       ++team->task_queued_count;
+       gomp_team_barrier_set_task_pending (&team->barrier);
++      uint64_t _tla_eq_e = tla_rdtsc ();
++      tla_emit_EnqueueTask (_tla_eq_s, _tla_eq_e,
++			    team->task_count, team->task_queued_count,
++			    tla_task_hash (task),
++			    task->detach_team != NULL ? 1 : 0);
+       do_wake = team->task_running_count + !parent->in_tied_task
+ 		< team->nthreads;
++      uint64_t _tla_uq_s = tla_rdtsc ();
+       gomp_mutex_unlock (&team->task_lock);
++      uint64_t _tla_uq_e = tla_rdtsc ();
++      tla_emit_EnqueueTaskUnlock (_tla_uq_s, _tla_uq_e);
+       if (do_wake)
+ 	gomp_team_barrier_wake (&team->barrier, 1);
+     }
+@@ -1558,7 +1569,16 @@ gomp_barrier_handle_tasks (gomp_barrier_state_t state)
+   struct gomp_task *to_free = NULL;
+   int do_wake = 0;
+ 
++  if (thr && team && !tla_tls.initialized)
++    tla_trace_team_thread_open (thr->ts.team_id);
++
++  uint64_t _tla_lk_s = tla_rdtsc ();
+   gomp_mutex_lock (&team->task_lock);
++  uint64_t _tla_lk_e = tla_rdtsc ();
++  tla_emit_HandleTasksLock (_tla_lk_s, _tla_lk_e,
++			    __atomic_load_n (&team->trace_region_id,
++					     MEMMODEL_RELAXED));
++
+   /* Avoid running tasks from next task scheduling region (PR122314).
+      N.b. we check that `team->task_count != 0` in order to avoid the
+      non-atomic read of `bar->generation` "conflicting" (in the C standard
+@@ -1572,7 +1592,10 @@ gomp_barrier_handle_tasks (gomp_barrier_state_t state)
+   if (team->task_count != 0
+       && gomp_barrier_has_completed (state, &team->barrier))
+     {
++      uint64_t _tla_ec_s = tla_rdtsc ();
+       gomp_mutex_unlock (&team->task_lock);
++      uint64_t _tla_ec_e = tla_rdtsc ();
++      tla_emit_HandleTasksCheckCompleted (_tla_ec_s, _tla_ec_e);
+       return;
+     }
+ 
+@@ -1580,12 +1603,26 @@ gomp_barrier_handle_tasks (gomp_barrier_state_t state)
+     {
+       if (team->task_count == 0)
+ 	{
++	  uint64_t _tla_lnt_s = tla_rdtsc ();
+ 	  gomp_team_barrier_done (&team->barrier, state);
++	  uint64_t _tla_lnt_e = tla_rdtsc ();
++	  tla_emit_HandleTasksLastNoTasks (_tla_lnt_s, _tla_lnt_e,
++					   team->barrier.generation,
++					   __atomic_load_n (&team->task_count,
++							    MEMMODEL_ACQUIRE));
+ 	  gomp_mutex_unlock (&team->task_lock);
+ 	  gomp_team_barrier_wake (&team->barrier, 0);
+ 	  return;
+ 	}
++      uint64_t _tla_sw_s = tla_rdtsc ();
+       gomp_team_barrier_set_waiting_for_tasks (&team->barrier);
++      uint64_t _tla_sw_e = tla_rdtsc ();
++      tla_emit_HandleTasksLastSetWaiting (_tla_sw_s, _tla_sw_e);
++    }
++  else
++    {
++      uint64_t _tla_dr = tla_rdtsc ();
++      tla_emit_HandleTasksEnterDrainLoop (_tla_dr, _tla_dr);
+     }
+ 
+   while (1)
+@@ -1611,13 +1648,22 @@ gomp_barrier_handle_tasks (gomp_barrier_state_t state)
+ 		}
+ 	      goto finish_cancelled;
+ 	    }
++	  uint64_t _tla_dq_s = tla_rdtsc ();
+ 	  team->task_running_count++;
++	  uint64_t _tla_dq_e = tla_rdtsc ();
+ 	  child_task->in_tied_task = true;
++	  tla_emit_HandleTasksDequeueAndRun (_tla_dq_s, _tla_dq_e,
++					     team->task_running_count,
++					     team->task_queued_count);
+ 	}
+       else if (team->task_count == 0
+ 	       && gomp_team_barrier_waiting_for_tasks (&team->barrier))
+ 	{
++	  uint64_t _tla_dc_s = tla_rdtsc ();
+ 	  gomp_team_barrier_done (&team->barrier, state);
++	  uint64_t _tla_dc_e = tla_rdtsc ();
++	  tla_emit_HandleTasksDrainComplete (_tla_dc_s, _tla_dc_e,
++					     team->barrier.generation);
+ 	  gomp_mutex_unlock (&team->task_lock);
+ 	  gomp_team_barrier_wake (&team->barrier, 0);
+ 	  if (to_free)
+@@ -1668,16 +1714,25 @@ gomp_barrier_handle_tasks (gomp_barrier_state_t state)
+ 	  thr->task = task;
+ 	}
+       else
+-	return;
++	{
++	  uint64_t _tla_ee = tla_rdtsc ();
++	  tla_emit_HandleTasksEmptyExit (_tla_ee, _tla_ee);
++	  return;
++	}
+       gomp_mutex_lock (&team->task_lock);
+       if (child_task)
+ 	{
+ 	  if (child_task->detach_team)
+ 	    {
+ 	      assert (child_task->detach_team == team);
++	      uint64_t _tla_fd_s = tla_rdtsc ();
+ 	      child_task->kind = GOMP_TASK_DETACHED;
+ 	      ++team->task_detach_count;
+ 	      --team->task_running_count;
++	      uint64_t _tla_fd_e = tla_rdtsc ();
++	      tla_emit_HandleTasksFinishDetach (_tla_fd_s, _tla_fd_e,
++						team->task_detach_count,
++						team->task_running_count);
+ 	      gomp_debug (0,
+ 			  "thread %d: task with event %p finished without "
+ 			  "completion event fulfilled in team barrier\n",
+@@ -1705,10 +1760,24 @@ gomp_barrier_handle_tasks (gomp_barrier_state_t state)
+ 	  /* Need to use RELEASE to sync with barrier read outside of the
+ 	     tasking code (See PR122356).  Only care when decrementing to zero
+ 	     because that's what the barrier cares about.  */
++	  uint64_t _tla_fn_s = tla_rdtsc ();
++	  const char *_tla_branch;
+ 	  if (team->task_count == 1)
+-	    __atomic_store_n (&team->task_count, 0, MEMMODEL_RELEASE);
++	    {
++	      __atomic_store_n (&team->task_count, 0, MEMMODEL_RELEASE);
++	      _tla_branch = "atomic-zero";
++	    }
+ 	  else
+-	    team->task_count--;
++	    {
++	      team->task_count--;
++	      _tla_branch = "plain";
++	    }
++	  uint64_t _tla_fn_e = tla_rdtsc ();
++	  tla_emit_HandleTasksFinishNormal (_tla_fn_s, _tla_fn_e,
++					    __atomic_load_n (&team->task_count,
++							     MEMMODEL_ACQUIRE),
++					    team->task_running_count,
++					    _tla_branch);
+ 	}
+     }
+ }
+@@ -2735,13 +2804,33 @@ omp_fulfill_event (omp_event_handle_t event)
+       return;
+     }
+ 
++  /* Open this thread's trace file.  Team thread → "tN", external
++     thread → "eN".  */
++  if (!tla_tls.initialized)
++    {
++      struct gomp_thread *_thr = gomp_thread ();
++      if (_thr && _thr->ts.team)
++	tla_trace_team_thread_open (_thr->ts.team_id);
++      else
++	tla_trace_ext_thread_open ();
++    }
++
++  uint64_t _tla_ld_s = tla_rdtsc ();
+   struct gomp_team *team = __atomic_load_n (&task->detach_team,
+ 					    MEMMODEL_RELAXED);
++  uint64_t _tla_ld_e = tla_rdtsc ();
+   if (!team)
+     gomp_fatal ("omp_fulfill_event: %p event is invalid or has already "
+ 		"been fulfilled!\n", task);
++  tla_emit_FulfillLoadDetachTeam (_tla_ld_s, _tla_ld_e,
++				  tla_task_hash (task),
++				  team->trace_region_id);
+ 
++  uint64_t _tla_lk_s = tla_rdtsc ();
+   gomp_mutex_lock (&team->task_lock);
++  uint64_t _tla_lk_e = tla_rdtsc ();
++  tla_emit_FulfillLockTeam (_tla_lk_s, _tla_lk_e);
++
+   if (task->kind != GOMP_TASK_DETACHED)
+     {
+       /* The task has not finished running yet.  */
+@@ -2759,8 +2848,12 @@ omp_fulfill_event (omp_event_handle_t event)
+   gomp_task_run_post_remove_parent (task);
+   gomp_clear_parent (&task->children_queue);
+   gomp_task_run_post_remove_taskgroup (task);
++  uint64_t _tla_fb_s = tla_rdtsc ();
+   team->task_count--;
+   team->task_detach_count--;
++  uint64_t _tla_fb_e = tla_rdtsc ();
++  tla_emit_FulfillBody (_tla_fb_s, _tla_fb_e,
++			team->task_count, team->task_detach_count);
+ 
+   int do_wake = 0;
+   bool shackled_thread_p = team == gomp_thread ()->ts.team;
+@@ -2773,6 +2866,7 @@ omp_fulfill_event (omp_event_handle_t event)
+ 	do_wake = new_tasks;
+     }
+ 
++  uint64_t _tla_g_s = tla_rdtsc ();
+   if (!shackled_thread_p
+       && !do_wake
+       && team->task_detach_count == 0
+@@ -2780,6 +2874,8 @@ omp_fulfill_event (omp_event_handle_t event)
+     /* Ensure that at least one thread is woken up to signal that the
+        barrier can finish.  */
+     do_wake = 1;
++  uint64_t _tla_g_e = tla_rdtsc ();
++  tla_emit_FulfillLastDetachGuard (_tla_g_s, _tla_g_e, do_wake);
+ 
+   /* If we are running in an unshackled thread, the team might vanish before
+      gomp_team_barrier_wake is run if we release the lock first, so keep the
+@@ -2788,11 +2884,18 @@ omp_fulfill_event (omp_event_handle_t event)
+     gomp_mutex_unlock (&team->task_lock);
+   if (do_wake)
+     gomp_team_barrier_wake (&team->barrier, do_wake);
++  uint64_t _tla_u_s = tla_rdtsc ();
+   if (!shackled_thread_p)
+     gomp_mutex_unlock (&team->task_lock);
++  uint64_t _tla_u_e = tla_rdtsc ();
++  if (!shackled_thread_p)
++    tla_emit_FulfillNonShackledWakeThenUnlock (_tla_u_s, _tla_u_e);
+ 
++  uint64_t _tla_fin_s = tla_rdtsc ();
+   gomp_finish_task (task);
+   free (task);
++  uint64_t _tla_fin_e = tla_rdtsc ();
++  tla_emit_FulfillFinish (_tla_fin_s, _tla_fin_e);
+ }
+ 
+ ialias (omp_fulfill_event)
+diff --git a/libgomp/team.c b/libgomp/team.c
+index 5282a3133ba..48da79fc046 100644
+--- a/libgomp/team.c
++++ b/libgomp/team.c
+@@ -30,6 +30,7 @@
+ #include "pool.h"
+ #include <stdlib.h>
+ #include <string.h>
++#include "tla_trace.h"
+ 
+ #ifdef LIBGOMP_USE_PTHREADS
+ pthread_attr_t gomp_thread_attr;
+@@ -219,6 +220,29 @@ gomp_new_team (unsigned nthreads)
+ 
+   team->task_detach_count = 0;
+ 
++  /* Bump trace_region_id monotonically — once per gomp_new_team call,
++     whether fresh allocation or cached-reuse.  This labels every trace
++     event with the team-region the caller is operating on.  */
++  uint64_t _tla_nr_s = tla_rdtsc ();
++  unsigned int _tla_new_region
++    = atomic_fetch_add (&tla_team_region_counter, 1u) + 1u;
++  team->trace_region_id = _tla_new_region;
++  uint64_t _tla_nr_e = tla_rdtsc ();
++  /* Open the primary thread's trace file lazily so this PrimaryStartNewRegion
++     event lands in the correct per-thread trace.  */
++  {
++    struct gomp_thread *_thr = gomp_thread ();
++    if (_thr && !tla_tls.initialized)
++      {
++	/* The primary thread is team_id 0 in the new team, but the call
++	   to gomp_new_team runs in the parent's context.  Tag as t1 to
++	   match the spec's PIDS = {"t1", "t2", "e1"}.  */
++	tla_trace_team_thread_open (_thr->ts.team_id);
++      }
++  }
++  tla_emit_PrimaryStartNewRegion (_tla_nr_s, _tla_nr_e,
++				  team->trace_region_id, team->task_count);
++
+   return team;
+ }
+ 
+@@ -1009,7 +1033,10 @@ gomp_team_end (void)
+       struct gomp_thread_pool *pool = thr->thread_pool;
+       if (pool->last_team)
+ 	free_team (pool->last_team);
++      uint64_t _tla_pe_s = tla_rdtsc ();
+       pool->last_team = team;
++      uint64_t _tla_pe_e = tla_rdtsc ();
++      tla_emit_PrimaryEndRegion (_tla_pe_s, _tla_pe_e, team->trace_region_id);
+       gomp_release_thread_pool (pool);
+     }
+ }

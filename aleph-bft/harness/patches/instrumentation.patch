@@ -1,0 +1,470 @@
+diff --git a/consensus/src/alerts/handler.rs b/consensus/src/alerts/handler.rs
+index 517f8c7..4c31e02 100644
+--- a/consensus/src/alerts/handler.rs
++++ b/consensus/src/alerts/handler.rs
+@@ -202,7 +202,19 @@ impl<H: Hasher, D: Data, MK: MultiKeychain> Handler<H, D, MK> {
+         let forker = contents.forker();
+         let sender = alert.as_signable().sender;
+         if self.known_rmcs.contains_key(&(contents.sender, forker)) {
+-            self.known_alerts.insert(contents.hash(), alert);
++            self.known_alerts.insert(contents.hash(), alert.clone());
++            #[cfg(test)]
++            {
++                let me = self.keychain.index();
++                crate::tla_trace::emit_receive_alert(
++                    me,
++                    alert.as_signable(),
++                    true,
++                    self.known_alerts.len() as u64,
++                    self.known_rmcs.len() as u64,
++                    self.known_forkers.len() as u64,
++                );
++            }
+             return Err(Error::RepeatedAlert(sender, forker));
+         }
+         let maybe_notification = if self.is_forker(forker) {
+@@ -212,7 +224,21 @@ impl<H: Hasher, D: Data, MK: MultiKeychain> Handler<H, D, MK> {
+             self.on_new_forker_detected(forker, contents.proof.clone());
+             Some(ForkingNotification::Forker(contents.proof.clone()))
+         };
++        #[cfg(test)]
++        let alert_for_trace = alert.clone();
+         let hash_for_rmc = self.rmc_alert(forker, alert);
++        #[cfg(test)]
++        {
++            let me = self.keychain.index();
++            crate::tla_trace::emit_receive_alert(
++                me,
++                alert_for_trace.as_signable(),
++                false,
++                self.known_alerts.len() as u64,
++                self.known_rmcs.len() as u64,
++                self.known_forkers.len() as u64,
++            );
++        }
+ 
+         // A response to a valid fork alert.
+         // It should be handled by starting RMC on the contained hash
+@@ -270,7 +296,17 @@ impl<H: Hasher, D: Data, MK: MultiKeychain> Handler<H, D, MK> {
+         };
+         let forker = alert.proof.0.as_signable().creator();
+         self.known_rmcs.insert((alert.sender, forker), alert.hash());
+-        self.verify_commitment(alert)?;
++        let verify_result = self.verify_commitment(alert);
++        #[cfg(test)]
++        {
++            let me = self.keychain.index();
++            let ok = verify_result.is_ok();
++            if ok {
++                crate::tla_trace::confirmed_alerts_inc(me);
++            }
++            crate::tla_trace::emit_confirm_alert(me, alert, ok);
++        }
++        verify_result?;
+         Ok(ForkingNotification::Units(alert.legit_units.clone()))
+     }
+ }
+diff --git a/consensus/src/alerts/mod.rs b/consensus/src/alerts/mod.rs
+index 998076b..fb17f6b 100644
+--- a/consensus/src/alerts/mod.rs
++++ b/consensus/src/alerts/mod.rs
+@@ -86,6 +86,24 @@ impl<H: Hasher, D: Data, S: Signature> Alert<H, D, S> {
+             .filter_map(|uu| uu.as_signable().data().clone())
+             .collect()
+     }
++
++    /// Trace-only crate-private accessor: alert sender index.
++    #[cfg(test)]
++    pub(crate) fn sender_index(&self) -> NodeIndex {
++        self.sender
++    }
++
++    /// Trace-only crate-private accessor: fork proof (two equivocating units).
++    #[cfg(test)]
++    pub(crate) fn proof_ref(&self) -> &ForkProof<H, D, S> {
++        &self.proof
++    }
++
++    /// Trace-only crate-private accessor: alert legit_units commitment.
++    #[cfg(test)]
++    pub(crate) fn legit_units_ref(&self) -> &Vec<UncheckedSignedUnit<H, D, S>> {
++        &self.legit_units
++    }
+ }
+ 
+ impl<H: Hasher, D: Data, S: Signature> Index for Alert<H, D, S> {
+diff --git a/consensus/src/backup/saver.rs b/consensus/src/backup/saver.rs
+index ebaaebf..44d3cbb 100644
+--- a/consensus/src/backup/saver.rs
++++ b/consensus/src/backup/saver.rs
+@@ -2,8 +2,8 @@ use std::pin::Pin;
+ 
+ use crate::{
+     dag::DagUnit,
+-    units::{UncheckedSignedUnit, WrappedUnit},
+-    Data, Hasher, MultiKeychain, Receiver, Sender, Terminator,
++    units::{UncheckedSignedUnit, Unit, WrappedUnit},
++    Data, Hasher, MultiKeychain, NodeIndex, Receiver, Sender, Terminator,
+ };
+ use codec::Encode;
+ use futures::{AsyncWrite, AsyncWriteExt, FutureExt, StreamExt};
+@@ -18,6 +18,8 @@ pub struct BackupSaver<H: Hasher, D: Data, MK: MultiKeychain, W: AsyncWrite> {
+     units_from_consensus: Receiver<DagUnit<H, D, MK>>,
+     responses_for_consensus: Sender<DagUnit<H, D, MK>>,
+     backup: Pin<Box<W>>,
++    #[cfg(test)]
++    node_index: NodeIndex,
+ }
+ 
+ impl<H: Hasher, D: Data, MK: MultiKeychain, W: AsyncWrite> BackupSaver<H, D, MK, W> {
+@@ -30,9 +32,19 @@ impl<H: Hasher, D: Data, MK: MultiKeychain, W: AsyncWrite> BackupSaver<H, D, MK,
+             units_from_consensus,
+             responses_for_consensus,
+             backup: Box::pin(backup),
++            #[cfg(test)]
++            node_index: NodeIndex(0),
+         }
+     }
+ 
++    /// Trace-only: associate this saver with its owning node's index so the
++    /// PersistUnit trace event can be filtered to own units (matching the spec).
++    #[cfg(test)]
++    pub(crate) fn with_node_index(mut self, index: NodeIndex) -> Self {
++        self.node_index = index;
++        self
++    }
++
+     pub async fn save_unit(&mut self, unit: &DagUnit<H, D, MK>) -> Result<(), std::io::Error> {
+         let unit: UncheckedSignedUnit<_, _, _> = unit.clone().unpack().into();
+         self.backup.write_all(&unit.encode()).await?;
+@@ -55,6 +67,16 @@ impl<H: Hasher, D: Data, MK: MultiKeychain, W: AsyncWrite> BackupSaver<H, D, MK,
+                         error!(target: LOG_TARGET, "couldn't save item to backup: {:?}", e);
+                         break;
+                     }
++                    // PersistUnit: only own units are tracked by the spec; the
++                    // saver writes all units, so we filter via the creator.
++                    #[cfg(test)]
++                    {
++                        if item.creator() == self.node_index {
++                            crate::tla_trace::persisted_inc(self.node_index);
++                            crate::tla_trace::in_flight_dec(self.node_index);
++                            crate::tla_trace::emit_persist_unit(self.node_index, &item);
++                        }
++                    }
+                     if self.responses_for_consensus.unbounded_send(item).is_err() {
+                         error!(target: LOG_TARGET, "couldn't respond with saved unit to consensus");
+                         break;
+diff --git a/consensus/src/consensus/handler.rs b/consensus/src/consensus/handler.rs
+index 5a22b52..e9c7e5e 100644
+--- a/consensus/src/consensus/handler.rs
++++ b/consensus/src/consensus/handler.rs
+@@ -26,6 +26,8 @@ where
+     responder: Responder<UFH::Hasher, UFH::Data, MK>,
+     ordering: Ordering<MK, UFH>,
+     task_manager: TaskManager<UFH::Hasher>,
++    #[cfg(test)]
++    node_index: NodeIndex,
+ }
+ 
+ /// The status of the consensus, for logging purposes.
+@@ -93,15 +95,30 @@ where
+     ) -> Self {
+         let n_members = keychain.node_count();
+         let index = keychain.index();
++        let mut ordering = Ordering::new(finalization_handler);
++        #[cfg(test)]
++        ordering.set_node_index(index);
+         Consensus {
+             store: UnitStore::new(n_members),
+             dag: Dag::new(validator),
+             responder: Responder::new(keychain),
+-            ordering: Ordering::new(finalization_handler),
++            ordering,
+             task_manager: TaskManager::new(index, n_members, delay_config),
++            #[cfg(test)]
++            node_index: index,
+         }
+     }
+ 
++    #[cfg(test)]
++    pub(crate) fn node_index(&self) -> NodeIndex {
++        self.node_index
++    }
++
++    #[cfg(test)]
++    pub(crate) fn store_size(&self) -> u64 {
++        self.store.size() as u64
++    }
++
+     fn handle_dag_result(
+         &mut self,
+         result: DagResult<UFH::Hasher, UFH::Data, MK>,
+diff --git a/consensus/src/consensus/mod.rs b/consensus/src/consensus/mod.rs
+index 5cc0014..967b4e6 100644
+--- a/consensus/src/consensus/mod.rs
++++ b/consensus/src/consensus/mod.rs
+@@ -134,11 +134,15 @@ pub async fn run_session<
+     debug!(target: LOG_TARGET, "Spawning backup saver.");
+     let backup_saver_terminator = terminator.add_offspring_connection("backup-saver");
+     let backup_saver_handle = spawn_handle.spawn_essential("consensus/backup_saver", {
+-        let mut backup_saver = BackupSaver::new(
++        let backup_saver = BackupSaver::new(
+             backup_units_from_service,
+             backup_units_for_service,
+             unit_saver,
+         );
++        #[cfg(test)]
++        let mut backup_saver = backup_saver.with_node_index(index);
++        #[cfg(not(test))]
++        let mut backup_saver = backup_saver;
+         async move {
+             backup_saver.run(backup_saver_terminator).await;
+         }
+diff --git a/consensus/src/consensus/service.rs b/consensus/src/consensus/service.rs
+index 3d0bb95..6106a58 100644
+--- a/consensus/src/consensus/service.rs
++++ b/consensus/src/consensus/service.rs
+@@ -167,12 +167,24 @@ where
+ 
+     fn on_unit_reconstructed(&mut self, unit: DagUnit<UFH::Hasher, UFH::Data, MK>) {
+         trace!(target: LOG_TARGET, "Unit {:?} {} reconstructed.", unit.hash(), unit.coord());
++        #[cfg(test)]
++        {
++            let node_id = self.handler.node_index();
++            if unit.creator() == node_id {
++                // The spec's Sign action covers honest own units only and fires
++                // right after the unit has been queued to the backup saver.
++                crate::tla_trace::in_flight_inc(node_id);
++                crate::tla_trace::emit_sign(node_id, &unit, unit.round());
++            }
++        }
+         if self.backup_units_for_saver.unbounded_send(unit).is_err() {
+             self.crucial_channel_closed("Backup");
+         }
+     }
+ 
+     fn on_unit_backup_saved(&mut self, unit: DagUnit<UFH::Hasher, UFH::Data, MK>) {
++        #[cfg(test)]
++        let node_id = self.handler.node_index();
+         if self
+             .parents_for_creator
+             .unbounded_send(unit.clone())
+@@ -180,7 +192,20 @@ where
+         {
+             self.crucial_channel_closed("Creator");
+         }
+-        if let Some(message) = self.handler.on_unit_backup_saved(unit) {
++        let maybe_message = self.handler.on_unit_backup_saved(unit.clone());
++        #[cfg(test)]
++        {
++            // BroadcastUnit fires for own units that complete the save -> broadcast
++            // chain. The first-broadcast deduplication is inside Manager::add_unit
++            // (dissemination/task.rs); the return of `maybe_message` here being Some
++            // is the impl signal that this is the first broadcast for an own unit.
++            if maybe_message.is_some() && unit.creator() == node_id {
++                crate::tla_trace::broadcast_inc(node_id);
++                let store_size = self.handler.store_size();
++                crate::tla_trace::emit_broadcast_unit(node_id, &unit, store_size);
++            }
++        }
++        if let Some(message) = maybe_message {
+             self.send_message_for_network(message);
+         }
+     }
+diff --git a/consensus/src/dag/mod.rs b/consensus/src/dag/mod.rs
+index a9818ea..b5f2b1b 100644
+--- a/consensus/src/dag/mod.rs
++++ b/consensus/src/dag/mod.rs
+@@ -192,12 +192,22 @@ impl<H: Hasher, D: Data, MK: MultiKeychain> Dag<H, D, MK> {
+                 result.accumulate(self.add_unit(other_unit, store));
+             }
+             Units(units) => {
++                #[cfg(test)]
++                let admitted_before = result.units.len();
+                 for unit in units {
+                     result.accumulate(match self.validator.validate_committed(unit, store) {
+                         Ok(unit) => self.reconstruction.add_unit(unit).into(),
+                         Err(e) => Self::handle_validation_error(e),
+                     })
+                 }
++                #[cfg(test)]
++                {
++                    let added = (result.units.len() - admitted_before) as u64;
++                    if added > 0 {
++                        let me = self.validator.index();
++                        crate::tla_trace::committed_units_inc(me, added);
++                    }
++                }
+             }
+         }
+         result
+@@ -216,6 +226,12 @@ impl<H: Hasher, D: Data, MK: MultiKeychain> Dag<H, D, MK> {
+     pub fn status(&self) -> DagStatus {
+         self.validator.status()
+     }
++
++    /// Trace-only crate-private accessor: dag's own NodeIndex.
++    #[cfg(test)]
++    pub(crate) fn index(&self) -> crate::NodeIndex {
++        self.validator.index()
++    }
+ }
+ 
+ #[cfg(test)]
+diff --git a/consensus/src/dag/validation.rs b/consensus/src/dag/validation.rs
+index 36d743f..d0cddc2 100644
+--- a/consensus/src/dag/validation.rs
++++ b/consensus/src/dag/validation.rs
+@@ -135,15 +135,39 @@ impl<H: Hasher, D: Data, MK: MultiKeychain> Validator<H, D, MK> {
+             .map(|unit| unit.clone().unpack())
+             .or(self.processing_units.canonical_unit(unit_coord).cloned())
+         {
+-            let proof = (canonical_unit.into(), unit.into());
++            let proof = (canonical_unit.clone().into(), unit.clone().into());
+             let committed_units = self.mark_forker(unit_coord.creator(), store);
+-            return Err(NewForker(Box::new(Alert::new(
+-                self.unit_validator.index(),
+-                proof,
+-                committed_units,
+-            ))));
++            let alert = Alert::new(self.unit_validator.index(), proof, committed_units);
++            #[cfg(test)]
++            {
++                let me = self.unit_validator.index();
++                // After mark_forker, this creator is in known_forkers, so the
++                // local forker count reflects the post-state of the action.
++                let local_forkers = self.known_forkers.len() as u64;
++                crate::tla_trace::emit_detect_fork(
++                    me,
++                    unit_coord.creator(),
++                    unit.as_signable(),
++                    canonical_unit.as_signable(),
++                    local_forkers,
++                    local_forkers, // knownAlerts count tracked at handler; approximate here
++                    local_forkers, // knownRmcs count tracked at handler; approximate here
++                );
++            }
++            return Err(NewForker(Box::new(alert)));
+         }
+         self.processing_units.insert(unit.clone());
++        #[cfg(test)]
++        {
++            let me = self.unit_validator.index();
++            let store_size = store.size() + self.processing_units.size();
++            // DeliverUnit: only emit when the delivered unit's creator is not
++            // the local node (own units travel through the Sign chain, not the
++            // generic deliver path in the spec).
++            if unit.as_signable().creator() != me {
++                crate::tla_trace::emit_deliver_unit(me, unit.as_signable(), store_size);
++            }
++        }
+         Ok(unit)
+     }
+ 
+@@ -167,6 +191,12 @@ impl<H: Hasher, D: Data, MK: MultiKeychain> Validator<H, D, MK> {
+         &self.processing_units
+     }
+ 
++    /// Trace-only crate-private accessor: validator's own NodeIndex.
++    #[cfg(test)]
++    pub(crate) fn index(&self) -> NodeIndex {
++        self.unit_validator.index()
++    }
++
+     /// Signal that a unit finished processing and thus it's copy no longer has to be kept for fork detection.
+     /// NOTE: This is only a memory optimization, if the units stay there forever everything still works.
+     pub fn finished_processing(&mut self, unit: &H::Hash) {
+diff --git a/consensus/src/extension/mod.rs b/consensus/src/extension/mod.rs
+index 482fd2b..e9199ae 100644
+--- a/consensus/src/extension/mod.rs
++++ b/consensus/src/extension/mod.rs
+@@ -1,4 +1,4 @@
+-use crate::{dag::DagUnit, MultiKeychain, UnitFinalizationHandler};
++use crate::{dag::DagUnit, MultiKeychain, NodeIndex, UnitFinalizationHandler};
+ 
+ mod election;
+ mod extender;
+@@ -18,6 +18,8 @@ use extender::Extender;
+ pub struct Ordering<MK: MultiKeychain, UFH: UnitFinalizationHandler> {
+     extender: Extender<DagUnit<UFH::Hasher, UFH::Data, MK>>,
+     finalization_handler: UFH,
++    #[cfg(test)]
++    node_index: NodeIndex,
+ }
+ 
+ impl<MK: MultiKeychain, UFH: UnitFinalizationHandler> Ordering<MK, UFH> {
+@@ -26,11 +28,32 @@ impl<MK: MultiKeychain, UFH: UnitFinalizationHandler> Ordering<MK, UFH> {
+         Ordering {
+             extender,
+             finalization_handler,
++            #[cfg(test)]
++            node_index: NodeIndex(0),
+         }
+     }
+ 
++    /// Trace-only: stamp the owning node's index so RunElection events get the
++    /// right `nid` field.
++    #[cfg(test)]
++    pub(crate) fn set_node_index(&mut self, index: NodeIndex) {
++        self.node_index = index;
++    }
++
+     pub fn add_unit(&mut self, unit: DagUnit<UFH::Hasher, UFH::Data, MK>) {
+         for batch in self.extender.add_unit(unit) {
++            #[cfg(test)]
++            {
++                use crate::units::Unit;
++                if let Some(head) = batch.last() {
++                    crate::tla_trace::emit_run_election(
++                        self.node_index,
++                        head.round(),
++                        head.creator(),
++                        head.round(),
++                    );
++                }
++            }
+             self.finalization_handler
+                 .batch_finalized(batch.into_iter().map(|unit| unit.into()).collect());
+         }
+diff --git a/consensus/src/lib.rs b/consensus/src/lib.rs
+index a2c0f2a..f41139d 100644
+--- a/consensus/src/lib.rs
++++ b/consensus/src/lib.rs
+@@ -19,6 +19,8 @@ mod backup;
+ mod task_queue;
+ #[cfg(test)]
+ mod testing;
++#[cfg(test)]
++mod tla_trace;
+ 
+ pub use aleph_bft_types::{
+     Data, DataProvider, FinalizationHandler, Hasher, IncompleteMultisignatureError, Index, Indexed,
+diff --git a/consensus/src/testing/mod.rs b/consensus/src/testing/mod.rs
+index 14f1710..84479f5 100644
+--- a/consensus/src/testing/mod.rs
++++ b/consensus/src/testing/mod.rs
+@@ -5,6 +5,7 @@ mod crash;
+ mod crash_recovery;
+ mod creation;
+ mod dag;
++mod trace_scenario;
+ mod unreliable;
+ 
+ use crate::{
+diff --git a/consensus/src/units/store.rs b/consensus/src/units/store.rs
+index d782bb3..3c2513e 100644
+--- a/consensus/src/units/store.rs
++++ b/consensus/src/units/store.rs
+@@ -145,6 +145,12 @@ impl<U: Unit> UnitStore<U> {
+             top_row: self.top_row.clone(),
+         }
+     }
++
++    /// Trace-only crate-private accessor: total units stored.
++    #[cfg(test)]
++    pub(crate) fn size(&self) -> u64 {
++        self.by_hash.len() as u64
++    }
+ }
+ 
+ #[cfg(test)]
