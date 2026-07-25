@@ -1,0 +1,729 @@
+/**
+ *  Copyright Notice:
+ *  Copyright 2021-2026 DMTF. All rights reserved.
+ *  License: BSD 3-Clause License. For full text see link: https://github.com/DMTF/libspdm/blob/main/LICENSE.md
+ **/
+
+#include "internal/libspdm_secured_message_lib.h"
+
+static bool libspdm_generate_aead_key_and_iv(
+    libspdm_secured_message_context_t *secured_message_context,
+    const uint8_t *major_secret, uint8_t *key, uint8_t *iv)
+{
+    bool status;
+    size_t hash_size;
+    size_t key_length;
+    size_t iv_length;
+    uint8_t bin_str5[128];
+    size_t bin_str5_size;
+    uint8_t bin_str6[128];
+    size_t bin_str6_size;
+
+    hash_size = secured_message_context->hash_size;
+    key_length = secured_message_context->aead_key_size;
+    iv_length = secured_message_context->aead_iv_size;
+
+    bin_str5_size = sizeof(bin_str5);
+    libspdm_bin_concat(secured_message_context->version,
+                       SPDM_BIN_STR_5_LABEL, sizeof(SPDM_BIN_STR_5_LABEL) - 1,
+                       NULL, (uint16_t)key_length, hash_size, bin_str5,
+                       &bin_str5_size);
+
+    LIBSPDM_DEBUG((LIBSPDM_DEBUG_INFO, "bin_str5 (0x%zx):\n", bin_str5_size));
+    LIBSPDM_INTERNAL_DUMP_HEX(bin_str5, bin_str5_size);
+    status = libspdm_hkdf_expand(secured_message_context->base_hash_algo,
+                                 major_secret, hash_size, bin_str5,
+                                 bin_str5_size, key, key_length);
+    if (!status) {
+        return false;
+    }
+    LIBSPDM_DEBUG((LIBSPDM_DEBUG_INFO, "key (0x%zx) - ", key_length));
+    LIBSPDM_INTERNAL_DUMP_DATA(key, key_length);
+    LIBSPDM_DEBUG((LIBSPDM_DEBUG_INFO, "\n"));
+
+    bin_str6_size = sizeof(bin_str6);
+    libspdm_bin_concat(secured_message_context->version,
+                       SPDM_BIN_STR_6_LABEL, sizeof(SPDM_BIN_STR_6_LABEL) - 1,
+                       NULL, (uint16_t)iv_length, hash_size, bin_str6,
+                       &bin_str6_size);
+
+    LIBSPDM_DEBUG((LIBSPDM_DEBUG_INFO, "bin_str6 (0x%zx):\n", bin_str6_size));
+    LIBSPDM_INTERNAL_DUMP_HEX(bin_str6, bin_str6_size);
+    status = libspdm_hkdf_expand(secured_message_context->base_hash_algo,
+                                 major_secret, hash_size, bin_str6,
+                                 bin_str6_size, iv, iv_length);
+    if (!status) {
+        return false;
+    }
+    LIBSPDM_DEBUG((LIBSPDM_DEBUG_INFO, "iv (0x%zx) - ", iv_length));
+    LIBSPDM_INTERNAL_DUMP_DATA(iv, iv_length);
+    LIBSPDM_DEBUG((LIBSPDM_DEBUG_INFO, "\n"));
+
+    return true;
+}
+
+static bool libspdm_generate_finished_key(
+    libspdm_secured_message_context_t *secured_message_context,
+    const uint8_t *handshake_secret, uint8_t *finished_key)
+{
+    bool status;
+    size_t hash_size;
+    uint8_t bin_str7[128];
+    size_t bin_str7_size;
+
+    hash_size = secured_message_context->hash_size;
+
+    bin_str7_size = sizeof(bin_str7);
+    libspdm_bin_concat(secured_message_context->version,
+                       SPDM_BIN_STR_7_LABEL, sizeof(SPDM_BIN_STR_7_LABEL) - 1,
+                       NULL, (uint16_t)hash_size, hash_size, bin_str7,
+                       &bin_str7_size);
+
+    LIBSPDM_DEBUG((LIBSPDM_DEBUG_INFO, "bin_str7 (0x%zx):\n", bin_str7_size));
+    LIBSPDM_INTERNAL_DUMP_HEX(bin_str7, bin_str7_size);
+    status = libspdm_hkdf_expand(secured_message_context->base_hash_algo,
+                                 handshake_secret, hash_size, bin_str7,
+                                 bin_str7_size, finished_key, hash_size);
+    if (!status) {
+        return false;
+    }
+    LIBSPDM_DEBUG((LIBSPDM_DEBUG_INFO, "finished_key (0x%zx) - ", hash_size));
+    LIBSPDM_INTERNAL_DUMP_DATA(finished_key, hash_size);
+    LIBSPDM_DEBUG((LIBSPDM_DEBUG_INFO, "\n"));
+
+    return true;
+}
+
+bool libspdm_generate_session_handshake_key(void *spdm_secured_message_context,
+                                            const uint8_t *th1_hash_data)
+{
+    bool status;
+    size_t hash_size;
+    libspdm_secured_message_context_t *secured_message_context;
+    size_t handshake_secret_size;
+    size_t request_handshake_secret_size;
+    size_t response_handshake_secret_size;
+
+    secured_message_context = spdm_secured_message_context;
+
+    hash_size = secured_message_context->hash_size;
+    handshake_secret_size = hash_size;
+    request_handshake_secret_size = hash_size;
+    response_handshake_secret_size = hash_size;
+
+    #if LIBSPDM_ENABLE_CAPABILITY_PSK_CAP
+    if (secured_message_context->use_psk) {
+        status = libspdm_generate_handshake_key (
+            secured_message_context->version,
+            NULL,
+            0,
+            false,
+            secured_message_context->psk_hint,
+            secured_message_context->psk_hint_size,
+            secured_message_context->use_psk,
+            secured_message_context->base_hash_algo,
+            th1_hash_data,
+            secured_message_context->master_secret.handshake_secret,
+            &handshake_secret_size,
+            secured_message_context->handshake_secret.request_handshake_secret,
+            &request_handshake_secret_size,
+            secured_message_context->handshake_secret.response_handshake_secret,
+            &response_handshake_secret_size);
+
+        if (!status) {
+            return status;
+        }
+    }
+    #endif /* LIBSPDM_ENABLE_CAPABILITY_PSK_CAP */
+    if (!(secured_message_context->use_psk)) {
+        if (secured_message_context->kem_alg != 0) {
+            LIBSPDM_DEBUG((LIBSPDM_DEBUG_INFO, "[KEM Secret]: "));
+        } else {
+            LIBSPDM_DEBUG((LIBSPDM_DEBUG_INFO, "[DHE Secret]: "));
+        }
+        LIBSPDM_INTERNAL_DUMP_HEX_STR(
+            secured_message_context->master_secret.shared_secret,
+            secured_message_context->shared_key_size);
+        LIBSPDM_DEBUG((LIBSPDM_DEBUG_INFO, "\n"));
+
+        status = libspdm_generate_handshake_key (
+            secured_message_context->version,
+            secured_message_context->master_secret.shared_secret,
+            secured_message_context->shared_key_size,
+            false,
+            NULL,
+            0,
+            secured_message_context->use_psk,
+            secured_message_context->base_hash_algo,
+            th1_hash_data,
+            secured_message_context->master_secret.handshake_secret,
+            &handshake_secret_size,
+            secured_message_context->handshake_secret.request_handshake_secret,
+            &request_handshake_secret_size,
+            secured_message_context->handshake_secret.response_handshake_secret,
+            &response_handshake_secret_size);
+
+        if (!status) {
+            return status;
+        }
+
+        LIBSPDM_DEBUG((LIBSPDM_DEBUG_INFO, "handshake_secret (0x%zx) - ", hash_size));
+        LIBSPDM_INTERNAL_DUMP_DATA(secured_message_context->master_secret.handshake_secret, hash_size);
+        LIBSPDM_DEBUG((LIBSPDM_DEBUG_INFO, "\n"));
+
+        LIBSPDM_DEBUG((LIBSPDM_DEBUG_INFO, "request_handshake_secret (0x%zx) - ", hash_size));
+        LIBSPDM_INTERNAL_DUMP_DATA(secured_message_context->handshake_secret.request_handshake_secret, hash_size);
+        LIBSPDM_DEBUG((LIBSPDM_DEBUG_INFO, "\n"));
+
+        LIBSPDM_DEBUG((LIBSPDM_DEBUG_INFO, "response_handshake_secret (0x%zx) - ", hash_size));
+        LIBSPDM_INTERNAL_DUMP_DATA(secured_message_context->handshake_secret.response_handshake_secret, hash_size);
+        LIBSPDM_DEBUG((LIBSPDM_DEBUG_INFO, "\n"));
+    }
+
+    status = libspdm_generate_finished_key(
+        secured_message_context,
+        secured_message_context->handshake_secret
+        .request_handshake_secret,
+        secured_message_context->handshake_secret.request_finished_key);
+    if (!status) {
+        return status;
+    }
+
+    status = libspdm_generate_finished_key(
+        secured_message_context,
+        secured_message_context->handshake_secret.response_handshake_secret,
+        secured_message_context->handshake_secret.response_finished_key);
+    if (!status) {
+        return status;
+    }
+
+    status = libspdm_generate_aead_key_and_iv(secured_message_context,
+                                              secured_message_context->handshake_secret
+                                              .request_handshake_secret,
+                                              secured_message_context->handshake_secret
+                                              .request_handshake_encryption_key,
+                                              secured_message_context->handshake_secret
+                                              .request_handshake_salt);
+    if (!status) {
+        return status;
+    }
+    secured_message_context->handshake_secret.request_handshake_sequence_number = 0;
+
+    status = libspdm_generate_aead_key_and_iv(
+        secured_message_context,
+        secured_message_context->handshake_secret.response_handshake_secret,
+        secured_message_context->handshake_secret.response_handshake_encryption_key,
+        secured_message_context->handshake_secret.response_handshake_salt);
+    if (!status) {
+        return status;
+    }
+
+    secured_message_context->handshake_secret.response_handshake_sequence_number = 0;
+    libspdm_zero_mem(secured_message_context->master_secret.shared_secret, LIBSPDM_MAX_SHARED_KEY_SIZE);
+
+    return true;
+}
+
+bool libspdm_generate_session_data_key(void *spdm_secured_message_context,
+                                       const uint8_t *th2_hash_data)
+{
+    bool status;
+    size_t hash_size;
+    size_t master_secret_size;
+    size_t request_data_secret_size;
+    size_t response_data_secret_size;
+    size_t export_master_secret_size;
+
+    libspdm_secured_message_context_t *secured_message_context;
+
+    secured_message_context = spdm_secured_message_context;
+
+    hash_size = secured_message_context->hash_size;
+    master_secret_size = hash_size;
+    request_data_secret_size = hash_size;
+    response_data_secret_size = hash_size;
+    export_master_secret_size = hash_size;
+
+    #if LIBSPDM_ENABLE_CAPABILITY_PSK_CAP
+    if (secured_message_context->use_psk) {
+        status = libspdm_generate_data_key(
+            secured_message_context->version,
+            NULL,
+            0,
+            secured_message_context->psk_hint,
+            secured_message_context->psk_hint_size,
+            secured_message_context->use_psk,
+            secured_message_context->base_hash_algo,
+            th2_hash_data,
+            secured_message_context->master_secret.master_secret,
+            &master_secret_size,
+            secured_message_context->application_secret.request_data_secret,
+            &request_data_secret_size,
+            secured_message_context->application_secret.response_data_secret,
+            &response_data_secret_size,
+            secured_message_context->export_master_secret,
+            &export_master_secret_size);
+
+        if (!status) {
+            return status;
+        }
+    }
+    #endif /* LIBSPDM_ENABLE_CAPABILITY_PSK_CAP */
+    if (!(secured_message_context->use_psk)) {
+        status = libspdm_generate_data_key(
+            secured_message_context->version,
+            secured_message_context->master_secret.handshake_secret,
+            hash_size,
+            NULL,
+            0,
+            secured_message_context->use_psk,
+            secured_message_context->base_hash_algo,
+            th2_hash_data,
+            secured_message_context->master_secret.master_secret,
+            &master_secret_size,
+            secured_message_context->application_secret.request_data_secret,
+            &request_data_secret_size,
+            secured_message_context->application_secret.response_data_secret,
+            &response_data_secret_size,
+            secured_message_context->export_master_secret,
+            &export_master_secret_size);
+
+        if (!status) {
+            return status;
+        }
+
+        LIBSPDM_DEBUG((LIBSPDM_DEBUG_INFO, "master_secret (0x%zx) - ", hash_size));
+        LIBSPDM_INTERNAL_DUMP_DATA(secured_message_context->master_secret.master_secret, hash_size);
+        LIBSPDM_DEBUG((LIBSPDM_DEBUG_INFO, "\n"));
+
+        LIBSPDM_DEBUG((LIBSPDM_DEBUG_INFO, "request_data_secret (0x%zx) - ", hash_size));
+        LIBSPDM_INTERNAL_DUMP_DATA(secured_message_context->application_secret.request_data_secret, hash_size);
+        LIBSPDM_DEBUG((LIBSPDM_DEBUG_INFO, "\n"));
+
+        LIBSPDM_DEBUG((LIBSPDM_DEBUG_INFO, "response_data_secret (0x%zx) - ", hash_size));
+        LIBSPDM_INTERNAL_DUMP_DATA(secured_message_context->application_secret.response_data_secret, hash_size);
+        LIBSPDM_DEBUG((LIBSPDM_DEBUG_INFO, "\n"));
+
+        LIBSPDM_DEBUG((LIBSPDM_DEBUG_INFO, "export_master_secret (0x%zx) - ", hash_size));
+        LIBSPDM_INTERNAL_DUMP_DATA(secured_message_context->export_master_secret, hash_size);
+        LIBSPDM_DEBUG((LIBSPDM_DEBUG_INFO, "\n"));
+    }
+
+    status = libspdm_generate_aead_key_and_iv(
+        secured_message_context,
+        secured_message_context->application_secret.request_data_secret,
+        secured_message_context->application_secret.request_data_encryption_key,
+        secured_message_context->application_secret.request_data_salt);
+    if (!status) {
+        return status;
+    }
+    secured_message_context->application_secret.request_data_sequence_number = 0;
+
+    status = libspdm_generate_aead_key_and_iv(
+        secured_message_context,
+        secured_message_context->application_secret.response_data_secret,
+        secured_message_context->application_secret.response_data_encryption_key,
+        secured_message_context->application_secret.response_data_salt);
+    if (!status) {
+        return status;
+    }
+    secured_message_context->application_secret.response_data_sequence_number = 0;
+
+    return true;
+}
+
+bool libspdm_create_update_session_data_key(void *spdm_secured_message_context,
+                                            libspdm_key_update_action_t action)
+{
+    bool status;
+    size_t hash_size;
+    uint8_t bin_str9[128];
+    size_t bin_str9_size;
+    libspdm_secured_message_context_t *secured_message_context;
+
+    secured_message_context = spdm_secured_message_context;
+
+    hash_size = secured_message_context->hash_size;
+
+    bin_str9_size = sizeof(bin_str9);
+    libspdm_bin_concat(secured_message_context->version,
+                       SPDM_BIN_STR_9_LABEL, sizeof(SPDM_BIN_STR_9_LABEL) - 1,
+                       NULL, (uint16_t)hash_size, hash_size, bin_str9,
+                       &bin_str9_size);
+
+    LIBSPDM_DEBUG((LIBSPDM_DEBUG_INFO, "bin_str9 (0x%zx):\n", bin_str9_size));
+    LIBSPDM_INTERNAL_DUMP_HEX(bin_str9, bin_str9_size);
+
+    if (action == LIBSPDM_KEY_UPDATE_ACTION_REQUESTER) {
+        libspdm_copy_mem(&secured_message_context->application_secret_backup
+                         .request_data_secret,
+                         sizeof(secured_message_context->application_secret_backup
+                                .request_data_secret),
+                         &secured_message_context->application_secret
+                         .request_data_secret,
+                         LIBSPDM_MAX_HASH_SIZE);
+        libspdm_copy_mem(&secured_message_context->application_secret_backup
+                         .request_data_encryption_key,
+                         sizeof(secured_message_context->application_secret_backup
+                                .request_data_encryption_key),
+                         &secured_message_context->application_secret
+                         .request_data_encryption_key,
+                         LIBSPDM_MAX_AEAD_KEY_SIZE);
+        libspdm_copy_mem(&secured_message_context->application_secret_backup
+                         .request_data_salt,
+                         sizeof(secured_message_context->application_secret_backup
+                                .request_data_salt),
+                         &secured_message_context->application_secret
+                         .request_data_salt,
+                         LIBSPDM_MAX_AEAD_IV_SIZE);
+        secured_message_context->application_secret_backup
+        .request_data_sequence_number =
+            secured_message_context->application_secret.request_data_sequence_number;
+
+        status = libspdm_hkdf_expand(
+            secured_message_context->base_hash_algo,
+            secured_message_context->application_secret.request_data_secret,
+            hash_size, bin_str9, bin_str9_size,
+            secured_message_context->application_secret.request_data_secret,
+            hash_size);
+        if (!status) {
+            return false;
+        }
+        LIBSPDM_DEBUG((LIBSPDM_DEBUG_INFO, "RequestDataSecretUpdate (0x%zx) - ", hash_size));
+        LIBSPDM_INTERNAL_DUMP_DATA(secured_message_context->application_secret.request_data_secret,
+                                   hash_size);
+        LIBSPDM_DEBUG((LIBSPDM_DEBUG_INFO, "\n"));
+
+        status = libspdm_generate_aead_key_and_iv(
+            secured_message_context,
+            secured_message_context->application_secret.request_data_secret,
+            secured_message_context->application_secret.request_data_encryption_key,
+            secured_message_context->application_secret.request_data_salt);
+        if (!status) {
+            return status;
+        }
+        secured_message_context->application_secret.request_data_sequence_number = 0;
+
+        secured_message_context->requester_backup_valid = true;
+    } else if (action == LIBSPDM_KEY_UPDATE_ACTION_RESPONDER) {
+        libspdm_copy_mem(&secured_message_context->application_secret_backup
+                         .response_data_secret,
+                         sizeof(secured_message_context->application_secret_backup
+                                .response_data_secret),
+                         &secured_message_context->application_secret
+                         .response_data_secret,
+                         LIBSPDM_MAX_HASH_SIZE);
+        libspdm_copy_mem(&secured_message_context->application_secret_backup
+                         .response_data_encryption_key,
+                         sizeof(secured_message_context->application_secret_backup
+                                .response_data_encryption_key),
+                         &secured_message_context->application_secret
+                         .response_data_encryption_key,
+                         LIBSPDM_MAX_AEAD_KEY_SIZE);
+        libspdm_copy_mem(&secured_message_context->application_secret_backup
+                         .response_data_salt,
+                         sizeof(secured_message_context->application_secret_backup
+                                .response_data_salt),
+                         &secured_message_context->application_secret
+                         .response_data_salt,
+                         LIBSPDM_MAX_AEAD_IV_SIZE);
+        secured_message_context->application_secret_backup
+        .response_data_sequence_number =
+            secured_message_context->application_secret.response_data_sequence_number;
+
+        status = libspdm_hkdf_expand(
+            secured_message_context->base_hash_algo,
+            secured_message_context->application_secret.response_data_secret,
+            hash_size, bin_str9, bin_str9_size,
+            secured_message_context->application_secret.response_data_secret,
+            hash_size);
+        if (!status) {
+            return false;
+        }
+        LIBSPDM_DEBUG((LIBSPDM_DEBUG_INFO, "ResponseDataSecretUpdate (0x%zx) - ",
+                       hash_size));
+        LIBSPDM_INTERNAL_DUMP_DATA(secured_message_context->application_secret.response_data_secret,
+                                   hash_size);
+        LIBSPDM_DEBUG((LIBSPDM_DEBUG_INFO, "\n"));
+
+        status = libspdm_generate_aead_key_and_iv(
+            secured_message_context,
+            secured_message_context->application_secret.response_data_secret,
+            secured_message_context->application_secret.response_data_encryption_key,
+            secured_message_context->application_secret.response_data_salt);
+        if (!status) {
+            return status;
+        }
+        secured_message_context->application_secret.response_data_sequence_number = 0;
+
+        secured_message_context->responder_backup_valid = true;
+    } else {
+        return false;
+    }
+
+    return true;
+}
+
+void libspdm_clear_handshake_secret(void *spdm_secured_message_context)
+{
+    libspdm_secured_message_context_t *secured_message_context;
+
+    secured_message_context = spdm_secured_message_context;
+
+    libspdm_zero_mem(secured_message_context->master_secret.handshake_secret,
+                     LIBSPDM_MAX_HASH_SIZE);
+    libspdm_zero_mem(&(secured_message_context->handshake_secret),
+                     sizeof(libspdm_session_info_struct_handshake_secret_t));
+
+    secured_message_context->requester_backup_valid = false;
+    secured_message_context->responder_backup_valid = false;
+}
+
+void libspdm_clear_master_secret(void *spdm_secured_message_context)
+{
+    libspdm_secured_message_context_t *secured_message_context;
+
+    secured_message_context = spdm_secured_message_context;
+
+    libspdm_zero_mem(secured_message_context->master_secret.master_secret, LIBSPDM_MAX_HASH_SIZE);
+}
+
+bool libspdm_activate_update_session_data_key(void *spdm_secured_message_context,
+                                              libspdm_key_update_action_t action,
+                                              bool use_new_key)
+{
+    libspdm_secured_message_context_t *secured_message_context;
+
+    secured_message_context = spdm_secured_message_context;
+
+    if (!use_new_key) {
+        if ((action == LIBSPDM_KEY_UPDATE_ACTION_REQUESTER) &&
+            secured_message_context->requester_backup_valid) {
+            libspdm_copy_mem(&secured_message_context->application_secret
+                             .request_data_secret,
+                             sizeof(secured_message_context->application_secret
+                                    .request_data_secret),
+                             &secured_message_context
+                             ->application_secret_backup
+                             .request_data_secret,
+                             LIBSPDM_MAX_HASH_SIZE);
+            libspdm_copy_mem(&secured_message_context->application_secret
+                             .request_data_encryption_key,
+                             sizeof(secured_message_context->application_secret
+                                    .request_data_encryption_key),
+                             &secured_message_context
+                             ->application_secret_backup
+                             .request_data_encryption_key,
+                             LIBSPDM_MAX_AEAD_KEY_SIZE);
+            libspdm_copy_mem(&secured_message_context->application_secret
+                             .request_data_salt,
+                             sizeof(secured_message_context->application_secret
+                                    .request_data_salt),
+                             &secured_message_context
+                             ->application_secret_backup
+                             .request_data_salt,
+                             LIBSPDM_MAX_AEAD_IV_SIZE);
+            secured_message_context->application_secret
+            .request_data_sequence_number =
+                secured_message_context->application_secret_backup.request_data_sequence_number;
+        } else if ((action == LIBSPDM_KEY_UPDATE_ACTION_RESPONDER) &&
+                   secured_message_context->responder_backup_valid) {
+            libspdm_copy_mem(&secured_message_context->application_secret
+                             .response_data_secret,
+                             sizeof(secured_message_context->application_secret
+                                    .response_data_secret),
+                             &secured_message_context
+                             ->application_secret_backup
+                             .response_data_secret,
+                             LIBSPDM_MAX_HASH_SIZE);
+            libspdm_copy_mem(&secured_message_context->application_secret
+                             .response_data_encryption_key,
+                             sizeof(secured_message_context->application_secret
+                                    .response_data_encryption_key),
+                             &secured_message_context
+                             ->application_secret_backup
+                             .response_data_encryption_key,
+                             LIBSPDM_MAX_AEAD_KEY_SIZE);
+            libspdm_copy_mem(&secured_message_context->application_secret
+                             .response_data_salt,
+                             sizeof(secured_message_context->application_secret
+                                    .response_data_salt),
+                             &secured_message_context
+                             ->application_secret_backup
+                             .response_data_salt,
+                             LIBSPDM_MAX_AEAD_IV_SIZE);
+            secured_message_context->application_secret.response_data_sequence_number =
+                secured_message_context->application_secret_backup.response_data_sequence_number;
+        }
+    }
+
+    if (action == LIBSPDM_KEY_UPDATE_ACTION_REQUESTER) {
+        libspdm_zero_mem(&secured_message_context->application_secret_backup.request_data_secret,
+                         LIBSPDM_MAX_HASH_SIZE);
+        libspdm_zero_mem(&secured_message_context->application_secret_backup
+                         .request_data_encryption_key,
+                         LIBSPDM_MAX_AEAD_KEY_SIZE);
+        libspdm_zero_mem(&secured_message_context->application_secret_backup.request_data_salt,
+                         LIBSPDM_MAX_AEAD_IV_SIZE);
+        secured_message_context->application_secret_backup.request_data_sequence_number = 0;
+        secured_message_context->requester_backup_valid = false;
+    } else if (action == LIBSPDM_KEY_UPDATE_ACTION_RESPONDER) {
+        libspdm_zero_mem(&secured_message_context->application_secret_backup.response_data_secret,
+                         LIBSPDM_MAX_HASH_SIZE);
+        libspdm_zero_mem(&secured_message_context->application_secret_backup
+                         .response_data_encryption_key,
+                         LIBSPDM_MAX_AEAD_KEY_SIZE);
+        libspdm_zero_mem(&secured_message_context->application_secret_backup.response_data_salt,
+                         LIBSPDM_MAX_AEAD_IV_SIZE);
+        secured_message_context->application_secret_backup.response_data_sequence_number = 0;
+        secured_message_context->responder_backup_valid = false;
+    }
+
+    return true;
+}
+
+void *libspdm_hmac_new_with_request_finished_key(void *spdm_secured_message_context)
+{
+    libspdm_secured_message_context_t *secured_message_context;
+
+    secured_message_context = spdm_secured_message_context;
+    return libspdm_hmac_new(secured_message_context->base_hash_algo);
+}
+
+void libspdm_hmac_free_with_request_finished_key(
+    void *spdm_secured_message_context, void *hmac_ctx)
+{
+    libspdm_secured_message_context_t *secured_message_context;
+
+    secured_message_context = spdm_secured_message_context;
+    libspdm_hmac_free(secured_message_context->base_hash_algo, hmac_ctx);
+}
+
+bool libspdm_hmac_init_with_request_finished_key(
+    void *spdm_secured_message_context, void *hmac_ctx)
+{
+    libspdm_secured_message_context_t *secured_message_context;
+
+    secured_message_context = spdm_secured_message_context;
+    return libspdm_hmac_init(
+        secured_message_context->base_hash_algo, hmac_ctx,
+        secured_message_context->handshake_secret.request_finished_key,
+        secured_message_context->hash_size);
+}
+
+bool libspdm_hmac_duplicate_with_request_finished_key(
+    void *spdm_secured_message_context,
+    const void *hmac_ctx, void *new_hmac_ctx)
+{
+    libspdm_secured_message_context_t *secured_message_context;
+
+    secured_message_context = spdm_secured_message_context;
+    return libspdm_hmac_duplicate(secured_message_context->base_hash_algo, hmac_ctx, new_hmac_ctx);
+}
+
+bool libspdm_hmac_update_with_request_finished_key(
+    void *spdm_secured_message_context,
+    void *hmac_ctx, const void *data,
+    size_t data_size)
+{
+    libspdm_secured_message_context_t *secured_message_context;
+
+    secured_message_context = spdm_secured_message_context;
+    return libspdm_hmac_update(secured_message_context->base_hash_algo, hmac_ctx, data, data_size);
+}
+
+bool libspdm_hmac_final_with_request_finished_key(
+    void *spdm_secured_message_context,
+    void *hmac_ctx,  uint8_t *hmac_value)
+{
+    libspdm_secured_message_context_t *secured_message_context;
+
+    secured_message_context = spdm_secured_message_context;
+    return libspdm_hmac_final(secured_message_context->base_hash_algo, hmac_ctx, hmac_value);
+}
+
+bool libspdm_hmac_all_with_request_finished_key(void *spdm_secured_message_context,
+                                                const void *data, size_t data_size,
+                                                uint8_t *hmac_value)
+{
+    libspdm_secured_message_context_t *secured_message_context;
+
+    secured_message_context = spdm_secured_message_context;
+    return libspdm_hmac_all(
+        secured_message_context->base_hash_algo, data, data_size,
+        secured_message_context->handshake_secret.request_finished_key,
+        secured_message_context->hash_size, hmac_value);
+}
+
+void *libspdm_hmac_new_with_response_finished_key(void *spdm_secured_message_context)
+{
+    libspdm_secured_message_context_t *secured_message_context;
+
+    secured_message_context = spdm_secured_message_context;
+    return libspdm_hmac_new(secured_message_context->base_hash_algo);
+}
+
+void libspdm_hmac_free_with_response_finished_key(
+    void *spdm_secured_message_context, void *hmac_ctx)
+{
+    libspdm_secured_message_context_t *secured_message_context;
+
+    secured_message_context = spdm_secured_message_context;
+    libspdm_hmac_free(secured_message_context->base_hash_algo, hmac_ctx);
+}
+
+bool libspdm_hmac_init_with_response_finished_key(
+    void *spdm_secured_message_context, void *hmac_ctx)
+{
+    libspdm_secured_message_context_t *secured_message_context;
+
+    secured_message_context = spdm_secured_message_context;
+    return libspdm_hmac_init(
+        secured_message_context->base_hash_algo, hmac_ctx,
+        secured_message_context->handshake_secret.response_finished_key,
+        secured_message_context->hash_size);
+}
+
+bool libspdm_hmac_duplicate_with_response_finished_key(
+    void *spdm_secured_message_context,
+    const void *hmac_ctx, void *new_hmac_ctx)
+{
+    libspdm_secured_message_context_t *secured_message_context;
+
+    secured_message_context = spdm_secured_message_context;
+    return libspdm_hmac_duplicate(secured_message_context->base_hash_algo, hmac_ctx, new_hmac_ctx);
+}
+
+bool libspdm_hmac_update_with_response_finished_key(
+    void *spdm_secured_message_context,
+    void *hmac_ctx, const void *data,
+    size_t data_size)
+{
+    libspdm_secured_message_context_t *secured_message_context;
+
+    secured_message_context = spdm_secured_message_context;
+    return libspdm_hmac_update(secured_message_context->base_hash_algo, hmac_ctx, data, data_size);
+}
+
+bool libspdm_hmac_final_with_response_finished_key(
+    void *spdm_secured_message_context,
+    void *hmac_ctx,  uint8_t *hmac_value)
+{
+    libspdm_secured_message_context_t *secured_message_context;
+
+    secured_message_context = spdm_secured_message_context;
+    return libspdm_hmac_final(secured_message_context->base_hash_algo, hmac_ctx, hmac_value);
+}
+
+bool libspdm_hmac_all_with_response_finished_key(
+    void *spdm_secured_message_context, const void *data,
+    size_t data_size, uint8_t *hmac_value)
+{
+    libspdm_secured_message_context_t *secured_message_context;
+
+    secured_message_context = spdm_secured_message_context;
+    return libspdm_hmac_all(
+        secured_message_context->base_hash_algo, data, data_size,
+        secured_message_context->handshake_secret.response_finished_key,
+        secured_message_context->hash_size, hmac_value);
+}

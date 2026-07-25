@@ -1,0 +1,79 @@
+--- a/library/spdm_requester_lib/libspdm_req_get_measurement_extension_log.c
++++ b/library/spdm_requester_lib/libspdm_req_get_measurement_extension_log.c
+@@ -5,6 +5,7 @@
+  **/
+
+ #include "internal/libspdm_requester_lib.h"
++#include "../../harness/src/tla_trace.h"
+
+ #if LIBSPDM_ENABLE_CAPABILITY_MEL_CAP
+
+@@ -87,10 +88,16 @@ static libspdm_return_t libspdm_try_get_measurement_extension_log(libspdm_conte
+     length = LIBSPDM_MIN(SPDM_MAX_MEASUREMENT_EXTENSION_LOG_SIZE,
+                          spdm_context->local_context.capability.max_spdm_msg_size -
+                          sizeof(spdm_measurement_extension_log_response_t));
+
+     transport_header_size = spdm_context->local_context.capability.transport_header_size;
+
++    if (mel_size_internal == 0) {
++        tla_trace_init_event(0, 0, 0, 0, 0, 0, "ready", "ready");
++    }
++
+     do {
++        uint32_t req_pc_before = (remainder_length == 0) ? 0 : 1;
++
+         /* -=[Construct Request Phase]=- */
+         status = libspdm_acquire_sender_buffer (spdm_context, &message_size, (void **)&message);
+         if (LIBSPDM_STATUS_IS_ERROR(status)) {
+@@ -116,6 +123,13 @@ static libspdm_return_t libspdm_try_get_measurement_extension_log(libspdm_conte
+         LIBSPDM_DEBUG((LIBSPDM_DEBUG_INFO, "request (offset 0x%x, size 0x%x):\n",
+                        spdm_request->offset, spdm_request->length));
+
++        tla_trace_req_send_get_mel(
++            spdm_request->offset,
++            spdm_request->length,
++            (uint32_t)mel_size_internal, (uint32_t)mel_size_internal, remainder_length,
++            total_responder_mel_buffer_length,
++            "waiting");
++
+         /* -=[Send Request Phase]=- */
+         status =
+             libspdm_send_spdm_request(spdm_context, session_id, spdm_request_size, spdm_request);
+@@ -210,6 +224,14 @@ static libspdm_return_t libspdm_try_get_measurement_extension_log(libspdm_conte
+             goto done;
+         }
+
++        tla_trace_req_receive_mel_response(
++            spdm_response->portion_length,
++            spdm_response->remainder_length,
++            (uint32_t)(mel_size_internal + spdm_response->portion_length),
++            (uint32_t)(mel_size_internal + spdm_response->portion_length),
++            spdm_response->remainder_length,
++            total_responder_mel_buffer_length,
++            spdm_response->remainder_length == 0 ? "done" : "ready");
+
+         /* -=[Process Response Phase]=- */
+         remainder_length = spdm_response->remainder_length;
+--- a/library/spdm_responder_lib/libspdm_rsp_measurement_extension_log.c
++++ b/library/spdm_responder_lib/libspdm_rsp_measurement_extension_log.c
+@@ -5,6 +5,7 @@
+  **/
+ #include "internal/libspdm_responder_lib.h"
++#include "../../harness/src/tla_trace.h"
+
+ #if LIBSPDM_ENABLE_CAPABILITY_MEL_CAP
+
+@@ -134,6 +135,12 @@ libspdm_return_t libspdm_get_response_measurement_extension_log(libspdm_context_t
+         length = (uint32_t)(spdm_mel_len - offset);
+     }
+     remainder_length = spdm_mel_len - (length + offset);
++
++    tla_trace_resp_receive_and_send_mel(
++        (uint32_t)length,
++        (uint32_t)remainder_length,
++        (uint32_t)length,
++        (uint32_t)spdm_mel_len,
++        spdm_mel != NULL ? ((spdm_measurement_extension_log_dmtf_t *)spdm_mel)->mel_entries_len : 0);
+
+     libspdm_reset_message_buffer_via_request_code(spdm_context, session_info,
+                                                   spdm_request->header.request_response_code);

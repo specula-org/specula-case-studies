@@ -1,0 +1,127 @@
+commit 6c3e1ab7f608a38952abc5222d89192227e503b4
+Author: Qian-Cheng-nju <Qian-Cheng-nju@users.noreply.github.com>
+Date:   Mon Jun 8 13:58:10 2026 +0000
+
+    fix req_send trace placement; add test_vca_trace build
+
+diff --git a/library/spdm_requester_lib/libspdm_req_get_capabilities.c b/library/spdm_requester_lib/libspdm_req_get_capabilities.c
+index 6f2d4ba..c7c32b5 100644
+--- a/library/spdm_requester_lib/libspdm_req_get_capabilities.c
++++ b/library/spdm_requester_lib/libspdm_req_get_capabilities.c
+@@ -301,6 +301,12 @@ static libspdm_return_t libspdm_try_get_capabilities(libspdm_context_t *spdm_con
+         spdm_request->ext_flags = 0;
+     }
+ 
++#ifdef TLA_TRACE_ENABLED
++    tla_trace_req_send_get_capabilities(
++        spdm_context->connection_info.connection_state,
++        spdm_request->flags);
++#endif
++
+     /* -=[Send Request Phase]=- */
+     status = libspdm_send_spdm_request(spdm_context, NULL, spdm_request_size, spdm_request);
+     if (LIBSPDM_STATUS_IS_ERROR(status)) {
+@@ -401,11 +407,6 @@ static libspdm_return_t libspdm_try_get_capabilities(libspdm_context_t *spdm_con
+     if (LIBSPDM_STATUS_IS_ERROR(status)) {
+         goto receive_done;
+     }
+-#ifdef TLA_TRACE_ENABLED
+-    tla_trace_req_send_get_capabilities(
+-        spdm_context->connection_info.connection_state,
+-        spdm_request->flags);
+-#endif
+ 
+     status = libspdm_append_message_a(spdm_context, spdm_response, spdm_response_size);
+     if (LIBSPDM_STATUS_IS_ERROR(status)) {
+diff --git a/library/spdm_requester_lib/libspdm_req_get_version.c b/library/spdm_requester_lib/libspdm_req_get_version.c
+index 6214a12..f3150a4 100644
+--- a/library/spdm_requester_lib/libspdm_req_get_version.c
++++ b/library/spdm_requester_lib/libspdm_req_get_version.c
+@@ -76,6 +76,9 @@ static libspdm_return_t libspdm_try_get_version(libspdm_context_t *spdm_context,
+     spdm_request->header.param1 = 0;
+     spdm_request->header.param2 = 0;
+     spdm_request_size = sizeof(spdm_get_version_request_t);
++#ifdef TLA_TRACE_ENABLED
++    tla_trace_req_send_get_version(spdm_context->connection_info.connection_state);
++#endif
+ 
+     /* -=[Send Request Phase]=- */
+     status = libspdm_send_spdm_request(spdm_context, NULL, spdm_request_size, spdm_request);
+@@ -150,9 +153,6 @@ static libspdm_return_t libspdm_try_get_version(libspdm_context_t *spdm_context,
+     if (LIBSPDM_STATUS_IS_ERROR(status)) {
+         goto receive_done;
+     }
+-#ifdef TLA_TRACE_ENABLED
+-    tla_trace_req_send_get_version(spdm_context->connection_info.connection_state);
+-#endif
+ 
+     status = libspdm_append_message_a(spdm_context, spdm_response, spdm_response_size);
+     if (LIBSPDM_STATUS_IS_ERROR(status)) {
+diff --git a/library/spdm_requester_lib/libspdm_req_negotiate_algorithms.c b/library/spdm_requester_lib/libspdm_req_negotiate_algorithms.c
+index 149875a..7937cda 100644
+--- a/library/spdm_requester_lib/libspdm_req_negotiate_algorithms.c
++++ b/library/spdm_requester_lib/libspdm_req_negotiate_algorithms.c
+@@ -260,6 +260,31 @@ static libspdm_return_t libspdm_try_negotiate_algorithms(libspdm_context_t *spdm
+         LIBSPDM_ASSERT(index == spdm_request->header.param1);
+     }
+     spdm_request_size = spdm_request->length;
++#ifdef TLA_TRACE_ENABLED
++    {
++        uint32_t req_alg_mask = 0;
++        uint8_t _i;
++        const spdm_negotiate_algorithms_common_struct_table_t *_tbl =
++            &spdm_request->struct_table[0];
++        for (_i = 0; _i < spdm_request->header.param1; _i++) {
++            switch (_tbl->alg_type) {
++            case 2: req_alg_mask |= TLA_ALG_DHE;          break;
++            case 3: req_alg_mask |= TLA_ALG_AEAD;         break;
++            case 4: req_alg_mask |= TLA_ALG_REQ_ASYM;     break;
++            case 5: req_alg_mask |= TLA_ALG_KEY_SCHEDULE; break;
++            case 6: req_alg_mask |= TLA_ALG_REQ_PQC_ASYM; break;
++            case 7: req_alg_mask |= TLA_ALG_KEM;          break;
++            default: break;
++            }
++            _tbl = (const void *)((const uint8_t *)_tbl +
++                                   sizeof(spdm_negotiate_algorithms_common_struct_table_t) +
++                                   sizeof(uint32_t) * (_tbl->alg_count & 0xF));
++        }
++        tla_trace_req_send_negotiate_algorithms(
++            spdm_context->connection_info.connection_state,
++            req_alg_mask);
++    }
++#endif
+ 
+     /* -=[Send Request Phase]=- */
+     status = libspdm_send_spdm_request(spdm_context, NULL, spdm_request_size, spdm_request);
+@@ -426,31 +451,6 @@ static libspdm_return_t libspdm_try_negotiate_algorithms(libspdm_context_t *spdm
+     if (LIBSPDM_STATUS_IS_ERROR(status)) {
+         goto receive_done;
+     }
+-#ifdef TLA_TRACE_ENABLED
+-    {
+-        uint32_t req_alg_mask = 0;
+-        uint8_t i;
+-        const spdm_negotiate_algorithms_common_struct_table_t *req_tbl =
+-            &spdm_request->struct_table[0];
+-        for (i = 0; i < spdm_request->header.param1; i++) {
+-            switch (req_tbl->alg_type) {
+-            case 2: req_alg_mask |= TLA_ALG_DHE;          break;
+-            case 3: req_alg_mask |= TLA_ALG_AEAD;         break;
+-            case 4: req_alg_mask |= TLA_ALG_REQ_ASYM;     break;
+-            case 5: req_alg_mask |= TLA_ALG_KEY_SCHEDULE; break;
+-            case 6: req_alg_mask |= TLA_ALG_REQ_PQC_ASYM; break;
+-            case 7: req_alg_mask |= TLA_ALG_KEM;          break;
+-            default: break;
+-            }
+-            req_tbl = (const void *)((const uint8_t *)req_tbl +
+-                                     sizeof(spdm_negotiate_algorithms_common_struct_table_t) +
+-                                     sizeof(uint32_t) * (req_tbl->alg_count & 0xF));
+-        }
+-        tla_trace_req_send_negotiate_algorithms(
+-            spdm_context->connection_info.connection_state,
+-            req_alg_mask);
+-    }
+-#endif
+ 
+     status = libspdm_append_message_a(spdm_context, spdm_response, spdm_response_size);
+     if (LIBSPDM_STATUS_IS_ERROR(status)) {

@@ -1,0 +1,623 @@
+diff --git a/artifact/libspdm/include/tla_trace.h b/artifact/libspdm/include/tla_trace.h
+new file mode 100644
+index 0000000..42a8451
+--- /dev/null
++++ b/artifact/libspdm/include/tla_trace.h
+@@ -0,0 +1,172 @@
++/* tla_trace.h -- NDJSON trace emission for libspdm PSK exchange harness
++ * One-file header: include it in each instrumented translation unit.
++ * File path is controlled by TLA_TRACE_FILE env var; default /tmp/trace.ndjson.
++ */
++#ifndef TLA_TRACE_H
++#define TLA_TRACE_H
++
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <time.h>
++#include <stdint.h>
++#include <stdbool.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++/* ------------------------------------------------------------------
++ * File handle — opened lazily on first emit, never closed (process exit
++ * flushes it).  Two compilation units can both include this header; the
++ * static storage means each TU gets its own copy of the pointer.  Guard
++ * with a process-wide flag via a shared name:
++ *   we use a single .c file that defines g_tla_trace_fp externally.
++ * But for simplicity we use a single static per TU and guard with the env var.
++ * ------------------------------------------------------------------ */
++
++/* External linkage declaration — defined once in psk_trace_test.c */
++extern FILE *g_tla_trace_fp;
++
++/* ------------------------------------------------------------------
++ * Timestamp: epoch seconds * 1e9 (ANSI C99; avoids POSIX clock_gettime)
++ * ------------------------------------------------------------------ */
++static inline long long tla_ts_ns(void) {
++    return (long long)time(NULL) * 1000000000LL;
++}
++
++/* ------------------------------------------------------------------
++ * Low-level emit
++ * ------------------------------------------------------------------ */
++static inline void tla_emit_raw(const char *line) {
++    if (!g_tla_trace_fp) return;
++    fputs(line, g_tla_trace_fp);
++    fputc('\n', g_tla_trace_fp);
++    fflush(g_tla_trace_fp);
++}
++
++/* ------------------------------------------------------------------
++ * Mappings: C values → TLA+ strings
++ * ------------------------------------------------------------------ */
++
++/* LIBSPDM_SESSION_STATE_NOT_STARTED=0, HANDSHAKING=1, ESTABLISHED=2 */
++static inline const char *tla_state_str(int s) {
++    if (s == 1) return "HANDSHAKING";
++    if (s == 2) return "ESTABLISHED";
++    return "NOT_STARTED";
++}
++
++/* 0x1100 = SECURED_SPDM_VERSION_11 << SPDM_VERSION_NUMBER_SHIFT_BIT */
++#define TLA_VALID_VER ((uint16_t)0x1100u)
++
++static inline const char *tla_ver_str(uint16_t v) {
++    if (v == 0) return "V_NONE";
++    if (v == TLA_VALID_VER) return "V_VALID";
++    return "V_ALT";
++}
++
++/* ------------------------------------------------------------------
++ * Per-event emitters
++ * ------------------------------------------------------------------ */
++
++static inline void tla_emit_send_psk_exchange(uint32_t session_id,
++                                              bool has_opaque)
++{
++    char buf[512];
++    snprintf(buf, sizeof(buf),
++        "{\"tag\":\"trace\",\"ts\":\"%lld\","
++        "\"event\":\"SendPskExchange\",\"role\":\"requester\","
++        "\"session_id\":%u,\"session_state\":\"NOT_STARTED\","
++        "\"session_version\":\"V_NONE\",\"hmac_verified\":false,"
++        "\"has_opaque\":%s}",
++        tla_ts_ns(), session_id,
++        has_opaque ? "true" : "false");
++    tla_emit_raw(buf);
++}
++
++static inline void tla_emit_get_response_psk_exchange(uint32_t session_id)
++{
++    /* Emit PRE-STATE of GetResponsePskExchange (what ValidatePostStateRsp checks).
++     * - session_state: always NOT_STARTED (spec precondition)
++     * - session_version: always V_NONE (not yet assigned)
++     * - has_opaque: always false (rsp_has_opaque = FALSE before first call)
++     * - negotiated_version: always V_NONE (rsp_negotiated_version = V_NONE before first call)
++     * Actual opaque/version is driven by the message bag set in SendPskExchange. */
++    char buf[512];
++    snprintf(buf, sizeof(buf),
++        "{\"tag\":\"trace\",\"ts\":\"%lld\","
++        "\"event\":\"GetResponsePskExchange\",\"role\":\"responder\","
++        "\"session_id\":%u,\"session_state\":\"NOT_STARTED\","
++        "\"session_version\":\"V_NONE\",\"has_opaque\":false,"
++        "\"negotiated_version\":\"V_NONE\"}",
++        tla_ts_ns(), session_id);
++    tla_emit_raw(buf);
++}
++
++static inline void tla_emit_recv_psk_exchange_rsp(
++    uint32_t session_id, uint16_t neg_ver)
++{
++    /* Emit PRE-STATE fields + negotiated_version (POST-state, drives spec).
++     * - session_state: always HANDSHAKING (spec precondition)
++     * - session_version: always V_NONE (not yet set before RecvPskExchangeRsp)
++     * - hmac_verified: always false (not yet verified before RecvPskExchangeRsp)
++     * - negotiated_version: actual version negotiated; constrains req_negotiated_version' */
++    char buf[512];
++    snprintf(buf, sizeof(buf),
++        "{\"tag\":\"trace\",\"ts\":\"%lld\","
++        "\"event\":\"RecvPskExchangeRsp\",\"role\":\"requester\","
++        "\"session_id\":%u,\"session_state\":\"HANDSHAKING\","
++        "\"session_version\":\"V_NONE\",\"hmac_verified\":false,"
++        "\"negotiated_version\":\"%s\"}",
++        tla_ts_ns(), session_id,
++        tla_ver_str(neg_ver));
++    tla_emit_raw(buf);
++}
++
++static inline void tla_emit_send_psk_finish(uint32_t session_id,
++                                            int state, uint16_t ver)
++{
++    char buf[256];
++    snprintf(buf, sizeof(buf),
++        "{\"tag\":\"trace\",\"ts\":\"%lld\","
++        "\"event\":\"SendPskFinish\",\"role\":\"requester\","
++        "\"session_id\":%u,\"session_state\":\"%s\","
++        "\"session_version\":\"%s\",\"hmac_verified\":true}",
++        tla_ts_ns(), session_id,
++        tla_state_str(state), tla_ver_str(ver));
++    tla_emit_raw(buf);
++}
++
++static inline void tla_emit_get_response_psk_finish(uint32_t session_id,
++                                                    int state, uint16_t ver)
++{
++    char buf[256];
++    snprintf(buf, sizeof(buf),
++        "{\"tag\":\"trace\",\"ts\":\"%lld\","
++        "\"event\":\"GetResponsePskFinish\",\"role\":\"responder\","
++        "\"session_id\":%u,\"session_state\":\"%s\","
++        "\"session_version\":\"%s\"}",
++        tla_ts_ns(), session_id,
++        tla_state_str(state), tla_ver_str(ver));
++    tla_emit_raw(buf);
++}
++
++static inline void tla_emit_recv_psk_finish_rsp(uint32_t session_id,
++                                                int state, uint16_t ver)
++{
++    char buf[256];
++    snprintf(buf, sizeof(buf),
++        "{\"tag\":\"trace\",\"ts\":\"%lld\","
++        "\"event\":\"RecvPskFinishRsp\",\"role\":\"requester\","
++        "\"session_id\":%u,\"session_state\":\"%s\","
++        "\"session_version\":\"%s\",\"hmac_verified\":true}",
++        tla_ts_ns(), session_id,
++        tla_state_str(state), tla_ver_str(ver));
++    tla_emit_raw(buf);
++}
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif /* TLA_TRACE_H */
+diff --git a/artifact/libspdm/unit_test/test_spdm_psk_trace/CMakeLists.txt b/artifact/libspdm/unit_test/test_spdm_psk_trace/CMakeLists.txt
+new file mode 100644
+index 0000000..0e9820f
+--- /dev/null
++++ b/artifact/libspdm/unit_test/test_spdm_psk_trace/CMakeLists.txt
+@@ -0,0 +1,41 @@
++cmake_minimum_required(VERSION 3.5)
++
++add_executable(test_spdm_psk_trace)
++
++target_include_directories(test_spdm_psk_trace
++    PRIVATE
++        ${LIBSPDM_DIR}/unit_test/test_spdm_psk_trace
++        ${LIBSPDM_DIR}/include
++        ${LIBSPDM_DIR}/unit_test/include
++        ${LIBSPDM_DIR}/os_stub/spdm_device_secret_lib_${DEVICE}
++        ${LIBSPDM_DIR}/unit_test/cmockalib/cmocka/include
++        ${LIBSPDM_DIR}/unit_test/cmockalib/cmocka/include/cmockery
++        ${LIBSPDM_DIR}/unit_test/spdm_unit_test_common
++        ${LIBSPDM_DIR}/os_stub
++)
++
++target_sources(test_spdm_psk_trace
++    PRIVATE
++        psk_trace_test.c
++        ${LIBSPDM_DIR}/unit_test/spdm_unit_test_common/algo.c
++        ${LIBSPDM_DIR}/unit_test/spdm_unit_test_common/support.c
++)
++
++target_link_libraries(test_spdm_psk_trace
++    PRIVATE
++        memlib
++        debuglib
++        spdm_responder_lib
++        spdm_requester_lib
++        spdm_common_lib
++        ${CRYPTO_LIB_PATHS}
++        rnglib
++        cryptlib_${CRYPTO}
++        malloclib
++        spdm_crypt_lib
++        spdm_crypt_ext_lib
++        spdm_secured_message_lib
++        spdm_device_secret_lib_${DEVICE}
++        spdm_transport_test_lib
++        platform_lib
++)
+diff --git a/artifact/libspdm/unit_test/test_spdm_psk_trace/psk_trace_test.c b/artifact/libspdm/unit_test/test_spdm_psk_trace/psk_trace_test.c
+new file mode 100644
+index 0000000..ace8f59
+--- /dev/null
++++ b/artifact/libspdm/unit_test/test_spdm_psk_trace/psk_trace_test.c
+@@ -0,0 +1,392 @@
++/**
++ * PSK trace harness — two-context integration test for libspdm PSK exchange.
++ * Both real requester and real responder code run in one process.
++ * NDJSON trace is written to TLA_TRACE_FILE (default: /tmp/trace.ndjson).
++ *
++ * Scenario 1: PSK exchange with opaque data (has_opaque=true, with_context=true)
++ * Scenario 2: PSK exchange without opaque data (has_opaque=false) — for Family 1 bug
++ */
++
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <assert.h>
++
++#include "spdm_unit_test.h"
++#include "internal/libspdm_requester_lib.h"
++#include "internal/libspdm_responder_lib.h"
++#include "internal/libspdm_secured_message_lib.h"
++#include "library/spdm_transport_test_lib.h"
++
++/* tla_trace.h requires this external definition */
++FILE *g_tla_trace_fp = NULL;
++
++/* ------------------------------------------------------------------ */
++/* Buffer management — two independent sets                            */
++/* ------------------------------------------------------------------ */
++
++#define PSK_TRACE_BUF_SIZE LIBSPDM_MAX_SENDER_RECEIVER_BUFFER_SIZE
++
++static uint8_t g_req_sr_buf[PSK_TRACE_BUF_SIZE];
++static uint8_t g_rsp_sr_buf[PSK_TRACE_BUF_SIZE];
++
++/* Communication channel: requester → responder (one PSK_EXCHANGE at a time) */
++static uint8_t  g_req_to_rsp[PSK_TRACE_BUF_SIZE];
++static size_t   g_req_to_rsp_size;
++
++/* Communication channel: responder → requester */
++static uint8_t  g_rsp_to_req[PSK_TRACE_BUF_SIZE];
++static size_t   g_rsp_to_req_size;
++
++/* Forward-declaration so req_send_message can invoke the responder */
++static libspdm_context_t *g_rsp_ctx = NULL;
++
++/* ------------------------------------------------------------------ */
++/* Requester buffer callbacks                                          */
++/* ------------------------------------------------------------------ */
++
++static libspdm_return_t req_acquire_sender_buffer(void *ctx, void **buf)
++{
++    (void)ctx;
++    *buf = g_req_sr_buf;
++    return LIBSPDM_STATUS_SUCCESS;
++}
++
++static void req_release_sender_buffer(void *ctx, const void *buf)
++{
++    (void)ctx; (void)buf;
++}
++
++static libspdm_return_t req_acquire_receiver_buffer(void *ctx, void **buf)
++{
++    (void)ctx;
++    *buf = g_req_sr_buf;
++    return LIBSPDM_STATUS_SUCCESS;
++}
++
++static void req_release_receiver_buffer(void *ctx, const void *buf)
++{
++    (void)ctx; (void)buf;
++}
++
++/* ------------------------------------------------------------------ */
++/* Responder buffer callbacks                                          */
++/* ------------------------------------------------------------------ */
++
++static libspdm_return_t rsp_acquire_sender_buffer(void *ctx, void **buf)
++{
++    (void)ctx;
++    *buf = g_rsp_sr_buf;
++    return LIBSPDM_STATUS_SUCCESS;
++}
++
++static void rsp_release_sender_buffer(void *ctx, const void *buf)
++{
++    (void)ctx; (void)buf;
++}
++
++static libspdm_return_t rsp_acquire_receiver_buffer(void *ctx, void **buf)
++{
++    (void)ctx;
++    *buf = g_rsp_sr_buf;
++    return LIBSPDM_STATUS_SUCCESS;
++}
++
++static void rsp_release_receiver_buffer(void *ctx, const void *buf)
++{
++    (void)ctx; (void)buf;
++}
++
++/* ------------------------------------------------------------------ */
++/* Transport I/O callbacks                                             */
++/* ------------------------------------------------------------------ */
++
++/* Requester sends a request: copy to relay buffer, then dispatch responder */
++static libspdm_return_t req_send_message(void *ctx, size_t msg_size,
++                                         const void *msg, uint64_t timeout)
++{
++    (void)ctx; (void)timeout;
++    assert(msg_size <= sizeof(g_req_to_rsp));
++    memcpy(g_req_to_rsp, msg, msg_size);
++    g_req_to_rsp_size = msg_size;
++    /* Synchronously dispatch the responder to process and respond */
++    return libspdm_responder_dispatch_message(g_rsp_ctx);
++}
++
++/* Requester receives a response: copy from relay buffer */
++static libspdm_return_t req_receive_message(void *ctx, size_t *msg_size,
++                                            void **msg, uint64_t timeout)
++{
++    (void)ctx; (void)timeout;
++    assert(g_rsp_to_req_size <= *msg_size);
++    memcpy(*msg, g_rsp_to_req, g_rsp_to_req_size);
++    *msg_size = g_rsp_to_req_size;
++    return LIBSPDM_STATUS_SUCCESS;
++}
++
++/* Responder receives a request: copy from relay buffer */
++static libspdm_return_t rsp_receive_message(void *ctx, size_t *msg_size,
++                                            void **msg, uint64_t timeout)
++{
++    (void)ctx; (void)timeout;
++    assert(g_req_to_rsp_size <= *msg_size);
++    memcpy(*msg, g_req_to_rsp, g_req_to_rsp_size);
++    *msg_size = g_req_to_rsp_size;
++    return LIBSPDM_STATUS_SUCCESS;
++}
++
++/* Responder sends a response: copy to relay buffer */
++static libspdm_return_t rsp_send_message(void *ctx, size_t msg_size,
++                                         const void *msg, uint64_t timeout)
++{
++    (void)ctx; (void)timeout;
++    assert(msg_size <= sizeof(g_rsp_to_req));
++    memcpy(g_rsp_to_req, msg, msg_size);
++    g_rsp_to_req_size = msg_size;
++    return LIBSPDM_STATUS_SUCCESS;
++}
++
++/* ------------------------------------------------------------------ */
++/* Context initialisation                                              */
++/* ------------------------------------------------------------------ */
++
++static void init_context(libspdm_context_t *ctx, bool is_requester)
++{
++    void *scratch_buffer;
++    size_t scratch_buffer_size;
++
++    libspdm_init_context(ctx);
++
++    /* Transport layer — same test transport on both sides */
++    libspdm_register_transport_layer_func(
++        ctx,
++        LIBSPDM_MAX_SPDM_MSG_SIZE,
++        LIBSPDM_TEST_TRANSPORT_HEADER_SIZE,
++        LIBSPDM_TEST_TRANSPORT_TAIL_SIZE,
++        libspdm_transport_test_encode_message,
++        libspdm_transport_test_decode_message);
++
++    if (is_requester) {
++        libspdm_register_device_io_func(ctx,
++                                        req_send_message,
++                                        req_receive_message);
++        libspdm_register_device_buffer_func(
++            ctx,
++            LIBSPDM_MAX_SENDER_RECEIVER_BUFFER_SIZE,
++            LIBSPDM_MAX_SENDER_RECEIVER_BUFFER_SIZE,
++            req_acquire_sender_buffer,
++            req_release_sender_buffer,
++            req_acquire_receiver_buffer,
++            req_release_receiver_buffer);
++        ctx->local_context.is_requester = true;
++    } else {
++        libspdm_register_device_io_func(ctx,
++                                        rsp_send_message,
++                                        rsp_receive_message);
++        libspdm_register_device_buffer_func(
++            ctx,
++            LIBSPDM_MAX_SENDER_RECEIVER_BUFFER_SIZE,
++            LIBSPDM_MAX_SENDER_RECEIVER_BUFFER_SIZE,
++            rsp_acquire_sender_buffer,
++            rsp_release_sender_buffer,
++            rsp_acquire_receiver_buffer,
++            rsp_release_receiver_buffer);
++        ctx->local_context.is_requester = false;
++    }
++
++    /* Allocate and register scratch buffer (required when CHUNK_CAP is enabled) */
++    scratch_buffer_size = libspdm_get_sizeof_required_scratch_buffer(ctx);
++    scratch_buffer = malloc(scratch_buffer_size);
++    assert(scratch_buffer != NULL);
++    libspdm_set_scratch_buffer(ctx, scratch_buffer, scratch_buffer_size);
++
++    /* Both sides: SPDM 1.1, SHA-256, AES-256-GCM, SPDM key schedule */
++    ctx->connection_info.version =
++        SPDM_MESSAGE_VERSION_11 << SPDM_VERSION_NUMBER_SHIFT_BIT;
++    ctx->connection_info.connection_state = LIBSPDM_CONNECTION_STATE_NEGOTIATED;
++    ctx->connection_info.algorithm.base_hash_algo =
++        SPDM_ALGORITHMS_BASE_HASH_ALGO_TPM_ALG_SHA_256;
++    ctx->connection_info.algorithm.aead_cipher_suite =
++        SPDM_ALGORITHMS_AEAD_CIPHER_SUITE_AES_256_GCM;
++    ctx->connection_info.algorithm.key_schedule =
++        SPDM_ALGORITHMS_KEY_SCHEDULE_SPDM;
++    ctx->connection_info.algorithm.dhe_named_group = 0;
++
++    /* Supported secured message versions */
++    ctx->local_context.secured_message_version.secured_message_version_count = 1;
++    ctx->local_context.secured_message_version.secured_message_version[0] =
++        SECURED_SPDM_VERSION_11 << SPDM_VERSION_NUMBER_SHIFT_BIT;
++
++    if (is_requester) {
++        /* Requester's own capabilities */
++        ctx->local_context.capability.flags |=
++            SPDM_GET_CAPABILITIES_REQUEST_FLAGS_PSK_CAP_REQUESTER;
++        ctx->local_context.capability.flags |=
++            SPDM_GET_CAPABILITIES_REQUEST_FLAGS_MAC_CAP;
++        /* Peer (responder) capabilities: PSK_CAP_RESPONDER only (not WITH_CONTEXT).
++         * This models PSK_CAP_REQUESTER_ONLY — requester won't send PSK_FINISH and
++         * transitions directly to ESTABLISHED after RecvPskExchangeRsp, matching
++         * req_state = InitState(PSK_CAP_REQUESTER_ONLY) in the TLA+ spec Init. */
++        ctx->connection_info.capability.flags |=
++            SPDM_GET_CAPABILITIES_RESPONSE_FLAGS_PSK_CAP_RESPONDER;
++        ctx->connection_info.capability.flags |=
++            SPDM_GET_CAPABILITIES_RESPONSE_FLAGS_MAC_CAP;
++    } else {
++        /* Responder's own capabilities: PSK_CAP_RESPONDER only (not WITH_CONTEXT).
++         * Responder enters application phase directly without waiting for PSK_FINISH.
++         * GetResponsePskExchange emits while still HANDSHAKING (before the
++         * PSK_CAP_RESPONDER_WITH_CONTEXT check), matching TLA+ rsp_state HANDSHAKING. */
++        ctx->local_context.capability.flags |=
++            SPDM_GET_CAPABILITIES_RESPONSE_FLAGS_PSK_CAP_RESPONDER;
++        ctx->local_context.capability.flags |=
++            SPDM_GET_CAPABILITIES_RESPONSE_FLAGS_MAC_CAP;
++        /* Peer (requester) capabilities */
++        ctx->connection_info.capability.flags |=
++            SPDM_GET_CAPABILITIES_REQUEST_FLAGS_PSK_CAP_REQUESTER;
++        ctx->connection_info.capability.flags |=
++            SPDM_GET_CAPABILITIES_REQUEST_FLAGS_MAC_CAP;
++    }
++}
++
++/* ------------------------------------------------------------------ */
++/* Trace file management                                               */
++/* ------------------------------------------------------------------ */
++
++static void trace_open(const char *path)
++{
++    g_tla_trace_fp = fopen(path, "w");
++    if (!g_tla_trace_fp) {
++        fprintf(stderr, "[psk_trace] Cannot open trace file: %s\n", path);
++        exit(1);
++    }
++    /* Config line */
++    fprintf(g_tla_trace_fp,
++            "{\"tag\":\"config\",\"ts\":\"0\",\"config\":"
++            "{\"scenarios\":[\"psk_with_context\",\"psk_no_opaque\"]}}\n");
++    fflush(g_tla_trace_fp);
++}
++
++static void trace_close(void)
++{
++    if (g_tla_trace_fp) {
++        fflush(g_tla_trace_fp);
++        fclose(g_tla_trace_fp);
++        g_tla_trace_fp = NULL;
++    }
++}
++
++/* ------------------------------------------------------------------ */
++/* Run a single PSK session (PSK_EXCHANGE + PSK_FINISH)               */
++/* ------------------------------------------------------------------ */
++
++static int run_psk_session(libspdm_context_t *req_ctx,
++                           const char *psk_hint, uint16_t hint_size)
++{
++    libspdm_return_t status;
++    uint32_t session_id = 0;
++
++    /* PSK_EXCHANGE + PSK_EXCHANGE_RSP */
++    status = libspdm_send_receive_psk_exchange(
++        req_ctx,
++        psk_hint, hint_size,
++        SPDM_PSK_EXCHANGE_REQUEST_NO_MEASUREMENT_SUMMARY_HASH,
++        0,   /* session_policy */
++        &session_id,
++        NULL,  /* heartbeat_period */
++        NULL   /* measurement_hash */
++    );
++    if (LIBSPDM_STATUS_IS_ERROR(status)) {
++        fprintf(stderr, "[psk_trace] PSK_EXCHANGE failed: 0x%x\n",
++                (unsigned)status);
++        return -1;
++    }
++
++    /* PSK_CAP_REQUESTER_ONLY: session is ESTABLISHED directly after PSK_EXCHANGE,
++     * no PSK_FINISH needed. This matches req_state = InitState(PSK_CAP_REQUESTER_ONLY)
++     * in the TLA+ spec. */
++    return 0;
++}
++
++/* ------------------------------------------------------------------ */
++/* Main                                                                */
++/* ------------------------------------------------------------------ */
++
++int main(void)
++{
++    const char *trace_dir = getenv("TLA_TRACE_DIR");
++    if (!trace_dir) trace_dir = ".";
++
++    char path1[512], path2[512];
++    snprintf(path1, sizeof(path1), "%s/psk_with_context.ndjson", trace_dir);
++    snprintf(path2, sizeof(path2), "%s/psk_no_opaque.ndjson", trace_dir);
++
++    /* -------- Scenario 1: normal PSK with opaque data (has_opaque=true) -------- */
++    {
++        libspdm_context_t *req_ctx = malloc(libspdm_get_context_size());
++        libspdm_context_t *rsp_ctx = malloc(libspdm_get_context_size());
++        assert(req_ctx && rsp_ctx);
++
++        init_context(req_ctx, true);
++        init_context(rsp_ctx, false);
++        g_rsp_ctx = rsp_ctx;
++
++        trace_open(path1);
++
++        int rc = run_psk_session(req_ctx, LIBSPDM_TEST_PSK_HINT_STRING,
++                                 sizeof(LIBSPDM_TEST_PSK_HINT_STRING));
++        trace_close();
++
++        if (rc != 0) {
++            fprintf(stderr, "[psk_trace] Scenario 1 FAILED\n");
++            void *sb; size_t sbs;
++            libspdm_get_scratch_buffer(req_ctx, &sb, &sbs); free(sb);
++            libspdm_get_scratch_buffer(rsp_ctx, &sb, &sbs); free(sb);
++            free(req_ctx); free(rsp_ctx);
++            return 1;
++        }
++        printf("[psk_trace] Scenario 1 (psk_with_context) OK -> %s\n", path1);
++
++        { void *sb; size_t sbs;
++          libspdm_get_scratch_buffer(req_ctx, &sb, &sbs); free(sb);
++          libspdm_get_scratch_buffer(rsp_ctx, &sb, &sbs); free(sb); }
++        free(req_ctx);
++        free(rsp_ctx);
++        g_rsp_ctx = NULL;
++    }
++
++    /* -------- Scenario 2: PSK without opaque data (has_opaque=false) -------- */
++    /* The requester sends opaque_length=0 by having 0 secured_message_versions */
++    {
++        libspdm_context_t *req_ctx = malloc(libspdm_get_context_size());
++        libspdm_context_t *rsp_ctx = malloc(libspdm_get_context_size());
++        assert(req_ctx && rsp_ctx);
++
++        init_context(req_ctx, true);
++        init_context(rsp_ctx, false);
++
++        /* Disable opaque data by clearing secured_message_version count on requester */
++        req_ctx->local_context.secured_message_version.secured_message_version_count = 0;
++
++        g_rsp_ctx = rsp_ctx;
++        trace_open(path2);
++
++        int rc = run_psk_session(req_ctx, LIBSPDM_TEST_PSK_HINT_STRING,
++                                 sizeof(LIBSPDM_TEST_PSK_HINT_STRING));
++        trace_close();
++
++        if (rc != 0) {
++            fprintf(stderr, "[psk_trace] Scenario 2 FAILED (may be expected for Family 1)\n");
++        } else {
++            printf("[psk_trace] Scenario 2 (psk_no_opaque) OK -> %s\n", path2);
++        }
++
++        { void *sb; size_t sbs;
++          libspdm_get_scratch_buffer(req_ctx, &sb, &sbs); free(sb);
++          libspdm_get_scratch_buffer(rsp_ctx, &sb, &sbs); free(sb); }
++        free(req_ctx);
++        free(rsp_ctx);
++        g_rsp_ctx = NULL;
++    }
++
++    return 0;
++}

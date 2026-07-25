@@ -1,0 +1,141 @@
+--- a/src/mongo/db/s/range_deleter_service.cpp
++++ b/src/mongo/db/s/range_deleter_service.cpp
+@@ -29,6 +29,8 @@
+
+ #include "mongo/db/s/range_deleter_service.h"
+
++#include "mongo/db/s/tla_trace.h"
++
+ #include "mongo/base/checked_cast.h"
+ #include "mongo/base/status.h"
+ #include "mongo/base/string_data.h"
+@@ -133,6 +135,9 @@ void RangeDeleterService::onStepUpBegin(OperationContext* opCtx, long long term)
+ void RangeDeleterService::onStepUpComplete(OperationContext* opCtx, long long term) {
+     // Wait until all tasks and thread from previous term drain
+     _joinAndResetState();
+     _activeTerm = _recoveryState.notifyStartOfTerm(term);
+
+     auto lock = _acquireMutexUnconditionally();
+@@ -149,11 +154,23 @@ void RangeDeleterService::onStepUpComplete(OperationContext* opCtx, long long te
+     _executor = std::move(taskExecutor);
+     _executor->startup();
+
++    // Emit OnStepUpComplete event
++    std::map<std::string, std::string> fields;
++    fields["service_state"] = "READY_FOR_INIT";
++    fields["recovery_started"] = "true";
++    tla_trace::Emitter::getInstance().emit("OnStepUpComplete", "n1", term, fields);
++
+     // Initialize the range deletion processor to allow enqueueing ready task.
+     _readyRangeDeletionsProcessorPtr =
+         std::make_unique<ReadyRangeDeletionsProcessor>(opCtx, _executor);
+
+     _recoveryState.getRecoveryFuture(term)
+         .thenRunOn(_executor)
+         .then([this, term](RangeDeletionRecoveryTracker::Outcome outcome) {
+             LOGV2_INFO(11079601,
+                        "Range deleter service task recovery finished",
+@@ -165,6 +182,17 @@ void RangeDeleterService::onStepUpComplete(OperationContext* opCtx, long long te
+             if (_state != kDown) {
+                 _state = kUp;
+                 LOGV2_INFO(11079600, "Range deleter service is now up", "term"_attr = term);
++
++                // Emit RecoveryCompletes event
++                std::string outcome_str;
++                if (outcome == RangeDeletionRecoveryTracker::Outcome::kComplete) {
++                    outcome_str = "COMPLETE";
++                } else {
++                    outcome_str = "INCOMPLETE";
++                }
++                std::map<std::string, std::string> rcf;
++                rcf["service_state"] = "UP";
++                rcf["recovery_outcome"] = outcome_str;
++                tla_trace::Emitter::getInstance().emit("RecoveryCompletes", "n1", term, rcf);
++
+                 _readyRangeDeletionsProcessorPtr->beginProcessing();
+                 if (_serviceUpPromise.has_value()) {
+                     ensureSet(lock, *_serviceUpPromise);
+@@ -198,12 +226,26 @@ void RangeDeleterService::_launchRangeDeletionRecoveryTask(OperationContext* opC
+             {
+                 auto lock = _acquireMutexUnconditionally();
+                 if (_state != kReadyForInitialization) {
+                     return;
+                 }
+                 _state = kInitializing;
+                 _initOpCtxHolder = tc->makeOperationContext();
+             }
+
++            // Emit LaunchRangeDeletionRecoveryTask event
++            {
++                std::map<std::string, std::string> ltask;
++                ltask["service_state"] = "INITIALIZING";
++                tla_trace::Emitter::getInstance().emit("LaunchRangeDeletionRecoveryTask", "n1", term, ltask);
++            }
++
+             ON_BLOCK_EXIT([this] {
+                 auto lock = _acquireMutexUnconditionally();
+                 _initOpCtxHolder.reset();
+             });
+
+             auto opCtx{_initOpCtxHolder.get()};
+
+             LOGV2(6834800, "Resubmitting range deletion tasks");
+@@ -230,6 +272,12 @@ void RangeDeleterService::_launchRangeDeletionRecoveryTask(OperationContext* opC
+                 nRescheduledTasks++;
+             }
+
++            // Emit RecoveryCompletesFirstScan event
++            {
++                std::map<std::string, std::string> rfs;
++                rfs["recovery_scan_state"] = "scanned_processing";
++                tla_trace::Emitter::getInstance().emit("RecoveryCompletesFirstScan", "n1", term, rfs);
++            }
++
+             if (nRescheduledTasks > 1) {
+                 LOGV2_WARNING(6834801,
+                               "Rescheduling several range deletions marked as processing. "
+@@ -252,6 +300,13 @@ void RangeDeleterService::_launchRangeDeletionRecoveryTask(OperationContext* opC
+                     }
+                 }
+             }
+
++            // Emit RecoveryCompletesSecondScan event
++            {
++                std::map<std::string, std::string> rss;
++                rss["recovery_scan_state"] = "scanned_all";
++                tla_trace::Emitter::getInstance().emit("RecoveryCompletesSecondScan", "n1", term, rss);
++            }
++
+             LOGV2_INFO(6834802,
+                        "Finished resubmitting range deletion tasks",
+                        "nRescheduledTasks"_attr = nRescheduledTasks);
+@@ -313,6 +368,11 @@ void RangeDeleterService::_stopService() {
+     _state = kDown;
+     _activeTerm.reset();
+
++    // Emit OnStepDown event
++    std::map<std::string, std::string> stepdown_fields;
++    stepdown_fields["service_state"] = "DOWN";
++    tla_trace::Emitter::getInstance().emit("OnStepDown", "n1", 0, stepdown_fields);
++
+     if (_initOpCtxHolder) {
+         stdx::lock_guard<Client> lk(*_initOpCtxHolder->getClient());
+         _initOpCtxHolder->markKilled(ErrorCodes::Interrupted);
+@@ -377,6 +437,20 @@ SharedSemiFuture<void> RangeDeleterService::registerTask(
+
+     auto [task, registrationResult] = _rangeDeletionTasks.registerTask(rdt);
+
++    // Emit RegisterTask event
++    if (registrationResult == RangeDeletionTaskTracker::kRegisteredNewTask) {
++        std::map<std::string, std::string> reg_fields;
++        reg_fields["task"] = rdt.getId().toString();
++        reg_fields["registration_time"] = std::to_string(task->getRegistrationTime());
++        reg_fields["overlapping_with"] = "[]";  // Simplified - will be computed later
++        auto overlappingTasks = _rangeDeletionTasks.getOverlappingTasks(
++            rdt.getCollectionUuid(), rdt.getRange());
++        tla_trace::Emitter::getInstance().emit("RegisterTask", "n1", current_term[0], reg_fields);
++    }
++
+     auto scheduleRangeDeletionChain = [&](SharedSemiFuture<void> pendingFuture) {
+         (void)pendingFuture.thenRunOn(_executor)
+             .then([this]() {

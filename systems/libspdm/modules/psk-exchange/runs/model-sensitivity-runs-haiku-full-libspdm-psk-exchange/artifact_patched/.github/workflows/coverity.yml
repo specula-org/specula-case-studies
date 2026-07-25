@@ -1,0 +1,54 @@
+# https://scan.coverity.com/projects/libspdm
+
+name: Coverity Scan
+
+on:
+    workflow_dispatch:
+      inputs:
+        build:
+          type: choice
+          description: 'Build Type'
+          required: true
+          options:
+            - 'Release'
+            - 'Debug'
+        transcript:
+          type: choice
+          description: 'LIBSPDM_RECORD_TRANSCRIPT_DATA_SUPPORT Value'
+          required: true
+          options:
+            - '0'
+            - '1'
+
+jobs:
+  coverity:
+    strategy:
+      matrix:
+        os: [ubuntu-latest]
+        cc: [gcc]
+    runs-on: ${{ matrix.os }}
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v6
+      with:
+        submodules: recursive
+
+    - name: Download, Build, and Submit
+      run: |
+        curl https://scan.coverity.com/download/cxx/linux64/ \
+             --data "token=${{ secrets.COVERITY_SCAN_TOKEN }}&project=libspdm" \
+             --output cov-analysis.tar.gz
+        mkdir cov-analysis
+        tar -C ./cov-analysis -xzf cov-analysis.tar.gz --strip-components=1
+        PATH=$PATH:$(pwd)/cov-analysis/bin
+        mkdir build
+        cd build
+        cmake -E env CFLAGS="-DLIBSPDM_FIPS_MODE=1 -DLIBSPDM_RECORD_TRANSCRIPT_DATA_SUPPORT=${{ inputs.transcript }}" cmake -DTOOLCHAIN=GCC -DTARGET=${{ inputs.build }} -DCRYPTO=mbedtls ..
+        cov-build --dir cov-int make -j`nproc`
+        tar czf libspdm.tgz cov-int
+        curl --form token=${{ secrets.COVERITY_SCAN_TOKEN }} \
+             --form email=sbellock@nvidia.com \
+             --form file=@libspdm.tgz \
+             --form version="" \
+             --form description="${{ inputs.build }} build" \
+             https://scan.coverity.com/builds?project=libspdm

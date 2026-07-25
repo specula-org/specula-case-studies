@@ -1,0 +1,283 @@
+diff --git a/library/spdm_requester_lib/libspdm_req_get_version.c b/library/spdm_requester_lib/libspdm_req_get_version.c
+index original..instrumented 100644
+--- a/library/spdm_requester_lib/libspdm_req_get_version.c
++++ b/library/spdm_requester_lib/libspdm_req_get_version.c
+@@ -6,6 +6,8 @@
+
+ #include "internal/libspdm_requester_lib.h"
+
++#include "../../harness/src/tla_trace.h"
++#include "../../harness/src/state_capture.h"
+ #pragma pack(1)
+ typedef struct {
+     spdm_message_header_t header;
+@@ -75,6 +77,11 @@ static libspdm_return_t libspdm_try_get_version(libspdm_context_t *spdm_context
+     spdm_request_size = sizeof(spdm_get_version_request_t);
+
+     /* -=[Send Request Phase]=- */
++    state_capture_requester_state("requester_version_sent");
++    char *state_json = build_state_json();
++    tla_trace_event_t evt = {.event = "requester_init_version", .node_id = "requester", .state_json = state_json};
++    tla_trace_emit(&evt);
++    free(state_json);
+     status = libspdm_send_spdm_request(spdm_context, NULL, spdm_request_size, spdm_request);
+     if (LIBSPDM_STATUS_IS_ERROR(status)) {
+         libspdm_release_sender_buffer (spdm_context);
+@@ -168,6 +175,17 @@ static libspdm_return_t libspdm_try_get_version(libspdm_context_t *spdm_context
+         goto receive_done;
+     }
+
++    /* Emit trace for version reception */
++    state_capture_version_negotiated(true);
++    state_capture_requester_state("requester_caps_sent");
++    state_capture_negotiated_version(common_version >> SPDM_VERSION_NUMBER_SHIFT_BIT);
++    char *evt_json = build_event_json_version(common_version >> SPDM_VERSION_NUMBER_SHIFT_BIT);
++    state_json = build_state_json();
++    tla_trace_event_t evt2 = {.event = "requester_receives_version", .node_id = "requester", .state_json = state_json, .msg_json = evt_json};
++    tla_trace_emit(&evt2);
++    free(state_json);
++    free(evt_json);
++
+     libspdm_copy_mem(&(spdm_context->connection_info.version),
+                      sizeof(spdm_context->connection_info.version),
+                      &(common_version), sizeof(spdm_version_number_t));
+diff --git a/library/spdm_requester_lib/libspdm_req_get_capabilities.c b/library/spdm_requester_lib/libspdm_req_get_capabilities.c
+index original..instrumented 100644
+--- a/library/spdm_requester_lib/libspdm_req_get_capabilities.c
++++ b/library/spdm_requester_lib/libspdm_req_get_capabilities.c
+@@ -6,6 +6,8 @@
+
+ #include "internal/libspdm_requester_lib.h"
+
++#include "../../harness/src/tla_trace.h"
++#include "../../harness/src/state_capture.h"
+ #pragma pack(1)
+ typedef struct {
+     spdm_message_header_t header;
+@@ -90,6 +92,11 @@ static libspdm_return_t libspdm_try_get_capabilities(libspdm_context_t *spdm_con
+     spdm_request_size = sizeof(spdm_get_capabilities_request_t);
+
+     /* -=[Send Request Phase]=- */
++    state_capture_requester_state("requester_algo_sent");
++    char *state_json = build_state_json();
++    tla_trace_event_t evt = {.event = "requester_init_capabilities", .node_id = "requester", .state_json = state_json};
++    tla_trace_emit(&evt);
++    free(state_json);
+     status = libspdm_send_spdm_request(spdm_context, NULL, spdm_request_size, spdm_request);
+     if (LIBSPDM_STATUS_IS_ERROR(status)) {
+         libspdm_release_sender_buffer (spdm_context);
+@@ -145,6 +152,14 @@ static libspdm_return_t libspdm_try_get_capabilities(libspdm_context_t *spdm_con
+         goto receive_done;
+     }
+
++    /* Emit trace for capabilities reception */
++    state_capture_capabilities_negotiated(true);
++    state_capture_requester_state("requester_algo_sent");
++    state_json = build_state_json();
++    tla_trace_event_t evt2 = {.event = "requester_receives_capabilities", .node_id = "requester", .state_json = state_json};
++    tla_trace_emit(&evt2);
++    free(state_json);
++
+     /* -=[Update State Phase]=- */
+     spdm_context->connection_info.connection_state = LIBSPDM_CONNECTION_STATE_AFTER_CAPABILITIES;
+     status = LIBSPDM_STATUS_SUCCESS;
+diff --git a/library/spdm_requester_lib/libspdm_req_negotiate_algorithms.c b/library/spdm_requester_lib/libspdm_req_negotiate_algorithms.c
+index original..instrumented 100644
+--- a/library/spdm_requester_lib/libspdm_req_negotiate_algorithms.c
++++ b/library/spdm_requester_lib/libspdm_req_negotiate_algorithms.c
+@@ -6,6 +6,8 @@
+
+ #include "internal/libspdm_requester_lib.h"
+
++#include "../../harness/src/tla_trace.h"
++#include "../../harness/src/state_capture.h"
+ #pragma pack(1)
+ typedef struct {
+     spdm_message_header_t header;
+@@ -200,6 +202,18 @@ static libspdm_return_t libspdm_try_negotiate_algorithms(libspdm_context_t *spdm
+     spdm_request_size = sizeof(spdm_negotiate_algorithms_request_t) +
+                        sizeof(spdm_negotiate_algorithms_request_mine_t);
+
++    /* Emit trace for algorithm proposal */
++    char algos_buf[256];
++    snprintf(algos_buf, sizeof(algos_buf), "[%d, %d, %d, %d]",
++             request_mine->base_asym_algo,
++             request_mine->base_hash_algo,
++             request_mine->dhe_algo ? request_mine->dhe_algo : 0,
++             request_mine->aead_algo ? request_mine->aead_algo : 0);
++    char *state_json = build_state_json();
++    char *evt_json = build_event_json_proposed_algos(algos_buf, false);
++    /* Will emit after send, see below */
++
+     /* -=[Send Request Phase]=- */
+     status = libspdm_send_spdm_request(spdm_context, NULL, spdm_request_size, spdm_request);
+     if (LIBSPDM_STATUS_IS_ERROR(status)) {
+@@ -207,6 +221,12 @@ static libspdm_return_t libspdm_try_negotiate_algorithms(libspdm_context_t *spdm
+         return status;
+     }
+     libspdm_release_sender_buffer (spdm_context);
++
++    state_capture_requester_state("requester_algo_sent");
++    tla_trace_event_t evt = {.event = "requester_init_algorithms", .node_id = "requester", .state_json = state_json, .msg_json = evt_json};
++    tla_trace_emit(&evt);
++    free(state_json);
++    free(evt_json);
+
+     spdm_request = (void *)spdm_context->last_spdm_request;
+
+@@ -541,6 +561,19 @@ static libspdm_return_t libspdm_try_negotiate_algorithms(libspdm_context_t *spdm
+         return status;
+     }
+
++    /* Emit trace for algorithm validation */
++    bool validation_passed = result;
++    state_capture_algorithms_negotiated(validation_passed);
++    state_capture_requester_state("requester_complete");
++    char algo_val[128];
++    snprintf(algo_val, sizeof(algo_val), "[%d]", common_algorithms.base_asym_algo);
++    state_json = build_state_json();
++    evt_json = build_event_json_algos(algo_val, validation_passed);
++    tla_trace_event_t evt2 = {.event = "requester_validates_algorithms", .node_id = "requester", .state_json = state_json, .msg_json = evt_json};
++    tla_trace_emit(&evt2);
++    free(state_json);
++    free(evt_json);
++
+     /* -=[Update State Phase]=- */
+     spdm_context->connection_info.connection_state = LIBSPDM_CONNECTION_STATE_AFTER_ALGORITHMS;
+     status = LIBSPDM_STATUS_SUCCESS;
+diff --git a/library/spdm_responder_lib/libspdm_rsp_version.c b/library/spdm_responder_lib/libspdm_rsp_version.c
+index original..instrumented 100644
+--- a/library/spdm_responder_lib/libspdm_rsp_version.c
++++ b/library/spdm_responder_lib/libspdm_rsp_version.c
+@@ -6,6 +6,8 @@
+
+ #include "internal/libspdm_responder_lib.h"
+
++#include "../../harness/src/tla_trace.h"
++#include "../../harness/src/state_capture.h"
+ #pragma pack(1)
+ typedef struct {
+     spdm_message_header_t header;
+@@ -75,6 +77,12 @@ static libspdm_return_t libspdm_process_request_get_version(
+         return LIBSPDM_STATUS_INVALID_MSG_FIELD;
+     }
+
++    /* Emit trace for version handling */
++    state_capture_responder_state("responder_version_resp");
++    char *state_json = build_state_json();
++    tla_trace_event_t evt = {.event = "responder_handles_version", .node_id = "responder", .state_json = state_json};
++    tla_trace_emit(&evt);
++    free(state_json);
+
+     libspdm_reset_context(spdm_context);
+
+@@ -110,6 +118,17 @@ static libspdm_return_t libspdm_process_request_get_version(
+         goto done;
+     }
+
++    /* Emit trace for version sending */
++    state_capture_version_negotiated(true);
++    state_capture_responder_state("responder_caps_resp");
++    uint8_t version_num = response->version_number_entry[0] >> SPDM_VERSION_NUMBER_SHIFT_BIT;
++    char *evt_json = build_event_json_version(version_num);
++    state_json = build_state_json();
++    tla_trace_event_t evt2 = {.event = "responder_sends_version", .node_id = "responder", .state_json = state_json, .msg_json = evt_json};
++    tla_trace_emit(&evt2);
++    free(state_json);
++    free(evt_json);
++
+     status = LIBSPDM_STATUS_SUCCESS;
+     spdm_context->connection_info.connection_state = LIBSPDM_CONNECTION_STATE_AFTER_VERSION;
+     spdm_context->local_context.is_requester = false;
+diff --git a/library/spdm_responder_lib/libspdm_rsp_capabilities.c b/library/spdm_responder_lib/libspdm_rsp_capabilities.c
+index original..instrumented 100644
+--- a/library/spdm_responder_lib/libspdm_rsp_capabilities.c
++++ b/library/spdm_responder_lib/libspdm_rsp_capabilities.c
+@@ -6,6 +6,8 @@
+
+ #include "internal/libspdm_responder_lib.h"
+
++#include "../../harness/src/tla_trace.h"
++#include "../../harness/src/state_capture.h"
+ #pragma pack(1)
+ typedef struct {
+     spdm_message_header_t header;
+@@ -198,6 +200,12 @@ static libspdm_return_t libspdm_process_request_get_capabilities(
+         return LIBSPDM_STATUS_INVALID_MSG_FIELD;
+     }
+
++    /* Emit trace for capabilities handling */
++    state_capture_responder_state("responder_algo_resp");
++    char *state_json = build_state_json();
++    tla_trace_event_t evt = {.event = "responder_handles_capabilities", .node_id = "responder", .state_json = state_json};
++    tla_trace_emit(&evt);
++    free(state_json);
+
+     libspdm_build_response_get_capabilities(spdm_context, response_size, response);
+     status = LIBSPDM_STATUS_SUCCESS;
+@@ -350,6 +358,12 @@ static libspdm_return_t libspdm_build_response_get_capabilities(
+         return LIBSPDM_STATUS_BUFFER_TOO_SMALL;
+     }
+
++    /* Emit trace for capabilities sending */
++    state_capture_responder_state("responder_algo_resp");
++    state_json = build_state_json();
++    tla_trace_event_t evt2 = {.event = "responder_sends_capabilities", .node_id = "responder", .state_json = state_json};
++    tla_trace_emit(&evt2);
++    free(state_json);
+
+     return LIBSPDM_STATUS_SUCCESS;
+ }
+diff --git a/library/spdm_responder_lib/libspdm_rsp_algorithms.c b/library/spdm_responder_lib/libspdm_rsp_algorithms.c
+index original..instrumented 100644
+--- a/library/spdm_responder_lib/libspdm_rsp_algorithms.c
++++ b/library/spdm_responder_lib/libspdm_rsp_algorithms.c
+@@ -6,6 +6,8 @@
+
+ #include "internal/libspdm_responder_lib.h"
+
++#include "../../harness/src/tla_trace.h"
++#include "../../harness/src/state_capture.h"
+ #pragma pack(1)
+ typedef struct {
+     spdm_message_header_t header;
+@@ -620,6 +622,24 @@ static libspdm_return_t libspdm_process_request_negotiate_algorithms(
+     if (!libspdm_is_algorithms_negotiated(spdm_context)) {
+         return LIBSPDM_STATUS_INVALID_STATE;
+     }
++
++    /* Emit trace for algorithm handling */
++    char algos_buf[256];
++    snprintf(algos_buf, sizeof(algos_buf), "[%d, %d, %d, %d]",
++             request->base_asym_algo,
++             request->base_hash_algo,
++             request->dhe_algo ? request->dhe_algo : 0,
++             request->aead_algo ? request->aead_algo : 0);
++    bool prioritization_failed = (algos.base_asym_algo == 0);
++    state_capture_responder_state("responder_complete");
++    char *state_json = build_state_json();
++    char *evt_json = build_event_json_proposed_algos(algos_buf, prioritization_failed);
++    tla_trace_event_t evt = {.event = "responder_handles_algorithms", .node_id = "responder", .state_json = state_json, .msg_json = evt_json};
++    tla_trace_emit(&evt);
++    free(state_json);
++    free(evt_json);
+
+     spdm_context->connection_info.algorithm.base_asym_algo = algos.base_asym_algo;
+     spdm_context->connection_info.algorithm.base_hash_algo = algos.base_hash_algo;
+@@ -745,6 +765,16 @@ static libspdm_return_t libspdm_build_response_negotiate_algorithms(
+         return LIBSPDM_STATUS_BUFFER_TOO_SMALL;
+     }
+
++    /* Emit trace for algorithms sending */
++    char algo_val[128];
++    snprintf(algo_val, sizeof(algo_val), "[%d]", response->base_asym_algo);
++    state_json = build_state_json();
++    evt_json = build_event_json_algos(algo_val, false);
++    tla_trace_event_t evt2 = {.event = "responder_sends_algorithms", .node_id = "responder", .state_json = state_json, .msg_json = evt_json};
++    tla_trace_emit(&evt2);
++    free(state_json);
++    free(evt_json);
++
+     return LIBSPDM_STATUS_SUCCESS;
+ }
+

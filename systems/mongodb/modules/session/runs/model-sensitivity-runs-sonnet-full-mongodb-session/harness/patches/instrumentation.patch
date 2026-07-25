@@ -1,0 +1,169 @@
+diff --git a/src/mongo/db/session/session_catalog.cpp b/src/mongo/db/session/session_catalog.cpp
+index 0000000..0000001 100644
+--- a/src/mongo/db/session/session_catalog.cpp
++++ b/src/mongo/db/session/session_catalog.cpp
+@@ -29,6 +29,7 @@
+
+ #include "mongo/db/session/session_catalog.h"
+
++#include "mongo/db/session/tla_trace_session.h"
+ #include "mongo/db/service_context.h"
+ #include "mongo/db/session/logical_session_id_helpers.h"
+ #include "mongo/db/shard_role/transaction_resources.h"
+@@ -125,7 +126,16 @@ SessionCatalog::ScopedCheckedOutSession SessionCatalog::_checkOutSessionInner(
+     // Wait until the session is no longer checked out and until the previously scheduled kill has
+     // completed.
+     ++session->_numWaitingToCheckOut;
++    // TLA+: wait_for_checkout — thread enters the wait queue (session_catalog.cpp:128)
++    TLA_SESSION_EMIT("wait_for_checkout", lsid,
++        {"waiters", jnum(session->_numWaitingToCheckOut)},
++        {"sessionInCatalog", jbool(true)},
++        {"killsRequested", jnum(sri->killsRequested)});
+     ON_BLOCK_EXIT([&] { --session->_numWaitingToCheckOut; });
+@@ -148,6 +158,13 @@ SessionCatalog::ScopedCheckedOutSession SessionCatalog::_checkOutSessionInner(
+
+     sri->checkoutOpCtx = opCtx;
+     sri->lastCheckout = Date_t::now();
++    // TLA+: checkout_session (non-kill) or checkout_for_kill (kill) — session_catalog.cpp:150
++    if (!killToken) {
++        TLA_SESSION_EMIT("checkout_session", lsid,
++            {"checkoutOpCtx", jstr("normal")},
++            {"sessionInCatalog", jbool(true)},
++            {"killsRequested", jnum(sri->killsRequested)});
++    }
++    // kill checkout has no trace event; kill release events imply it (Phase 3 silent action)
+
+     return ScopedCheckedOutSession(*this, std::move(sri), session, std::move(killToken));
+ }
+@@ -364,10 +381,31 @@ void SessionCatalog::_releaseSession(
+     ServiceContext* service = sri->checkoutOpCtx->getServiceContext();
+
+     sri->checkoutOpCtx = nullptr;
++    // TLA+: checkin_session OR kill_release_clear_checkout — session_catalog.cpp:371
++    if (killToken) {
++        TLA_SESSION_EMIT("kill_release_clear_checkout", killToken->lsidToKill,
++            {"checkoutOpCtx", jstr("none")},
++            {"killsRequested", jnum(sri->killsRequested)});
++    } else {
++        // Normal checkin: emit checkin_session for the session being released.
++        // We access the session ID via session->getSessionId().
++        TLA_SESSION_EMIT("checkin_session", session->getSessionId(),
++            {"checkoutOpCtx", jstr("none")});
++    }
++
+     sri->availableCondVar.notify_all();
++    // TLA+: kill_release_notify — session_catalog.cpp:372
++    if (killToken) {
++        TLA_SESSION_EMIT("kill_release_notify", killToken->lsidToKill,
++            {"killsRequested", jnum(sri->killsRequested)});
++    }
+
+     if (killToken) {
+         invariant(sri->killsRequested > 0);
+         --sri->killsRequested;
++        // TLA+: kill_release_decrement — session_catalog.cpp:376
++        TLA_SESSION_EMIT("kill_release_decrement", killToken->lsidToKill,
++            {"killsRequested", jnum(sri->killsRequested)},
++            {"killTokenRegistered", jbool(false)});
+     }
+@@ -444,6 +484,11 @@ SessionCatalog::KillToken ObservableSession::kill(ErrorCodes::Error reason) con
+     const bool firstKiller = (0 == _sri->killsRequested);
+     ++_sri->killsRequested;
+
++    // TLA+: request_kill — session_catalog.cpp:449
++    TLA_SESSION_EMIT("request_kill", getSessionId(),
++        {"killsRequested", jnum(_sri->killsRequested)},
++        {"killTokenRegistered", jbool(false)});
++
+     if (firstKiller && hasCurrentOperation()) {
+         const auto serviceContext = _sri->checkoutOpCtx->getServiceContext();
+         serviceContext->killOperation(_clientLock, _sri->checkoutOpCtx, reason);
+diff --git a/src/mongo/db/session/session_catalog_mongod.cpp b/src/mongo/db/session/session_catalog_mongod.cpp
+index 0000000..0000002 100644
+--- a/src/mongo/db/session/session_catalog_mongod.cpp
++++ b/src/mongo/db/session/session_catalog_mongod.cpp
+@@ -1,4 +1,5 @@
+ // ... (copyright header omitted for brevity)
++#include "mongo/db/session/tla_trace_session.h"
+
+ // After registerChange in observeDirectWriteToConfigTransactions (line ~684):
+ //
+@@ -680,6 +680,13 @@ void MongoDSessionCatalog::observeDirectWriteToConfigTransactions(OperationConte
+         if (shouldRegisterKill) {
+             shard_role_details::getRecoveryUnit(opCtx)->registerChange(
+                 std::make_unique<KillSessionTokenOnCommit>(ti,
+                                                            session.kill(ErrorCodes::Interrupted)));
++            // TLA+: register_kill_change_succeed — token durably registered
++            TLA_SESSION_EMIT("register_kill_change_succeed", lsid,
++                {"killTokenRegistered", jbool(true)});
+         }
+     });
+ }
+diff --git a/src/mongo/db/session/logical_session_cache_impl.cpp b/src/mongo/db/session/logical_session_cache_impl.cpp
+index 0000000..0000003 100644
+--- a/src/mongo/db/session/logical_session_cache_impl.cpp
++++ b/src/mongo/db/session/logical_session_cache_impl.cpp
+@@ -29,6 +29,7 @@
+
+ #include "mongo/db/session/logical_session_cache_impl.h"
+
++#include "mongo/db/session/tla_trace_session.h"
+ // ... existing includes ...
+@@ -246,7 +246,11 @@ Status LogicalSessionCacheImpl::_reap(Client* client) {
+     int numReaped = 0;
+     try {
+         ON_BLOCK_EXIT([&opCtx] { clearShardingOperationFailedStatus(opCtx); });
++        // TLA+: start_reap — before _reapSessionsOlderThanFn
++        auto reapCutoff = _service->now() - Minutes(gTransactionRecordMinimumLifetimeMinutes);
++        TLA_GLOBAL_EMIT("start_reap",
++            {"reapCutoff", jnum(static_cast<long long>(reapCutoff.toMillisSinceEpoch()))});
+         try {
+             _sessionsColl->checkSessionsCollectionExists(opCtx);
+         } catch (const DBException& ex) {
+@@ -271,6 +276,9 @@ Status LogicalSessionCacheImpl::_reap(Client* client) {
+     } catch (const DBException& ex) {
+         // ... existing catch block ...
+     }
++    // TLA+: end_reap
++    TLA_GLOBAL_EMIT("end_reap", {});
+
+     // ... stats ...
+     return Status::OK();
+@@ -324,6 +331,9 @@ Status LogicalSessionCacheImpl::_refresh(Client* client) {
+     {
+         using std::swap;
+         stdx::lock_guard<stdx::mutex> lk(_mutex);
++        // TLA+: start_refresh — before swap (captures active sessions snapshot)
++        TLA_GLOBAL_EMIT("start_refresh", {});
+         swap(explicitlyEndingSessions, _endingSessions);
+         swap(activeSessions, _activeSessions);
+     }
+@@ -369,6 +379,11 @@ Status LogicalSessionCacheImpl::_refresh(Client* client) {
+
+     // Refresh the active sessions in the sessions collection.
+     auto refreshRes = _sessionsColl->refreshSessions(opCtx, activeSessionRecords);
++    // TLA+: refresh_succeed / refresh_fail per session
++    for (const auto& record : activeSessionRecords) {
++        const auto& lsid = record.getId();
++        bool failed = refreshRes.failedSessions.count(record) > 0;
++        if (!failed) {
++            TLA_SESSION_EMIT("refresh_succeed", lsid,
++                {"lastRefreshed", jnum(static_cast<long long>(_service->now().toMillisSinceEpoch()))});
++        } else {
++            // Determine source: was it from activeSessions (active) or runningOps (runningOp)?
++            bool isActive = activeSessions.count(lsid) > 0;
++            TLA_SESSION_EMIT("refresh_fail", lsid,
++                {"sessionSource", jstr(isActive ? "active" : "runningOp")});
++        }
++    }
++
+     activeSessionsBackSwapper.dismiss();
+@@ -450,6 +465,9 @@ Status LogicalSessionCacheImpl::_refresh(Client* client) {
+     auto killRes = _service->killCursorsWithMatchingSessions(opCtx, std::move(matcher));
+     // ... stats ...
+
++    // TLA+: end_refresh
++    TLA_GLOBAL_EMIT("end_refresh", {});
++
+     return refreshStatus;
+ }

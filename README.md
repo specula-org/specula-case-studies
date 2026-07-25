@@ -1,36 +1,36 @@
 # Specula Case Studies
 
-Case studies with [Specula](https://github.com/specula-org/Specula): TLA+ specifications synthesized from real-world systems.
+Experiment records produced with
+[Specula](https://github.com/specula-org/Specula), organized by system, module,
+and run.
 
-## Case Studies
+## Repository layout
 
-We have currently run case studies on a variety of distributed systems protocols (Raft, Paxos, BFT) in Go, Java, Rust, and C++. See subfolders for more information.
+```text
+case-studies/
+├── systems/    experiment records grouped by system
+├── catalog/    machine-readable system and run indexes
+└── docs/       archive layout and maintenance notes
+```
 
-## Structure
+Each experiment is stored at:
 
-The case studies follow this structure:
+```text
+systems/<system>/modules/<module>/runs/<run-id>/
+```
 
-- `artifact/` - a Git submodule of the system implementation.
-- `harness/` - if not already included in base repo, trace extraction or replay driver code used for trace validation.
-- `spec/` - TLA+ specs and configs.
-- `patches/` - instrumentation and other local modifications (usually LLM-generated).
-- `invariants/` - a copy of the original paper, or plain-text natural-language invariants to guide spec generation.
+The run directory is the record. Original reports, specifications, harnesses,
+traces, prompts, logs, and other evidence retain their relative paths beneath
+it. Generated provenance and file inventories live in the run's `.record/`
+directory.
 
-Traces are usually found in `harness/traces/` or as untracked files inside the `artifact` folder itself.
+This working tree is also the complete local archive. Large source captures and
+raw `.specula-output/` trees remain on disk but are excluded from ordinary Git
+objects. Tracked manifests and file inventories retain their paths, sizes, and
+hashes, so the local payloads can still be audited against the index. The
+verified pre-restructure backup is the recovery copy for the full corpus.
 
-<details>
-<summary>Etcd Raft Scenarios</summary>
+System summaries belong at `systems/<system>/overview.md`. They will be added as
+the experiment results are reviewed.
 
-We have specified multiple scenarios for Etcd Raft, focusing on different submodules. Each is available in its own `scenarios` folder within the `etcd-raft` case study.
-
-| Scenario             | Description                                               |
-| -------------------- | --------------------------------------------------------- |
-| `snapshot`           | Core Raft protocol with snapshot and configuration change |
-| `progress_inflights` | Progress tracking and in-flight message management        |
-| `leaseRead`          | Lease-based read optimization                             |
-
-Each scenario contains its own `harness/traces/` for the extracted execution traces and its own `patches/` for source code instrumentation.
-
-We've added some modifications to Raft, so we use the submodule at [specula-org/raft](https://github.com/specula-org/raft) instead of the Etcd base repo.
-
-</details>
+See [docs/layout.md](docs/layout.md) for the complete organization rules.

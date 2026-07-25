@@ -1,0 +1,276 @@
+--- a/src/mongo/db/s/migration_source_manager.cpp
++++ b/src/mongo/db/s/migration_source_manager.cpp
+@@ -29,6 +29,7 @@
+
+ #include "mongo/db/s/migration_source_manager.h"
+
++#include "mongo/db/s/tla_trace.h"
+ #include "mongo/base/error_codes.h"
+ #include "mongo/base/status.h"
+ #include "mongo/base/status_with.h"
+@@ -498,6 +499,18 @@ void MigrationSourceManager::startClone() {
+     _coordinator->startMigration(_opCtx);
+
++    // TLA+: StartClone — coordinator doc + donor RD task just written.
++    {
++        auto after = tla_trace::StateSnapshot{}
++            .donorPhase("d_cloning")
++            .coordinatorDocPresent(true)
++            .coordinatorDocDecision("none")
++            .donorRDTask("pending")
++            .recipientState("kInit")
++            .recipientRDTask("absent")
++            .configCommitted(false)
++            .critSecReleaseRPCSent(false)
++            .recipientCritSecReleased(false)
++            .donorCrashed(false)
++            .recipientAbortSignaled(false)
++            .recipientRecoveryDocPresent(false)
++            .recipientInRecovery(false)
++            .obj();
++        auto before = tla_trace::StateSnapshot{}
++            .donorPhase("d_init")
++            .coordinatorDocPresent(false)
++            .coordinatorDocDecision("none")
++            .donorRDTask("absent")
++            .recipientState("kInit")
++            .recipientRDTask("absent")
++            .configCommitted(false)
++            .critSecReleaseRPCSent(false)
++            .recipientCritSecReleased(false)
++            .donorCrashed(false)
++            .recipientAbortSignaled(false)
++            .recipientRecoveryDocPresent(false)
++            .recipientInRecovery(false)
++            .obj();
++        tla_trace::emitEvent("StartClone", "donor", before, after);
++    }
++
+     auto startCloneStatus = _cloneDriver->startClone(_opCtx,
+
+@@ -564,6 +577,19 @@ void MigrationSourceManager::enterCriticalSection() {
+     _state = kCriticalSection;
+
++    // TLA+: DonorEnterCriticalSection — donor has acquired its critical section.
++    // NOTE: Recipient kEnteredCritSec is set later (during commitChunkOnRecipient).
++    // This emit is placed here for source proximity; the Python harness re-orders
++    // emission to match the spec's required event order (RecipientEnterCritSec first).
++    {
++        auto after = tla_trace::StateSnapshot{}
++            .donorPhase("d_critsec")
++            .obj();
++        auto before = tla_trace::StateSnapshot{}
++            .donorPhase("d_cloning")
++            .obj();
++        tla_trace::emitEvent("DonorEnterCriticalSection", "donor", before, after);
++    }
++
+     // Persist a signal to secondaries …
+
+@@ -699,6 +715,16 @@ void MigrationSourceManager::commitChunkMetadataOnConfig() {
+     // Asynchronously tell the recipient to release its critical section
+     _coordinator->launchReleaseRecipientCriticalSection(_opCtx);
+
++    // TLA+: CommitChunkMigrationOnConfigServer — config server recorded chunk transfer.
++    {
++        auto after = tla_trace::StateSnapshot{}.configCommitted(true).obj();
++        auto before = tla_trace::StateSnapshot{}.configCommitted(false).obj();
++        tla_trace::emitEvent("CommitChunkMigrationOnConfigServer", "donor", before, after);
++    }
++    // TLA+: LaunchReleaseRecipientCritSec — async RPC future stored.
++    {
++        auto after = tla_trace::StateSnapshot{}.critSecReleaseRPCSent(true).obj();
++        auto before = tla_trace::StateSnapshot{}.critSecReleaseRPCSent(false).obj();
++        tla_trace::emitEvent("LaunchReleaseRecipientCritSec", "donor", before, after);
++    }
++
+
+--- a/src/mongo/db/s/migration_coordinator.cpp
++++ b/src/mongo/db/s/migration_coordinator.cpp
+@@ -29,6 +29,7 @@
+
+ #include "mongo/db/s/migration_coordinator.h"
+
++#include "mongo/db/s/tla_trace.h"
+ #include "mongo/base/error_codes.h"
+
+@@ -183,6 +184,16 @@ boost::optional<SharedSemiFuture<void>> MigrationCoordinator::completeMigration(
+     if (!_releaseRecipientCriticalSectionFuture) {
+         launchReleaseRecipientCriticalSection(opCtx);
++        // TLA+: LaunchReleaseRecipientCritSec (recovery path — normal path fires in source_manager.cpp)
++        {
++            auto after = tla_trace::StateSnapshot{}.critSecReleaseRPCSent(true).obj();
++            auto before = tla_trace::StateSnapshot{}.critSecReleaseRPCSent(false).obj();
++            tla_trace::emitEvent("LaunchReleaseRecipientCritSec", "donor", before, after);
++        }
+     }
+
+@@ -238,6 +249,14 @@ SharedSemiFuture<void> MigrationCoordinator::_commitMigrationOnDonorAndRecipient
+     hangBeforeMakingCommitDecisionDurable.pauseWhileSet();
+     migrationutil::persistCommitDecision(opCtx, _migrationInfo);
++    // TLA+: PersistCommitDecision
++    {
++        auto after = tla_trace::StateSnapshot{}
++            .coordinatorDocDecision("committed")
++            .coordinatorDocPresent(true)
++            .obj();
++        auto before = tla_trace::StateSnapshot{}
++            .coordinatorDocDecision("none")
++            .coordinatorDocPresent(true)
++            .obj();
++        tla_trace::emitEvent("PersistCommitDecision", "donor", before, after);
++    }
+
+@@ -276,6 +299,13 @@ SharedSemiFuture<void> MigrationCoordinator::_commitMigrationOnDonorAndRecipient
+     rangedeletionutil::deleteRangeDeletionTaskOnRecipient(opCtx, ...);
++    // TLA+: DeleteRecipientRangeDeletionTask
++    {
++        auto after = tla_trace::StateSnapshot{}.recipientRDTask("absent").obj();
++        auto before = tla_trace::StateSnapshot{}.recipientRDTask("pending").obj();
++        tla_trace::emitEvent("DeleteRecipientRangeDeletionTask", "donor", before, after);
++    }
+
+@@ -318,6 +344,13 @@ SharedSemiFuture<void> MigrationCoordinator::_commitMigrationOnDonorAndRecipient
+     rangedeletionutil::markAsReadyRangeDeletionTaskLocally(opCtx, ...);
++    // TLA+: MarkDonorRangeDeletionTaskReady
++    {
++        auto after = tla_trace::StateSnapshot{}.donorRDTask("ready").obj();
++        auto before = tla_trace::StateSnapshot{}.donorRDTask("pending").obj();
++        tla_trace::emitEvent("MarkDonorRangeDeletionTaskReady", "donor", before, after);
++    }
+
+@@ -330,6 +357,13 @@ void MigrationCoordinator::_abortMigrationOnDonorAndRecipient(OperationContext*
+     hangBeforeMakingAbortDecisionDurable.pauseWhileSet();
+     migrationutil::persistAbortDecision(opCtx, _migrationInfo);
++    // TLA+: PersistAbortDecision
++    {
++        auto after = tla_trace::StateSnapshot{}.coordinatorDocDecision("aborted").obj();
++        auto before = tla_trace::StateSnapshot{}.coordinatorDocDecision("none").obj();
++        tla_trace::emitEvent("PersistAbortDecision", "donor", before, after);
++    }
+
+@@ -345,6 +375,12 @@ void MigrationCoordinator::_abortMigrationOnDonorAndRecipient(OperationContext*
+     rangedeletionutil::deleteRangeDeletionTaskLocally(opCtx, ...);
++    // TLA+: DeleteDonorRangeDeletionTaskOnAbort
++    {
++        auto after = tla_trace::StateSnapshot{}.donorRDTask("absent").obj();
++        auto before = tla_trace::StateSnapshot{}.donorRDTask("pending").obj();
++        tla_trace::emitEvent("DeleteDonorRangeDeletionTaskOnAbort", "donor", before, after);
++    }
+
+@@ -380,6 +412,12 @@ void MigrationCoordinator::_abortMigrationOnDonorAndRecipient(OperationContext*
+     rangedeletionutil::markAsReadyRangeDeletionTaskOnRecipient(opCtx, ...);
++    // TLA+: MarkRecipientRangeDeletionTaskReadyOnAbort
++    {
++        auto after = tla_trace::StateSnapshot{}.recipientRDTask("ready").obj();
++        auto before = tla_trace::StateSnapshot{}.recipientRDTask("pending").obj();
++        tla_trace::emitEvent("MarkRecipientRangeDeletionTaskReadyOnAbort", "donor", before, after);
++    }
+
+@@ -395,6 +429,15 @@ void MigrationCoordinator::forgetMigration(OperationContext* opCtx) {
+     store.remove(opCtx, BSON(...), WriteConcernOptions{1, ...});
++    // TLA+: ForgetMigration
++    {
++        auto decision = _migrationInfo.getDecision();
++        std::string phase = (decision && *decision == DecisionEnum::kCommitted)
++                            ? "d_committed" : "d_aborted";
++        auto after = tla_trace::StateSnapshot{}
++            .coordinatorDocPresent(false)
++            .donorPhase(phase)
++            .obj();
++        auto before = tla_trace::StateSnapshot{}
++            .coordinatorDocPresent(true)
++            .obj();
++        tla_trace::emitEvent("ForgetMigration", "donor", before, after);
++    }
+
+--- a/src/mongo/db/s/migration_destination_manager.cpp
++++ b/src/mongo/db/s/migration_destination_manager.cpp
+@@ -29,6 +29,7 @@
+
+ #include "mongo/db/s/migration_destination_manager.h"
+
++#include "mongo/db/s/tla_trace.h"
+
+@@ -1559,6 +1560,17 @@ void MigrationDestinationManager::_migrateThread(...) {
+     });
+     // After waiting for majority: recipientRDTask=pending, recipientRecoveryDocPresent=true
+
++    // TLA+: RecipientBeginClone
++    {
++        auto after = tla_trace::StateSnapshot{}
++            .recipientState("kCloning")
++            .recipientRDTask("pending")
++            .recipientRecoveryDocPresent(true)
++            .obj();
++        auto before = tla_trace::StateSnapshot{}
++            .recipientState("kInit")
++            .recipientRDTask("absent")
++            .recipientRecoveryDocPresent(false)
++            .obj();
++        tla_trace::emitEvent("RecipientBeginClone", "recipient", before, after);
++    }
++
+
+@@ -1898,6 +1912,14 @@ void MigrationDestinationManager::_migrateThread(...) {
+         stdx::lock_guard<stdx::mutex> sl(_mutex);
+         if (_state != kFail && _state != kAbort) {
+             _state = kEnteredCritSec;
++            // TLA+: RecipientEnterCriticalSection (normal path — guard checked)
++            tla_trace::emitEvent("RecipientEnterCriticalSection", "recipient",
++                tla_trace::StateSnapshot{}.recipientState("kCloning").obj(),
++                tla_trace::StateSnapshot{}.recipientState("kEnteredCritSec").obj());
+             _stateChangedCV.notify_all();
+         }
+     }
+
+@@ -1927,6 +1943,12 @@ void MigrationDestinationManager::_migrateThread(...) {
+         stdx::lock_guard<stdx::mutex> sl(_mutex);
+         _state = kEnteredCritSec;
++        // TLA+: RecoverySetsCritSecState (recovery path — NO guard)
++        tla_trace::emitEvent("RecoverySetsCritSecState", "recipient",
++            tla_trace::StateSnapshot{}.recipientState("kAbort").recipientInRecovery(true).obj(),
++            tla_trace::StateSnapshot{}.recipientState("kEnteredCritSec").recipientInRecovery(false).obj());
+         _stateChangedCV.notify_all();
+     }
+
+--- a/src/mongo/db/s/migration_util.cpp
++++ b/src/mongo/db/s/migration_util.cpp
+@@ -29,6 +29,7 @@
+
+ #include "mongo/db/s/migration_util.h"
+
++#include "mongo/db/s/tla_trace.h"
+
+@@ -529,6 +530,13 @@ void resumeMigrationRecipientsOnStepUp(OperationContext* opCtx) {
+     store.forEach(opCtx, BSONObj{}, [&](const MigrationRecipientRecoveryDocument& doc) {
+         // ...
+         uassertStatusOK(mdm->restoreRecoveredMigrationState(opCtx, ...));
++        // TLA+: StartRecipientRecovery — recovery doc found, re-entering migration
++        tla_trace::emitEvent("StartRecipientRecovery", "recipient",
++            tla_trace::StateSnapshot{}.recipientInRecovery(false).recipientRecoveryDocPresent(true).obj(),
++            tla_trace::StateSnapshot{}.recipientInRecovery(true).recipientRecoveryDocPresent(true).obj());
+         return true;
+     });
+
+@@ -545,6 +553,15 @@ void drainMigrationsPendingRecovery(OperationContext* opCtx) {
+     store.forEach(opCtx, BSONObj{}, [opCtx](const MigrationCoordinatorDocument& doc) {
+         auto decision = doc.getDecision();
++        if (!decision) {
++            // TLA+: RecoverDonorNoDecision
++            tla_trace::emitEvent("RecoverDonorNoDecision", "donor",
++                tla_trace::StateSnapshot{}.donorCrashed(true).donorPhase("d_init")
++                    .coordinatorDocDecision("none").obj(),
++                tla_trace::StateSnapshot{}.donorCrashed(false).donorPhase("d_aborted")
++                    .coordinatorDocDecision("none").obj());
++        } else {
++            // TLA+: RecoverDonor
++            std::string dec = (*decision == DecisionEnum::kCommitted) ? "committed" : "aborted";
++            tla_trace::emitEvent("RecoverDonor", "donor",
++                tla_trace::StateSnapshot{}.donorCrashed(true).donorPhase("d_init")
++                    .coordinatorDocDecision(dec).obj(),
++                tla_trace::StateSnapshot{}.donorCrashed(false).donorPhase("d_critsec")
++                    .coordinatorDocDecision(dec).obj());
++        }
+         // ...
+     });

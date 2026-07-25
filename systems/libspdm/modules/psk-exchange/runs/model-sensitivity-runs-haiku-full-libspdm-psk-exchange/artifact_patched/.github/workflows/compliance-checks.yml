@@ -1,0 +1,70 @@
+name: Compliance Checks
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+jobs:
+  markdown-style-check:
+    name: Markdown Style Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Check
+        # Reject any .md files with tabs in them
+        run: |
+          if grep -rn "	" * --include=*.md;
+          then exit 1
+          fi
+
+  # Do not allow merge commits in pull request
+  reject-merge-commits:
+    if: ${{ github.event_name == 'pull_request' }}
+    name: Reject Merge Commits
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: motlin/forbid-merge-commits-action@v1.0.7
+        with:
+            fail-on-merge-commits: true
+
+  uncrustify:
+    name: Style Compliance
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install uncrustify
+        run: |
+          sudo apt update
+          sudo apt install --no-install-recommends -y uncrustify
+      - uses: actions/checkout@v6
+      - name: Check
+        # Run an uncrustify check. If the check indicates problems, then apply the fixes and show the diff.
+        run: |
+          set +e
+          ./script/format_nix.sh --check
+          if [ $? -ne 0 ]; then
+            set -e
+            ./script/format_nix.sh
+            git diff
+            exit 1
+          fi
+
+  script-checks:
+    name: ${{ matrix.name }}
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - name: File Encoding Check
+            script: check_encode.sh
+          - name: Check Copyright Year
+            script: check_copyright_date.sh
+    steps:
+      - uses: actions/checkout@v6
+      - name: Check
+        run: ./script/${{ matrix.script }}

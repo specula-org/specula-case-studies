@@ -1,0 +1,21 @@
+# mongodb / raftreconfig / fill-gap:raftreconfig
+
+This directory is the canonical record of one experiment run.
+
+- Source: `fill-gap`
+- Record ID: `fill-gap:raftreconfig`
+- Role: `failed-or-salvaged`
+- Status: `completion-unknown`
+- Run ID status: `provisional`
+- Agent: `unknown`
+- Requested model: `unknown`
+- Observed models: `unknown`
+
+Original run files retain their relative paths directly in this directory.
+Generated provenance and file dispositions are stored under `.record/`.
+
+## Review signals
+
+- `completion_not_proven`
+- `model_version_unknown`
+- `run_id_is_provisional`

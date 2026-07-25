@@ -1,0 +1,190 @@
+diff --git a/src/mongo/db/s/migration_coordinator.cpp b/src/mongo/db/s/migration_coordinator.cpp
+index 1000000..2000000 100644
+--- a/src/mongo/db/s/migration_coordinator.cpp
++++ b/src/mongo/db/s/migration_coordinator.cpp
+@@ -29,6 +29,8 @@
+
+ #include "mongo/db/s/migration_coordinator.h"
+
++#include "tla_trace.h"
++
+ #include "mongo/base/error_codes.h"
+ #include "mongo/base/status.h"
+ #include "mongo/bson/bsonmisc.h"
+@@ -147,11 +149,17 @@ void MigrationCoordinator::startMigration(OperationContext* opCtx) {
+     LOGV2_DEBUG(
+         23889, 2, "Persisting migration coordinator doc", "migrationDoc"_attr = _migrationInfo);
+     migrationutil::insertMigrationCoordinatorDoc(opCtx, _migrationInfo);
++    // TLA+ trace: WriteCoordDoc — coord doc written, donor task not yet created
++    tla_trace::emit("WriteCoordDoc", _migrationInfo.getId().toString(),
++                    "present", "absent", "absent", true);
+
+     LOGV2_DEBUG(23890,
+                 2,
+                 "Persisting range deletion task on donor",
+                 "migrationId"_attr = _migrationInfo.getId(),
+                 logAttrs(_migrationInfo.getNss()));
+
+     _donorRangeDeletionTask.emplace(rangedeletionutil::createAndPersistRangeDeletionTask(
+         opCtx,
+         _migrationInfo.getId(),
+         _migrationInfo.getNss(),
+         _migrationInfo.getCollectionUuid(),
+         _migrationInfo.getDonorShardId(),
+         _migrationInfo.getRange(),
+         _waitForDelete ? CleanWhenEnum::kNow : CleanWhenEnum::kDelayed,
+         true,
+         *_shardKeyPattern,
+         _shardVersionPriorToTheMigration,
+         defaultMajorityWriteConcernDoNotUse()));
++    // TLA+ trace: WriteRangeDeletionTask — donor + recipient tasks both pending
++    tla_trace::emit("WriteRangeDeletionTask", _migrationInfo.getId().toString(),
++                    "present", "pending", "pending", true);
+ }
+
+ void MigrationCoordinator::setMigrationDecision(DecisionEnum decision) {
+@@ -236,6 +254,9 @@ SharedSemiFuture<void> MigrationCoordinator::_commitMigrationOnDonorAndRecipien
+                 logAttrs(_migrationInfo.getNss()));
+     migrationutil::persistCommitDecision(opCtx, _migrationInfo);
+
++    // TLA+ trace: PersistCommitDecision
++    tla_trace::emit("PersistCommitDecision", _migrationInfo.getId().toString(),
++                    "committed", "pending", "pending", true);
++
+     _waitForReleaseRecipientCriticalSectionFutureIgnoreShardNotFound(opCtx);
+
+@@ -271,6 +292,9 @@ SharedSemiFuture<void> MigrationCoordinator::_commitMigrationOnDonorAndRecipien
+                 logAttrs(_migrationInfo.getNss()));
+     rangedeletionutil::deleteRangeDeletionTaskOnRecipient(opCtx,
+                                                           _migrationInfo.getRecipientShardId(),
+                                                           _migrationInfo.getCollectionUuid(),
+                                                           _migrationInfo.getRange(),
+                                                           _migrationInfo.getId());
++    // TLA+ trace: DeleteRecipientTaskOnCommit — recipient task removed
++    tla_trace::emit("DeleteRecipientTaskOnCommit", _migrationInfo.getId().toString(),
++                    "committed", "pending", "absent", true);
++
+     // We only expect _donorRangeDeletionTask to be empty in a recovery scenario in which case we
+
+@@ -315,6 +339,10 @@ SharedSemiFuture<void> MigrationCoordinator::_commitMigrationOnDonorAndRecipien
+     rangedeletionutil::markAsReadyRangeDeletionTaskLocally(
+         opCtx, _donorRangeDeletionTask->getCollectionUuid(), _donorRangeDeletionTask->getRange());
+
++    // TLA+ trace: ActivateDonorTaskOnCommit — pending flag unset, task ready for processing
++    tla_trace::emit("ActivateDonorTaskOnCommit", _migrationInfo.getId().toString(),
++                    "committed", "ready", "absent", true);
++
+     return rangeDeletionCompletionFuture;
+ }
+
+@@ -327,6 +355,9 @@ void MigrationCoordinator::_abortMigrationOnDonorAndRecipient(OperationContext*
+                 logAttrs(_migrationInfo.getNss()));
+     migrationutil::persistAbortDecision(opCtx, _migrationInfo);
+
++    // TLA+ trace: PersistAbortDecision
++    tla_trace::emit("PersistAbortDecision", _migrationInfo.getId().toString(),
++                    "aborted", "pending", "pending", true);
++
+     hangBeforeSendingAbortDecision.pauseWhileSet();
+
+@@ -341,6 +372,9 @@ void MigrationCoordinator::_abortMigrationOnDonorAndRecipient(OperationContext*
+     rangedeletionutil::deleteRangeDeletionTaskLocally(opCtx,
+                                                       _migrationInfo.getCollectionUuid(),
+                                                       _migrationInfo.getRange(),
+                                                       defaultMajorityWriteConcernDoNotUse());
++    // TLA+ trace: DeleteDonorTaskOnAbort — donor task deleted, range stays on donor
++    tla_trace::emit("DeleteDonorTaskOnAbort", _migrationInfo.getId().toString(),
++                    "aborted", "absent", "pending", true);
+
+     try {
+
+@@ -376,6 +410,9 @@ void MigrationCoordinator::_abortMigrationOnDonorAndRecipient(OperationContext*
+     rangedeletionutil::markAsReadyRangeDeletionTaskOnRecipient(opCtx,
+                                                                _migrationInfo.getRecipientShardId(),
+                                                                _migrationInfo.getCollectionUuid(),
+                                                                _migrationInfo.getRange(),
+                                                                _migrationInfo.getId());
++    // TLA+ trace: MarkRecipientTaskReady — outside try/catch: ShardNotFound propagates uncaught
++    // No event emitted if this throws (spec's TraceSilentMarkRecipientTaskReadyFails handles it)
++    tla_trace::emit("MarkRecipientTaskReady", _migrationInfo.getId().toString(),
++                    "aborted", "absent", "ready", true);
+ }
+
+ void MigrationCoordinator::forgetMigration(OperationContext* opCtx) {
+@@ -389,6 +426,14 @@ void MigrationCoordinator::forgetMigration(OperationContext* opCtx) {
+     store.remove(opCtx,
+                  BSON(MigrationCoordinatorDocument::kIdFieldName << _migrationInfo.getId()),
+                  WriteConcernOptions{1, WriteConcernOptions::SyncMode::UNSET, Seconds(0)});
++
++    // TLA+ trace: ForgetMigration — coord doc removed with w:1 (may not replicate before stepdown)
++    // donorTask/recipientTask states inferred from decision path taken
++    auto _tlaDec = _migrationInfo.getDecision();
++    bool _tlaCommit = _tlaDec && (*_tlaDec == DecisionEnum::kCommitted);
++    bool _tlaDonorWritten = _donorRangeDeletionTask.has_value();
++    std::string _tlaDonor = (!_tlaDonorWritten) ? "absent" : (_tlaCommit ? "ready" : "absent");
++    std::string _tlaRecip = _tlaCommit ? "absent" : "ready";
++    tla_trace::emit("ForgetMigration", _migrationInfo.getId().toString(),
++                    "absent", _tlaDonor, _tlaRecip, true);
+ }
+
+diff --git a/src/mongo/db/s/ready_range_deletions_processor.cpp b/src/mongo/db/s/ready_range_deletions_processor.cpp
+index 1000000..2000000 100644
+--- a/src/mongo/db/s/ready_range_deletions_processor.cpp
++++ b/src/mongo/db/s/ready_range_deletions_processor.cpp
+@@ -29,6 +29,8 @@
+
+ #include "mongo/db/s/ready_range_deletions_processor.h"
+
++#include "tla_trace.h"
++
+ #include "mongo/db/hierarchical_cancelable_operation_context_factory.h"
+ #include "mongo/db/repl/wait_for_majority_service.h"
+ #include "mongo/db/s/range_deleter_service.h"
+@@ -255,6 +257,10 @@ void ReadyRangeDeletionsProcessor::_runRangeDeletions() {
+                         LOGV2_INFO(6872501,
+                                    "Beginning deletion of documents in orphan range",
+                                    "namespace"_attr = nss,
+                                    "collectionUUID"_attr = collectionUuid.toString(),
+                                    "range"_attr = redact(range.toString()));
+
++                        // TLA+ trace: ExecuteRangeDeletion — processing flag set, batches begin
++                        tla_trace::emit("ExecuteRangeDeletion", task.getId().toString(),
++                                        "absent", "processing", "absent", true);
++
+                         auto shardKeyPattern =
+
+@@ -340,6 +346,11 @@ void ReadyRangeDeletionsProcessor::_runRangeDeletions() {
+                 try {
+                     auto* self = RangeDeleterService::get(opCtx);
+                     auto innerTask = self->completeTask(collectionUuid, range);
+                     if (innerTask) {
+                         rangedeletionutil::removePersistentTask(opCtx, innerTask->getTaskId());
++                        // TLA+ trace: CompleteRangeDeletion — task removed from disk
++                        tla_trace::emit("CompleteRangeDeletion", innerTask->getId().toString(),
++                                        "absent", "absent", "absent", true);
+                     }
+
+diff --git a/src/mongo/db/s/range_deleter_service.cpp b/src/mongo/db/s/range_deleter_service.cpp
+index 1000000..2000000 100644
+--- a/src/mongo/db/s/range_deleter_service.cpp
++++ b/src/mongo/db/s/range_deleter_service.cpp
+@@ -29,6 +29,8 @@
+
+ #include "mongo/db/s/range_deleter_service.h"
+
++#include "tla_trace.h"
++
+ #include "mongo/db/catalog/collection.h"
+ #include "mongo/db/catalog/database_holder.h"
+ #include "mongo/db/commands/server_status.h"
+@@ -256,6 +258,9 @@ void RangeDeleterService::_launchRangeDeletionRecoveryTask(OperationContext* opC
+             LOGV2_INFO(6834802,
+                        "Finished resubmitting range deletion tasks",
+                        "nRescheduledTasks"_attr = nRescheduledTasks);
+             notifyRecoveryJobComplete(term);
++
++            // TLA+ trace: Recovery — all tasks re-registered after step-up
++            tla_trace::emit("Recovery", "*", "absent", "absent", "absent", true);
+         })
+         .getAsync([](auto) {});
+ }

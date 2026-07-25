@@ -1,0 +1,278 @@
+diff --git a/artifact/libspdm/library/spdm_requester_lib/libspdm_req_challenge.c b/artifact/libspdm/library/spdm_requester_lib/libspdm_req_challenge.c
+index f81145a..3ea8997 100644
+--- a/artifact/libspdm/library/spdm_requester_lib/libspdm_req_challenge.c
++++ b/artifact/libspdm/library/spdm_requester_lib/libspdm_req_challenge.c
+@@ -5,6 +5,7 @@
+  **/
+ 
+ #include "internal/libspdm_requester_lib.h"
++#include "../../../harness/src/tla_trace.h"
+ 
+ #if LIBSPDM_SEND_CHALLENGE_SUPPORT
+ 
+@@ -143,6 +144,17 @@ static libspdm_return_t libspdm_try_challenge(libspdm_context_t *spdm_context,
+         LIBSPDM_DEBUG((LIBSPDM_DEBUG_INFO, "\n"));
+     }
+ 
++    /* -=[Trace: RequesterSendChallenge]=- */
++    {
++        uint64_t ts = tla_get_timestamp_us();
++        uint8_t *ctx_ptr = (spdm_request->header.spdm_version >= SPDM_MESSAGE_VERSION_13)
++                          ? (uint8_t *)(spdm_request + 1) : NULL;
++        tla_state_t state_before = {"null", "\"NONE\"", "null"};
++        tla_state_t state_after = {"null", "\"ONE_WAY_STARTED\"", "null"};
++        tla_emit_requester_send_challenge(ts, slot_id, spdm_request->header.spdm_version,
++                                         spdm_request->nonce, ctx_ptr, state_before, state_after);
++    }
++
+     /* -=[Send Request Phase]=- */
+     status = libspdm_send_spdm_request(spdm_context, NULL, spdm_request_size, spdm_request);
+     if (LIBSPDM_STATUS_IS_ERROR(status)) {
+@@ -379,6 +391,21 @@ static libspdm_return_t libspdm_try_challenge(libspdm_context_t *spdm_context,
+      * the Responder intends to authenticate the Requester. */
+     spdm_context->connection_info.connection_state = LIBSPDM_CONNECTION_STATE_AUTHENTICATED;
+ 
++    /* -=[Trace: RequesterHandleChallengeAuth]=- */
++    {
++        uint64_t ts = tla_get_timestamp_us();
++        int ctx_match = 1;  /* We already verified context above, so it matches */
++        if (spdm_request->header.spdm_version < SPDM_MESSAGE_VERSION_13) {
++            ctx_match = 0;  /* No context in earlier versions */
++        }
++        tla_state_t state_before = {"\"challenged\"", "\"ONE_WAY_STARTED\"", "null"};
++        tla_state_t state_after = {"\"authenticated\"", "\"ONE_WAY_COMPLETE\"", "null"};
++        tla_emit_requester_handle_challenge_auth(ts, slot_id,
++                                                (slot_id == 0xFF) ? "\"public_key_only\"" : "\"cert_chain\"",
++                                                (const uint8_t *)nonce, ctx_match,
++                                                state_before, state_after);
++    }
++
+     /* -=[Update State Phase]=- */
+ #if (LIBSPDM_ENABLE_CAPABILITY_MUT_AUTH_CAP) && (LIBSPDM_ENABLE_CAPABILITY_ENCAP_CAP)
+     if ((auth_attribute & SPDM_CHALLENGE_AUTH_RESPONSE_ATTRIBUTE_BASIC_MUT_AUTH_REQ) != 0) {
+@@ -393,6 +420,15 @@ static libspdm_return_t libspdm_try_challenge(libspdm_context_t *spdm_context,
+             libspdm_reset_message_c(spdm_context);
+             return status;
+         }
++
++        /* -=[Trace: RequesterHandleEncapChallengeAuth]=- */
++        {
++            uint64_t ts = tla_get_timestamp_us();
++            tla_state_t state_before = {"\"authenticated\"", "\"ONE_WAY_COMPLETE\"", "null"};
++            tla_state_t state_after = {"\"authenticated\"", "\"FULLY_AUTHENTICATED\"", "null"};
++            tla_emit_requester_handle_encap_challenge_auth(ts, state_before, state_after);
++        }
++
+         return LIBSPDM_STATUS_SUCCESS;
+     }
+ #endif /* (LIBSPDM_ENABLE_CAPABILITY_MUT_AUTH_CAP) && (LIBSPDM_ENABLE_CAPABILITY_ENCAP_CAP) */
+diff --git a/artifact/libspdm/library/spdm_responder_lib/libspdm_rsp_challenge_auth.c b/artifact/libspdm/library/spdm_responder_lib/libspdm_rsp_challenge_auth.c
+index d462247..215e6df 100644
+--- a/artifact/libspdm/library/spdm_responder_lib/libspdm_rsp_challenge_auth.c
++++ b/artifact/libspdm/library/spdm_responder_lib/libspdm_rsp_challenge_auth.c
+@@ -5,7 +5,7 @@
+  **/
+ 
+ #include "internal/libspdm_responder_lib.h"
+-
++#include "../../../harness/src/tla_trace.h"
+ 
+ #if LIBSPDM_ENABLE_CAPABILITY_CHAL_CAP
+ 
+@@ -338,6 +338,26 @@ libspdm_return_t libspdm_get_response_challenge_auth(libspdm_context_t *spdm_con
+                                      LIBSPDM_CONNECTION_STATE_AUTHENTICATED);
+     }
+ 
++    /* -=[Trace: ResponderHandleChallenge]=- */
++    {
++        uint64_t ts = tla_get_timestamp_us();
++        uint8_t *nonce_ptr = (uint8_t *)(ptr - SPDM_NONCE_SIZE - hash_size - sizeof(spdm_challenge_auth_response_t) - measurement_summary_hash_size - sizeof(uint16_t) - opaque_data_size);
++        uint8_t *ctx_echo = NULL;
++        if (spdm_request->header.spdm_version >= SPDM_MESSAGE_VERSION_13) {
++            ctx_echo = (uint8_t *)request_context;
++        }
++        const char *key_src = (slot_id == 0xFF) ? "\"public_key_only\"" : "\"cert_chain\"";
++        const char *conn_state = (auth_attribute & SPDM_CHALLENGE_AUTH_RESPONSE_ATTRIBUTE_BASIC_MUT_AUTH_REQ)
++                                 ? "\"challenged\"" : "\"authenticated\"";
++        const char *auth_phase = (auth_attribute & SPDM_CHALLENGE_AUTH_RESPONSE_ATTRIBUTE_BASIC_MUT_AUTH_REQ)
++                                 ? "\"MUTUAL_IN_PROGRESS\"" : "\"ONE_WAY_COMPLETE\"";
++        tla_state_t state_before = {"null", "\"NONE\"", "null"};
++        tla_state_t state_after = {conn_state, auth_phase, key_src};
++        size_t msg_c_len = libspdm_get_managed_buffer(&spdm_context->transcript.message_c)->buffer_size;
++        tla_emit_responder_handle_challenge(ts, slot_id, key_src, nonce_ptr, (uint32_t)msg_c_len,
++                                           ctx_echo, state_before, state_after);
++    }
++
+     libspdm_reset_message_b(spdm_context);
+     libspdm_reset_message_c(spdm_context);
+ 
+diff --git a/artifact/libspdm/library/spdm_responder_lib/libspdm_rsp_encap_challenge.c b/artifact/libspdm/library/spdm_responder_lib/libspdm_rsp_encap_challenge.c
+index 75a625f..47200f2 100644
+--- a/artifact/libspdm/library/spdm_responder_lib/libspdm_rsp_encap_challenge.c
++++ b/artifact/libspdm/library/spdm_responder_lib/libspdm_rsp_encap_challenge.c
+@@ -5,6 +5,7 @@
+  **/
+ 
+ #include "internal/libspdm_responder_lib.h"
++#include "../../../harness/src/tla_trace.h"
+ 
+ #if (LIBSPDM_ENABLE_CAPABILITY_MUT_AUTH_CAP) && (LIBSPDM_ENABLE_CAPABILITY_ENCAP_CAP) && \
+     (LIBSPDM_SEND_CHALLENGE_SUPPORT)
+@@ -74,6 +75,15 @@ libspdm_return_t libspdm_get_encap_request_challenge(libspdm_context_t *spdm_con
+                      &spdm_request->header, sizeof(spdm_message_header_t));
+     spdm_context->encap_context.last_encap_request_size = spdm_request_size;
+ 
++    /* -=[Trace: ResponderHandleEncapChallenge]=- */
++    {
++        uint64_t ts = tla_get_timestamp_us();
++        size_t msg_mut_len = libspdm_get_managed_buffer(&spdm_context->transcript.message_mut_c)->buffer_size;
++        tla_state_t state_before = {"\"challenged\"", "\"MUTUAL_IN_PROGRESS\"", "null"};
++        tla_state_t state_after = {"\"challenged\"", "\"MUTUAL_IN_PROGRESS\"", "null"};
++        tla_emit_responder_handle_encap_challenge(ts, (uint32_t)msg_mut_len, state_before, state_after);
++    }
++
+     return LIBSPDM_STATUS_SUCCESS;
+ }
+ 
+diff --git a/harness/src/tla_trace.c b/harness/src/tla_trace.c
+index 857dc4d..48acdee 100644
+--- a/harness/src/tla_trace.c
++++ b/harness/src/tla_trace.c
+@@ -69,17 +69,30 @@ static void emit_event(
+     pthread_mutex_unlock(&g_trace_lock);
+ }
+ 
++static void add_quoted_field(char *buffer, size_t len, const char *value) {
++    if (value == NULL) {
++        snprintf(buffer, len, "null");
++    } else {
++        snprintf(buffer, len, "\"%s\"", value);
++    }
++}
++
+ static void build_state_json(char *buffer, size_t len,
+                              tla_state_t state_before, tla_state_t state_after) {
++    char cs_before[64], ap_before[64], ks_before[64];
++    char cs_after[64], ap_after[64], ks_after[64];
++
++    add_quoted_field(cs_before, sizeof(cs_before), state_before.connection_state);
++    add_quoted_field(ap_before, sizeof(ap_before), state_before.authentication_phase);
++    add_quoted_field(ks_before, sizeof(ks_before), state_before.key_source);
++    add_quoted_field(cs_after, sizeof(cs_after), state_after.connection_state);
++    add_quoted_field(ap_after, sizeof(ap_after), state_after.authentication_phase);
++    add_quoted_field(ks_after, sizeof(ks_after), state_after.key_source);
++
+     snprintf(buffer, len,
+              "\"state_before\":{\"connection_state\":%s,\"authentication_phase\":%s,\"key_source\":%s},"
+              "\"state_after\":{\"connection_state\":%s,\"authentication_phase\":%s,\"key_source\":%s}",
+-             state_before.connection_state ? state_before.connection_state : "null",
+-             state_before.authentication_phase ? state_before.authentication_phase : "null",
+-             state_before.key_source ? state_before.key_source : "null",
+-             state_after.connection_state ? state_after.connection_state : "null",
+-             state_after.authentication_phase ? state_after.authentication_phase : "null",
+-             state_after.key_source ? state_after.key_source : "null"
++             cs_before, ap_before, ks_before, cs_after, ap_after, ks_after
+     );
+ }
+ 
+@@ -94,11 +107,15 @@ void tla_emit_requester_send_challenge(
+ ) {
+     char nonce_hex[65] = {0};
+     char context_hex[65] = {0};
++    char context_json[70] = "null";
+     char state_buf[512];
+     char msg_buf[1024];
+ 
+     if (nonce) tla_bytes_to_hex(nonce, 32, nonce_hex, sizeof(nonce_hex));
+-    if (context) tla_bytes_to_hex(context, 32, context_hex, sizeof(context_hex));
++    if (context) {
++        tla_bytes_to_hex(context, 32, context_hex, sizeof(context_hex));
++        snprintf(context_json, sizeof(context_json), "\"%s\"", context_hex);
++    }
+ 
+     build_state_json(state_buf, sizeof(state_buf), state_before, state_after);
+ 
+@@ -106,7 +123,7 @@ void tla_emit_requester_send_challenge(
+              "\"slot_id\":%u,\"version\":%u,\"nonce\":\"%s\",\"context\":%s",
+              slot_id, version,
+              nonce_hex[0] ? nonce_hex : "null",
+-             context_hex[0] ? ("\"" + strcmp(context_hex, "") ? context_hex : "") : "null");
++             context_json);
+ 
+     emit_event("requester_send_challenge", "requester", timestamp, state_buf, msg_buf);
+ }
+@@ -123,21 +140,29 @@ void tla_emit_responder_handle_challenge(
+ ) {
+     char nonce_hex[65] = {0};
+     char context_hex[65] = {0};
++    char key_source_json[50] = "null";
++    char context_echo_json[70] = "null";
+     char state_buf[512];
+     char msg_buf[1024];
+ 
+     if (nonce) tla_bytes_to_hex(nonce, 32, nonce_hex, sizeof(nonce_hex));
+-    if (context_echo) tla_bytes_to_hex(context_echo, 32, context_hex, sizeof(context_hex));
++    if (context_echo) {
++        tla_bytes_to_hex(context_echo, 32, context_hex, sizeof(context_hex));
++        snprintf(context_echo_json, sizeof(context_echo_json), "\"%s\"", context_hex);
++    }
++    if (key_source) {
++        snprintf(key_source_json, sizeof(key_source_json), "\"%s\"", key_source);
++    }
+ 
+     build_state_json(state_buf, sizeof(state_buf), state_before, state_after);
+ 
+     snprintf(msg_buf, sizeof(msg_buf),
+-             "\"slot_id\":%u,\"key_source\":\"%s\",\"nonce\":\"%s\",\"message_c_len\":%u,\"context_echo\":%s",
++             "\"slot_id\":%u,\"key_source\":%s,\"nonce\":\"%s\",\"message_c_len\":%u,\"context_echo\":%s",
+              slot_id,
+-             key_source ? key_source : "null",
++             key_source_json,
+              nonce_hex[0] ? nonce_hex : "null",
+              message_c_len,
+-             context_hex[0] ? ("\"" + strcmp(context_hex, "") ? context_hex : "") : "null");
++             context_echo_json);
+ 
+     emit_event("responder_handle_challenge", "responder", timestamp, state_buf, msg_buf);
+ }
+@@ -152,17 +177,21 @@ void tla_emit_requester_handle_challenge_auth(
+     tla_state_t state_after
+ ) {
+     char nonce_hex[65] = {0};
++    char key_source_json[50] = "null";
+     char state_buf[512];
+     char msg_buf[512];
+ 
+     if (responder_nonce) tla_bytes_to_hex(responder_nonce, 32, nonce_hex, sizeof(nonce_hex));
++    if (key_source) {
++        snprintf(key_source_json, sizeof(key_source_json), "\"%s\"", key_source);
++    }
+ 
+     build_state_json(state_buf, sizeof(state_buf), state_before, state_after);
+ 
+     snprintf(msg_buf, sizeof(msg_buf),
+-             "\"slot_id\":%u,\"key_source\":\"%s\",\"responder_nonce\":\"%s\",\"context_match\":%s",
++             "\"slot_id\":%u,\"key_source\":%s,\"responder_nonce\":\"%s\",\"context_match\":%s",
+              slot_id,
+-             key_source ? key_source : "null",
++             key_source_json,
+              nonce_hex[0] ? nonce_hex : "null",
+              context_match ? "true" : "false");
+ 
+diff --git a/harness/src/tla_trace.h b/harness/src/tla_trace.h
+index 5c893f8..4e867d6 100644
+--- a/harness/src/tla_trace.h
++++ b/harness/src/tla_trace.h
+@@ -12,9 +12,9 @@ void tla_trace_shutdown(void);
+ 
+ /* ============ State Snapshot ============ */
+ typedef struct {
+-    const char *connection_state;
+-    const char *authentication_phase;
+-    const char *key_source;
++    const char *connection_state;  /* Pass as null or "null", "authenticated", "challenged", etc. */
++    const char *authentication_phase;  /* Pass as "NONE", "ONE_WAY_STARTED", etc. - no quotes */
++    const char *key_source;  /* Pass as null or "cert_chain", "public_key_only" - no quotes */
+ } tla_state_t;
+ 
+ /* ============ Event Emission ============ */

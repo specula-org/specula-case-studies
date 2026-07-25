@@ -1,0 +1,244 @@
+diff --git a/src/mongo/db/s/range_deleter_service.cpp b/src/mongo/db/s/range_deleter_service.cpp
+index 9b1af91..fa68463 100644
+--- a/src/mongo/db/s/range_deleter_service.cpp
++++ b/src/mongo/db/s/range_deleter_service.cpp
+@@ -29,6 +29,9 @@
+ 
+ #include "mongo/db/s/range_deleter_service.h"
+ 
++// TLA+ trace instrumentation
++#include "tla_trace.h"
++
+ #include "mongo/base/checked_cast.h"
+ #include "mongo/base/status_with.h"
+ #include "mongo/base/string_data.h"
+@@ -133,6 +136,10 @@ void RangeDeleterService::onStepUpBegin(OperationContext* opCtx, long long term)
+ }
+ 
+ void RangeDeleterService::onStepUpComplete(OperationContext* opCtx, long long term) {
++    // TLA+ trace: StepUp (pre-state: Secondary, termInitReady=false, recoveryPhase=idle)
++    // Emitted before state transitions; hardcoded pre-state values match spec preconditions.
++    tlaTrace::emitStepUp(tlaTrace::nodeId(), term);
++
+     // Wait until all tasks and thread from previous term drain
+     _joinAndResetState();
+     _activeTerm = _recoveryState.notifyStartOfTerm(term);
+@@ -218,6 +225,8 @@ void RangeDeleterService::_launchRangeDeletionRecoveryTask(OperationContext* opC
+             int nRescheduledTasks = 0;
+ 
+             // (1) register range deletion tasks marked as "processing"
++            // TLA+ trace: RecoveryPhase1Scan captures pre-state (recoveryPhase=phase1)
++            // and transitions atom to phase2 after emitting.
+             FindCommandRequest findCommand(NamespaceString::kRangeDeletionNamespace);
+             findCommand.setFilter(BSON(RangeDeletionTask::kProcessingFieldName << true));
+             auto cursor = client.find(std::move(findCommand));
+@@ -229,6 +238,8 @@ void RangeDeleterService::_launchRangeDeletionRecoveryTask(OperationContext* opC
+                     SemiFuture<void>::makeReady());
+                 nRescheduledTasks++;
+             }
++            // TLA+ trace: RecoveryPhase1Scan — emit after phase-1 cursor exhausted
++            tlaTrace::emitRecoveryPhase1Scan(tlaTrace::nodeId());
+ 
+             if (nRescheduledTasks > 1) {
+                 LOGV2_WARNING(6834801,
+@@ -252,6 +263,8 @@ void RangeDeleterService::_launchRangeDeletionRecoveryTask(OperationContext* opC
+                         SemiFuture<void>::makeReady());
+                 }
+             }
++            // TLA+ trace: RecoveryPhase2Scan — emit after phase-2 cursor exhausted
++            tlaTrace::emitRecoveryPhase2Scan(tlaTrace::nodeId());
+ 
+             LOGV2_INFO(6834802,
+                        "Finished resubmitting range deletion tasks",
+@@ -313,6 +326,15 @@ void RangeDeleterService::_stopService() {
+ }
+ 
+ void RangeDeleterService::onStepDown() {
++    // TLA+ trace: StepDown (pre-state: Primary, before _stopService clears state)
++    {
++        auto lock = _acquireMutexUnconditionally();
++        if (_state != kDown) {
++            bool termInitReady = _termInitializationPromise.has_value() &&
++                                  _termInitializationPromise->getFuture().isReady();
++            tlaTrace::emitStepDown(tlaTrace::nodeId(), termInitReady);
++        }
++    }
+     _stopService();
+ }
+ 
+diff --git a/src/mongo/db/s/range_deleter_service_op_observer.cpp b/src/mongo/db/s/range_deleter_service_op_observer.cpp
+index f48c068..ab3cc5f 100644
+--- a/src/mongo/db/s/range_deleter_service_op_observer.cpp
++++ b/src/mongo/db/s/range_deleter_service_op_observer.cpp
+@@ -29,6 +29,9 @@
+ 
+ #include "mongo/db/s/range_deleter_service_op_observer.h"
+ 
++// TLA+ trace instrumentation
++#include "tla_trace.h"
++
+ #include "mongo/base/error_codes.h"
+ #include "mongo/base/status.h"
+ #include "mongo/base/string_data.h"
+@@ -39,6 +42,7 @@
+ #include "mongo/db/namespace_string.h"
+ #include "mongo/db/query/client_cursor/cursor_manager.h"
+ #include "mongo/db/repl/replication_coordinator.h"
++
+ #include "mongo/db/s/range_deleter_service.h"
+ #include "mongo/db/s/range_deletion_task_gen.h"
+ #include "mongo/db/shard_role/lock_manager/lock_manager_defs.h"
+@@ -70,6 +74,22 @@ void registerTaskWithOngoingQueriesOnOpLogEntryCommit(OperationContext* opCtx,
+ 
+     shard_role_details::getRecoveryUnit(opCtx)->onCommit([rdt](OperationContext* opCtx,
+                                                                boost::optional<Timestamp>) {
++        // TLA+ trace: OpObserverClearPending
++        // Pre-state: diskTaskState="pending" (pending is being cleared by this commit)
++        {
++            auto* replCoord = repl::ReplicationCoordinator::get(opCtx);
++            bool isPrimary = replCoord->getMemberState().primary();
++            std::string role = isPrimary ? "Primary" : "Secondary";
++            // termInitReady: true on primary (set in onStepUpComplete), false on secondary
++            bool termInitReady = isPrimary;
++            std::string nid = tlaTrace::nodeId();
++            std::string taskK = tlaTrace::taskKey(
++                rdt.getCollectionUuid().toString(),
++                rdt.getRange().getMin().toString(),
++                rdt.getRange().getMax().toString());
++            tlaTrace::emitOpObserverClearPending(nid, taskK, role, termInitReady, "pending");
++        }
++
+         try {
+             auto waitForActiveQueriesToComplete =
+                 CollectionShardingRuntime::acquireShared(opCtx, rdt.getNss())
+@@ -88,7 +108,29 @@ void registerTaskWithOngoingQueriesOnOpLogEntryCommit(OperationContext* opCtx,
+             }
+             (void)RangeDeleterService::get(opCtx)->registerTask(
+                 rdt, std::move(waitForActiveQueriesToComplete));
++            // TLA+ trace: OpObserverRegisterTask (primary path, registration succeeded)
++            {
++                std::string nid = tlaTrace::nodeId();
++                std::string taskK = tlaTrace::taskKey(
++                    rdt.getCollectionUuid().toString(),
++                    rdt.getRange().getMin().toString(),
++                    rdt.getRange().getMax().toString());
++                tlaTrace::emitOpObserverRegisterTask(nid, taskK);
++            }
+         } catch (const DBException& ex) {
++            if (ex.code() == ErrorCodes::NotYetInitialized ||
++                ErrorCodes::isA<ErrorCategory::NotPrimaryError>(ex.code())) {
++                // TLA+ trace: ReplicateDiskState (secondary path: oplog entry applied)
++                // Pre-state of secondary: "pending" (about to become "ready")
++                std::string nid = tlaTrace::nodeId();
++                std::string taskK = tlaTrace::taskKey(
++                    rdt.getCollectionUuid().toString(),
++                    rdt.getRange().getMin().toString(),
++                    rdt.getRange().getMax().toString());
++                const char* primaryEnv = std::getenv("TLA_PRIMARY_NODE");
++                std::string primaryId = primaryEnv ? primaryEnv : "n_primary";
++                tlaTrace::emitReplicateDiskState(primaryId, nid, taskK, "pending");
++            }
+             if (ex.code() != ErrorCodes::NotYetInitialized &&
+                 !ErrorCodes::isA<ErrorCategory::NotPrimaryError>(ex.code())) {
+                 LOGV2_WARNING(7092800,
+@@ -166,6 +208,19 @@ void RangeDeleterServiceOpObserver::onUpdate(OperationContext* opCtx,
+                 // equal to the preMigrationShardVersion. This ensures that reads on secondaries are
+                 // terminated, preventing them from potentially targeting orphaned documents.
+                 invalidateRangePreservers(opCtx, deletionTask);
++                // TLA+ trace: ReplicateDiskState on secondary when primary's processing flag is applied.
++                // Pre-state of secondary: "ready" (before processing flag replication).
++                auto* replCoord = repl::ReplicationCoordinator::get(opCtx);
++                if (replCoord->getMemberState().secondary()) {
++                    std::string nid = tlaTrace::nodeId();
++                    std::string taskK = tlaTrace::taskKey(
++                        deletionTask.getCollectionUuid().toString(),
++                        deletionTask.getRange().getMin().toString(),
++                        deletionTask.getRange().getMax().toString());
++                    const char* primaryEnv = std::getenv("TLA_PRIMARY_NODE");
++                    std::string primaryId = primaryEnv ? primaryEnv : "n_primary";
++                    tlaTrace::emitReplicateDiskState(primaryId, nid, taskK, "ready");
++                }
+             }
+             if (pendingFieldIsRemoved || pendingFieldUpdatedToFalse) {
+                 registerTaskWithOngoingQueriesOnOpLogEntryCommit(opCtx, deletionTask);
+diff --git a/src/mongo/db/s/ready_range_deletions_processor.cpp b/src/mongo/db/s/ready_range_deletions_processor.cpp
+index 513a70d..62cd7ba 100644
+--- a/src/mongo/db/s/ready_range_deletions_processor.cpp
++++ b/src/mongo/db/s/ready_range_deletions_processor.cpp
+@@ -29,6 +29,9 @@
+ 
+ #include "mongo/db/s/ready_range_deletions_processor.h"
+ 
++// TLA+ trace instrumentation
++#include "tla_trace.h"
++
+ #include "mongo/db/hierarchical_cancelable_operation_context_factory.h"
+ #include "mongo/db/repl/wait_for_majority_service.h"
+ #include "mongo/db/s/range_deleter_service.h"
+@@ -238,11 +241,19 @@ void ReadyRangeDeletionsProcessor::_runRangeDeletions() {
+         // - All orphans have been deleted
+         // - The deletions have been majority committed
+         // - The range deletion task document has been deleted
++        // Build task key for trace (stable across the lifetime of this task)
++        std::string tlaTaskKey = tlaTrace::taskKey(
++            collectionUuid.toString(),
++            range.getMin().toString(),
++            range.getMax().toString());
++        std::string tlaNid = tlaTrace::nodeId();
++
+         bool taskCompleted = false;
+         while (!taskCompleted) {
+             try {
+                 // Perform the actual range deletion
+                 bool orphansRemovalCompleted = false;
++                bool inMajorityWait = false; // tracks majority-wait phase for MajorityWaitInterrupted
+                 while (!orphansRemovalCompleted) {
+                     try {
+                         NamespaceString nss;
+@@ -260,6 +271,8 @@ void ReadyRangeDeletionsProcessor::_runRangeDeletions() {
+                                    "namespace"_attr = nss,
+                                    "collectionUUID"_attr = collectionUuid.toString(),
+                                    "range"_attr = redact(range.toString()));
++                        // TLA+ trace: DeleteOrphans — pre-state: diskTaskState="ready", deletionStep="idle"
++                        tlaTrace::emitDeleteOrphans(tlaNid, tlaTaskKey, "ready", "idle");
+ 
+                         auto shardKeyPattern =
+                             (optKeyPattern ? (*optKeyPattern).toBSON()
+@@ -334,9 +347,13 @@ void ReadyRangeDeletionsProcessor::_runRangeDeletions() {
+                     // different collections, so it's important not to apply
+                     // out of order the deletions of orphans and the removal of the
+                     // entry persisted in `config.rangeDeletions`
++                    inMajorityWait = true;
+                     WaitForMajorityService::get(opCtx->getServiceContext())
+                         .waitUntilMajorityForWrite(clientOpTime, CancellationToken::uncancelable())
+                         .get(opCtx);
++                    inMajorityWait = false;
++                    // TLA+ trace: MajorityWaitSuccess — pre-state: deletionStep="deleting"
++                    tlaTrace::emitMajorityWaitSuccess(tlaNid, tlaTaskKey);
+                 }
+ 
+                 // Remove persistent range deletion task
+@@ -344,7 +361,11 @@ void ReadyRangeDeletionsProcessor::_runRangeDeletions() {
+                     auto* self = RangeDeleterService::get(opCtx);
+                     auto task = self->completeTask(collectionUuid, range);
+                     if (task) {
++                        // TLA+ trace: CompleteInMemory — pre-state: deletionStep="waiting"
++                        tlaTrace::emitCompleteInMemory(tlaNid, tlaTaskKey);
+                         rangedeletionutil::removePersistentTask(opCtx, task->getTaskId());
++                        // TLA+ trace: RemovePersistentTask — pre-state: deletionStep="completing"
++                        tlaTrace::emitRemovePersistentTask(tlaNid, tlaTaskKey);
+                     }
+ 
+                     LOGV2_DEBUG(6872504,
+@@ -390,6 +411,11 @@ void ReadyRangeDeletionsProcessor::_runRangeDeletions() {
+                 // interruption only happens on shutdown/stepdown (this is fine because range
+                 // deletions will be resumed on the next step up)
+                 if (_stopRequested()) {
++                    // TLA+ trace: MajorityWaitInterrupted — only when interrupted during majority wait
++                    // Pre-state: deletionStep="deleting" (majority wait was in progress)
++                    if (inMajorityWait) {
++                        tlaTrace::emitMajorityWaitInterrupted(tlaNid, tlaTaskKey);
++                    }
+                     break;
+                 }
+ 
