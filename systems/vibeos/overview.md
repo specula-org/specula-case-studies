@@ -6,4 +6,4 @@ Specula analyzed and tested VibeOS's kernel heap allocator and process scheduler
 
 ## Bugs
 
-The bug tracker currently records no bugs for this system.
+Specula found no bugs for this system in the recorded experiments.

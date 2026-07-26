@@ -8,5 +8,5 @@ Specula analyzed and tested Algorand's BA* agreement core and catch-up boundary,
 
 Specula found 2 new bugs:
 
-- `AsyncVoteVerifier.Quit` can race with a late verification task, allowing task registration after shutdown waiting and a send to the closed `execpoolOut` channel; PR #5341 remains open.
+- **Open:** `AsyncVoteVerifier.Quit` can race with a late verification task, allowing task registration after shutdown waiting and a send to the closed `execpoolOut` channel; see PR #5341.
 - The `fetchRound` fork-detection branch only logs the fork and continues trying other peers instead of halting as intended.

@@ -6,4 +6,4 @@ Specula analyzed and tested Flurry's concurrent hash map, including lock-free lo
 
 ## Bugs
 
-The bug tracker currently records no bugs for this system.
+Specula found no bugs for this system in the recorded experiments.

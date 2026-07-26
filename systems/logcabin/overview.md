@@ -6,4 +6,4 @@ Specula analyzed and tested LogCabin's Raft core, including elections and leader
 
 ## Bugs
 
-The bug tracker currently records no bugs for this system.
+Specula found no bugs for this system in the recorded experiments.

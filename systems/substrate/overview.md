@@ -6,6 +6,6 @@ Specula analyzed and tested Substrate's GRANDPA finality gadget, including votin
 
 ## Bugs
 
-The bug tracker records 1 known bug examined by Specula:
+Specula found 1 previously known bug:
 
-- Completing one round could overwrite an existing vote record for the next round, allowing crash recovery to make an honest validator equivocate; PR #6823 fixed the overwrite.
+- **Fixed:** Completing one round could overwrite an existing vote record for the next round, allowing crash recovery to make an honest validator equivocate (PR #6823).

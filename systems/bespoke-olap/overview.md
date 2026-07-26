@@ -6,4 +6,4 @@ Specula analyzed and tested Bespoke-OLAP's parallel Parquet row-group loader, in
 
 ## Bugs
 
-The bug tracker currently records no bugs for this system.
+Specula found no bugs for this system in the recorded experiments.

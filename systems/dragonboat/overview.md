@@ -8,4 +8,4 @@ Specula analyzed and tested Dragonboat's multi-group Raft core, including electi
 
 Specula found 1 new bug:
 
-- `saveSnapshot` returns `nil` instead of its persistence error, causing the caller to treat an unsuccessful batch as saved and risking lost Raft log entries after a crash; PR #409 remains open.
+- **Open:** `saveSnapshot` returns `nil` instead of its persistence error, causing the caller to treat an unsuccessful batch as saved and risking lost Raft log entries after a crash; see PR #409.

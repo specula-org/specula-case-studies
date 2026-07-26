@@ -6,6 +6,6 @@ Specula analyzed and tested scc's concurrent HashMap, HashIndex, HashCache, and 
 
 ## Bugs
 
-The bug tracker records 1 known bug examined by Specula:
+Specula found 1 previously known bug:
 
-- A historical resize path cleared an entry from the old bucket before publishing it in the new bucket, briefly making it invisible; commit `9573fa1` fixed the ordering.
+- **Fixed:** A historical resize path cleared an entry from the old bucket before publishing it in the new bucket, briefly making it invisible (commit `9573fa1`).

@@ -9,8 +9,8 @@ Specula analyzed and tested left-right's reader/writer separation runtime, inclu
 Specula found 2 new bugs:
 
 - `change_drop` copies the value into a new alias without forgetting the consumed alias, so dropping the original can free data still referenced by the returned alias.
-- Reentrant `ReadHandle::enter` does not handle the null pointer installed by `take_inner`, so a nested read can reach an `unreachable!` panic; PR #150 remains open.
+- **Open:** Reentrant `ReadHandle::enter` does not handle the null pointer installed by `take_inner`, so a nested read can reach an `unreachable!` panic (PR #150).
 
-The bug tracker also records 1 known bug examined by Specula:
+Specula also found 1 previously known bug:
 
-- `take_inner` can reuse a stale epoch snapshot and miss a reader that enters before the null-pointer swap, allowing the writer to free data still being read; PR #144 remains open.
+- **Open:** `take_inner` can reuse a stale epoch snapshot and miss a reader that enters before the null-pointer swap, allowing the writer to free data still being read (PR #144).

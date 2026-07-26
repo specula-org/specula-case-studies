@@ -22,10 +22,10 @@ Specula found 13 new bugs:
 - Remote private-validator sign requests may omit their vote or proposal payload, which is dereferenced and can crash the signer process.
 - A stale retryable `CheckTx` completion can expire a newer seen-cache generation for the same transaction and admit a duplicate application callback.
 
-The bug tracker also records 5 known bugs examined by Specula:
+Specula also found 5 previously known bugs:
 
-- During blocksync handoff, the mempool is enabled before consensus starts, creating a window in which peer-flooded `CheckTx` work reaches the application; this remains open as Issue #3398.
-- A proposer skips verifying its own vote extension, so other validators can reject its precommit and permanently deadlock consensus; this remains open as Issue #5204.
-- Late precommits from the previous height can enter `LastCommit` without application-level vote-extension verification; this remains open as Issue #2523.
-- `DoubleSignCheckHeight=1` performs no historical look-back because of an off-by-one loop bound; this remains open as Issue #5435.
-- Early catch-up block parts are silently dropped when the proposal part set is not initialized, with no buffering or re-request; this remains open as Issue #3340.
+- **Open:** During blocksync handoff, the mempool is enabled before consensus starts, creating a window in which peer-flooded `CheckTx` work reaches the application; see Issue #3398.
+- **Open:** A proposer skips verifying its own vote extension, so other validators can reject its precommit and permanently deadlock consensus; see Issue #5204.
+- **Open:** Late precommits from the previous height can enter `LastCommit` without application-level vote-extension verification; see Issue #2523.
+- **Open:** `DoubleSignCheckHeight=1` performs no historical look-back because of an off-by-one loop bound; see Issue #5435.
+- **Open:** Early catch-up block parts are silently dropped when the proposal part set is not initialized, with no buffering or re-request; see Issue #3340.

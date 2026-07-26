@@ -6,4 +6,4 @@ Specula analyzed and tested FRRouting's Zebra route-realization pipeline, includ
 
 ## Bugs
 
-The bug tracker currently records no bugs for this system.
+Specula found no bugs for this system in the recorded experiments.

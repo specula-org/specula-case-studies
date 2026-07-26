@@ -6,4 +6,4 @@ Specula analyzed and tested Hazelcast's CP-subsystem Raft core, including electi
 
 ## Bugs
 
-The bug tracker currently records no bugs for this system.
+Specula found no bugs for this system in the recorded experiments.

@@ -10,7 +10,7 @@ Specula found 1 new bug:
 
 - `BTCDelegation.GetStatus` does not consider whether the finality provider is slashed, so it can report a delegation under a slashed provider as active.
 
-The bug tracker also records 2 known bugs examined by Specula:
+Specula also found 2 previously known bugs:
 
-- `CommitPubRandList` accepts retroactive public-randomness commitments because it does not enforce a lower bound on `StartHeight`; Issue #1984 remains open.
-- Reactivating a finality provider does not reset its liveness bitmap or missed-block counter, allowing stale state to bypass jailing; Issue #1852 remains open.
+- **Open:** `CommitPubRandList` accepts retroactive public-randomness commitments because it does not enforce a lower bound on `StartHeight`; see Issue #1984.
+- **Open:** Reactivating a finality provider does not reset its liveness bitmap or missed-block counter, allowing stale state to bypass jailing; see Issue #1852.

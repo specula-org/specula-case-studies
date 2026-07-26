@@ -6,8 +6,8 @@ Specula analyzed and tested memberlist's SWIM and Lifeguard membership protocol,
 
 ## Bugs
 
-The bug tracker records 3 known bugs examined by Specula:
+Specula found 3 previously known bugs:
 
-- Reaping a Left or Dead tombstone erases its incarnation floor, allowing stale push/pull Alive state to resurrect the node and delay membership convergence.
-- Because incarnation state is not persisted, a restarted node can announce an equal or lower incarnation that peers reject, prolonging a false-Dead view.
-- `Join` can report success after the receiver's `NotifyMerge` rejects the merge, leaving the two nodes with asymmetric membership views.
+- **Open:** Reaping a Left or Dead tombstone erases its incarnation floor, allowing stale push/pull Alive state to resurrect the node and delay membership convergence.
+- **Open:** Because incarnation state is not persisted, a restarted node can announce an equal or lower incarnation that peers reject, prolonging a false-Dead view.
+- **Open:** `Join` can report success after the receiver's `NotifyMerge` rejects the merge, leaving the two nodes with asymmetric membership views.

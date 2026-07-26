@@ -6,4 +6,4 @@ Specula analyzed and tested Apache Ratis's Raft implementation, including pre-vo
 
 ## Bugs
 
-The bug tracker currently records no bugs for this system.
+Specula found no bugs for this system in the recorded experiments.

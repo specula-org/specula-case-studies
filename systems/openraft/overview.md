@@ -6,4 +6,4 @@ Specula analyzed and tested OpenRaft's engine and runtime across vote handling a
 
 ## Bugs
 
-The bug tracker currently records no bugs for this system.
+Specula found no bugs for this system in the recorded experiments.

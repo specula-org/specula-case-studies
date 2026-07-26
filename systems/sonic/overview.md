@@ -20,7 +20,7 @@ Specula found 26 new bugs:
 - Peers with equal node identifiers increment them symmetrically on every collision and remain equal, preventing the MCLAG handshake from completing.
 - Deleting a DPU does not notify registered vDPU actors, allowing stale DPU state to propagate through vDPU, HA-set, and HA-scope decisions.
 - Deleting an HA set does not notify registered HA-scope actors, leaving orphaned actors with stale parent state.
-- `HaSetActorState::new_actor_msg` ignores its `up` argument and reports deletion as `up=true`; PR #145 fixed this bug.
+- **Fixed:** `HaSetActorState::new_actor_msg` ignores its `up` argument and reports deletion as `up=true` (PR #145).
 - Parent cleanup does not cascade deletion notifications from DPU and HA-set actors to their children, leaving stale actors that continue making HA decisions.
 - Syncd applies warm-reboot changes to the ASIC and Redis in separate non-atomic stages, while orchagent cannot observe failure and may declare reconciliation complete.
 - Warm-restart components reconcile independently without a global dependency barrier, allowing FDB restoration before VXLAN tunnels and causing a traffic blackhole.
@@ -35,12 +35,12 @@ Specula found 26 new bugs:
 - An untagged delayed mux-probe response can overwrite a newer completed intent and temporarily publish an Unhealthy state.
 - Canceling a hardware positive-probing timer still runs its callback because the error code is discarded, allowing it to publish Active after the link goes Down.
 
-The bug tracker also records 7 known bugs examined by Specula:
+Specula also found 7 previously known bugs:
 
-- Peer mux state is not reset across a link Down-to-Up transition, so initialization can treat stale pre-restart state as healthy; this remains open as Issue #285.
-- Local health recovery does not re-evaluate stale peer mux state, allowing asymmetric failure handling to leave both ToRs in Standby; this remains open under Issues #143 and #285.
-- Non-FIFO `strand::wrap` dispatch can process a stale link-prober Unknown event after a fresh Active event and spuriously switch a healthy mux to Standby; the remaining paths are open under Issues #104 and #254.
-- VLAN FDB flush does not mark entries as pending, so the completion notification skips them and leaves phantom FDB state; this remains open as Issue #4428.
-- Bridge-port removal deletes the OID mapping before asynchronous FDB flush events arrive, causing those events to be dropped and producing a long-lived traffic blackhole; the tracker links multiple open reports.
-- ICCPD clears the warm-reboot disconnection timestamp immediately after setting it, so the 90-second cleanup timeout never fires; PR #7724 remains open.
-- A stale or canceled warm-restart reconciliation callback can overwrite a newer Active or Manual mux-mode configuration with Auto; this remains open as Issue #25612.
+- **Open:** Peer mux state is not reset across a link Down-to-Up transition, so initialization can treat stale pre-restart state as healthy (Issue #285).
+- **Open:** Local health recovery does not re-evaluate stale peer mux state, allowing asymmetric failure handling to leave both ToRs in Standby (Issues #143 and #285).
+- **Open:** Non-FIFO `strand::wrap` dispatch can process a stale link-prober Unknown event after a fresh Active event and spuriously switch a healthy mux to Standby (Issues #104 and #254).
+- **Open:** VLAN FDB flush does not mark entries as pending, so the completion notification skips them and leaves phantom FDB state (Issue #4428).
+- **Open:** Bridge-port removal deletes the OID mapping before asynchronous FDB flush events arrive, causing those events to be dropped and producing a long-lived traffic blackhole.
+- **Open:** ICCPD clears the warm-reboot disconnection timestamp immediately after setting it, so the 90-second cleanup timeout never fires (PR #7724).
+- **Open:** A stale or canceled warm-restart reconciliation callback can overwrite a newer Active or Manual mux-mode configuration with Auto (Issue #25612).

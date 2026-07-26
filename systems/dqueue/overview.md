@@ -6,4 +6,4 @@ Specula analyzed and tested PGo's distributed publisher-consumer queue, includin
 
 ## Bugs
 
-The bug tracker currently records no bugs for this system.
+Specula found no bugs for this system in the recorded experiments.

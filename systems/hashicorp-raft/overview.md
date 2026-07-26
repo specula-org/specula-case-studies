@@ -8,9 +8,9 @@ Specula analyzed and tested HashiCorp Raft's core, including elections and PreVo
 
 Specula found 2 new bugs:
 
-- Independent heartbeats can maintain the leader lease while replication is blocked on disk I/O, preventing follower election even though the cluster cannot commit; Issue #666 records the fixed issue.
-- The `requestPreVote` metrics path retained the copied `requestVote` label; PR #665 fixed it.
+- **Fixed:** Independent heartbeats can maintain the leader lease while replication is blocked on disk I/O, preventing follower election even though the cluster cannot commit; see Issue #666.
+- **Fixed:** The `requestPreVote` metrics path retained the copied `requestVote` label; see PR #665.
 
-The bug tracker also records 1 known bug examined by Specula:
+Specula also found 1 previously known bug:
 
-- If suffix deletion succeeds but storing replacement logs fails, the cached last-log index and term still point to deleted entries; the developer TODO remains open for non-transactional log stores.
+- **Open:** If suffix deletion succeeds but storing replacement logs fails, the cached last-log index and term still point to deleted entries; a developer TODO documents the problem for non-transactional log stores.

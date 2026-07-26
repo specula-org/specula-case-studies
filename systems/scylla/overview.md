@@ -8,4 +8,4 @@ Specula analyzed and tested ScyllaDB's Raft library, including pre-vote and elec
 
 Specula found 1 new bug:
 
-- Read-quorum broadcasting can omit voters demoted only in the current half of a joint configuration, stalling read barriers and reducing fault tolerance; this was fixed in PR #29226.
+- **Fixed:** Read-quorum broadcasting can omit voters demoted only in the current half of a joint configuration, stalling read barriers and reducing fault tolerance (PR #29226).
