@@ -6,5 +6,8 @@ Specula analyzed and tested libgomp's core concurrency runtime, including team b
 
 ## Bugs
 
-- In stock libgomp, fulfilling the last detached task from an external thread can wake a barrier waiter without setting `BAR_TASK_PENDING`, causing the team to wait forever. This was reported upstream as GCC PR 124620.
-- In the proposed flat-barrier implementation, task-assisted barrier completion can overwrite the barrier's cancellation state, causing an assertion failure in checking builds and leaving inconsistent internal state otherwise.
+Specula found 3 new bugs:
+
+- In NVIDIA's flat-barrier path, cancellation can race with task-assisted completion so that some threads observe cancellation while others pass the barrier normally; the issue is fixed.
+- Fulfilling the last detached task from an external thread can wake barrier waiters without setting `BAR_TASK_PENDING`, leaving them asleep indefinitely; the tracker marks the issue approved.
+- The POSIX flat barrier's `gomp_team_barrier_done` clears `BAR_CANCELLED` when advancing the generation, losing cancellation during task completion.
