@@ -1,0 +1,129 @@
+{
+  "schema_version": "1",
+  "system": "opencbdc-tx (2PC)",
+  "generated_by": "consolidate",
+  "findings": [
+    {
+      "id": "MC-1",
+      "title": "Leader/Handler Activation Gap",
+      "source": "model-checking",
+      "family": "Family 1 — Leader/Follower Asymmetry in Message Handler Lifecycle",
+      "severity": "High",
+      "invariant": "MCLeaderHasHandler",
+      "config": "MC_hunt_family1.cfg",
+      "counterexample": "spec/output/MC_hunt_family1_full.out",
+      "affected_code": [
+        "coordinator/controller.cpp:112-130",
+        "coordinator/controller.cpp:536-583"
+      ],
+      "summary": "Coordinator raft_callback sets leader flag and startFlag but defers handler activation to start_stop_func. Between these two, isLeader=TRUE but handlerActive=FALSE, violating InvLeaderHasHandler. Sentinel submissions to this window are silently dropped. The locking shard uses a synchronous pattern and does not have this gap.",
+      "dedup_note": "Also covers code-review Family 1 (same leader/follower message handler lifecycle asymmetry mechanism), including the coordinator activation gap and execute_transaction() is_leader() synchronization concern."
+    },
+    {
+      "id": "MC-2",
+      "title": "Request In Flight During Leadership Change",
+      "source": "model-checking",
+      "family": "Family 3 — Sentinel-to-Coordinator Communication Gaps",
+      "severity": "Medium",
+      "invariant": "MCNonLeaderRejectsRequest",
+      "config": "MC_hunt_family3.cfg",
+      "counterexample": "spec/output/MC_hunt_family3_full.out",
+      "affected_code": [
+        "sentinel_2pc/controller.cpp:21-25",
+        "coordinator/controller.cpp:688-731",
+        "sentinel_2pc/controller.cpp:210-227"
+      ],
+      "summary": "Sentinels select coordinators by modulo without leader discovery. A submitted request sets requestInFlight=TRUE on a leader. If leadership changes before the request completes, the in-flight request lives on a non-leader, violating InvNonLeaderRejectsRequest. Coordinator's execute_transaction checks is_leader() only at entry.",
+      "dedup_note": "Also covers code-review Family 3 (same sentinel-to-coordinator communication gap mechanism), including the modulo-based endpoint selection and infinite retry pattern."
+    },
+    {
+      "id": "CR-1",
+      "title": "Non-Atomic Coordinator State Machine Transitions",
+      "source": "code-review",
+      "family": "Family 2 — Non-Atomic Coordinator State Machine Transitions",
+      "severity": "High",
+      "invariant": null,
+      "config": null,
+      "counterexample": null,
+      "affected_code": [
+        "coordinator/distributed_tx.cpp:109-145",
+        "coordinator/distributed_tx.cpp:23-70",
+        "coordinator/distributed_tx.cpp:72-107",
+        "coordinator/distributed_tx.cpp:180-216",
+        "coordinator/controller.cpp:219-329"
+      ],
+      "summary": "The coordinator's RSM state transitions (prepare/commit/discard/done) are not atomic with the actual locking shard operations. Between RSM replication and shard operation completion, state divergence can occur. If the leader crashes mid-phase, the new leader recovers from RSM state but may re-issue operations to shards that partially completed. The locking shard's apply_outputs calls fatal if dtx_id not found, indicating non-idempotent behavior. This is a classic 2PC failure scenario where crash recovery must handle partially-executed shard operations."
+    },
+    {
+      "id": "CR-2",
+      "title": "No Snapshots / Unbounded Raft Log Growth",
+      "source": "code-review",
+      "family": "Family 4 — No Snapshots / Unbounded Raft Log Growth",
+      "severity": "Medium",
+      "invariant": null,
+      "config": null,
+      "counterexample": null,
+      "affected_code": [
+        "coordinator/controller.cpp:37",
+        "coordinator/state_machine.cpp:101-104",
+        "locking_shard/controller.cpp:46",
+        "locking_shard/state_machine.cpp:56-58",
+        "raft/log_store.cpp:290-312"
+      ],
+      "summary": "Both coordinator and locking shard disable Raft snapshots with snapshot_distance_ set to 0 and TODO comments referencing issue #768. Raft logs grow unbounded over time, and recovery from a long-running system requires replaying the entire log. Combined with the in-memory locking shard, crash recovery becomes increasingly expensive as the log grows. This is a known acknowledged TODO, not a safety issue but a practical deployment and operational concern."
+    },
+    {
+      "id": "CR-3",
+      "title": "Race Conditions in Coordinator Batch Processing",
+      "source": "code-review",
+      "family": "Family 5 — Race Conditions in Coordinator Batch Processing",
+      "severity": "Medium",
+      "invariant": null,
+      "config": null,
+      "counterexample": null,
+      "affected_code": [
+        "coordinator/controller.cpp:364-458",
+        "coordinator/controller.cpp:491-525",
+        "coordinator/controller.cpp:684-731",
+        "coordinator/controller.cpp:331-362"
+      ],
+      "summary": "The coordinator's batch processing uses multiple threads with complex synchronization. Race windows exist between batch swap, callback registration, and transaction addition. batch_set_cbs is called on m_current_batch after m_batch_mut is released, but execute_transaction() accesses m_current_batch under m_batch_mut. The yield-based spin loop in schedule_exec() uses no condition variable, creating potential for livelock under high contention. No confirmed bugs but the synchronization complexity suggests future bugs are likely."
+    },
+    {
+      "id": "CR-4",
+      "title": "Locking Shard In-Memory State Loss on Crash",
+      "source": "code-review",
+      "family": "Family 6 — Locking Shard In-Memory State Loss on Crash",
+      "severity": "High",
+      "invariant": null,
+      "config": null,
+      "counterexample": null,
+      "affected_code": [
+        "locking_shard/locking_shard.hpp:32",
+        "locking_shard/locking_shard.hpp:139-144",
+        "locking_shard/locking_shard.cpp:78-102",
+        "locking_shard/locking_shard.cpp:135-182",
+        "locking_shard/state_machine.cpp:56-58",
+        "coordinator/controller.cpp:219-329"
+      ],
+      "summary": "The locking shard is purely in-memory with no persistence. On crash, all locked outputs, applied transactions, and prepared dtx state are lost. The locking shard Raft cluster can recover the log, but the state machine starts empty, meaning locked UTXOs may become unlocked on recovery and committed transactions may be lost. The coordinator's recovery function assumes shard state is recoverable, but this assumption is violated by a shard crash. The in-memory-only design is the fundamental fault-tolerance boundary of the system."
+    },
+    {
+      "id": "CR-5",
+      "title": "Error Handling Gaps",
+      "source": "code-review",
+      "family": "Family 7 — Error Handling Gaps",
+      "severity": "Low",
+      "invariant": null,
+      "config": null,
+      "counterexample": null,
+      "affected_code": [
+        "locking_shard/state_machine.cpp:40-44",
+        "coordinator/state_machine.cpp:34-36",
+        "coordinator/controller.cpp:236",
+        "sentinel_2pc/controller.cpp:72"
+      ],
+      "summary": "Multiple error paths log errors but continue execution with partial or inconsistent state. Locking shard state machine returns nullptr on deserialization error without signaling failure. Coordinator state machine calls fatal() on duplicate prepare, causing program termination. Recovery continues with empty response objects after errors. Sentinel client init failure is logged as warning only with a TODO for proper handling."
+    }
+  ]
+}
