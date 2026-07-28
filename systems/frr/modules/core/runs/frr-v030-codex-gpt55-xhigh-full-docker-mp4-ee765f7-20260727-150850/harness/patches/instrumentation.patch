@@ -1,0 +1,464 @@
+diff --git a/bgpd/bgp_zebra.c b/bgpd/bgp_zebra.c
+index 1eac916254..4cc62e06d8 100644
+--- a/bgpd/bgp_zebra.c
++++ b/bgpd/bgp_zebra.c
+@@ -25,6 +25,7 @@
+ #include "vxlan.h"
+ #include "pbr.h"
+ #include "frrdistance.h"
++#include "lib/specula_trace.h"
+ 
+ #include "bgpd/bgpd.h"
+ #include "bgpd/bgp_route.h"
+@@ -1949,6 +1950,10 @@ static void bgp_handle_route_announcements_to_zebra(struct event *e)
+ 			UNSET_FLAG(dest->flags, BGP_NODE_SCHEDULE_FOR_DELETE);
+ 		}
+ 
++		if (!is_evpn)
++			specula_trace_bgp_handle_route_announcement(
++				bgp_dest_get_prefix(dest), install, status);
++
+ 		if (is_evpn && status == ZCLIENT_SEND_FAILURE)
+ 			flog_err(EC_BGP_EVPN_FAIL,
+ 				 "%s (%u): Failed to %s EVPN %pFX %s route in VNI %u",
+@@ -2086,6 +2091,8 @@ void bgp_zebra_route_install(struct bgp_dest *dest, struct bgp_path_info *info,
+ 	if (!bgp_install_info_to_zebra(bgp) && !is_evpn)
+ 		return;
+ 
++	specula_trace_bgp_zebra_route_install(bgp_dest_get_prefix(dest), install);
++
+ 	if (!CHECK_FLAG(dest->flags, BGP_NODE_SCHEDULE_FOR_INSTALL) &&
+ 	    !CHECK_FLAG(dest->flags, BGP_NODE_SCHEDULE_FOR_DELETE)) {
+ 		bool want_early = CHECK_FLAG(dest->flags, BGP_NODE_ZEBRA_ANNOUNCE_EARLY);
+@@ -3043,6 +3050,23 @@ static int iptable_notify_owner(ZAPI_CALLBACK_ARGS)
+ 	return 0;
+ }
+ 
++static const char *specula_bgp_route_notify_note(enum zapi_route_notify_owner note)
++{
++	switch (note) {
++	case ZAPI_ROUTE_INSTALLED:
++		return "installed";
++	case ZAPI_ROUTE_FAIL_INSTALL:
++		return "fail_install";
++	case ZAPI_ROUTE_REMOVED:
++		return "removed";
++	case ZAPI_ROUTE_REMOVE_FAIL:
++		return "remove_fail";
++	case ZAPI_ROUTE_BETTER_ADMIN_WON:
++		return "better_admin_won";
++	}
++	return "none";
++}
++
+ /* Process route notification messages from RIB */
+ static int bgp_zebra_route_notify_owner(int command, struct zclient *zclient,
+ 					zebra_size_t length, vrf_id_t vrf_id)
+@@ -3164,6 +3188,9 @@ static int bgp_zebra_route_notify_owner(int command, struct zclient *zclient,
+ 		break;
+ 	}
+ 
++	specula_trace_bgp_route_notify_owner(&p,
++					     specula_bgp_route_notify_note(note));
++
+ 	bgp_dest_unlock_node(dest);
+ 	return 0;
+ }
+diff --git a/lib/subdir.am b/lib/subdir.am
+index 20947c306d..0e3a9988fa 100644
+--- a/lib/subdir.am
++++ b/lib/subdir.am
+@@ -110,6 +110,7 @@ lib_libfrr_la_SOURCES = \
+ 	lib/sockunion.c \
+ 	lib/spf_backoff.c \
+ 	lib/segment_routing.c \
++	lib/specula_trace.c \
+ 	lib/srcdest_table.c \
+ 	lib/stream.c \
+ 	lib/strformat.c \
+diff --git a/zebra/zapi_msg.c b/zebra/zapi_msg.c
+index e3580c52af..9d47afc1e1 100644
+--- a/zebra/zapi_msg.c
++++ b/zebra/zapi_msg.c
+@@ -25,6 +25,7 @@
+ #include "lib/libfrr.h"
+ #include "lib/lib_errors.h"
+ #include "lib/frrdistance.h"
++#include "lib/specula_trace.h"
+ 
+ #include "zebra/zebra_router.h"
+ #include "zebra/rib.h"
+@@ -745,6 +746,23 @@ int zsend_nhg_notify(uint16_t type, uint16_t instance, uint32_t session_id,
+ 	return zserv_send_message(client, s);
+ }
+ 
++static const char *specula_route_notify_note(enum zapi_route_notify_owner note)
++{
++	switch (note) {
++	case ZAPI_ROUTE_INSTALLED:
++		return "installed";
++	case ZAPI_ROUTE_FAIL_INSTALL:
++		return "fail_install";
++	case ZAPI_ROUTE_REMOVED:
++		return "removed";
++	case ZAPI_ROUTE_REMOVE_FAIL:
++		return "remove_fail";
++	case ZAPI_ROUTE_BETTER_ADMIN_WON:
++		return "better_admin_won";
++	}
++	return "none";
++}
++
+ /*
+  * Common utility to send route notification with prefix information.
+  */
+@@ -769,6 +787,9 @@ static int route_notify_internal(const struct prefix *p,
+ 				   zebra_route_string(type), p, table_id, note,
+ 				   VRF_LOGNAME(vrf));
+ 		}
++		specula_trace_route_notify_internal(
++			p, type, instance, table_id, specula_route_notify_note(note),
++			false);
+ 		return 0;
+ 	}
+ 
+@@ -809,6 +830,10 @@ static int route_notify_internal(const struct prefix *p,
+ 
+ 	stream_putw_at(s, 0, stream_get_endp(s));
+ 
++	specula_trace_route_notify_internal(
++		p, type, instance, table_id, specula_route_notify_note(note),
++		true);
++
+ 	return zserv_send_message(client, s);
+ }
+ 
+@@ -853,6 +878,7 @@ static void zread_route_notify_request(ZAPI_HANDLER_ARGS)
+ 
+ 	STREAM_GETC(msg, notify);
+ 	client->notify_owner = notify;
++	specula_trace_zread_route_notify_request(notify);
+ stream_failure:
+ 	return;
+ }
+diff --git a/zebra/zebra_dplane.c b/zebra/zebra_dplane.c
+index 2d9c41d09e..36fd831639 100644
+--- a/zebra/zebra_dplane.c
++++ b/zebra/zebra_dplane.c
+@@ -30,6 +30,7 @@
+ #include "zebra/zebra_tc.h"
+ #include "zebra/zebra_trace.h"
+ #include "printfrr.h"
++#include "lib/specula_trace.h"
+ 
+ /* Memory types */
+ DEFINE_MTYPE_STATIC(ZEBRA, DP_CTX, "Zebra DPlane Ctx");
+@@ -65,6 +66,35 @@ const uint32_t DPLANE_DEFAULT_MAX_QUEUED = 200;
+ /* Default value for new work per cycle */
+ const uint32_t DPLANE_DEFAULT_NEW_WORK = 100;
+ 
++static const char *specula_dplane_op(enum dplane_op_e op)
++{
++	switch (op) {
++	case DPLANE_OP_ROUTE_INSTALL:
++		return "install";
++	case DPLANE_OP_ROUTE_UPDATE:
++		return "update";
++	case DPLANE_OP_ROUTE_DELETE:
++		return "delete";
++	case DPLANE_OP_ROUTE_NOTIFY:
++		return "route_notify";
++	default:
++		return "none";
++	}
++}
++
++static const char *specula_dplane_status(enum zebra_dplane_result res)
++{
++	switch (res) {
++	case ZEBRA_DPLANE_REQUEST_SUCCESS:
++		return "success";
++	case ZEBRA_DPLANE_REQUEST_FAILURE:
++		return "failure";
++	case ZEBRA_DPLANE_REQUEST_QUEUED:
++		return "pending";
++	}
++	return "none";
++}
++
+ /* Validation check macro for context blocks */
+ /* #define DPLANE_DEBUG 1 */
+ 
+@@ -4147,6 +4177,10 @@ int dplane_ctx_route_init(struct zebra_dplane_ctx *ctx, enum dplane_op_e op,
+ 	 */
+ 	re->dplane_sequence = zebra_router_get_next_sequence();
+ 	ctx->zd_seq = re->dplane_sequence;
++	specula_trace_dplane_ctx_route_init(ctx, p, re->table,
++					    specula_dplane_op(op), re->type,
++					    re->instance, ctx->zd_seq,
++					    ctx->zd_old_seq);
+ 
+ 	return AOK;
+ }
+@@ -4811,6 +4845,7 @@ static int dplane_update_enqueue(struct zebra_dplane_ctx *ctx)
+ 
+ 	/* Ensure that an event for the dataplane thread is active */
+ 	ret = dplane_provider_work_ready();
++	specula_trace_dplane_update_enqueue(ctx, ret == AOK);
+ 
+ 	return ret;
+ }
+@@ -7740,6 +7775,7 @@ static int kernel_dplane_process_func(struct zebra_dplane_provider *prov)
+ 		 */
+ 		if (dplane_ctx_is_skip_kernel(ctx)) {
+ 			dplane_ctx_set_status(ctx, ZEBRA_DPLANE_REQUEST_SUCCESS);
++			specula_trace_kernel_result(ctx, "success", false, true);
+ 			dplane_provider_enqueue_out_ctx(prov, ctx);
+ 			continue;
+ 		}
+@@ -7755,6 +7791,7 @@ static int kernel_dplane_process_func(struct zebra_dplane_provider *prov)
+ 						  memory_order_relaxed);
+ 			dplane_ctx_set_status(ctx, ZEBRA_DPLANE_REQUEST_SUCCESS);
+ 			kernel_dplane_handle_result(ctx);
++			specula_trace_kernel_result(ctx, "success", false, true);
+ 			dplane_provider_enqueue_out_ctx(prov, ctx);
+ 			continue;
+ 		}
+@@ -7784,6 +7821,10 @@ static int kernel_dplane_process_func(struct zebra_dplane_provider *prov)
+ 
+ 	while ((ctx = dplane_ctx_list_pop(&work_list)) != NULL) {
+ 		kernel_dplane_handle_result(ctx);
++		specula_trace_kernel_result(
++			ctx, specula_dplane_status(dplane_ctx_get_status(ctx)),
++			dplane_ctx_get_status(ctx) == ZEBRA_DPLANE_REQUEST_SUCCESS,
++			false);
+ 
+ 		dplane_provider_enqueue_out_ctx(prov, ctx);
+ 	}
+@@ -8240,8 +8281,10 @@ static void dplane_thread_loop(struct event *event)
+ 		/* Enqueue new work to the provider */
+ 		dplane_provider_lock(prov);
+ 
+-		while ((ctx = dplane_ctx_list_pop(&work_list)) != NULL)
++		while ((ctx = dplane_ctx_list_pop(&work_list)) != NULL) {
+ 			dplane_ctx_list_add_tail(&(prov->dp_ctx_in_list), ctx);
++			specula_trace_dplane_thread_loop_to_provider(ctx);
++		}
+ 
+ 		atomic_fetch_add_explicit(&prov->dp_in_counter, counter,
+ 					  memory_order_relaxed);
+@@ -8373,6 +8416,8 @@ static void dplane_thread_loop(struct event *event)
+ 	dplane_ctx_list_init(&error_list);
+ 
+ 	/* Call through to zebra main */
++	frr_each (dplane_ctx_list, &work_list, ctx)
++		specula_trace_dplane_thread_loop_result(ctx);
+ 	(zdplane_info.dg_results_cb)(&work_list);
+ 
+ 	dplane_ctx_list_init(&work_list);
+@@ -8390,6 +8435,7 @@ void zebra_dplane_shutdown(void)
+ 
+ 	if (IS_ZEBRA_DEBUG_DPLANE)
+ 		zlog_debug("Zebra dataplane shutdown called");
++	specula_trace_zebra_dplane_shutdown();
+ 
+ 	/* Stop dplane thread, if it's running */
+ 
+diff --git a/zebra/zebra_rib.c b/zebra/zebra_rib.c
+index da7a0ae808..a443101820 100644
+--- a/zebra/zebra_rib.c
++++ b/zebra/zebra_rib.c
+@@ -31,6 +31,7 @@
+ #include "frrscript.h"
+ #include "frrdistance.h"
+ #include "lib/termtable.h"
++#include "lib/specula_trace.h"
+ 
+ #include "zebra/zebra_router.h"
+ #include "zebra/connected.h"
+@@ -705,6 +706,8 @@ void rib_install_kernel(struct route_node *rn, struct route_entry *re,
+ 
+ 	/* Update fib selection */
+ 	dest->selected_fib = re;
++	specula_trace_rib_install_kernel(&rn->p, re->table, re->type,
++					 re->instance);
+ 
+ 	/*
+ 	 * Make sure we update the FPM any time we send new information to
+@@ -760,6 +763,8 @@ void rib_uninstall_kernel(struct route_node *rn, struct route_entry *re)
+ 	hook_call(rib_update, rn, "uninstalling from kernel");
+ 
+ 	enum zebra_dplane_result result = dplane_route_delete(rn, re);
++	specula_trace_rib_uninstall_kernel(&rn->p, re->table, re->type,
++					   re->instance);
+ 
+ 	frrtrace(3, frr_zebra, rib_uninstall_kernel_route, srcdest_rnode2str(rn, buf, sizeof(buf)),
+ 		 re->nhe, result);
+@@ -1547,6 +1552,9 @@ static void rib_process(struct route_node *rn)
+ 	}
+ 
+ 	/* Update fib according to selection results */
++	if (new_fib)
++		specula_trace_rib_process(&rn->p, new_fib->table, new_fib->type,
++					  new_fib->instance);
+ 	if (new_fib && old_fib)
+ 		rib_process_update_fib(zvrf, rn, old_fib, new_fib);
+ 	else if (new_fib)
+@@ -2161,15 +2169,22 @@ static void rib_process_result(struct zebra_dplane_ctx *ctx)
+ 				zvrf->installs++;
+ 
+ 			/* Notify route owner */
+-			if (zebra_router_notify_on_ack())
+-				zsend_route_notify_owner_ctx(ctx, ZAPI_ROUTE_INSTALLED);
+-			else {
++			if (zebra_router_notify_on_ack()) {
++				specula_trace_rib_process_result(
++					ctx, "installed", "success");
++				zsend_route_notify_owner_ctx(ctx,
++							     ZAPI_ROUTE_INSTALLED);
++			} else {
+ 				if (re) {
+ 					if (CHECK_FLAG(re->flags,
+-						       ZEBRA_FLAG_OFFLOADED))
++						       ZEBRA_FLAG_OFFLOADED)) {
++						specula_trace_rib_process_result(
++							ctx, "installed",
++							"success");
+ 						zsend_route_notify_owner_ctx(
+ 							ctx,
+ 							ZAPI_ROUTE_INSTALLED);
++					}
+ 					if (CHECK_FLAG(
+ 						    re->flags,
+ 						    ZEBRA_FLAG_OFFLOAD_FAILED))
+@@ -2184,10 +2199,13 @@ static void rib_process_result(struct zebra_dplane_ctx *ctx)
+ 				UNSET_FLAG(re->status, ROUTE_ENTRY_INSTALLED);
+ 			} if (old_re)
+ 				SET_FLAG(old_re->status, ROUTE_ENTRY_FAILED);
+-			if (re)
++			if (re) {
++				specula_trace_rib_process_result(
++					ctx, "fail_install", "failure");
+ 				zsend_route_notify_owner(
+ 					rn, re, ZAPI_ROUTE_FAIL_INSTALL,
+ 					info->afi, info->safi);
++			}
+ 
+ 			zlog_warn("%s(%u:%u):%pRN: Route install failed",
+ 				  VRF_LOGNAME(vrf), dplane_ctx_get_vrf(ctx),
+@@ -2208,6 +2226,8 @@ static void rib_process_result(struct zebra_dplane_ctx *ctx)
+ 				UNSET_FLAG(re->status, ROUTE_ENTRY_FAILED);
+ 			}
+ 			rib_process_result_import_table_del(ctx);
++			specula_trace_rib_process_result(ctx, "removed",
++							 "success");
+ 			zsend_route_notify_owner_ctx(ctx, ZAPI_ROUTE_REMOVED);
+ 
+ 			if (zvrf)
+@@ -2215,6 +2235,8 @@ static void rib_process_result(struct zebra_dplane_ctx *ctx)
+ 		} else {
+ 			if (re)
+ 				SET_FLAG(re->status, ROUTE_ENTRY_FAILED);
++			specula_trace_rib_process_result(ctx, "remove_fail",
++							 "failure");
+ 			zsend_route_notify_owner_ctx(ctx,
+ 						     ZAPI_ROUTE_REMOVE_FAIL);
+ 
+@@ -2550,12 +2572,18 @@ static void process_subq_route(struct listnode *lnode, uint8_t qindex)
+ 	struct route_node *rnode = NULL;
+ 	rib_dest_t *dest = NULL;
+ 	struct zebra_vrf *zvrf = NULL;
++	struct route_entry *trace_re = NULL;
+ 
+ 	rnode = listgetdata(lnode);
+ 	dest = rib_dest_from_rnode(rnode);
+ 	assert(dest);
+ 
+ 	zvrf = rib_dest_vrf(dest);
++	trace_re = re_list_first(&dest->routes);
++	if (trace_re)
++		specula_trace_meta_queue_process(&rnode->p, trace_re->table,
++						 trace_re->type,
++						 trace_re->instance, qindex);
+ 
+ 	rib_process(rnode);
+ 
+@@ -3322,6 +3350,9 @@ static int rib_meta_queue_add(struct meta_queue *mq, void *data)
+ 		rnode_debug(rn, re->vrf_id, "queued rn %p into sub-queue %s mq size %u", (void *)rn,
+ 			    subqueue2str(qindex), zrouter.mq->size);
+ 
++	specula_trace_rib_meta_queue_add(&rn->p, re->table, re->type,
++					 re->instance, qindex);
++
+ 	return 0;
+ }
+ 
+@@ -4083,9 +4114,12 @@ static void rib_addnode(struct route_node *rn, struct route_entry *re)
+ 				    (void *)rn, (void *)re);
+ 
+ 		UNSET_FLAG(re->status, ROUTE_ENTRY_REMOVED);
++		specula_trace_rib_addnode(&rn->p, re->table, re->type,
++					  re->instance);
+ 		return;
+ 	}
+ 	rib_link(rn, re);
++	specula_trace_rib_addnode(&rn->p, re->table, re->type, re->instance);
+ }
+ 
+ /*
+@@ -4131,6 +4165,7 @@ void rib_delnode(struct route_node *rn, struct route_entry *re)
+ 	SET_FLAG(re->status, ROUTE_ENTRY_REMOVED);
+ 
+ 	rib_queue_add(rn);
++	specula_trace_rib_delnode(&rn->p, re->table, re->type, re->instance);
+ }
+ 
+ /*
+diff --git a/zebra/zebra_rnh.c b/zebra/zebra_rnh.c
+index 4e5c0176ee..8d6ad575d9 100644
+--- a/zebra/zebra_rnh.c
++++ b/zebra/zebra_rnh.c
+@@ -21,6 +21,7 @@
+ #include "nexthop.h"
+ #include "vrf.h"
+ #include "jhash.h"
++#include "lib/specula_trace.h"
+ 
+ #include "zebra/zebra_router.h"
+ #include "zebra/rib.h"
+@@ -161,6 +162,7 @@ static void zebra_rnh_store_in_routing_table(struct rnh *rnh)
+ 
+ 	dest = rib_dest_from_rnode(rn);
+ 	rnh_list_add_tail(&dest->nht, rnh);
++	specula_trace_zebra_rnh_store(&rnh->node->p);
+ 	route_unlock_node(rn);
+ }
+ 
+@@ -241,6 +243,7 @@ struct rnh *zebra_add_rnh(struct prefix *p, vrf_id_t vrfid, safi_t safi, struct
+ 		/* Add to hash */
+ 		rnh_rbtree_add(&rnhc->rnh_rbtree, rnh);
+ 
++		specula_trace_zebra_add_rnh(p);
+ 		zebra_rnh_store_in_routing_table(rnh);
+ 	}
+ 
+@@ -757,6 +760,7 @@ zebra_rnh_resolve_nexthop_entry(struct zebra_vrf *zvrf, afi_t afi,
+ 		/* Route entry found, we're done; else, walk up the tree. */
+ 		if (re) {
+ 			*prn = rn;
++			specula_trace_zebra_rnh_resolve(&nrn->p);
+ 			return re;
+ 		} else {
+ 			/* Resolve the nexthop recursively by finding matching
+@@ -1249,7 +1253,10 @@ int zebra_send_rnh_update(struct rnh *rnh, struct zserv *client,
+ 	stream_putw_at(s, 0, stream_get_endp(s));
+ 
+ 	client->nh_last_upd_time = monotime(NULL);
+-	return zserv_send_message(client, s);
++	ret = zserv_send_message(client, s);
++	if (ret >= 0)
++		specula_trace_zebra_send_rnh_update(&rn->p);
++	return ret;
+ 
+ failure:
+ 

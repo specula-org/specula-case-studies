@@ -1,0 +1,69 @@
+{
+  "schema_version": "2",
+  "system": "frr",
+  "generated_by": "validation-workflow",
+  "findings": [
+    {
+      "id": "MC-1",
+      "title": "Stale normal dataplane result mutates a newer route",
+      "source": "model-checking",
+      "scenario": "Scenario 5, with Scenario 3 duplicate",
+      "severity": "High",
+      "invariant": "ProviderSuccessImpliesRealizedAttrs",
+      "config": "MC_hunt_scenario5_provider.cfg",
+      "counterexample": "spec/output/MC_hunt_scenario5_provider_bfs_final2.out",
+      "affected_code": [
+        "zebra/zebra_rib.c:2036",
+        "zebra/zebra_rib.c:2054",
+        "zebra/zebra_rib.c:2060",
+        "zebra/zebra_rib.c:2103",
+        "zebra/zebra_rib.c:2125",
+        "zebra/zebra_rib.c:2171",
+        "zebra/zebra_rib.c:2260"
+      ],
+      "summary": "A stale generation-1 dataplane success can be matched against the current generation-2 route entry. FRR logs the sequence mismatch but continues into the success path, marking the current route installed, updating FIB/NHT state, and enqueueing owner notification work while the kernel still reflects the older route. Scenario 3 reproduces the same root cause through an NHT-facing invariant after the stale result creates an inconsistent RNH snapshot."
+    },
+    {
+      "id": "MC-2",
+      "title": "Late async route notify mutates the current selected route without generation gating",
+      "source": "model-checking",
+      "scenario": "Scenario 1",
+      "severity": "High",
+      "invariant": "NoStaleDplaneMutation",
+      "config": "MC_hunt_scenario1_dataplane.cfg",
+      "counterexample": "spec/output/MC_hunt_scenario1_dataplane_bfs_final2.out",
+      "affected_code": [
+        "zebra/zebra_rib.c:1603",
+        "zebra/zebra_rib.c:2310",
+        "zebra/zebra_rib.c:2335",
+        "zebra/zebra_rib.c:2387",
+        "zebra/zebra_rib.c:2408",
+        "zebra/dplane_fpm_nl.c:728",
+        "zebra/rt_netlink.c:1083"
+      ],
+      "summary": "A late `DPLANE_OP_ROUTE_NOTIFY` can be processed after a newer route generation becomes the selected FIB route. The async notify path matches by prefix/type/instance and lacks a route generation or sequence gate, so it can update FIB/offload/NHT state on the current route from a stale notification context. This can make route owners or NHT clients observe stale realization state."
+    },
+    {
+      "id": "MC-3",
+      "title": "BGP suppress-fib pending can survive ZAPI route send failure with no outstanding work",
+      "source": "model-checking",
+      "scenario": "Scenario 2, duplicated by Scenario 4",
+      "severity": "High",
+      "invariant": "PendingImpliesOutstandingWork",
+      "config": "MC_hunt_scenario2_owner_notify.cfg",
+      "counterexample": "spec/output/MC_hunt_scenario2_owner_notify_bfs_final2.out",
+      "affected_code": [
+        "bgpd/bgp_zebra.c:2061",
+        "bgpd/bgp_zebra.c:2074",
+        "bgpd/bgp_zebra.c:2096",
+        "bgpd/bgp_zebra.c:1923",
+        "bgpd/bgp_zebra.c:1937",
+        "bgpd/bgp_zebra.c:1968",
+        "lib/zclient.c:381",
+        "bgpd/bgp_zebra.c:3113",
+        "bgpd/bgp_zebra.c:3153"
+      ],
+      "summary": "BGP sets `BGP_NODE_FIB_INSTALL_PENDING` before the queued Zebra route announcement is actually sent. If the later ZAPI send returns `ZCLIENT_SEND_FAILURE`, the queued inode is released and no Zebra route, dataplane operation, or owner notification remains outstanding. The pending flag is normally cleared by a route-owner installed/fail notification, so this path can leave BGP suppressing advertisement indefinitely."
+    }
+  ]
+}
