@@ -1,0 +1,104 @@
+{
+  "schema_version": "1",
+  "system": "SlateDB Distributed Compaction",
+  "generated_by": "consolidate",
+  "findings": [
+    {
+      "id": "MC-2",
+      "title": "Submitted backlog can exceed the configured running-compaction bound",
+      "source": "model-checking",
+      "family": "5",
+      "severity": "High",
+      "invariant": "BoundedRunningClaims",
+      "config": "MC_hunt_family5.cfg",
+      "counterexample": "spec/output/MC_hunt_family5_bfs_repair.out",
+      "affected_code": [
+        "slatedb/src/compactor.rs:1235",
+        "slatedb/src/compactor.rs:1308",
+        "slatedb/src/compaction_worker.rs:304",
+        "slatedb/src/compaction_worker.rs:314"
+      ],
+      "summary": "After the RR-001 repair aligned family 1 with the confirmed duplicate-L0 scenario, the overlap artifact disappeared and both affected hunt reruns instead reached `BoundedRunningClaims`. In the family-5 rerun, the coordinator promotes two valid `Submitted` jobs to `Scheduled` and the worker then claims both while `MaxConcurrent = 1`; the family-1 rerun reaches the same bound violation after a local plus remote submission sequence. The resulting candidate matches the modeling brief's fragmented-capacity family rather than the consumed family-1 artifact. The next confirmation pass should check whether this running-bound counterexample is a real implementation bug or another fidelity gap.",
+      "dedup_note": "Also covers code-review Family 5 (same fragmented concurrent-compaction accounting across `maybe_validate_submitted_compactions()`, coordinator running-count scheduling, and worker-local claim limits)."
+    },
+    {
+      "id": "CR-1",
+      "title": "External `Submitted` compactions may bypass coordinator admission checks",
+      "source": "code-review",
+      "family": "1",
+      "severity": "High",
+      "invariant": null,
+      "config": null,
+      "counterexample": null,
+      "affected_code": [
+        "slatedb/src/admin.rs:192",
+        "slatedb/src/compactor.rs:478",
+        "slatedb/src/compactor_state.rs:988",
+        "slatedb/src/compactor.rs:1022",
+        "slatedb/src/compactor.rs:1130",
+        "slatedb/src/compactor.rs:1308",
+        "slatedb/src/compaction_worker.rs:304",
+        "slatedb/src/compaction_worker.rs:327"
+      ],
+      "summary": "This family covers the durable `Submitted` path used by admin or manual compactions, which writes directly to `.compactions` and is later promoted by `maybe_validate_submitted_compactions()`. The code-review concern is that this path does not share the same `add_compaction()` destination-collision and active-drain checks as locally proposed jobs, and it also relies on separate promotion-time capacity logic. The surviving MC finding now focuses on the narrower running-bound overflow at the promotion and claim stages, not on the broader split-admission mechanism across submission, validation, and local conflict checks. Because the current MC candidate does not represent the `admin.rs` / `compactor_state.rs` admission-bypass sites or the `validate_compaction()` overlap-check gap, this family remains a separate confirmation candidate."
+    },
+    {
+      "id": "CR-2",
+      "title": "Crash windows between manifest and `.compactions` writes may break recovery safety",
+      "source": "code-review",
+      "family": "2",
+      "severity": "High",
+      "invariant": null,
+      "config": null,
+      "counterexample": null,
+      "affected_code": [
+        "slatedb/src/compactor_state_protocols.rs:93",
+        "slatedb/src/compactor_state_protocols.rs:247",
+        "slatedb/src/compactor_state_protocols.rs:326",
+        "slatedb/src/compactor.rs:907",
+        "slatedb/src/compactor.rs:930",
+        "slatedb/src/garbage_collector/compacted_gc.rs:200"
+      ],
+      "summary": "This family concerns the coordinator's ordered checkpoint -> manifest -> `.compactions` write sequence and the reader or GC logic that interprets those objects during recovery. A crash after manifest publication but before terminal compaction-state persistence can leave `.compactions` and manifest-visible state intentionally divergent, so later classification and reclaim must remain safe. No current MC finding survives for this publication and recovery mechanism, but the brief cites the coordinator commit path and GC read-order dependency as the relevant code sites. It therefore remains a standalone code-review candidate for confirmation rather than being deduplicated away."
+    },
+    {
+      "id": "CR-3",
+      "title": "Reclaim and heartbeat races may let stale executions act after ownership moves",
+      "source": "code-review",
+      "family": "3",
+      "severity": "High",
+      "invariant": null,
+      "config": null,
+      "counterexample": null,
+      "affected_code": [
+        "slatedb/src/compactor.rs:790",
+        "slatedb/src/compaction_worker.rs:377",
+        "slatedb/src/compaction_worker.rs:581",
+        "slatedb/src/compaction_worker.rs:610",
+        "slatedb/src/compaction_worker.rs:719",
+        "slatedb/src/compaction_worker.rs:742",
+        "slatedb/src/compaction_worker.rs:780",
+        "slatedb/src/compaction_worker.rs:805",
+        "slatedb/src/compaction_worker.rs:827"
+      ],
+      "summary": "This family models worker execution, heartbeat updates, reclaim, and executor shutdown as independent loops that can observe different ownership states. The code-review concern is that ownership is keyed by `worker_id` without a per-claim generation, while reclaim and local shutdown happen asynchronously, so an old execution may still run or finish after the coordinator has moved the durable claim. The current MC findings do not include a surviving counterexample for this reclaim and ownership mechanism even though it was explicitly modeled. It remains a separate candidate for confirmation across the heartbeat, reclaim, publish, and release paths."
+    },
+    {
+      "id": "CR-4",
+      "title": "Independent refresh and merge of manifest and `.compactions` may admit stale state",
+      "source": "code-review",
+      "family": "4",
+      "severity": "Medium",
+      "invariant": null,
+      "config": null,
+      "counterexample": null,
+      "affected_code": [
+        "slatedb/src/compactor_state_protocols.rs:177",
+        "slatedb/src/manifest/store.rs:52",
+        "slatedb/src/compactor_state.rs:882",
+        "slatedb/src/compactor_state.rs:951"
+      ],
+      "summary": "This family targets the split refresh and merge flow where the coordinator loads `.compactions` and manifest independently, fences them separately, and then merges remote state back into local state. The concern is that stale versions or epochs can be accepted in some branches and rejected in others, requiring post-merge repair to avoid reviving metadata that should have remained fenced off. No current MC finding concretely represents this stale-merge mechanism, so the brief's fencing and merge sites still need confirmation work. It therefore remains a code-review candidate instead of being deduplicated against the surviving capacity-only MC result."
+    }
+  ]
+}

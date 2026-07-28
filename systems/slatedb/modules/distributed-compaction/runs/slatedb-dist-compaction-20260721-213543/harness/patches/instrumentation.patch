@@ -1,0 +1,560 @@
+diff --git a/slatedb/src/compaction_worker.rs b/slatedb/src/compaction_worker.rs
+index 5cf86efd..9537c997 100644
+--- a/slatedb/src/compaction_worker.rs
++++ b/slatedb/src/compaction_worker.rs
+@@ -348,6 +348,20 @@ impl CompactionWorkerHandler {
+                         c.id()
+                     );
+                     Self::stop_compaction_job(&self.executor, &mut self.job_progress, c.id());
++                    #[cfg(test)]
++                    {
++                        let durable_manifest = self.manifest_store.read_latest_manifest().await?;
++                        let durable_compactions =
++                            self.compactions_store.read_latest_compactions().await?;
++                        crate::tla_trace::emit_worker_event(
++                            "PollAndClaimStopDuplicate",
++                            self.clock.now().timestamp_millis(),
++                            &self.worker_id,
++                            Some(c.id()),
++                            &durable_manifest,
++                            &durable_compactions,
++                        );
++                    }
+                 } else if to_claim.len() < capacity {
+                     to_claim.push(c.clone());
+                 }
+@@ -389,6 +403,20 @@ impl CompactionWorkerHandler {
+         // sorted run rebuilt with the same id), which the id-equality
+         // validation in `build_job_args` cannot detect.
+         let manifest = self.manifest_store.read_latest_manifest().await?;
++        #[cfg(test)]
++        {
++            let durable_compactions = self.compactions_store.read_latest_compactions().await?;
++            for compaction in &claimed {
++                crate::tla_trace::emit_worker_event(
++                    "PollAndClaim",
++                    self.clock.now().timestamp_millis(),
++                    &self.worker_id,
++                    Some(compaction.id()),
++                    &manifest,
++                    &durable_compactions,
++                );
++            }
++        }
+ 
+         for compaction in claimed {
+             match Self::build_job_args(&compaction, manifest.core(), &self.worker_id) {
+@@ -401,6 +429,19 @@ impl CompactionWorkerHandler {
+                     self.job_progress
+                         .insert(compaction.id(), compaction.ctx().cloned());
+                     Self::dispatch_to_executor(&self.executor, args);
++                    #[cfg(test)]
++                    {
++                        let durable_compactions =
++                            self.compactions_store.read_latest_compactions().await?;
++                        crate::tla_trace::emit_worker_event(
++                            "DispatchClaimedJob",
++                            self.clock.now().timestamp_millis(),
++                            &self.worker_id,
++                            Some(compaction.id()),
++                            &manifest,
++                            &durable_compactions,
++                        );
++                    }
+                 }
+                 Err(e) => {
+                     warn!(
+@@ -410,6 +451,19 @@ impl CompactionWorkerHandler {
+                         e
+                     );
+                     self.release_claim(compaction.id()).await?;
++                    #[cfg(test)]
++                    {
++                        let durable_compactions =
++                            self.compactions_store.read_latest_compactions().await?;
++                        crate::tla_trace::emit_worker_event(
++                            "ReleaseClaimPostClaimInvalid",
++                            self.clock.now().timestamp_millis(),
++                            &self.worker_id,
++                            Some(compaction.id()),
++                            &manifest,
++                            &durable_compactions,
++                        );
++                    }
+                 }
+             }
+         }
+@@ -537,6 +591,20 @@ impl CompactionWorkerHandler {
+                         id
+                     );
+                     Self::stop_compaction_job(&self.executor, &mut self.job_progress, id);
++                    #[cfg(test)]
++                    {
++                        let durable_manifest = self.manifest_store.read_latest_manifest().await?;
++                        let durable_compactions =
++                            self.compactions_store.read_latest_compactions().await?;
++                        crate::tla_trace::emit_worker_event(
++                            "HeartbeatLoseOwnership",
++                            self.clock.now().timestamp_millis(),
++                            &self.worker_id,
++                            Some(id),
++                            &durable_manifest,
++                            &durable_compactions,
++                        );
++                    }
+                     continue;
+                 };
+                 if existing.worker().map(|w| w.worker_id.as_str()) != Some(self.worker_id.as_str())
+@@ -547,6 +615,20 @@ impl CompactionWorkerHandler {
+                         id
+                     );
+                     Self::stop_compaction_job(&self.executor, &mut self.job_progress, id);
++                    #[cfg(test)]
++                    {
++                        let durable_manifest = self.manifest_store.read_latest_manifest().await?;
++                        let durable_compactions =
++                            self.compactions_store.read_latest_compactions().await?;
++                        crate::tla_trace::emit_worker_event(
++                            "HeartbeatLoseOwnership",
++                            self.clock.now().timestamp_millis(),
++                            &self.worker_id,
++                            Some(id),
++                            &durable_manifest,
++                            &durable_compactions,
++                        );
++                    }
+                     continue;
+                 }
+ 
+@@ -576,6 +658,22 @@ impl CompactionWorkerHandler {
+                             Err(SlateDBError::Fenced)
+                         });
+                     }
++                    #[cfg(test)]
++                    {
++                        let durable_manifest = self.manifest_store.read_latest_manifest().await?;
++                        let durable_compactions =
++                            self.compactions_store.read_latest_compactions().await?;
++                        for id in self.job_progress.keys().copied().collect::<Vec<_>>() {
++                            crate::tla_trace::emit_worker_event(
++                                "HeartbeatOwnedJobs",
++                                self.clock.now().timestamp_millis(),
++                                &self.worker_id,
++                                Some(id),
++                                &durable_manifest,
++                                &durable_compactions,
++                            );
++                        }
++                    }
+                     return Ok(());
+                 }
+                 Err(e) if e.is_sequenced_write_conflict() => continue,
+@@ -602,6 +700,20 @@ impl CompactionWorkerHandler {
+                     "compaction entry missing on completion; dropping [id={}]",
+                     compaction_id
+                 );
++                #[cfg(test)]
++                {
++                    let durable_manifest = self.manifest_store.read_latest_manifest().await?;
++                    let durable_compactions =
++                        self.compactions_store.read_latest_compactions().await?;
++                    crate::tla_trace::emit_worker_event(
++                        "HandleFinishedLostOwnership",
++                        self.clock.now().timestamp_millis(),
++                        &self.worker_id,
++                        Some(compaction_id),
++                        &durable_manifest,
++                        &durable_compactions,
++                    );
++                }
+                 return Ok(());
+             };
+             if existing.worker().map(|w| w.worker_id.as_str()) != Some(self.worker_id.as_str()) {
+@@ -611,6 +723,20 @@ impl CompactionWorkerHandler {
+                     existing.status(),
+                     existing.worker().map(|w| &w.worker_id),
+                 );
++                #[cfg(test)]
++                {
++                    let durable_manifest = self.manifest_store.read_latest_manifest().await?;
++                    let durable_compactions =
++                        self.compactions_store.read_latest_compactions().await?;
++                    crate::tla_trace::emit_worker_event(
++                        "HandleFinishedLostOwnership",
++                        self.clock.now().timestamp_millis(),
++                        &self.worker_id,
++                        Some(compaction_id),
++                        &durable_manifest,
++                        &durable_compactions,
++                    );
++                }
+                 return Ok(());
+             }
+             let heartbeat_ms = self.clock.now().timestamp_millis() as u64;
+@@ -621,7 +747,23 @@ impl CompactionWorkerHandler {
+                 .with_ctx(None);
+             dirty.value.insert(updated);
+             match stored.update(dirty).await {
+-                Ok(()) => return Ok(()),
++                Ok(()) => {
++                    #[cfg(test)]
++                    {
++                        let durable_manifest = self.manifest_store.read_latest_manifest().await?;
++                        let durable_compactions =
++                            self.compactions_store.read_latest_compactions().await?;
++                        crate::tla_trace::emit_worker_event(
++                            "HandleFinishedSuccess",
++                            self.clock.now().timestamp_millis(),
++                            &self.worker_id,
++                            Some(compaction_id),
++                            &durable_manifest,
++                            &durable_compactions,
++                        );
++                    }
++                    return Ok(());
++                }
+                 Err(e) if e.is_sequenced_write_conflict() => continue,
+                 Err(e) => return Err(e),
+             }
+@@ -693,6 +835,20 @@ impl CompactionWorkerHandler {
+             Err(e) => {
+                 error!("compaction job failed [id={}, error={:?}]", id, e);
+                 self.release_claim(id).await?;
++                #[cfg(test)]
++                {
++                    let durable_manifest = self.manifest_store.read_latest_manifest().await?;
++                    let durable_compactions =
++                        self.compactions_store.read_latest_compactions().await?;
++                    crate::tla_trace::emit_worker_event(
++                        "HandleFinishedExecError",
++                        self.clock.now().timestamp_millis(),
++                        &self.worker_id,
++                        Some(id),
++                        &durable_manifest,
++                        &durable_compactions,
++                    );
++                }
+             }
+         }
+         Ok(())
+diff --git a/slatedb/src/compactor.rs b/slatedb/src/compactor.rs
+index 39eaf95b..b9ccc5a0 100644
+--- a/slatedb/src/compactor.rs
++++ b/slatedb/src/compactor.rs
+@@ -551,6 +551,20 @@ impl MessageHandler<CompactorMessage> for CompactorEventHandler {
+             CompactorMessage::PollManifest => self.handle_ticker().await?,
+             CompactorMessage::CommitCompacted => {
+                 self.state_writer.load_compactions().await?;
++                #[cfg(test)]
++                {
++                    let now_ms = self.system_clock.now().timestamp_millis();
++                    let (durable_manifest, durable_compactions) =
++                        self.state_writer.trace_durable_view()?;
++                    crate::tla_trace::emit_coord_event(
++                        "CoordinatorRefreshCompactions",
++                        now_ms,
++                        None,
++                        &self.state_writer.state,
++                        &durable_manifest,
++                        &durable_compactions,
++                    );
++                }
+                 self.update_distributed_compaction_metrics();
+                 self.commit_compacted_entries().await?;
+             }
+@@ -588,7 +602,7 @@ impl CompactorEventHandler {
+         .await?;
+         let compactor_epoch = state_writer.state.manifest().value.compactor_epoch;
+         stats.compactor_epoch.set(compactor_epoch as i64);
+-        Ok(Self {
++        let handler = Self {
+             state_writer,
+             options,
+             scheduler,
+@@ -598,7 +612,22 @@ impl CompactorEventHandler {
+             recorder,
+             prev_claimed: HashSet::new(),
+             worker_heartbeat_gauges: HashMap::new(),
+-        })
++        };
++        #[cfg(test)]
++        {
++            let now_ms = handler.system_clock.now().timestamp_millis();
++            let (durable_manifest, durable_compactions) =
++                handler.state_writer.trace_durable_view()?;
++            crate::tla_trace::emit_coord_event(
++                "StartCoordinator",
++                now_ms,
++                None,
++                &handler.state_writer.state,
++                &durable_manifest,
++                &durable_compactions,
++            );
++        }
++        Ok(handler)
+     }
+ 
+     fn state(&self) -> &CompactorState {
+@@ -713,7 +742,34 @@ impl CompactorEventHandler {
+ 
+     /// Handles a polling tick by refreshing compactions and the manifest, then possibly scheduling compactions.
+     async fn handle_ticker(&mut self) -> Result<(), SlateDBError> {
+-        self.state_writer.refresh().await?;
++        self.state_writer.load_compactions().await?;
++        #[cfg(test)]
++        {
++            let now_ms = self.system_clock.now().timestamp_millis();
++            let (durable_manifest, durable_compactions) = self.state_writer.trace_durable_view()?;
++            crate::tla_trace::emit_coord_event(
++                "CoordinatorRefreshCompactions",
++                now_ms,
++                None,
++                &self.state_writer.state,
++                &durable_manifest,
++                &durable_compactions,
++            );
++        }
++        self.state_writer.load_manifest().await?;
++        #[cfg(test)]
++        {
++            let now_ms = self.system_clock.now().timestamp_millis();
++            let (durable_manifest, durable_compactions) = self.state_writer.trace_durable_view()?;
++            crate::tla_trace::emit_coord_event(
++                "CoordinatorRefreshManifest",
++                now_ms,
++                None,
++                &self.state_writer.state,
++                &durable_manifest,
++                &durable_compactions,
++            );
++        }
+         self.reclaim_stale_workers().await?;
+         self.update_distributed_compaction_metrics();
+         self.commit_compacted_entries().await?;
+@@ -777,6 +833,21 @@ impl CompactorEventHandler {
+         }
+ 
+         self.state_writer.write_compactions_safely().await?;
++        #[cfg(test)]
++        {
++            let now_ms = self.system_clock.now().timestamp_millis();
++            let (durable_manifest, durable_compactions) = self.state_writer.trace_durable_view()?;
++            for (id, _) in &stale {
++                crate::tla_trace::emit_coord_event(
++                    "ReclaimStaleWorkers",
++                    now_ms,
++                    Some(*id),
++                    &self.state_writer.state,
++                    &durable_manifest,
++                    &durable_compactions,
++                );
++            }
++        }
+         self.stats.jobs_reclaimed.increment(stale.len() as u64);
+         Ok(())
+     }
+@@ -867,6 +938,11 @@ impl CompactorEventHandler {
+             return Ok(());
+         }
+ 
++        #[cfg(test)]
++        let pre_write = self.state_writer.trace_durable_view()?;
++        let mut committed_ids = Vec::new();
++        let mut failed_ids = Vec::new();
++
+         for compaction in compacted {
+             let id = compaction.id();
+             match self.validate_compaction(&compaction) {
+@@ -887,6 +963,7 @@ impl CompactorEventHandler {
+                     self.stats
+                         .last_compaction_ts
+                         .set(self.system_clock.now().timestamp());
++                    committed_ids.push(id);
+                 }
+                 Err(_) => {
+                     // Validation failed against the current manifest. Mark Failed so the
+@@ -897,12 +974,47 @@ impl CompactorEventHandler {
+                     );
+                     self.state_mut()
+                         .update_compaction(&id, |c| c.set_status(CompactionStatus::Failed));
++                    failed_ids.push(id);
+                 }
+             }
+         }
+ 
+         self.log_compaction_state();
+         self.state_writer.write_state_safely().await?;
++        #[cfg(test)]
++        {
++            let now_ms = self.system_clock.now().timestamp_millis();
++            let (_, pre_compactions) = pre_write;
++            let (post_manifest, post_compactions) = self.state_writer.trace_durable_view()?;
++            for id in &committed_ids {
++                crate::tla_trace::emit_coord_event(
++                    "CommitCompactedEntriesWriteManifest",
++                    now_ms,
++                    Some(*id),
++                    &self.state_writer.state,
++                    &post_manifest,
++                    &pre_compactions,
++                );
++                crate::tla_trace::emit_coord_event(
++                    "CommitCompactedEntriesWriteCompactions",
++                    now_ms,
++                    Some(*id),
++                    &self.state_writer.state,
++                    &post_manifest,
++                    &post_compactions,
++                );
++            }
++            for id in &failed_ids {
++                crate::tla_trace::emit_coord_event(
++                    "CommitCompactedEntriesFail",
++                    now_ms,
++                    Some(*id),
++                    &self.state_writer.state,
++                    &post_manifest,
++                    &post_compactions,
++                );
++            }
++        }
+ 
+         Ok(())
+     }
+@@ -1139,6 +1251,7 @@ impl CompactorEventHandler {
+         let mut specs = self.scheduler.propose(&self.state().into());
+ 
+         // Add new compactions up to the max concurrency limit
++        let mut added_ids = Vec::new();
+         let num_specs_added = specs
+             .drain(..available_capacity.min(specs.len()))
+             .map(|spec| -> Result<(), SlateDBError> {
+@@ -1149,6 +1262,7 @@ impl CompactorEventHandler {
+                 );
+                 self.state_mut()
+                     .add_compaction(Compaction::new(compaction_id, spec))?;
++                added_ids.push(compaction_id);
+                 Ok(())
+             })
+             .count();
+@@ -1156,6 +1270,22 @@ impl CompactorEventHandler {
+         // Save newly added compactions
+         if num_specs_added > 0 {
+             self.state_writer.write_compactions_safely().await?;
++            #[cfg(test)]
++            {
++                let now_ms = self.system_clock.now().timestamp_millis();
++                let (durable_manifest, durable_compactions) =
++                    self.state_writer.trace_durable_view()?;
++                for id in added_ids {
++                    crate::tla_trace::emit_coord_event(
++                        "MaybeScheduleCompactions",
++                        now_ms,
++                        Some(id),
++                        &self.state_writer.state,
++                        &durable_manifest,
++                        &durable_compactions,
++                    );
++                }
++            }
+         }
+ 
+         Ok(())
+@@ -1187,6 +1317,8 @@ impl CompactorEventHandler {
+         }
+ 
+         let any_drain = submitted_compactions.iter().any(|c| c.spec().is_drain());
++        let mut failed_ids = Vec::new();
++        let mut scheduled_ids = Vec::new();
+ 
+         for compaction in &submitted_compactions {
+             // Validate the candidate compaction; mark as failed if invalid.
+@@ -1198,6 +1330,7 @@ impl CompactorEventHandler {
+                 self.state_mut().update_compaction(&compaction.id(), |c| {
+                     c.set_status(CompactionStatus::Failed)
+                 });
++                failed_ids.push(compaction.id());
+                 continue;
+             }
+ 
+@@ -1212,6 +1345,7 @@ impl CompactorEventHandler {
+                     c.clear_ctx();
+                     c.set_status(CompactionStatus::Scheduled)
+                 });
++                scheduled_ids.push(compaction.id());
+             }
+         }
+ 
+@@ -1220,6 +1354,31 @@ impl CompactorEventHandler {
+         } else {
+             self.state_writer.write_compactions_safely().await?;
+         }
++        #[cfg(test)]
++        {
++            let now_ms = self.system_clock.now().timestamp_millis();
++            let (durable_manifest, durable_compactions) = self.state_writer.trace_durable_view()?;
++            for id in failed_ids {
++                crate::tla_trace::emit_coord_event(
++                    "MaybeValidateSubmittedFail",
++                    now_ms,
++                    Some(id),
++                    &self.state_writer.state,
++                    &durable_manifest,
++                    &durable_compactions,
++                );
++            }
++            for id in scheduled_ids {
++                crate::tla_trace::emit_coord_event(
++                    "MaybeValidateSubmittedSchedule",
++                    now_ms,
++                    Some(id),
++                    &self.state_writer.state,
++                    &durable_manifest,
++                    &durable_compactions,
++                );
++            }
++        }
+ 
+         Ok(())
+     }
+diff --git a/slatedb/src/compactor_state_protocols.rs b/slatedb/src/compactor_state_protocols.rs
+index 47b24d66..8c1bfaed 100644
+--- a/slatedb/src/compactor_state_protocols.rs
++++ b/slatedb/src/compactor_state_protocols.rs
+@@ -328,6 +328,21 @@ impl CompactorStateWriter {
+         self.write_manifest_safely().await?;
+         self.write_compactions_safely().await
+     }
++
++    #[cfg(test)]
++    pub(crate) fn trace_durable_view(
++        &self,
++    ) -> Result<(VersionedManifest, VersionedCompactions), SlateDBError> {
++        let manifest = self.manifest.prepare_dirty()?;
++        let compactions = self.compactions.prepare_dirty()?;
++        Ok((
++            VersionedManifest::from_manifest(manifest.id.into(), manifest.value.clone()),
++            VersionedCompactions::from_compactions(
++                compactions.id.into(),
++                compactions.value.clone(),
++            ),
++        ))
++    }
+ }
+ 
+ #[cfg(test)]
+diff --git a/slatedb/src/lib.rs b/slatedb/src/lib.rs
+index bb37dc97..6f650ce1 100644
+--- a/slatedb/src/lib.rs
++++ b/slatedb/src/lib.rs
+@@ -165,6 +165,10 @@ mod subcompaction;
+ mod tablestore;
+ #[cfg(test)]
+ mod test_utils;
++#[cfg(test)]
++mod tla_trace;
++#[cfg(test)]
++mod tla_trace_scenarios;
+ mod transaction_manager;
+ mod types;
+ mod utils;
