@@ -1,0 +1,900 @@
+diff --git a/clients/stratus/tools/submit_tool.py b/clients/stratus/tools/submit_tool.py
+index 494b0bc5..0cc24dc5 100644
+--- a/clients/stratus/tools/submit_tool.py
++++ b/clients/stratus/tools/submit_tool.py
+@@ -12,6 +12,7 @@ from langgraph.types import Command
+ from mcp import ClientSession
+ from mcp.client.sse import sse_client
+ 
++from sregym import tla_trace
+ from clients.stratus.configs.langgraph_tool_configs import LanggraphToolConfig
+ from clients.stratus.stratus_agent.state import State
+ 
+@@ -69,10 +70,13 @@ async def submit_tool(
+ 
+     await session.initialize()
+ 
++    request_id = tla_trace.new_request_id()
++    tla_trace.send_submission(request_id)
+     result = await session.call_tool(
+         "submit",
+         arguments={
+             "ans": ans,
++            "trace_request_id": request_id,
+         },
+     )
+     result = result.content[0].text
+@@ -164,10 +168,13 @@ async def manual_submit_tool(ans: str) -> str:
+ 
+     await session.initialize()
+ 
++    request_id = tla_trace.new_request_id()
++    tla_trace.send_submission(request_id)
+     await session.call_tool(
+         "submit",
+         arguments={
+             "ans": ans,
++            "trace_request_id": request_id,
+         },
+     )
+     try:
+diff --git a/clients/tierzero/driver.py b/clients/tierzero/driver.py
+index 4ed8b060..e50eb680 100644
+--- a/clients/tierzero/driver.py
++++ b/clients/tierzero/driver.py
+@@ -27,6 +27,7 @@ if str(sregym_root) not in sys.path:
+     sys.path.insert(0, str(sregym_root))
+ 
+ from logger import init_logger  # noqa: E402
++from sregym import tla_trace  # noqa: E402
+ 
+ init_logger()
+ 
+@@ -187,9 +188,12 @@ def wait_for_stage(target_stages: set[str], timeout: int = 300) -> str:
+ def submit_to_conductor(solution: str) -> None:
+     """POST /submit to conductor."""
+     logger.info(f"Submitting to conductor ({len(solution)} chars)")
++    request_id = tla_trace.new_request_id()
++    tla_trace.send_submission(request_id)
+     resp = requests.post(
+         f"{CONDUCTOR_URL}/submit",
+         json={"solution": solution},
++        headers={"X-SREGym-Trace-Request-ID": request_id},
+         timeout=30,
+     )
+     if not resp.ok:
+diff --git a/main.py b/main.py
+index 87e65172..64f1dfb2 100644
+--- a/main.py
++++ b/main.py
+@@ -34,6 +34,7 @@ from sregym.run_artifacts import ArtifactFinalizationError, RunArtifacts
+ from sregym.service.container_runner import ContainerRunner, ExecInput
+ from sregym.traces import postprocess as trace_postprocess
+ from sregym.traces import store as trace_store
++from sregym import tla_trace
+ 
+ LAUNCHER = AgentLauncher()
+ logger = logging.getLogger(__name__)
+@@ -397,10 +398,8 @@ def driver_loop(
+                         timed_out = True
+                         console.log(f"⏰ Agent timeout ({agent_timeout}s) exceeded, killing agent")
+                         LAUNCHER.cleanup_agent(agent_to_run)
+-                        conductor.results["timed_out"] = True
+-                        conductor.results["agent_timeout_seconds"] = agent_timeout
+                         console.log("🧹 Running conductor cleanup after agent timeout...")
+-                        conductor._finish_problem()
++                        conductor.finish_after_agent_timeout(agent_timeout)
+                         break
+ 
+                     tracked_proc = LAUNCHER._procs.get(agent_to_run) or agent_proc
+@@ -409,19 +408,26 @@ def driver_loop(
+                         if tracked_proc.proc.returncode is not None:
+                             agent_proc = tracked_proc
+                             console.log(f"⚠️  Agent process exited with return code {tracked_proc.proc.returncode}")
+-                            if conductor._submit_future is not None and not conductor._submit_future.done():
++                            evaluation_in_flight = (
++                                conductor._submit_future is not None and not conductor._submit_future.done()
++                            )
++                            tla_trace.agent_exit(evaluation_in_flight)
++                            if evaluation_in_flight:
+                                 console.log("⏳ Waiting for conductor evaluation to complete...")
+                                 try:
+                                     await asyncio.wait_for(
+                                         asyncio.wrap_future(conductor._submit_future),
+                                         timeout=300,
+                                     )
++                                    tla_trace.agent_exit_after_evaluation()
+                                 except TimeoutError:
+                                     console.log("⚠️  Conductor evaluation did not finish within 300s")
++                                    tla_trace.agent_exit_wait_timeout()
+                                 except Exception as e:
+                                     console.log(f"⚠️  Conductor evaluation raised: {e}")
+                             console.log("🧹 Running conductor cleanup after agent exit...")
+-                            conductor._finish_problem()
++                            with tla_trace.cleanup_context("driver"):
++                                conductor._finish_problem()
+                             break
+                     await asyncio.sleep(1)
+ 
+@@ -557,6 +563,7 @@ def _run_driver_and_shutdown(
+         global _driver_results
+         _driver_results = results
+     except Exception:
++        tla_trace.crash()
+         logger.exception("Driver thread crashed")
+     finally:
+         LAUNCHER.cleanup_all()
+diff --git a/sregym/conductor/conductor.py b/sregym/conductor/conductor.py
+index b6870bd8..1193d7b5 100644
+--- a/sregym/conductor/conductor.py
++++ b/sregym/conductor/conductor.py
+@@ -30,6 +30,7 @@ from sregym.service.kubectl import KubeCtl
+ from sregym.service.mcp_server import MCPServer
+ from sregym.service.telemetry.loki import Loki
+ from sregym.service.telemetry.prometheus import Prometheus
++from sregym import tla_trace
+ 
+ 
+ @dataclass
+@@ -87,6 +88,7 @@ class Conductor:
+         self.waiting_for_agent: bool = False
+         self._evaluating: bool = False  # True while a submission is being evaluated
+         self.fault_injected: bool = False
++        tla_trace.restart_if_needed()
+ 
+     @property
+     def current_problem(self):
+@@ -229,6 +231,7 @@ class Conductor:
+         problem.inject_fault()
+         self.logger.info("[ENV] Injected fault")
+         self.fault_injected = True
++        tla_trace.inject_fault(self)
+ 
+         # Prepare diagnosis checkpoint if available, after fault injection but before agent stages
+         if (
+@@ -304,6 +307,8 @@ class Conductor:
+             self.waiting_for_agent = True
+             self.submission_stage = stage_name
+             self.logger.info(f"[STAGE] Go to stage {self.submission_stage}")
++            if start_index == 0:
++                tla_trace.advance_to_first_stage(self)
+ 
+             # Update NoiseManager stage
+             if self.config.enable_noise:
+@@ -328,6 +333,8 @@ class Conductor:
+ 
+         self.logger.info("[CLEANUP] Starting cleanup (fault recovery, undeploy, reconcile)")
+ 
++        actor = tla_trace.current_cleanup_actor()
++
+         # Stop noises
+         if self.config.enable_noise:
+             try:
+@@ -348,6 +355,7 @@ class Conductor:
+         if problem:
+             problem.app.cleanup()
+         self.logger.info("[CLEANUP] App undeployed")
++        tla_trace.complete_recovery(actor)
+ 
+         # Reconcile cluster state to baseline
+         if self._baseline_captured:
+@@ -362,6 +370,7 @@ class Conductor:
+ 
+         # Set to "done" after all cleanup is complete
+         self.submission_stage = "done"
++        tla_trace.complete_cleanup(self, actor)
+         self.logger.info("[CLEANUP] Cleanup complete, stage set to 'done'")
+ 
+     def _finish_problem(self):
+@@ -375,15 +384,28 @@ class Conductor:
+         resets the stage to ``"setup"``, so the deploy-retry path still cleans up
+         each failed attempt.
+         """
+-        if self.submission_stage in ("done", "tearing_down"):
+-            self.logger.info(
+-                f"[STAGE] _finish_problem already ran/running (submission_stage={self.submission_stage!r}); skipping"
+-            )
+-            return
+-        self.logger.info("[STAGE] Done, starting teardown")
+-        self.submission_stage = "tearing_down"
+-        self._cleanup_sync()
+-        self.logger.info("[STAGE] Teardown complete")
++        actor = tla_trace.current_cleanup_actor()
++        with tla_trace.cleanup_context(actor):
++            already_finishing = self.submission_stage in ("done", "tearing_down")
++            tla_trace.finish_problem_check(actor, already_finishing)
++            if already_finishing:
++                self.logger.info(
++                    f"[STAGE] _finish_problem already ran/running (submission_stage={self.submission_stage!r}); skipping"
++                )
++                return
++            self.logger.info("[STAGE] Done, starting teardown")
++            self.submission_stage = "tearing_down"
++            tla_trace.begin_cleanup(self, actor)
++            self._cleanup_sync()
++            self.logger.info("[STAGE] Teardown complete")
++
++    def finish_after_agent_timeout(self, agent_timeout: int) -> None:
++        """Record a driver timeout boundary and run the normal teardown path."""
++        self.results["timed_out"] = True
++        self.results["agent_timeout_seconds"] = agent_timeout
++        tla_trace.agent_timeout(self)
++        with tla_trace.cleanup_context("driver"):
++            self._finish_problem()
+ 
+     async def start_problem(self) -> StartProblemResult:
+         """
+@@ -436,6 +458,7 @@ class Conductor:
+         self.logger.info("App leftovers undeployed.")
+         self.logger.info("Deploying app...")
+         self.deploy_app()
++        tla_trace.deploy_problem(self)
+         self.logger.info("App deployed.")
+ 
+         # Update NoiseManager with problem context
+@@ -470,48 +493,71 @@ class Conductor:
+         Blocking work for a submission: evaluate the oracle, advance stage, manage noise.
+         Runs in a background thread so the HTTP response is not blocked.
+         """
+-        stage_name: str = current_stage["name"]
+-        self.logger.info(f"Evaluating stage '{stage_name}'", extra={"sol": sol})
++        with tla_trace.evaluation_context():
++            stage_name: str = current_stage["name"]
++            self.logger.info(f"Evaluating stage '{stage_name}'", extra={"sol": sol})
++            tla_trace.begin_evaluation()
+ 
+-        # Stop noise before evaluation to ensure clean environment
+-        if self.config.enable_noise:
+-            try:
+-                nm = get_noise_manager()
+-                self.logger.info("Stopping noise manager before evaluation...")
+-                nm.stop()
+-            except Exception as e:
+-                self.logger.warning(f"Failed to stop noise manager: {e}")
++            # Stop noise before evaluation to ensure clean environment
++            if self.config.enable_noise:
++                try:
++                    nm = get_noise_manager()
++                    self.logger.info("Stopping noise manager before evaluation...")
++                    nm.stop()
++                except Exception as e:
++                    self.logger.warning(f"Failed to stop noise manager: {e}")
+ 
+-        try:
+-            # Run the evaluation function for the current stage. The per-stage
+-            # _evaluate_* methods catch their own oracle exceptions and record
+-            # a failure result; this outer guard is defense in depth so the
+-            # stage always advances even if something above the oracle blows up.
++            evaluation_success = False
++            tla_trace.begin_oracle()
+             try:
+-                current_stage["evaluation"](sol)
++                # Run the evaluation function for the current stage. The per-stage
++                # _evaluate_* methods catch their own oracle exceptions and record
++                # a failure result; this outer guard is defense in depth so the
++                # stage always advances even if something above the oracle blows up.
++                try:
++                    evaluation_result = current_stage["evaluation"](sol)
++                    evaluation_success = bool(
++                        isinstance(evaluation_result, dict) and evaluation_result.get("success")
++                    )
++                except Exception:
++                    self.logger.exception(
++                        f"Stage '{stage_name}' evaluation raised unexpectedly; advancing anyway "
++                        "so the conductor doesn't get stuck waiting on a dead stage."
++                    )
++                    self.results.setdefault(
++                        stage_name.capitalize(),
++                        {"success": False, "error": "stage evaluation raised", "submission": sol},
++                    )
+             except Exception:
+-                self.logger.exception(
+-                    f"Stage '{stage_name}' evaluation raised unexpectedly; advancing anyway "
+-                    "so the conductor doesn't get stuck waiting on a dead stage."
+-                )
+-                self.results.setdefault(
+-                    stage_name.capitalize(), {"success": False, "error": "stage evaluation raised", "submission": sol}
+-                )
+-        finally:
+-            self._evaluating = False
+-
+-        # After evaluation, advance to the next stage (if any)
+-        next_index = self.current_stage_index + 1
+-        self._advance_to_next_stage(start_index=next_index)
++                self.logger.exception(f"Unexpected evaluation wrapper failure for stage '{stage_name}'")
++            finally:
++                tla_trace.complete_oracle(evaluation_success)
++                self._evaluating = False
++                tla_trace.complete_evaluation()
+ 
+-        # Restart noise if there are more stages AND not in teardown
+-        if self.config.enable_noise and self.submission_stage not in ("done", "tearing_down"):
+             try:
+-                nm = get_noise_manager()
+-                self.logger.info("Restarting noise manager for next stage...")
+-                nm.start()
+-            except Exception as e:
+-                self.logger.warning(f"Failed to restart noise manager: {e}")
++                # Mitigation advancement synchronously enters _finish_problem().
++                # Record the end-of-sequence decision before that nested cleanup;
++                # diagnosis is recorded after its ordinary stage mutation.
++                if stage_name == "mitigation":
++                    tla_trace.advance_stage_after_evaluation(self, stage_name)
++
++                # After evaluation, advance to the next stage (if any)
++                next_index = self.current_stage_index + 1
++                self._advance_to_next_stage(start_index=next_index)
++                if stage_name == "diagnosis":
++                    tla_trace.advance_stage_after_evaluation(self, stage_name)
++
++                # Restart noise if there are more stages AND not in teardown
++                if self.config.enable_noise and self.submission_stage not in ("done", "tearing_down"):
++                    try:
++                        nm = get_noise_manager()
++                        self.logger.info("Restarting noise manager for next stage...")
++                        nm.start()
++                    except Exception as e:
++                        self.logger.warning(f"Failed to restart noise manager: {e}")
++            finally:
++                tla_trace.finish_evaluation_future()
+ 
+     async def submit(self, solution: str | None) -> dict:
+         """
+@@ -523,11 +569,15 @@ class Conductor:
+         # If all tasks are already completed, simply return the final snapshot.
+         if self.submission_stage == "done":
+             self.logger.info("All tasks already completed; ignoring new submission.")
++            if tla_trace.enabled():
++                tla_trace.conductor_submit_late()
+             return dict(self.results)
+ 
+         # If teardown is in progress, return current results without evaluation
+         if self.submission_stage == "tearing_down":
+             self.logger.info("Teardown in progress; returning current results without evaluation.")
++            if tla_trace.enabled():
++                tla_trace.conductor_submit_late()
+             return dict(self.results)
+ 
+         if not self.stage_sequence:
+@@ -540,6 +590,7 @@ class Conductor:
+                     "submit() called while evaluation is already in progress for "
+                     f"stage '{self.submission_stage}'. Submission was already accepted."
+                 )
++                tla_trace.conductor_submit_duplicate()
+                 return {"status": "ok", "message": "Submission already accepted; evaluation in progress."}
+             self.logger.error(
+                 "submit() called when conductor is not waiting for a submission. "
+@@ -562,7 +613,9 @@ class Conductor:
+         # asyncio.wrap_future() in start_problem() binds the future to whichever loop
+         # is running at await time, avoiding "Future attached to a different loop".
+         executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+-        self._submit_future = executor.submit(self._submit_evaluate_and_advance, sol, current_stage)
++        with tla_trace.boundary_lock():
++            self._submit_future = executor.submit(self._submit_evaluate_and_advance, sol, current_stage)
++            tla_trace.conductor_submit_accept(self)
+         executor.shutdown(wait=False)
+ 
+         return {"status": "ok", "message": "Submission received"}
+@@ -783,6 +836,7 @@ class Conductor:
+         """Kubectl + Prometheus + problem.app deployment."""
+         problem = self.current_problem
+         self.submission_stage = "setup"
++        tla_trace.start_problem(self)
+ 
+         # Load or capture baseline state BEFORE any infrastructure deployment.
+         # This captures the bare cluster state so reconciliation can clean up
+diff --git a/sregym/conductor/conductor_api.py b/sregym/conductor/conductor_api.py
+index b6fc3593..6ab12db3 100644
+--- a/sregym/conductor/conductor_api.py
++++ b/sregym/conductor/conductor_api.py
+@@ -2,9 +2,10 @@ import asyncio
+ import logging
+ import os
+ import threading
++from typing import Annotated
+ 
+ import pyfiglet
+-from fastapi import FastAPI, HTTPException
++from fastapi import FastAPI, Header, HTTPException
+ from fastmcp import FastMCP
+ from fastmcp.server.http import create_sse_app
+ from pydantic import BaseModel
+@@ -14,6 +15,7 @@ from starlette.routing import Mount
+ from uvicorn import Config, Server
+ 
+ from logger import console
++from sregym import tla_trace
+ 
+ _conductor = None
+ 
+@@ -21,7 +23,7 @@ submit_mcp = FastMCP("Submit MCP Server")
+ 
+ 
+ @submit_mcp.tool(name="submit")
+-async def submit_via_conductor(ans: str) -> dict[str, str]:
++async def submit_via_conductor(ans: str, trace_request_id: str | None = None) -> dict[str, str]:
+     """Submit task result to benchmark
+ 
+     Args:
+@@ -39,18 +41,21 @@ async def submit_via_conductor(ans: str) -> dict[str, str]:
+             }
+         return {"status": "error", "text": f"Cannot submit at stage: {stage!r}"}
+ 
+-    max_wait = 60
+-    for attempt in range(max_wait):
+-        try:
+-            await _conductor.submit(ans)
+-            return {"status": "200", "text": "Submission received"}
+-        except RuntimeError:
+-            if attempt < max_wait - 1:
+-                await asyncio.sleep(1)
+-                continue
+-            return {"status": "error", "text": "Previous stage is still being evaluated. Try again later."}
+-        except Exception as e:
+-            return {"status": "error", "text": f"Grading error: {e}"}
++    with tla_trace.received_submission_context(trace_request_id) as claimed_request:
++        max_wait = 60
++        for attempt in range(max_wait):
++            try:
++                await _conductor.submit(ans)
++                tla_trace.acknowledge(claimed_request)
++                return {"status": "200", "text": "Submission received"}
++            except RuntimeError:
++                if attempt < max_wait - 1:
++                    tla_trace.retry_submission()
++                    await asyncio.sleep(1)
++                    continue
++                return {"status": "error", "text": "Previous stage is still being evaluated. Try again later."}
++            except Exception as e:
++                return {"status": "error", "text": f"Grading error: {e}"}
+ 
+ 
+ app = FastAPI(
+@@ -112,7 +117,10 @@ class SubmitRequest(BaseModel):
+ 
+ 
+ @app.post("/submit")
+-async def submit_solution(req: SubmitRequest):
++async def submit_solution(
++    req: SubmitRequest,
++    trace_request_id: Annotated[str | None, Header(alias="X-SREGym-Trace-Request-ID")] = None,
++):
+     allowed = {"diagnosis", "mitigation"}
+     if _conductor is None or _conductor.submission_stage not in allowed:
+         stage = _conductor.submission_stage if _conductor else None
+@@ -128,24 +136,27 @@ async def submit_solution(req: SubmitRequest):
+     # The conductor evaluates submissions asynchronously. If a previous stage
+     # is still being evaluated, waiting_for_agent will be False and submit()
+     # raises RuntimeError.  Retry for up to 60s to handle this race.
+-    max_wait = 60
+-    for attempt in range(max_wait):
+-        try:
+-            await _conductor.submit(req.solution)
+-            return {"status": "200", "message": "Submission received"}
+-        except RuntimeError:
+-            if attempt < max_wait - 1:
+-                logger.debug("Conductor not ready for submission yet, retrying in 1s...")
+-                await asyncio.sleep(1)
+-                continue
+-            logger.error("Conductor did not become ready for submission within timeout")
+-            raise HTTPException(
+-                status_code=503,
+-                detail="Previous stage is still being evaluated. Try again later.",
+-            ) from None
+-        except Exception as e:
+-            logger.error(f"Grading error: {e}")
+-            raise HTTPException(status_code=400, detail=f"Grading error: {e}") from e
++    with tla_trace.received_submission_context(trace_request_id) as claimed_request:
++        max_wait = 60
++        for attempt in range(max_wait):
++            try:
++                await _conductor.submit(req.solution)
++                tla_trace.acknowledge(claimed_request)
++                return {"status": "200", "message": "Submission received"}
++            except RuntimeError:
++                if attempt < max_wait - 1:
++                    logger.debug("Conductor not ready for submission yet, retrying in 1s...")
++                    tla_trace.retry_submission()
++                    await asyncio.sleep(1)
++                    continue
++                logger.error("Conductor did not become ready for submission within timeout")
++                raise HTTPException(
++                    status_code=503,
++                    detail="Previous stage is still being evaluated. Try again later.",
++                ) from None
++            except Exception as e:
++                logger.error(f"Grading error: {e}")
++                raise HTTPException(status_code=400, detail=f"Grading error: {e}") from e
+ 
+ 
+ @app.get("/status")
+diff --git a/sregym/conductor/problems/khaos_faults.py b/sregym/conductor/problems/khaos_faults.py
+index a611cfb1..c26bb950 100644
+--- a/sregym/conductor/problems/khaos_faults.py
++++ b/sregym/conductor/problems/khaos_faults.py
+@@ -6,6 +6,7 @@ from enum import StrEnum
+ 
+ from pydantic import BaseModel, Field
+ 
++from sregym import tla_trace
+ from sregym.conductor.oracles.alert_oracle import AlertOracle
+ from sregym.conductor.oracles.llm_as_a_judge.llm_as_a_judge_oracle import LLMAsAJudgeOracle
+ from sregym.conductor.problems.base import Problem
+@@ -174,6 +175,7 @@ class _FaultReinjectionMonitor:
+                 # stop flag right before the kubectl exec that would actually
+                 # pin a probe, since _get_host_pid_on_node can take a few
+                 # seconds and stop() may have fired in the meantime.
++                tla_trace.restart_pod()
+                 host_pid = self._injector._get_host_pid_on_node(self._node, cid)
+                 if self._stop_event.is_set():
+                     return
+@@ -182,6 +184,7 @@ class _FaultReinjectionMonitor:
+                     f"PID {host_pid} (pod {pod_ref}, container {cid[:12]})"
+                 )
+                 self._injector._exec_khaos_fault_on_node(self._node, self._fault_type, host_pid, self._params)
++                tla_trace.reattach_fault()
+ 
+                 if self._fault_type in _NEEDS_CACHE_DROP:
+                     kernel_injector = KernelInjector(self._injector.kubectl)
+diff --git a/sregym/generators/noise/manager.py b/sregym/generators/noise/manager.py
+index 1a2da7b2..cf2ec9e2 100644
+--- a/sregym/generators/noise/manager.py
++++ b/sregym/generators/noise/manager.py
+@@ -18,6 +18,7 @@ from typing import Any
+ 
+ import yaml
+ 
++from sregym import tla_trace
+ from sregym.generators.noise.catalog import EXPERIMENT_CATALOG
+ from sregym.service.kubectl import KubeCtl
+ 
+@@ -55,6 +56,7 @@ class NoiseManager:
+         self._last_injection_time: float = 0
+         self._lock = threading.Lock()
+         self._chaos_mesh_ready = False
++        self._loop_sleep_seconds = 5.0
+ 
+     # ── Context from Conductor ────────────────────────────────────────
+ 
+@@ -76,33 +78,55 @@ class NoiseManager:
+         if not self._chaos_mesh_ready:
+             logger.warning("Chaos Mesh is not ready; noise will not be injected.")
+             return
+-        self.running = True
+-        self._background_thread = threading.Thread(target=self._background_loop, daemon=True)
+-        self._background_thread.start()
++        epoch = tla_trace.next_noise_epoch()
++
++        def run_loop():
++            with tla_trace.noise_loop_context(epoch):
++                self._background_loop()
++
++        with tla_trace.boundary_lock():
++            self.running = True
++            self._background_thread = threading.Thread(target=run_loop, daemon=True)
++            self._background_thread.start()
++            tla_trace.noise_manager_start(epoch)
+         logger.info("Noise injection started.")
+ 
+     def stop(self):
+         """Stop the background loop and clean up all active experiments."""
+         self.running = False
+-        if self._background_thread:
+-            self._background_thread.join(timeout=5)
++        tla_trace.noise_manager_stop()
++        thread = self._background_thread
++        if thread:
++            thread.join(timeout=5)
++            if thread.is_alive():
++                tla_trace.noise_manager_join_timeout()
++            else:
++                tla_trace.noise_manager_join_complete()
+             self._background_thread = None
++        else:
++            tla_trace.noise_manager_join_complete()
+         self._cleanup_experiments()
+         # Strip finalizers from any remaining chaos-mesh CRs so the namespace
+         # can terminate cleanly when reconcile_to_baseline deletes it.
+         self._force_remove_all_chaos_resources()
++        tla_trace.noise_manager_force_remove()
+         self._last_injection_time = 0
++        tla_trace.noise_manager_stop_return()
+         logger.info("Noise injection stopped.")
+ 
+     # ── Background loop ───────────────────────────────────────────────
+ 
+     def _background_loop(self):
+-        while self.running:
+-            try:
+-                self._maybe_inject()
+-            except Exception as e:
+-                logger.error(f"Error in noise background loop: {e}")
+-            time.sleep(5)
++        epoch = tla_trace.current_noise_epoch()
++        try:
++            while self.running:
++                try:
++                    self._maybe_inject()
++                except Exception as e:
++                    logger.error(f"Error in noise background loop: {e}")
++                time.sleep(self._loop_sleep_seconds)
++        finally:
++            tla_trace.noise_loop_exit(epoch)
+ 
+     def _maybe_inject(self):
+         if not self.target_namespace:
+@@ -147,12 +171,15 @@ class NoiseManager:
+                 yaml.dump(crd, tmp)
+                 tmp_path = tmp.name
+ 
++            trace_apply = tla_trace.begin_noise_apply()
+             out = self.kubectl.exec_command(f"kubectl apply -f {tmp_path}")
+             os.remove(tmp_path)
+             logger.info(f"Applied noise experiment {name}: {out}")
+ 
+             with self._lock:
+                 self.active_experiments.append({"name": name, "kind": kind})
++            if trace_apply:
++                tla_trace.complete_noise_apply()
+         except Exception as e:
+             logger.error(f"Failed to apply noise experiment {name}: {e}")
+ 
+@@ -201,6 +228,7 @@ class NoiseManager:
+                 except Exception as e:
+                     logger.error(f"Failed to clean up noise experiment {exp['name']}: {e}")
+             self.active_experiments.clear()
++        tla_trace.noise_manager_cleanup_recorded()
+ 
+     def _force_remove_all_chaos_resources(self):
+         try:
+diff --git a/sregym/service/cluster_state.py b/sregym/service/cluster_state.py
+index f01de126..a1356cba 100644
+--- a/sregym/service/cluster_state.py
++++ b/sregym/service/cluster_state.py
+@@ -9,6 +9,7 @@ from pathlib import Path
+ from kubernetes import client
+ from kubernetes.client.rest import ApiException
+ 
++from sregym import tla_trace
+ from sregym.service.kubectl import KubeCtl
+ 
+ logger = logging.getLogger("all.infra.cluster_state")
+@@ -134,18 +135,34 @@ class ClusterStateManager:
+         """
+         logger.info("Capturing cluster baseline state...")
+ 
++        tla_trace.begin_baseline_capture()
++        namespaces = self._get_namespaces()
++        cluster_roles = self._get_cluster_roles()
++        cluster_role_bindings = self._get_cluster_role_bindings()
++        persistent_volumes = self._get_persistent_volumes()
++        storage_classes = self._get_storage_classes()
++        crds = self._get_crds()
++        validating_webhook_configs = self._get_validating_webhook_configs()
++        mutating_webhook_configs = self._get_mutating_webhook_configs()
++        tla_trace.observe_baseline("resources")
++
++        node_labels = self._get_node_labels()
++        node_taints = self._get_node_taints()
++        coredns_configmap_data = self._get_coredns_configmap_data()
++        tla_trace.observe_baseline("values")
++
+         self.baseline = ClusterBaseline(
+-            namespaces=self._get_namespaces(),
+-            cluster_roles=self._get_cluster_roles(),
+-            cluster_role_bindings=self._get_cluster_role_bindings(),
+-            persistent_volumes=self._get_persistent_volumes(),
+-            storage_classes=self._get_storage_classes(),
+-            crds=self._get_crds(),
+-            validating_webhook_configs=self._get_validating_webhook_configs(),
+-            mutating_webhook_configs=self._get_mutating_webhook_configs(),
+-            node_labels=self._get_node_labels(),
+-            node_taints=self._get_node_taints(),
+-            coredns_configmap_data=self._get_coredns_configmap_data(),
++            namespaces=namespaces,
++            cluster_roles=cluster_roles,
++            cluster_role_bindings=cluster_role_bindings,
++            persistent_volumes=persistent_volumes,
++            storage_classes=storage_classes,
++            crds=crds,
++            validating_webhook_configs=validating_webhook_configs,
++            mutating_webhook_configs=mutating_webhook_configs,
++            node_labels=node_labels,
++            node_taints=node_taints,
++            coredns_configmap_data=coredns_configmap_data,
+         )
+ 
+         return self.baseline
+@@ -160,6 +177,7 @@ class ClusterStateManager:
+         path.parent.mkdir(parents=True, exist_ok=True)
+         with open(path, "w") as f:
+             json.dump(baseline.to_json(), f, indent=2)
++        tla_trace.persist_baseline_state()
+         logger.info(f"Baseline state snapshot saved to {path}")
+ 
+     def load_baseline_state(self, path: Path) -> bool:
+@@ -175,6 +193,7 @@ class ClusterStateManager:
+             with open(path) as f:
+                 data = json.load(f)
+             self.baseline = ClusterBaseline.from_json(data)
++            tla_trace.load_baseline_state()
+             logger.info(f"Baseline state loaded from {path}")
+             return True
+         except (json.JSONDecodeError, KeyError) as e:
+@@ -213,6 +232,7 @@ class ClusterStateManager:
+             try:
+                 self.kubectl.delete_namespace(ns)
+                 changes["namespaces_deleted"].append(ns)
++                tla_trace.reconcile_delete(tla_trace.RUN_RESOURCE)
+             except Exception as e:
+                 logger.warning(f"Failed to delete namespace {ns}: {e}")
+ 
+@@ -229,6 +249,7 @@ class ClusterStateManager:
+             try:
+                 self.rbac_v1.delete_cluster_role(name=role)
+                 changes["cluster_roles_deleted"].append(role)
++                tla_trace.reconcile_delete(tla_trace.RUN_RESOURCE)
+             except ApiException as e:
+                 if e.status != 404:
+                     logger.warning(f"Failed to delete ClusterRole {role}: {e}")
+@@ -245,6 +266,7 @@ class ClusterStateManager:
+             try:
+                 self.rbac_v1.delete_cluster_role_binding(name=binding)
+                 changes["cluster_role_bindings_deleted"].append(binding)
++                tla_trace.reconcile_delete(tla_trace.RUN_RESOURCE)
+             except ApiException as e:
+                 if e.status != 404:
+                     logger.warning(f"Failed to delete ClusterRoleBinding {binding}: {e}")
+@@ -257,6 +279,7 @@ class ClusterStateManager:
+             try:
+                 self.core_v1.delete_persistent_volume(name=pv)
+                 changes["persistent_volumes_deleted"].append(pv)
++                tla_trace.reconcile_delete(tla_trace.RUN_RESOURCE)
+             except ApiException as e:
+                 if e.status != 404:
+                     logger.warning(f"Failed to delete PersistentVolume {pv}: {e}")
+@@ -287,6 +310,7 @@ class ClusterStateManager:
+             try:
+                 self.storage_v1.delete_storage_class(name=sc)
+                 changes["storage_classes_deleted"].append(sc)
++                tla_trace.reconcile_delete(tla_trace.RUN_RESOURCE)
+             except ApiException as e:
+                 if e.status != 404:
+                     logger.warning(f"Failed to delete StorageClass {sc}: {e}")
+@@ -302,6 +326,7 @@ class ClusterStateManager:
+             try:
+                 self.apiextensions_v1.delete_custom_resource_definition(name=crd)
+                 changes["crds_deleted"].append(crd)
++                tla_trace.reconcile_delete(tla_trace.RUN_RESOURCE)
+             except ApiException as e:
+                 if e.status != 404:
+                     logger.warning(f"Failed to delete CRD {crd}: {e}")
+@@ -316,6 +341,7 @@ class ClusterStateManager:
+             try:
+                 self.admission_v1.delete_validating_webhook_configuration(name=vwc)
+                 changes["validating_webhook_configs_deleted"].append(vwc)
++                tla_trace.reconcile_delete(tla_trace.RUN_RESOURCE)
+             except ApiException as e:
+                 if e.status != 404:
+                     logger.warning(f"Failed to delete ValidatingWebhookConfiguration {vwc}: {e}")
+@@ -330,6 +356,7 @@ class ClusterStateManager:
+             try:
+                 self.admission_v1.delete_mutating_webhook_configuration(name=mwc)
+                 changes["mutating_webhook_configs_deleted"].append(mwc)
++                tla_trace.reconcile_delete(tla_trace.RUN_RESOURCE)
+             except ApiException as e:
+                 if e.status != 404:
+                     logger.warning(f"Failed to delete MutatingWebhookConfiguration {mwc}: {e}")
+@@ -355,6 +382,7 @@ class ClusterStateManager:
+             ns_list = self.core_v1.list_namespace()
+             return {ns.metadata.name for ns in ns_list.items}
+         except ApiException as e:
++            tla_trace.baseline_getter_failed("resources")
+             logger.error(f"Failed to list namespaces: {e}")
+             return set()
+ 
+@@ -364,6 +392,7 @@ class ClusterStateManager:
+             roles = self.rbac_v1.list_cluster_role()
+             return {role.metadata.name for role in roles.items}
+         except ApiException as e:
++            tla_trace.baseline_getter_failed("resources")
+             logger.error(f"Failed to list ClusterRoles: {e}")
+             return set()
+ 
+@@ -373,6 +402,7 @@ class ClusterStateManager:
+             bindings = self.rbac_v1.list_cluster_role_binding()
+             return {binding.metadata.name for binding in bindings.items}
+         except ApiException as e:
++            tla_trace.baseline_getter_failed("resources")
+             logger.error(f"Failed to list ClusterRoleBindings: {e}")
+             return set()
+ 
+@@ -382,6 +412,7 @@ class ClusterStateManager:
+             pvs = self.core_v1.list_persistent_volume()
+             return {pv.metadata.name for pv in pvs.items}
+         except ApiException as e:
++            tla_trace.baseline_getter_failed("resources")
+             logger.error(f"Failed to list PersistentVolumes: {e}")
+             return set()
+ 
+@@ -391,6 +422,7 @@ class ClusterStateManager:
+             scs = self.storage_v1.list_storage_class()
+             return {sc.metadata.name for sc in scs.items}
+         except ApiException as e:
++            tla_trace.baseline_getter_failed("resources")
+             logger.error(f"Failed to list StorageClasses: {e}")
+             return set()
+ 
+@@ -454,6 +486,7 @@ class ClusterStateManager:
+             crds = self.apiextensions_v1.list_custom_resource_definition()
+             return {crd.metadata.name for crd in crds.items}
+         except ApiException as e:
++            tla_trace.baseline_getter_failed("resources")
+             logger.error(f"Failed to list CRDs: {e}")
+             return set()
+ 
+@@ -463,6 +496,7 @@ class ClusterStateManager:
+             configs = self.admission_v1.list_validating_webhook_configuration()
+             return {cfg.metadata.name for cfg in configs.items}
+         except ApiException as e:
++            tla_trace.baseline_getter_failed("resources")
+             logger.error(f"Failed to list ValidatingWebhookConfigurations: {e}")
+             return set()
+ 
+@@ -472,6 +506,7 @@ class ClusterStateManager:
+             configs = self.admission_v1.list_mutating_webhook_configuration()
+             return {cfg.metadata.name for cfg in configs.items}
+         except ApiException as e:
++            tla_trace.baseline_getter_failed("resources")
+             logger.error(f"Failed to list MutatingWebhookConfigurations: {e}")
+             return set()
+ 
+@@ -481,6 +516,7 @@ class ClusterStateManager:
+             nodes = self.core_v1.list_node()
+             return {node.metadata.name: dict(node.metadata.labels or {}) for node in nodes.items}
+         except ApiException as e:
++            tla_trace.baseline_getter_failed("values")
+             logger.error(f"Failed to get node labels: {e}")
+             return {}
+ 
+@@ -495,6 +531,7 @@ class ClusterStateManager:
+                 result[node.metadata.name] = [{"key": t.key, "value": t.value, "effect": t.effect} for t in taints]
+             return result
+         except ApiException as e:
++            tla_trace.baseline_getter_failed("values")
+             logger.error(f"Failed to get node taints: {e}")
+             return {}
+ 
+@@ -504,6 +541,7 @@ class ClusterStateManager:
+             cm = self.core_v1.read_namespaced_config_map(name="coredns", namespace="kube-system")
+             return dict(cm.data or {})  # type: ignore[union-attr]
+         except ApiException as e:
++            tla_trace.baseline_getter_failed("values")
+             if e.status == 404:
+                 logger.warning("CoreDNS ConfigMap not found")
+                 return {}
+@@ -532,6 +570,7 @@ class ClusterStateManager:
+                 "kubectl rollout restart deployment coredns -n kube-system 2>/dev/null || "
+                 "kubectl rollout restart daemonset coredns -n kube-system 2>/dev/null || true"
+             )
++            tla_trace.reconcile_restore(tla_trace.PRE_RESOURCE)
+             logger.info("CoreDNS ConfigMap restored to baseline")
+         except ApiException as e:
+             logger.error(f"Failed to restore CoreDNS ConfigMap: {e}")
+@@ -578,6 +617,7 @@ class ClusterStateManager:
+                     body = {"metadata": {"labels": patch_labels}}
+                     self.core_v1.patch_node(name=node_name, body=body)
+                     modified_nodes.append(node_name)
++                    tla_trace.reconcile_restore(tla_trace.PRE_RESOURCE)
+                     logger.info(
+                         f"Reset labels on node {node_name}: "
+                         f"removed={labels_to_remove}, restored={list(labels_to_restore.keys())}"
+@@ -617,6 +657,7 @@ class ClusterStateManager:
+                     body = {"spec": {"taints": taints if taints else None}}
+                     self.core_v1.patch_node(name=node_name, body=body)
+                     modified_nodes.append(node_name)
++                    tla_trace.reconcile_restore(tla_trace.PRE_RESOURCE)
+                     logger.info(f"Reset taints on node {node_name}")
+                 except ApiException as e:
+                     logger.warning(f"Failed to reconcile taints for node {node_name}: {e}")
+

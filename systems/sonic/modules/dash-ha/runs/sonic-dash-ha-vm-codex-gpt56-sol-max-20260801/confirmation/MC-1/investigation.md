@@ -1,0 +1,50 @@
+# MC-1 investigation evidence
+
+## Scope and source
+
+- Finding: `MC-1`, “Late DPU acknowledgement regresses an Active scope's ASIC role.”
+- Source classification evidence: the cited TLC output is a real `LegalRolePair` violation, not a no-violation review scenario. `spec/output/MC_hunt_scenario1_role_pair_postfix_bfs.out:37` reports `Invariant LegalRolePair is violated`.
+- Counterexample sequence: the saved JSON trace has two outstanding role writes at state 12. Transition 12→13 acknowledges `Active` first and leaves the older `SwitchingToActive` write pending; transition 13→14 then acknowledges `SwitchingToActive`, leaving `cpState[n2] = Active`, `ackedRole[n2] = SwitchingToActive`, and no pending role write. The text trace shows the same final state at output lines 1489-1506, 1627-1640, and 1761-1792.
+
+## Step 1 — code audit
+
+### Cited code and call chain
+
+1. A normal DPU `DASH_HA_SCOPE_STATE_TABLE` notification is read by the consumer bridge. `crates/hamgrd/src/actors.rs:328-345` creates a `SubscriberStateTable` and addresses a single-entry update with `DpuDashHaScopeState::table_name()`. `crates/swss-common-bridge/src/consumer.rs:62-100` merges the update into a full `KeyOpFieldValues` value and forwards it as an `ActorMessage` without a request/write generation.
+2. `HaScopeActor::handle_message` is the production actor entry point (`crates/hamgrd/src/actors/ha_scope/mod.rs:171-220`). In NPU-driven mode, `NpuHaScopeActor::handle_message_inner` recognizes the DPU state-table key and calls `handle_dpu_ha_scope_state_update_npu_driven` (`crates/hamgrd/src/actors/ha_scope/npu.rs:94-115`).
+3. The handler parses the latest DPU state and unconditionally assigns both `local_acked_asic_ha_state` and `local_acked_term` from it (`crates/hamgrd/src/actors/ha_scope/npu.rs:623-652`). There is no comparison with `local_target_asic_ha_state`, `local_target_term`, a write id, or a monotonic generation.
+4. The same handler immediately broadcasts the resulting acknowledged role (`crates/hamgrd/src/actors/ha_scope/npu.rs:660-662`). `broadcast_ha_scope_state` copies `local_acked_asic_ha_state` into `HaScopeActorState` and sends it to the peer scope and HA-set actors (`crates/hamgrd/src/actors/ha_scope/npu.rs:1968-2005`).
+5. A peer is a real consumer: `handle_ha_state_change` stores the broadcast value as `peer_acked_asic_ha_state` (`crates/hamgrd/src/actors/ha_scope/npu.rs:753-775`), and `next_state` uses that value as a hardware-commit gate, including planned-switchover transitions (`crates/hamgrd/src/actors/ha_scope/npu.rs:1850-1907`). A heartbeat caller also receives the currently recorded local acknowledged role (`crates/hamgrd/src/actors/ha_scope/npu.rs:366-398`).
+
+### Reachability and concrete trigger
+
+- The existing production-path test `ha_scope_npu_planned_switchover` exercises the normal configuration and peer-message APIs. Its phase 3 causes a `switching_to_active`, term 1 `DASH_HA_SCOPE_TABLE` write (`crates/hamgrd/src/actors/ha_scope/mod.rs:1615-1641`). Its phase 4 receives the peer's `SwitchingToStandby`/`standby` acknowledgement, changes the local control plane to `Active`, increments the term, and emits a second `active`, term 2 write (`crates/hamgrd/src/actors/ha_scope/mod.rs:1663-1707`). Thus the two writes are naturally produced by a planned switchover.
+- The production side effects issue those writes independently: entering `SwitchingToActive` calls `update_dpu_ha_scope_table_with_params`, while entering `Active` increments the target term and calls it again (`crates/hamgrd/src/actors/ha_scope/npu.rs:1510-1524,1543-1560`). `update_dpu_ha_scope_table_with_params` sends an asynchronous producer-bridge request and does not retain a generation or wait for the corresponding DPU state (`crates/hamgrd/src/actors/ha_scope/npu.rs:2310-2351`).
+- The producer bridge applies requests one at a time to `ProducerStateTable`/`ZmqProducerStateTable`, but its response only confirms the table call; it carries no later ASIC-state generation (`crates/swss-common-bridge/src/producer.rs:28-70`). The DPU state arrives on the separate consumer path above.
+- Lower-layer corroboration was checked against `sonic-net/sonic-swss` at SHA `4f3dda156e52ed7647b1dbf900d54d87efaea455`. `DashHaOrch::setHaScopeHaRole` returns after `set_ha_scope_attribute` (`orchagent/dash/dashhaorch.cpp:691-727`), while SAI HA-scope events are later handled independently and written to state DB in arrival order (`orchagent/dash/dashhaorch.cpp:1123-1253`). Its event handler has no hamgrd write id/generation either. For switch-owned scopes, it also synthesizes stable-role state immediately after the SAI call (`orchagent/dash/dashhaorch.cpp:482-492,730-779`) while `SwitchingToActive` explicitly skips that synthetic update, making the active-state/stale-event interleaving concrete.
+- Concrete natural sequence: approved planned switchover → hamgrd emits `SwitchingToActive(term 1)` → peer reports `SwitchingToStandby` with ASIC `standby` → hamgrd advances to `Active` and emits `Active(term 2)` before correlating the first DPU state → the active state is observed first → the older switching state is observed later. The final two deliveries instantiate counterexample transitions 12→13 and 13→14.
+
+### Safeguards and possible masks recorded for Phase 2
+
+- Peer role and control-plane checks guard the transition into `Active`, but they concern the *peer* and do not correlate the local DPU acknowledgements (`crates/hamgrd/src/actors/ha_scope/npu.rs:1917-1928`).
+- `DpuStateChanged` does not reapply the current Active role. In the `Active` branch, only switchover/failure events cause transitions; a DPU-state update falls through without side effects (`crates/hamgrd/src/actors/ha_scope/npu.rs:1830-1856`).
+- Actor outgoing maintenance resends only unacknowledged swbus requests. Once the producer bridge replies, it has no retained role intent to reconcile against a later state notification (`crates/swbus-actor/src/state/outgoing.rs:211-282`).
+- Crash rehydration can reissue the persisted role, but it runs only on process rehydration, not as periodic reconciliation (`crates/hamgrd/src/actors/ha_scope/npu.rs:1335-1428,1618-1629`).
+- A later external DPU `Active` notification could overwrite the stale value, but no hamgrd mechanism guarantees or synthesizes such a notification after the exact trace has drained both outstanding acknowledgements. Phase 2 must observe whether the actor itself repairs the state and whether a real peer/heartbeat consumer sees the regressed value.
+
+## Step 2 — developer-knowledge evidence
+
+- Upstream issue [sonic-net/sonic-dash-ha#171](https://github.com/sonic-net/sonic-dash-ha/issues/171), opened 2026-05-26 and still open as of 2026-08-01, states that HamgrD should wait for a state-transition acknowledgement from DPU/Orchagent before proceeding; otherwise corner-case millisecond windows can drop new connections. This is direct developer evidence for serialization/ack gating and its traffic consequence.
+- PR [#193](https://github.com/sonic-net/sonic-dash-ha/pull/193) says control-plane state may lead or lag the ASIC role and calls the ASIC-acknowledged role the authoritative hardware-commit signal. Commit `3a89149` implemented peer-role gates but did not add local write/ack correlation.
+- PR [#199](https://github.com/sonic-net/sonic-dash-ha/pull/199), commit `94f5e22`, intentionally broadcasts every DPU HA-scope state change to downstream actors. It introduced the broadcast at the audited handler but added no stale-update filter.
+- PR [#201](https://github.com/sonic-net/sonic-dash-ha/pull/201) added peer control-plane gating alongside peer ASIC-role gating; it did not serialize local DPU role writes.
+- PR [#205](https://github.com/sonic-net/sonic-dash-ha/pull/205) explicitly records that producer-bridge writes are only *issued* and that the actor framework does not surface true end-to-end DPU APPL_DB acknowledgements into actor logic. It concerns HA-set/scope dependency ordering, not this same-site stale role acknowledgement, but corroborates the asynchronous pipeline.
+- The official [SmartSwitch HA HLD](https://github.com/sonic-net/SONiC/blob/master/doc/smart-switch/high-availability/smart-switch-ha-hld.md#821-workflow) requires close-to-zero loss and one decision maker throughout a planned switchover. Its workflow orders `SwitchingToActive` before `Active`, and describes the switching state as transient. Those goals make a stable control-plane Active / ASIC SwitchingToActive result contrary to the documented workflow.
+- Existing test coverage proves the normal two-write sequence but does not deliver those local DPU acknowledgements out of order or assert term monotonicity. No nearby TODO/FIXME documents acceptance of stale acknowledgements.
+
+## Step 3 — known status and precedent
+
+- **Novelty evidence: KNOWN; fix status unfixed.** Issue [#171](https://github.com/sonic-net/sonic-dash-ha/issues/171) reports the same missing wait/serialization mechanism in the NPU-driven DPU/Orchagent state-transition path and remains open. Its proposed requirement—wait for the DPU transition acknowledgement before proceeding—would prevent the two outstanding role transitions used by MC-1.
+- Tracker coverage included all upstream issues returned by the repository issue API and the 100 most recently updated open/closed/merged PRs. Recently merged PRs through #211 were reviewed by title/body, including #193, #199, #201, #203, #205, #206, #210, and #211. None adds per-scope write generations, target-role/term filtering, or role-transition serialization; current `origin/master` is `f53422a4b5f0de372714fd309d1975ce34445633`.
+- PR #211's “stale active state” is a different site and mechanism (HA-set VNET route selection from cached scope states), so it is not the novelty citation for MC-1. PR #171 remains the exact missing-transition-ack report.
+- Because the finding has a real TLC violation, the code-review × known Phase-1 drop rule does not apply; evidence proceeds to mandatory reproduction without a Phase-1 verdict.

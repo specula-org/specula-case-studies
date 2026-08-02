@@ -1,0 +1,124 @@
+{
+  "schema_version": "2",
+  "system": "dash-ha",
+  "generated_by": "validation-workflow",
+  "findings": [
+    {
+      "id": "MC-1",
+      "title": "Late DPU acknowledgement regresses an Active scope's ASIC role",
+      "source": "model-checking",
+      "scenario": "Asynchronous role-write acknowledgements during planned switchover",
+      "severity": "High",
+      "invariant": "LegalRolePair",
+      "config": "MC_hunt_scenario1_role_pair.cfg",
+      "counterexample": "spec/output/MC_hunt_scenario1_role_pair_postfix_bfs.out",
+      "affected_code": [
+        "crates/hamgrd/src/actors/ha_scope/npu.rs:623-652",
+        "crates/hamgrd/src/actors/ha_scope/npu.rs:1510-1524",
+        "crates/hamgrd/src/actors/ha_scope/npu.rs:1543-1560",
+        "crates/swss-common-bridge/src/producer.rs:28-70"
+      ],
+      "summary": "Multiple DPU role writes can be outstanding during a planned switchover. The DPU-state handler accepts every observed role and term without correlating it to the latest write generation or expected role. An older SwitchingToActive acknowledgement can therefore arrive after Active was acknowledged and regress the recorded ASIC role while the control plane remains Active. The implementation should correlate acknowledgements to a monotonic per-scope write generation or serialize role transitions."
+    },
+    {
+      "id": "MC-2",
+      "title": "Logical HA scope state can redirect traffic before ASIC acknowledgement",
+      "source": "model-checking",
+      "scenario": "Route selection from replayed logical peer state",
+      "severity": "High",
+      "invariant": "RouteMatchesAckedOwner",
+      "config": "MC_hunt_scenario6_route.cfg",
+      "counterexample": "spec/output/MC_hunt_scenario6_route_postfix_bfs.out",
+      "affected_code": [
+        "crates/hamgrd/src/actors/ha_set.rs:74-78",
+        "crates/hamgrd/src/actors/ha_set.rs:537-552",
+        "crates/hamgrd/src/actors/ha_set.rs:601-672",
+        "crates/hamgrd/src/actors/ha_set.rs:996-1029"
+      ],
+      "summary": "HA-set route selection caches logical scope state but omits acknowledged ASIC role, acknowledged term, and pairing freshness. A replayed logical Active update can consequently select and program a route owner whose hardware acknowledgement is still Dead or stale. The route configuration and the broader pipeline configuration independently reproduce this mechanism. Route eligibility should require logical and acknowledged hardware state to agree for the same current term and pairing epoch."
+    },
+    {
+      "id": "MC-3",
+      "title": "Delayed old peer state regresses the accepted term",
+      "source": "model-checking",
+      "scenario": "Reordered at-least-once HA-scope state delivery",
+      "severity": "High",
+      "invariant": "TermNonRegression",
+      "config": "MC_hunt_scenario2_replay.cfg",
+      "counterexample": "spec/output/MC_hunt_scenario2_replay_postfix_bfs.out",
+      "affected_code": [
+        "crates/swbus-actor/src/state/outgoing.rs:37-50",
+        "crates/swbus-actor/src/state/outgoing.rs:97-140",
+        "crates/swbus-actor/src/state/outgoing.rs:211-275",
+        "crates/swbus-actor/src/state/incoming.rs:49-72",
+        "crates/swbus-actor/src/state/incoming.rs:147-154",
+        "crates/hamgrd/src/actors/ha_scope/npu.rs:749-793"
+      ],
+      "summary": "The transport can retain and deliver distinct requests for the same logical HA-scope key out of order. The incoming table overwrites that key on every arrival, and the HA-scope handler then unconditionally copies the peer state and term. A delayed term-1 message can thus overwrite an already accepted term-2 message. Messages need a sender incarnation and monotonic sequence watermark that is checked before either cache or actor state is modified."
+    },
+    {
+      "id": "MC-4",
+      "title": "Former-peer message contaminates a new pairing",
+      "source": "model-checking",
+      "scenario": "Peer re-pair while an old peer message is pending",
+      "severity": "High",
+      "invariant": "CurrentPeerIsolation",
+      "config": "MC_hunt_scenario3_repair.cfg",
+      "counterexample": "spec/output/MC_hunt_scenario3_repair_postfix_bfs.out",
+      "affected_code": [
+        "crates/hamgrd/src/actors/ha_scope/npu.rs:525-586",
+        "crates/hamgrd/src/actors/ha_scope/npu.rs:93-235",
+        "crates/hamgrd/src/actors/ha_scope/npu.rs:749-793",
+        "crates/hamgrd/src/actors/ha_scope/base.rs:125-136"
+      ],
+      "summary": "Re-pairing replaces the configured peer but does not invalidate a former peer's message that is already pending in the incoming table. Dispatch and decoding do not verify that the entry source is the current peer, so the old message can be applied after re-pair and mark the new relationship connected with foreign state. Peer messages should carry a pairing epoch and be validated against both current source and epoch. Re-pair should also clear peer-derived caches and pending protocol work."
+    },
+    {
+      "id": "MC-5",
+      "title": "Restart duplicates a pending-operation UUID for one live DPU flag",
+      "source": "model-checking",
+      "scenario": "Crash/recovery while a DPU pending flag remains asserted",
+      "severity": "High",
+      "invariant": "PendingOperationBijective",
+      "config": "MC_hunt_scenario4_recovery.cfg",
+      "counterexample": "spec/output/MC_hunt_scenario4_recovery_postfix_bfs.out",
+      "affected_code": [
+        "crates/hamgrd/src/actors/ha_scope/dpu.rs:158-182",
+        "crates/hamgrd/src/actors/ha_scope/base.rs:445-493"
+      ],
+      "summary": "A DPU pending flag creates a fresh UUID on its false-to-true edge, but the edge cache is volatile. After restart, a still-asserted flag is treated as new even though the old UUID remains in the persisted pending-operation map. The new UUID is appended, leaving two live identifiers for one DPU request. A durable flag generation or idempotent operation-type reconciliation should reuse the existing UUID after recovery."
+    },
+    {
+      "id": "MC-6",
+      "title": "HA-set deletion leaves an applied child scope without its parent",
+      "source": "model-checking",
+      "scenario": "Parent HA-set cleanup while a child HA scope remains applied",
+      "severity": "High",
+      "invariant": "ParentBeforeScope",
+      "config": "MC_hunt_scenario5_lifecycle.cfg",
+      "counterexample": "spec/output/MC_hunt_scenario5_lifecycle_postfix_bfs.out",
+      "affected_code": [
+        "crates/hamgrd/src/actors/ha_set.rs:1041-1067",
+        "crates/hamgrd/src/actors/ha_scope/npu.rs:1587-1596",
+        "crates/hamgrd/src/actors/ha_scope/npu.rs:2310-2351"
+      ],
+      "summary": "HA-set cleanup can queue and complete parent deletion without first invalidating or draining its dependent HA scope. The child continues to trust cached parent state and remains applied after the parent is removed. This breaks the required parent-before-child lifecycle ordering and can leave orphaned hardware programming. Deletion needs an explicit child invalidation and acknowledgement barrier before parent removal."
+    },
+    {
+      "id": "MC-7",
+      "title": "Vote completion resets an in-progress switchover retry budget",
+      "source": "model-checking",
+      "scenario": "Interleaved vote and switchover retries on one HA scope",
+      "severity": "Medium",
+      "invariant": "RetryIsolation",
+      "config": "MC_hunt_scenario7_retry.cfg",
+      "counterexample": "spec/output/MC_hunt_scenario7_retry_postfix_bfs.out",
+      "affected_code": [
+        "crates/hamgrd/src/actors/ha_scope/npu.rs:863-948",
+        "crates/hamgrd/src/actors/ha_scope/npu.rs:986-1028",
+        "crates/hamgrd/src/actors/ha_scope/npu.rs:2063-2117"
+      ],
+      "summary": "Vote, switchover, and connection workflows share one actor-wide retry counter. A switchover rejection can increment that counter, after which an unrelated final vote result resets it to zero while the switchover is still active. One protocol can therefore erase or consume another protocol's retry budget. Counters should be separated by protocol and operation identifier, and reset only by their owner workflow."
+    }
+  ]
+}

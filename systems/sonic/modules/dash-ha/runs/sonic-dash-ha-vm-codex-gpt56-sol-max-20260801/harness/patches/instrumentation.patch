@@ -1,0 +1,958 @@
+diff --git a/crates/hamgrd/src/actors.rs b/crates/hamgrd/src/actors.rs
+index da004a2..323f707 100644
+--- a/crates/hamgrd/src/actors.rs
++++ b/crates/hamgrd/src/actors.rs
+@@ -136,6 +136,13 @@ where
+ 
+             match result {
+                 Ok(Ok(())) => {
++                    if let Some(destination) = msg.header.as_ref().and_then(|header| header.destination.as_ref()) {
++                        swbus_actor::tla_trace::emit(
++                            "ActorCreatorHandleReceivedMessage",
++                            &destination.resource_id,
++                            serde_json::json!({}),
++                        );
++                    }
+                     // forward the message to the actor that is just spawned
+                     if self.rt.send(msg).await.is_err() {
+                         error!("Failed to send response to swbus");
+diff --git a/crates/hamgrd/src/actors/ha_scope/base.rs b/crates/hamgrd/src/actors/ha_scope/base.rs
+index 082bfca..cee3490 100644
+--- a/crates/hamgrd/src/actors/ha_scope/base.rs
++++ b/crates/hamgrd/src/actors/ha_scope/base.rs
+@@ -462,9 +462,11 @@ impl HaScopeBase {
+         let old_pending_operations = pending_operations.clone();
+ 
+         let mut approved_types = Vec::new();
++        let mut trace_approved_operation_ids = Vec::new();
+         for op_id in approved_operations {
+             if let Some(op_type) = pending_operations.get(&op_id).cloned() {
+                 approved_types.push(op_type);
++                trace_approved_operation_ids.push(op_id.clone());
+             }
+             pending_operations.remove(&op_id);
+         }
+@@ -490,6 +492,14 @@ impl HaScopeBase {
+         let fvs = swss_serde::to_field_values(&npu_ha_scope_state)?;
+         internal.get_mut(NpuDashHaScopeState::table_name()).clone_from(&fvs);
+ 
++        for operation_id in trace_approved_operation_ids {
++            swbus_actor::tla_trace::emit(
++                "NpuApprovePendingOperation",
++                &self.id,
++                serde_json::json!({"operationIdRaw": operation_id}),
++            );
++        }
++
+         Ok(approved_types)
+     }
+ }
+diff --git a/crates/hamgrd/src/actors/ha_scope/dpu.rs b/crates/hamgrd/src/actors/ha_scope/dpu.rs
+index 595df97..5f14c99 100644
+--- a/crates/hamgrd/src/actors/ha_scope/dpu.rs
++++ b/crates/hamgrd/src/actors/ha_scope/dpu.rs
+@@ -177,8 +177,16 @@ impl DpuHaScopeActor {
+         self.update_npu_ha_scope_state_ha_state(state)?;
+ 
+         if !operations.is_empty() {
++            let trace_operations = operations.clone();
+             self.base
+                 .update_npu_ha_scope_state_pending_operations(state, operations, Vec::new())?;
++            for (operation_id, _) in trace_operations {
++                swbus_actor::tla_trace::emit(
++                    "DpuHandlePendingOperation",
++                    &self.base.id,
++                    serde_json::json!({"operationIdRaw": operation_id}),
++                );
++            }
+         }
+ 
+         Ok(())
+diff --git a/crates/hamgrd/src/actors/ha_scope/mod.rs b/crates/hamgrd/src/actors/ha_scope/mod.rs
+index a7ffa4b..e82a50e 100644
+--- a/crates/hamgrd/src/actors/ha_scope/mod.rs
++++ b/crates/hamgrd/src/actors/ha_scope/mod.rs
+@@ -2,6 +2,9 @@ mod base;
+ mod dpu;
+ mod npu;
+ 
++#[cfg(test)]
++mod trace_scenarios;
++
+ use crate::actors::DbBasedActor;
+ use anyhow::Result;
+ use sonic_common::SonicDbTable;
+diff --git a/crates/hamgrd/src/actors/ha_scope/npu.rs b/crates/hamgrd/src/actors/ha_scope/npu.rs
+index 594062f..f733604 100644
+--- a/crates/hamgrd/src/actors/ha_scope/npu.rs
++++ b/crates/hamgrd/src/actors/ha_scope/npu.rs
+@@ -24,6 +24,26 @@ fn ha_role_to_string(ha_role: &str) -> String {
+     ha_role.strip_prefix("HA_ROLE_").unwrap_or(ha_role).to_lowercase()
+ }
+ 
++fn trace_cp_state(state: HaState) -> &'static str {
++    match state {
++        HaState::Dead => "Dead",
++        HaState::Connecting => "Connecting",
++        HaState::Connected => "Connected",
++        HaState::InitializingToActive => "InitializingToActive",
++        HaState::InitializingToStandby => "InitializingToStandby",
++        HaState::PendingActiveActivation => "PendingActiveActivation",
++        HaState::PendingStandbyActivation => "PendingStandbyActivation",
++        HaState::Active => "Active",
++        HaState::Standby => "Standby",
++        HaState::Standalone => "Standalone",
++        HaState::SwitchingToActive => "SwitchingToActive",
++        HaState::SwitchingToStandby => "SwitchingToStandby",
++        HaState::SwitchingToStandalone => "SwitchingToStandalone",
++        HaState::Destroying => "Destroying",
++        _ => "Dead",
++    }
++}
++
+ pub struct NpuHaScopeActor {
+     pub(super) base: HaScopeBase,
+     /// Target state that HAmgrd should transition to upon HA events
+@@ -547,12 +567,22 @@ impl NpuHaScopeActor {
+                 Ok(sp) => {
+                     info!("Resolved peer HA scope SP: {}", sp.to_longest_path());
+                     self.base.peer_sp = Some(sp);
++                    swbus_actor::tla_trace::emit(
++                        "NpuHandleHaSetStateUpdateRePairResolved",
++                        &self.base.id,
++                        serde_json::json!({}),
++                    );
+                 }
+                 Err(e) => {
+                     error!("Failed to resolve peer SP: {e}. Will retry on next heartbeat.");
+                     self.peer_connected = false;
+                     // Send a signal to itself to schedule a check later
+                     self.send_self_notification(state, "CheckPeerConnection", RETRY_INTERVAL)?;
++                    swbus_actor::tla_trace::emit(
++                        "NpuHandleHaSetStateUpdateRePairUnresolved",
++                        &self.base.id,
++                        serde_json::json!({}),
++                    );
+                 }
+             }
+         }
+@@ -563,6 +593,11 @@ impl NpuHaScopeActor {
+         }
+         // update basic info of NPU HA scope state
+         let _ = self.base.update_npu_ha_scope_state_base(state);
++        swbus_actor::tla_trace::emit(
++            "HaScopeHandleHaSetState",
++            &self.base.id,
++            serde_json::json!({}),
++        );
+ 
+         // Cache the HA set up/down status, keeping the previous value to detect transitions
+         let was_up = self.ha_set_up;
+@@ -616,6 +651,12 @@ impl NpuHaScopeActor {
+             .clone_from(&fvs);
+         self.base.dpu_ha_scope_state = Some(new_dpu_ha_scope_state);
+ 
++        swbus_actor::tla_trace::emit(
++            "DpuAsicAcknowledgeRole",
++            &self.base.id,
++            serde_json::json!({}),
++        );
++
+         // Broadcast a new HA scope state upon DPU state changes
+         let current_state = self.current_npu_ha_state(state.internal());
+         self.broadcast_ha_scope_state(state, current_state);
+@@ -737,13 +778,19 @@ impl NpuHaScopeActor {
+         let fvs = swss_serde::to_field_values(&npu_ha_scope_state)?;
+         internal.get_mut(NpuDashHaScopeState::table_name()).clone_from(&fvs);
+ 
+-        if self.peer_connected {
+-            Ok(HaEvent::PeerStateChanged)
++        let event = if self.peer_connected {
++            HaEvent::PeerStateChanged
+         } else {
+             // we treat the first HaScopeActorState message from the peer as a confirmation of connection
+             self.peer_connected = true;
+-            Ok(HaEvent::PeerConnected)
+-        }
++            HaEvent::PeerConnected
++        };
++        swbus_actor::tla_trace::emit(
++            "NpuHandleHaStateChange",
++            &self.base.id,
++            serde_json::json!({}),
++        );
++        Ok(event)
+     }
+ 
+     /// Handle shutdown request messages for this HA scope.
+@@ -815,7 +862,8 @@ impl NpuHaScopeActor {
+ 
+     /// Handle vote request messages for this HA scope
+     /// Following procedure documented in <https://github.com/sonic-net/SONiC/blob/master/doc/smart-switch/high-availability/smart-switch-ha-hld.md#73-primary-election>
+-    fn handle_vote_request(&mut self, state: &mut State, key: &str) {
++    pub(super) fn handle_vote_request(&mut self, state: &mut State, key: &str) {
++        let retry_before = self.retry_count;
+         let response: &str;
+         let source_actor_id = key.strip_prefix(VoteRequest::msg_key_prefix()).unwrap_or(key);
+         let (internal, incoming, outgoing) = state.get_all();
+@@ -879,6 +927,19 @@ impl NpuHaScopeActor {
+             // reset retry count when determining the final result;
+             self.retry_count = 0;
+         }
++        if response == "RetryLater" && self.retry_count > retry_before {
++            swbus_actor::tla_trace::emit(
++                "NpuHandleVoteRequestRetry",
++                &self.base.id,
++                serde_json::json!({"sharedRetry": self.retry_count}),
++            );
++        } else if response != "RetryLater" && retry_before > 0 {
++            swbus_actor::tla_trace::emit(
++                "NpuHandleVoteRequestFinal",
++                &self.base.id,
++                serde_json::json!({"sharedRetry": self.retry_count}),
++            );
++        }
+         if let Ok(msg) = VoteReply::new_actor_msg(&self.base.id, source_actor_id, response) {
+             if let Some(peer_sp) = self.peer_sp() {
+                 outgoing.send(peer_sp, msg);
+@@ -922,7 +983,7 @@ impl NpuHaScopeActor {
+     /// When the standby side transitions to SwitchingToActive, it sends a SwitchoverRequest to the active side.
+     /// The active side validates and transitions to SwitchingToStandby if appropriate.
+     /// Following procedure documented in <https://github.com/sonic-net/SONiC/blob/master/doc/smart-switch/high-availability/smart-switch-ha-hld.md#82-planned-switchover>
+-    fn handle_switchover_request(&mut self, state: &mut State, key: &str) -> Result<HaEvent> {
++    pub(super) fn handle_switchover_request(&mut self, state: &mut State, key: &str) -> Result<HaEvent> {
+         let request: Option<SwitchoverRequest> = self.base.decode_hascope_actor_message(state.incoming(), key);
+         let Some(request) = request else {
+             return Err(anyhow!("Failed to decode SwitchoverRequest message"));
+@@ -933,7 +994,15 @@ impl NpuHaScopeActor {
+                 "The switchover request has been accepted by the peer: switchover_id={}",
+                 request.switchover_id
+             );
++            let retry_before = self.retry_count;
+             self.retry_count = 0;
++            if retry_before > 0 {
++                swbus_actor::tla_trace::emit(
++                    "NpuHandleSwitchoverFin",
++                    &self.base.id,
++                    serde_json::json!({"sharedRetry": self.retry_count}),
++                );
++            }
+             return Ok(HaEvent::None);
+         } else if request.flag == MessageMetaFlags::Rst {
+             info!(
+@@ -944,6 +1013,11 @@ impl NpuHaScopeActor {
+             if self.retry_count < 3 {
+                 self.send_switchover_request_to_peer(state, &request.switchover_id, MessageMetaFlags::Syn, true)?;
+                 self.retry_count += 1;
++                swbus_actor::tla_trace::emit(
++                    "NpuHandleSwitchoverRst",
++                    &self.base.id,
++                    serde_json::json!({"sharedRetry": self.retry_count}),
++                );
+                 return Ok(HaEvent::None);
+             } else {
+                 self.retry_count = 0;
+@@ -1358,18 +1432,22 @@ impl NpuHaScopeActor {
+         current_state: &HaState,
+         pending_state: &HaState,
+         event: &HaEvent,
+-    ) -> Result<()> {
++    ) -> Result<Vec<&'static str>> {
+         let _internal = state.internal();
++        let mut trace_actions = Vec::new();
+         match pending_state {
+             HaState::Connecting => {
+                 // Send a heartbeat message to the peer ha scope actor as a request to connect
+                 self.send_heartbeat_to_peer(state)?;
++                trace_actions.push("Heartbeat");
+                 // Send a signal to itself to schedule a check later
+                 self.send_self_notification(state, "CheckPeerConnection", RETRY_INTERVAL)?;
++                trace_actions.push("CheckPeerConnection");
+             }
+             HaState::Connected => {
+                 // Send VoteRequest to the peer to start primary election
+                 self.send_vote_request_to_peer(state, false)?;
++                trace_actions.push("VoteRequest");
+             }
+             HaState::InitializingToActive => {
+                 // If the peer's ASIC has already acked the standby role and the peer
+@@ -1386,6 +1464,7 @@ impl NpuHaScopeActor {
+                 let operations: Vec<(String, String)> = vec![(Uuid::new_v4().to_string(), "activate_role".to_string())];
+                 self.base
+                     .update_npu_ha_scope_state_pending_operations(state, operations, Vec::new())?;
++                trace_actions.push("PendingOperation");
+             }
+             HaState::Standalone => {
+                 // Activate Standalone role on DPU with a new term
+@@ -1423,6 +1502,8 @@ impl NpuHaScopeActor {
+                         // Cannot connect with peer, enter standalone right away
+                         error!("Failed to send DPURequestEnterStandalone to peer: {e}");
+                         self.send_self_notification(state, "EnterStandalone", 0)?;
++                    } else {
++                        trace_actions.push("FailoverRequest");
+                     }
+                 }
+             }
+@@ -1431,6 +1512,7 @@ impl NpuHaScopeActor {
+                     // When starting from PendingActiveRoleActivation, no need to do bulk sync.
+                     // Send BulkSyncCompleted signal to the peer immediately
+                     self.send_bulk_sync_completed_to_peer(state)?;
++                    trace_actions.push("BulkSyncCompleted");
+                 } else if *current_state == HaState::SwitchingToActive {
+                     // Per HLD Section 8.2.1 Step 5: Switchover to active is complete.
+                     // Mark switchover as completed on the new active side.
+@@ -1450,8 +1532,10 @@ impl NpuHaScopeActor {
+                     // Per HLD Section 8.2.1 Step 6: Switchover to standby is complete.
+                     // Mark switchover as completed on the new standby side.
+                     self.complete_switchover(state, "completed")?;
++                    trace_actions.push("SwitchoverFin");
+                 } else if *current_state == HaState::SwitchingToActive {
+                     self.complete_switchover(state, "failed")?;
++                    trace_actions.push("SwitchoverFin");
+                 }
+                 // The Standby role on DPU may have been activated, this operation is to update the term and also ensure the DPU is in standby role if not done previously
+                 let _ = self.update_dpu_ha_scope_table_with_params(state, HaRole::Standby.as_str_name());
+@@ -1467,6 +1551,7 @@ impl NpuHaScopeActor {
+                     .and_then(|s| s.switchover_id)
+                     .unwrap_or_default();
+                 self.send_switchover_request_to_peer(state, &switchover_id, MessageMetaFlags::Syn, false)?;
++                trace_actions.push("SwitchoverRequest");
+                 self.set_npu_switchover_state(state, &switchover_id, "in_progress")?;
+             }
+             HaState::SwitchingToStandby => {
+@@ -1480,7 +1565,7 @@ impl NpuHaScopeActor {
+             }
+             _ => {}
+         }
+-        Ok(())
++        Ok(trace_actions)
+     }
+ 
+     fn drive_npu_state_machine(&mut self, state: &mut State, event: &HaEvent) -> Result<()> {
+@@ -1539,6 +1624,11 @@ impl NpuHaScopeActor {
+ 
+             // Rehydration completed, reset the flag
+             self.rehydration_needed = false;
++            swbus_actor::tla_trace::emit(
++                "NpuApplyRehydrationSideEffects",
++                &self.base.id,
++                serde_json::json!({}),
++            );
+             return Ok(());
+         }
+ 
+@@ -1548,11 +1638,37 @@ impl NpuHaScopeActor {
+             Some((next_state, reason)) if next_state != current_state => {
+                 info!("Pending next state: {}, reason: {}", next_state.as_str_name(), reason);
+                 let pending_state = next_state;
+-                self.apply_pending_state_side_effects(state, &current_state, &pending_state, &event_to_use)?;
++                let trace_actions =
++                    self.apply_pending_state_side_effects(state, &current_state, &pending_state, &event_to_use)?;
+                 self.set_npu_local_ha_state(state, pending_state, reason)?;
+ 
+                 // send out HaScopeActorState message to the peer and ha-set actor
+                 self.broadcast_ha_scope_state(state, pending_state);
++                let peer_ack_branch = event_to_use == HaEvent::PeerStateChanged
++                    && matches!(
++                        pending_state,
++                        HaState::PendingActiveActivation | HaState::Active
++                    );
++                if peer_ack_branch {
++                    swbus_actor::tla_trace::emit(
++                        "NpuDriveStateMachinePeerAck",
++                        &self.base.id,
++                        serde_json::json!({}),
++                    );
++                } else {
++                    swbus_actor::tla_trace::emit(
++                        "NpuDriveStateMachine",
++                        &self.base.id,
++                        serde_json::json!({"nextState": trace_cp_state(pending_state)}),
++                    );
++                }
++                for action in trace_actions {
++                    swbus_actor::tla_trace::emit(
++                        "ActorDriverSendQueuedAction",
++                        &self.base.id,
++                        serde_json::json!({"action": action}),
++                    );
++                }
+             }
+             _ => {
+                 // No state transition. Handle special cases that require side effects
+@@ -1944,7 +2060,11 @@ impl NpuHaScopeActor {
+     /// Check if the peer HA scope is connected
+     /// If not, send a self notification to schedule an execution of the same function for later
+     /// Upon exceeding retry count threshold, signal a PeerLost event
+-    async fn check_peer_connection_and_retry(&mut self, state: &mut State, context: &mut Context) -> Result<HaEvent> {
++    pub(super) async fn check_peer_connection_and_retry(
++        &mut self,
++        state: &mut State,
++        context: &mut Context,
++    ) -> Result<HaEvent> {
+         if !self.peer_connected {
+             if self.retry_count < MAX_RETRIES {
+                 // retry connecting with peer
+@@ -1966,15 +2086,33 @@ impl NpuHaScopeActor {
+ 
+                 // Send a signal to itself to schedule a check later
+                 self.send_self_notification(state, "CheckPeerConnection", RETRY_INTERVAL)?;
++                swbus_actor::tla_trace::emit(
++                    "NpuCheckPeerConnectionAndRetry",
++                    &self.base.id,
++                    serde_json::json!({"sharedRetry": self.retry_count}),
++                );
+             } else {
+                 // reset retry count
+                 // report peer lost
+                 self.retry_count = 0;
++                swbus_actor::tla_trace::emit(
++                    "NpuCheckPeerConnectionLost",
++                    &self.base.id,
++                    serde_json::json!({"sharedRetry": self.retry_count}),
++                );
+                 return Ok(HaEvent::PeerLost);
+             }
+         } else {
+             // no-op but resetting retry count, if the peer is connected
++            let retry_before = self.retry_count;
+             self.retry_count = 0;
++            if retry_before > 0 {
++                swbus_actor::tla_trace::emit(
++                    "NpuPeerConnectedReset",
++                    &self.base.id,
++                    serde_json::json!({"sharedRetry": self.retry_count}),
++                );
++            }
+         }
+         Ok(HaEvent::None)
+     }
+@@ -2212,6 +2350,15 @@ impl NpuHaScopeActor {
+         let msg = ActorMessage::new(self.base.ha_scope_id.clone(), &kfv)?;
+         outgoing.send(outgoing.common_bridge_sp::<DashHaScopeTable>(), msg);
+ 
++        swbus_actor::tla_trace::emit(
++            "NpuUpdateDpuHaScopeTable",
++            &self.base.id,
++            serde_json::json!({
++                "role": ha_role_to_string(ha_role),
++                "term": dash_ha_scope.ha_term,
++            }),
++        );
++
+         Ok(())
+     }
+ 
+diff --git a/crates/hamgrd/src/actors/ha_set.rs b/crates/hamgrd/src/actors/ha_set.rs
+index 6e924a6..b69e7e1 100644
+--- a/crates/hamgrd/src/actors/ha_set.rs
++++ b/crates/hamgrd/src/actors/ha_set.rs
+@@ -223,6 +223,17 @@ impl HaSetActor {
+         for actor_sp in peer_actors {
+             outgoing.send(actor_sp, msg.clone());
+         }
++        let trace_node = vdpus
++            .iter()
++            .find(|vdpu| vdpu.is_primary)
++            .or_else(|| vdpus.first())
++            .map(|vdpu| vdpu.id.as_str())
++            .unwrap_or(self.id.as_str());
++        swbus_actor::tla_trace::emit(
++            "HaSetActorUpdateDashHaSetTable",
++            trace_node,
++            serde_json::json!({}),
++        );
+         Ok(())
+     }
+ 
+@@ -253,6 +264,7 @@ impl HaSetActor {
+         vdpus: &[VDpuStateExt],
+         incoming: &Incoming,
+         outgoing: &mut Outgoing,
++        writer: &'static str,
+     ) -> Result<()> {
+         let Some(global_cfg) = Self::get_dash_global_config(incoming) else {
+             return Ok(());
+@@ -350,6 +362,19 @@ impl HaSetActor {
+         let msg = ActorMessage::new(self.id.clone(), &kfv)?;
+         outgoing.send(outgoing.common_bridge_sp::<VnetRouteTunnelTable>(), msg);
+ 
++        let trace_node = vdpus
++            .iter()
++            .find(|vdpu| vdpu.is_primary)
++            .or_else(|| vdpus.first())
++            .map(|vdpu| vdpu.id.as_str())
++            .unwrap_or(self.id.as_str());
++        let event = match writer {
++            "ScopeState" => "HaSetComputeRouteFromScope",
++            "Replay" => "HaSetComputeRouteFromReplay",
++            _ => "HaSetComputeRouteFromConfig",
++        };
++        swbus_actor::tla_trace::emit(event, trace_node, serde_json::json!({}));
++
+         Ok(())
+     }
+ 
+@@ -854,7 +879,8 @@ impl HaSetActor {
+                 return Ok(());
+             };
+ 
+-            self.update_vnet_route_tunnel_table(&vdpus, incoming, outgoing).await?;
++            self.update_vnet_route_tunnel_table(&vdpus, incoming, outgoing, "Config")
++                .await?;
+             self.update_bfd_sessions(incoming, outgoing, false)?;
+         }
+         Ok(())
+@@ -868,7 +894,8 @@ impl HaSetActor {
+         // global config update affects Vxlan tunnel and dash-ha-set in DPU
+         self.update_dash_ha_set_table(&vdpus, incoming, outgoing)?;
+         if self.ha_owner == HaOwner::Dpu {
+-            self.update_vnet_route_tunnel_table(&vdpus, incoming, outgoing).await?;
++            self.update_vnet_route_tunnel_table(&vdpus, incoming, outgoing, "Config")
++                .await?;
+         }
+         self.update_bfd_sessions(incoming, outgoing, false)?;
+         Ok(())
+@@ -882,7 +909,8 @@ impl HaSetActor {
+         };
+         self.update_dash_ha_set_table(&vdpus, incoming, outgoing)?;
+         if self.ha_owner == HaOwner::Dpu {
+-            self.update_vnet_route_tunnel_table(&vdpus, incoming, outgoing).await?;
++            self.update_vnet_route_tunnel_table(&vdpus, incoming, outgoing, "Config")
++                .await?;
+         }
+         // Note: vdpu state update doesn't change the set of npu_ips, but
+         // may provide initial vdpu states needed for BFD session creation
+@@ -935,6 +963,13 @@ impl HaSetActor {
+ 
+             outgoing.send(entry.source.clone(), msg);
+         }
++        if active {
++            swbus_actor::tla_trace::emit(
++                "ActorRegistrationHandle",
++                &entry.source.resource_id,
++                serde_json::json!({}),
++            );
++        }
+         Ok(())
+     }
+ 
+@@ -990,7 +1025,8 @@ impl HaSetActor {
+                     "Received HaScopeStateUpdate with owner={} state={}, updating VNET ROUTE table.",
+                     self.ha_owner as i32, &ha_scope.new_state
+                 );
+-                self.update_vnet_route_tunnel_table(&vdpus, incoming, outgoing).await?;
++                self.update_vnet_route_tunnel_table(&vdpus, incoming, outgoing, "ScopeState")
++                    .await?;
+             }
+         }
+ 
+@@ -1023,10 +1059,19 @@ impl HaSetActor {
+         }
+ 
+         self.register_to_vdpu_actor(outgoing, false)?;
++        swbus_actor::tla_trace::emit(
++            "HaSetActorDoCleanup",
++            &self.id,
++            serde_json::json!({}),
++        );
+         Ok(())
+     }
+ }
+ 
++#[cfg(test)]
++#[path = "ha_set_trace_scenarios.rs"]
++mod trace_scenarios;
++
+ impl Actor for HaSetActor {
+     #[instrument(name="handle_message", level="info", skip_all, fields(actor=format!("ha-set/{}", self.id), key=key))]
+     async fn handle_message(&mut self, state: &mut State, key: &str, context: &mut Context) -> Result<()> {
+diff --git a/crates/swbus-actor/src/driver.rs b/crates/swbus-actor/src/driver.rs
+index 13367d5..ba4cd5f 100644
+--- a/crates/swbus-actor/src/driver.rs
++++ b/crates/swbus-actor/src/driver.rs
+@@ -63,6 +63,11 @@ impl<A: Actor> ActorDriver<A> {
+                         "actor {} terminated",
+                         self.swbus_edge.get_service_path().to_longest_path()
+                     );
++                    crate::tla_trace::emit(
++                        "ActorDriverFinishDelete",
++                        &self.swbus_edge.get_service_path().resource_id,
++                        serde_json::json!({}),
++                    );
+                     break;
+                 } else {
+                     debug!(
+@@ -94,6 +99,11 @@ impl<A: Actor> ActorDriver<A> {
+                         })
+                         .await
+                         .expect("failed to send swbus message");
++                    crate::tla_trace::emit(
++                        "ActorDriverHandleSetWhileDeleting",
++                        &self.swbus_edge.get_service_path().resource_id,
++                        serde_json::json!({}),
++                    );
+                     return;
+                 }
+ 
+@@ -124,6 +134,24 @@ impl<A: Actor> ActorDriver<A> {
+                     .await
+                     .expect("failed to send swbus message");
+ 
++                let raw_node = &self.swbus_edge.get_service_path().resource_id;
++                if actor_msg.key.starts_with("HaScopeActorState|") {
++                    crate::tla_trace::emit(
++                        "IncomingHandleRequest",
++                        raw_node,
++                        serde_json::json!({"requestIdRaw": id.to_string()}),
++                    );
++                } else if matches!(
++                    actor_msg.key.as_str(),
++                    "DASH_HA_SET_CONFIG_TABLE" | "DASH_HA_SCOPE_CONFIG_TABLE"
++                ) {
++                    crate::tla_trace::emit(
++                        "ActorDriverHandleSwbusMessage",
++                        raw_node,
++                        serde_json::json!({}),
++                    );
++                }
++
+                 if let Ok(key) = res {
+                     self.handle_actor_message(&key).await;
+                 }
+@@ -145,10 +173,28 @@ impl<A: Actor> ActorDriver<A> {
+ 
+     /// Handle an actor message in the incoming state table, triggering `Actor::handle_message`.
+     async fn handle_actor_message(&mut self, key: &str) {
++        let modeled_config = matches!(
++            key,
++            "DASH_HA_SET_CONFIG_TABLE" | "DASH_HA_SCOPE_CONFIG_TABLE"
++        );
++        if modeled_config {
++            crate::tla_trace::emit(
++                "ActorDriverHandleActorMessage",
++                &self.swbus_edge.get_service_path().resource_id,
++                serde_json::json!({}),
++            );
++        }
+         let res = self.actor.handle_message(&mut self.state, key, &mut self.context).await;
+         let (error_code, error_message) = match res {
+             Ok(()) => {
+                 self.state.internal.commit_changes().await;
++                if modeled_config {
++                    crate::tla_trace::emit(
++                        "ActorDriverCommitChanges",
++                        &self.swbus_edge.get_service_path().resource_id,
++                        serde_json::json!({}),
++                    );
++                }
+                 self.state.outgoing.send_queued_messages().await;
+                 (SwbusErrorCode::Ok, String::new())
+             }
+diff --git a/crates/swbus-actor/src/lib.rs b/crates/swbus-actor/src/lib.rs
+index 053976f..9b5f049 100644
+--- a/crates/swbus-actor/src/lib.rs
++++ b/crates/swbus-actor/src/lib.rs
+@@ -1,5 +1,7 @@
+ mod driver;
+ 
++pub mod tla_trace;
++
+ pub mod actor_message;
+ pub mod runtime;
+ pub mod state;
+diff --git a/crates/swbus-actor/src/state.rs b/crates/swbus-actor/src/state.rs
+index 48d04f1..18b16e0 100644
+--- a/crates/swbus-actor/src/state.rs
++++ b/crates/swbus-actor/src/state.rs
+@@ -18,7 +18,7 @@ pub struct State {
+ }
+ 
+ impl State {
+-    pub(crate) fn new(swbus_edge: Arc<SimpleSwbusEdgeClient>) -> Self {
++    pub fn new(swbus_edge: Arc<SimpleSwbusEdgeClient>) -> Self {
+         Self {
+             internal: Internal::new(),
+             incoming: Incoming::new(swbus_edge.clone()),
+diff --git a/crates/swbus-actor/src/state/incoming.rs b/crates/swbus-actor/src/state/incoming.rs
+index 0b55b6c..7937e18 100644
+--- a/crates/swbus-actor/src/state/incoming.rs
++++ b/crates/swbus-actor/src/state/incoming.rs
+@@ -59,7 +59,7 @@ impl Incoming {
+ 
+     /// Extracts the ActorMessage from a request and inserts it into the table,
+     /// and returns a clone of the key to pass to the actor callback.
+-    pub(crate) async fn handle_request(
++    pub async fn handle_request(
+         &mut self,
+         id: MessageId,
+         source: ServicePath,
+diff --git a/crates/swbus-actor/src/state/outgoing.rs b/crates/swbus-actor/src/state/outgoing.rs
+index e6944c4..909085d 100644
+--- a/crates/swbus-actor/src/state/outgoing.rs
++++ b/crates/swbus-actor/src/state/outgoing.rs
+@@ -35,7 +35,11 @@ impl Outgoing {
+     ///
+     /// If the actor callback fails, the message will be dropped.
+     pub fn send(&mut self, dest: ServicePath, msg: ActorMessage) {
++        let trace_destination = dest.clone();
++        let trace_key = msg.key.clone();
++        let trace_data = msg.data.clone();
+         let swbus_message = actor_msg_to_swbus_msg(&msg, dest, &self.swbus_client);
++        let trace_request_id = swbus_message.header.as_ref().map(|header| header.id);
+         let time_sent = SystemTime::now();
+         self.queued_messages.push({
+             UnackedMessage {
+@@ -44,6 +48,24 @@ impl Outgoing {
+                 time_sent,
+             }
+         });
++        if trace_destination.resource_type == "ha-scope" && trace_key.starts_with("HaScopeActorState|") {
++            let generation = trace_data
++                .get("term")
++                .and_then(|value| value.as_u64().or_else(|| value.as_str().and_then(|raw| raw.parse().ok())))
++                .unwrap_or(1)
++                .max(1);
++            crate::tla_trace::emit(
++                "OutgoingSendHaScopeState",
++                &trace_destination.resource_id,
++                serde_json::json!({
++                    "requestIdRaw": trace_request_id.unwrap_or_default().to_string(),
++                    "generation": generation,
++                    "peerState": trace_wire_state(trace_data.get("new_state").and_then(|value| value.as_str())),
++                    "ackedRole": trace_wire_role(trace_data.get("acked_asic_ha_state").and_then(|value| value.as_str())),
++                    "owner": "NoOwner",
++                }),
++            );
++        }
+     }
+ 
+     pub fn send_with_delay(&mut self, dest: ServicePath, msg: ActorMessage, delay: Duration) {
+@@ -90,6 +112,19 @@ impl Outgoing {
+ 
+             let id = msg.swbus_message.header.as_ref().unwrap().id;
+             let actor_msg = msg.actor_message.clone();
++            let destination = msg
++                .swbus_message
++                .header
++                .as_ref()
++                .and_then(|header| header.destination.as_ref())
++                .cloned();
++            let trace_operation = actor_msg
++                .data
++                .get("operation")
++                .and_then(|value| value.as_str())
++                .unwrap_or_default()
++                .to_string();
++            let trace_is_ha_set_state = actor_msg.key.starts_with("HaSetActorState|");
+ 
+             // Update the table for GetActorState
+             match self.sent_messages.get_mut(msg.key()) {
+@@ -102,6 +137,29 @@ impl Outgoing {
+ 
+             // Add to unacked messages/resend queue
+             self.unacked_messages.insert(id, msg);
++
++            if let Some(destination) = destination {
++                let event = if destination.resource_id.contains("DASH_HA_SET_TABLE") {
++                    Some(if trace_operation.eq_ignore_ascii_case("del") {
++                        "ActorDriverSendQueuedHaSetDelete"
++                    } else {
++                        "ActorDriverSendQueuedHaSetWrite"
++                    })
++                } else if destination.resource_id.contains("DASH_HA_SCOPE_TABLE") {
++                    Some("ActorDriverSendQueuedScopeWrite")
++                } else if trace_is_ha_set_state {
++                    Some("ActorDriverSendQueuedHaSetState")
++                } else {
++                    None
++                };
++                if let Some(event) = event {
++                    crate::tla_trace::emit(
++                        event,
++                        &self.swbus_client.get_service_path().resource_id,
++                        serde_json::json!({"requestIdRaw": id.to_string()}),
++                    );
++                }
++            }
+         }
+ 
+         // requeue all the delayed messages
+@@ -125,6 +183,11 @@ impl Outgoing {
+     ) {
+         let Some(unacked_message) = self.unacked_messages.get(&id) else {
+             // Response for message that was already acked. Ignore it.
++            crate::tla_trace::emit(
++                "OutgoingHandleLateResponse",
++                &self.swbus_client.get_service_path().resource_id,
++                serde_json::json!({"requestIdRaw": id.to_string()}),
++            );
+             return;
+         };
+ 
+@@ -137,6 +200,11 @@ impl Outgoing {
+         // Response was successfully acked. Remove it from unacked messages/resend queue
+         if error_code == SwbusErrorCode::Ok {
+             self.unacked_messages.remove(&id);
++            crate::tla_trace::emit(
++                "OutgoingHandleResponse",
++                &self.swbus_client.get_service_path().resource_id,
++                serde_json::json!({"requestIdRaw": id.to_string()}),
++            );
+         }
+     }
+ 
+@@ -165,8 +233,33 @@ impl Outgoing {
+             self.last_resend_time = now;
+ 
+             // Drop messages that have been unacked for over a minute, as a memory leak failsafe
+-            self.unacked_messages
+-                .retain(|_, msg| Duration::from_secs(get_elapsed_time(&msg.time_sent)) < Duration::from_secs(60));
++            let mut expired = Vec::new();
++            self.unacked_messages.retain(|id, msg| {
++                let keep = Duration::from_secs(get_elapsed_time(&msg.time_sent)) < Duration::from_secs(60);
++                if !keep {
++                    let destination = msg
++                        .swbus_message
++                        .header
++                        .as_ref()
++                        .and_then(|header| header.destination.as_ref())
++                        .map(|sp| sp.resource_id.clone())
++                        .unwrap_or_default();
++                    expired.push((*id, destination));
++                }
++                keep
++            });
++            for (id, destination) in expired {
++                let event = if destination.contains("DASH_HA_SET_TABLE") {
++                    "ActorDriverCleanupTimeout"
++                } else {
++                    "OutgoingDropExpired"
++                };
++                crate::tla_trace::emit(
++                    event,
++                    &self.swbus_client.get_service_path().resource_id,
++                    serde_json::json!({"requestIdRaw": id.to_string()}),
++                );
++            }
+ 
+             // Resend unacked messages
+             for msg in self.unacked_messages.values() {
+@@ -178,6 +271,12 @@ impl Outgoing {
+ 
+                     // Update the table for GetActorState
+                     self.sent_messages.get_mut(msg.key()).unwrap().message_resent();
++                    let id = msg.swbus_message.header.as_ref().map(|header| header.id).unwrap_or_default();
++                    crate::tla_trace::emit(
++                        "OutgoingDriveMaintenanceLoop",
++                        &self.swbus_client.get_service_path().resource_id,
++                        serde_json::json!({"requestIdRaw": id.to_string()}),
++                    );
+                 }
+             }
+         }
+@@ -216,6 +315,26 @@ impl Outgoing {
+     }
+ }
+ 
++fn trace_wire_state(raw: Option<&str>) -> &'static str {
++    match raw.unwrap_or_default().to_ascii_lowercase().as_str() {
++        "active" | "ha_state_active" => "Active",
++        "standalone" | "ha_state_standalone" => "Standalone",
++        "initializing_to_standby" | "ha_state_initializing_to_standby" => "InitializingToStandby",
++        "switching_to_standby" | "ha_state_switching_to_standby" => "SwitchingToStandby",
++        _ => "Dead",
++    }
++}
++
++fn trace_wire_role(raw: Option<&str>) -> &'static str {
++    match raw.unwrap_or_default().to_ascii_lowercase().as_str() {
++        "active" | "ha_role_active" => "Active",
++        "standby" | "ha_role_standby" => "Standby",
++        "standalone" | "ha_role_standalone" => "Standalone",
++        "dead" | "ha_role_dead" => "Dead",
++        _ => "None",
++    }
++}
++
+ pub fn get_elapsed_time(systime: &SystemTime) -> u64 {
+     match systime.elapsed() {
+         Ok(elapsed) => elapsed.as_secs(),
+diff --git a/crates/swss-common-bridge/src/consumer.rs b/crates/swss-common-bridge/src/consumer.rs
+index b101fcb..063cf0c 100644
+--- a/crates/swss-common-bridge/src/consumer.rs
++++ b/crates/swss-common-bridge/src/consumer.rs
+@@ -100,6 +100,34 @@ where
+                 })
+                 .await
+                 .expect("Sending swbus message");
++
++            if matches!(
++                P::table_name(),
++                "DASH_HA_SET_CONFIG_TABLE" | "DASH_HA_SCOPE_CONFIG_TABLE"
++            ) {
++                let event = if kfv.operation == KeyOperation::Del {
++                    "ConsumerBridgeConfigDelete"
++                } else {
++                    "ConsumerBridgeConfigSet"
++                };
++                let epoch = kfv
++                    .field_values
++                    .get("json")
++                    .and_then(|raw| {
++                        serde_json::from_str::<serde_json::Value>(&raw.to_string_lossy()).ok()
++                    })
++                    .and_then(|value| value.get("version").cloned())
++                    .and_then(|value| {
++                        value
++                            .as_u64()
++                            .or_else(|| value.as_str().and_then(|raw| raw.parse().ok()))
++                    });
++                swbus_actor::tla_trace::emit(
++                    event,
++                    &kfv.key,
++                    serde_json::json!({"epoch": epoch}),
++                );
++            }
+         };
+ 
+         // Send initial/rehydration updates
+diff --git a/crates/swss-common-bridge/src/producer.rs b/crates/swss-common-bridge/src/producer.rs
+index 5bb423c..a3f6e59 100644
+--- a/crates/swss-common-bridge/src/producer.rs
++++ b/crates/swss-common-bridge/src/producer.rs
+@@ -29,6 +29,7 @@ pub fn spawn_producer_bridge<T>(rt: Arc<SwbusEdgeRuntime>, addr: ServicePath, mu
+ where
+     T: ProducerTable,
+ {
++    let trace_table = addr.resource_id.clone();
+     let swbus = SimpleSwbusEdgeClient::new(rt, addr, false, false);
+     tokio::task::spawn(async move {
+         loop {
+@@ -45,7 +46,25 @@ where
+             let (error_code, error_message) = match ActorMessage::deserialize(&payload) {
+                 Ok(actor_msg) => match actor_msg.deserialize_data::<KeyOpFieldValues>() {
+                     Ok(kfv) => {
++                        let trace_key = kfv.key.clone();
++                        let trace_is_delete = kfv.operation == KeyOperation::Del;
+                         table.apply_kfv(kfv).await;
++                        let event = if trace_table.contains("DASH_HA_SET_TABLE") {
++                            Some(if trace_is_delete {
++                                "ProducerBridgeApplyHaSetDelete"
++                            } else {
++                                "ProducerBridgeApplyHaSet"
++                            })
++                        } else if trace_table.contains("DASH_HA_SCOPE_TABLE") && !trace_is_delete {
++                            Some("ProducerBridgeApplyScope")
++                        } else if trace_table.contains("VNET_ROUTE_TUNNEL_TABLE") && !trace_is_delete {
++                            Some("ProducerBridgeApplyRoute")
++                        } else {
++                            None
++                        };
++                        if let Some(event) = event {
++                            swbus_actor::tla_trace::emit(event, &trace_key, serde_json::json!({}));
++                        }
+                         (SwbusErrorCode::Ok, String::new())
+                     }
+                     Err(e) => (
+

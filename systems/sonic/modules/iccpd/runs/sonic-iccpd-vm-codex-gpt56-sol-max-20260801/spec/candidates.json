@@ -1,0 +1,83 @@
+{
+  "schema_version": "2",
+  "system": "iccpd",
+  "generated_by": "consolidate",
+  "findings": [
+    {
+      "id": "MC-1",
+      "title": "Crash after socket teardown permanently skips peer failover cleanup",
+      "source": "model-checking",
+      "scenario": "1 — warm recovery and reconstruction",
+      "severity": "High",
+      "invariant": "MCWarmRecoveryTerminates",
+      "config": "MC_hunt_scenario1.cfg",
+      "counterexample": "spec/output/MC_hunt_scenario1_bfs_validated.out",
+      "affected_code": [
+        "src/iccpd/src/scheduler.c:844",
+        "src/iccpd/src/mlacp_link_handler.c:2391",
+        "src/iccpd/src/system.c:57",
+        "src/iccpd/src/scheduler.c:375",
+        "dockers/docker-iccpd/supervisord.conf:39"
+      ],
+      "summary": "The peer socket is torn down before mlacp_peer_disconn_handler performs failover cleanup. An abrupt process death in that gap destroys the volatile disconnect state, and startup rebuilds userspace caches without replaying FDB conversion, ICCP-down publication, isolation cleanup, traffic recovery, or remote-interface deletion. The node can therefore remain disconnected with stale forwarding state and no remaining cleanup trigger. Cleanup must be made idempotent and crash-consistent with a startup reconciliation barrier.",
+      "dedup_note": "also covers code-review Scenario 1 (same crash-window loss of failover and recovery state across socket teardown and restart)"
+    },
+    {
+      "id": "MC-2",
+      "title": "Uncorrelated resync requests accept an earlier response as the latest transaction",
+      "source": "model-checking",
+      "scenario": "2 — synchronization transaction integrity",
+      "severity": "High",
+      "invariant": "MCSyncEnvelopeOrdering",
+      "config": "MC_hunt_scenario2.cfg",
+      "counterexample": "spec/output/MC_hunt_scenario2_bfs_validated.out",
+      "affected_code": [
+        "src/iccpd/src/mlacp_fsm.c:1544",
+        "src/iccpd/src/mlacp_sync_prepare.c:49",
+        "src/iccpd/src/mlacp_sync_prepare.c:105",
+        "src/iccpd/src/mlacp_fsm.c:538"
+      ],
+      "summary": "Established resync does not serialize against an outstanding response, so a second need_to_sync event can issue another request before the first response arrives. Every request uses wire request number zero, and Sync Start/End processing never correlates that number with the current transaction. The earlier response is consequently accepted as the later request and can apply stale state or clear the wrong wait. Use unique request IDs, one outstanding transaction, and validated Start/Data/End envelopes.",
+      "dedup_note": "also covers code-review Scenario 2 (same uncorrelated, non-serialized synchronization transaction at mlacp_fsm.c and mlacp_sync_prepare.c)"
+    },
+    {
+      "id": "MC-3",
+      "title": "Failed traffic-disable leaves a flapping MLAG port forwarding before current isolation",
+      "source": "model-checking",
+      "scenario": "3 — data-plane isolation and acknowledgement",
+      "severity": "High",
+      "invariant": "MCCurrentIsolationBeforeTraffic",
+      "config": "MC_hunt_scenario3.cfg",
+      "counterexample": "spec/output/MC_hunt_scenario3_bfs_validated.out",
+      "affected_code": [
+        "src/iccpd/src/mlacp_link_handler.c:2067",
+        "src/iccpd/src/mlacp_link_handler.c:3588",
+        "src/iccpd/src/mlacp_link_handler.c:530",
+        "src/iccpd/src/iccp_netlink.c:2212",
+        "src/iccpd/src/scheduler.c:469"
+      ],
+      "summary": "A PortChannel DOWN event makes only one attempt to disable traffic through mclagsyncd. If that write fails, is_traffic_disable remains false and no retry obligation is retained; a rapid UP then leaves forwarding enabled while the peer still has an older isolation generation. Ignored sidecar EOF and stale-descriptor reconnect logic make this failure persistent. Fail closed, repair the sidecar connection, retry until acknowledged, and release forwarding only after generation-correlated peer isolation.",
+      "dedup_note": "also covers code-review Scenario 3 (same failed isolation application allowing forwarding before current-generation peer isolation)"
+    },
+    {
+      "id": "CR-4",
+      "title": "Transport activity and scheduler progress diverge",
+      "source": "code-review",
+      "scenario": "4 — transport activity and scheduler progress",
+      "severity": "Medium",
+      "invariant": null,
+      "config": null,
+      "counterexample": null,
+      "affected_code": [
+        "src/iccpd/src/scheduler.c:129",
+        "src/iccpd/src/scheduler.c:318",
+        "src/iccpd/src/iccp_netlink.c:2225",
+        "src/iccpd/src/app_csm.c:100",
+        "src/iccpd/src/mlacp_link_handler.c:3369",
+        "src/iccpd/src/iccp_netlink.c:2212",
+        "src/iccpd/src/scheduler.c:469"
+      ],
+      "summary": "The single epoll scheduler can block indefinitely while reading a fragmented peer header or retrying a body, preventing protocol FSMs and timers from running. Conversely, any complete peer frame refreshes heartbeat state, so unsupported APP traffic can preserve a session even when synchronization makes no progress. A mclagsyncd EOF or error is ignored and leaves a positive stale descriptor that suppresses reconnect attempts, further separating apparent connectivity from actual control-plane progress. This transport-liveness mechanism was not represented by a model-checking finding and remains a code-review candidate for confirmation."
+    }
+  ]
+}

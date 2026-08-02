@@ -1,0 +1,223 @@
+diff --git a/src/iccpd/src/Makefile.am b/src/iccpd/src/Makefile.am
+index 7415f8d4d..c98ba0664 100644
+--- a/src/iccpd/src/Makefile.am
++++ b/src/iccpd/src/Makefile.am
+@@ -18,6 +18,7 @@ iccpd_SOURCES = \
+ 	    mlacp_sync_prepare.c mlacp_sync_update.c\
+ 	    mlacp_fsm.c \
+ 	    iccp_netlink.c \
++	    tla_trace.c \
+             openbsd_tree.c
+ iccpd_CFLAGS = $(DBGFLAGS) $(AM_CFLAGS) $(CFLAGS_COMMON)
+ iccpd_LDADD = -lnl-genl-3 -lnl-route-3 -lnl-3 -lpthread
+diff --git a/src/iccpd/src/iccp_csm.c b/src/iccpd/src/iccp_csm.c
+index 8dcae3992..8d9b76f33 100644
+--- a/src/iccpd/src/iccp_csm.c
++++ b/src/iccpd/src/iccp_csm.c
+@@ -31,6 +31,7 @@
+ #include "../include/iccp_csm.h"
+ #include "../include/iccp_cli.h"
+ #include "../include/mlacp_link_handler.h"
++#include "../include/tla_trace.h"
+ /*****************************************
+ * Define
+ *
+@@ -266,7 +267,7 @@ int iccp_csm_send(struct CSM* csm, char* buf, int msg_len)
+         csm->msg_log.end_index = 0;
+ 
+     tlv_type = ntohs(param->type);
+-    rc = write(csm->sock_fd, buf, msg_len);
++    rc = tla_trace_write(csm, csm->sock_fd, buf, msg_len);
+     if ((rc <= 0) || (rc != msg_len))
+     {
+         MLACP_SET_ICCP_TX_DBG_COUNTER(
+diff --git a/src/iccpd/src/iccp_netlink.c b/src/iccpd/src/iccp_netlink.c
+index a3e270295..c799ac29c 100644
+--- a/src/iccpd/src/iccp_netlink.c
++++ b/src/iccpd/src/iccp_netlink.c
+@@ -58,6 +58,7 @@
+ #include "../include/iccp_netlink.h"
+ #include "../include/mlacp_sync_update.h"
+ #include "../include/mlacp_tlv.h"
++#include "../include/tla_trace.h"
+ 
+ /**
+  * SECTION: Netlink helpers
+@@ -2232,6 +2233,8 @@ int iccp_handle_events(struct System * sys)
+                     {
+                         //consider any msg from peer as heartbeat update, this will be in scenarios of scaled msg sync b/w peers
+                         mlacp_fsm_update_heartbeat(csm, &dummy_tlv);
++                        tla_trace_event(csm,
++                            "scheduler_csm_read_callback_Complete");
+                     }
+                     break;
+                 }
+diff --git a/src/iccpd/src/mlacp_link_handler.c b/src/iccpd/src/mlacp_link_handler.c
+index a6ab21c0c..f3c1613d6 100644
+--- a/src/iccpd/src/mlacp_link_handler.c
++++ b/src/iccpd/src/mlacp_link_handler.c
+@@ -47,6 +47,7 @@
+ #include "../include/iccp_netlink.h"
+ #include "../include/scheduler.h"
+ #include "../include/iccp_ifm.h"
++#include "../include/tla_trace.h"
+ 
+ /*****************************************
+ * Enum
+@@ -2089,6 +2090,9 @@ void mlacp_portchannel_state_handler(struct CSM* csm,
+ 
+     update_po_if_info(csm, local_if, po_state);
+ 
++    tla_trace_event_bool(csm, "mlacp_portchannel_state_handler",
++                         po_state != 0);
++
+     /* Disable packet tx/rx on MLAG interface when it is down
+      * Traffic is re-enabled back after the interface is up and ack is
+      * received from peer
+@@ -2384,6 +2388,7 @@ void mlacp_peer_disconn_handler(struct CSM* csm)
+         /*peer connection must be establised again within 90s
+           from last disconnection for peer warm reboot*/
+         time(&csm->warm_reboot_disconn_time);
++        tla_trace_event(csm, "mlacp_peer_disconn_handler_Grace");
+         ICCPD_LOG_DEBUG(__FUNCTION__, "Peer warm reboot and disconnect, recover to normal reboot for next time!");
+         return;
+     }
+@@ -2437,6 +2442,7 @@ void mlacp_peer_disconn_handler(struct CSM* csm)
+     {
+         mlacp_link_del_remote_if_info(csm->mlag_id, peer_if->name);
+     }
++    tla_trace_event(csm, "mlacp_peer_disconn_handler_Cleanup");
+     return;
+ }
+ 
+@@ -3608,7 +3614,14 @@ int iccp_mclagsyncd_msg_handler(struct System *sys)
+          ICCPD_LOG_DEBUG("ICCP_FSM", "MLAG_IF %s: set traffic disable, rc %d",
+              lif->name, rc);
+          if (rc == 0)
++         {
+              lif->is_traffic_disable = true;
++             tla_trace_event(lif->csm,
++                 "mlacp_link_disable_traffic_distribution_Success");
++         }
++         else
++             tla_trace_event(lif->csm,
++                 "mlacp_link_disable_traffic_distribution_Fail");
+      }
+  }
+ 
+@@ -3633,7 +3646,14 @@ int iccp_mclagsyncd_msg_handler(struct System *sys)
+         ICCPD_LOG_DEBUG("ICCP_FSM", "MLAG_IF %s: set traffic enable, rc %d",
+             lif->name, rc);
+         if (rc == 0)
++        {
+             lif->is_traffic_disable = false;
++            tla_trace_event(lif->csm,
++                "mlacp_link_enable_traffic_distribution_Success");
++        }
++        else
++            tla_trace_event(lif->csm,
++                "mlacp_link_enable_traffic_distribution_Fail");
+     }
+ }
+ 
+diff --git a/src/iccpd/src/mlacp_sync_update.c b/src/iccpd/src/mlacp_sync_update.c
+index d9a074022..0ffded940 100644
+--- a/src/iccpd/src/mlacp_sync_update.c
++++ b/src/iccpd/src/mlacp_sync_update.c
+@@ -35,6 +35,7 @@
+ #include "../include/iccp_consistency_check.h"
+ #include "../include/port.h"
+ #include "../include/openbsd_tree.h"
++#include "../include/tla_trace.h"
+ 
+ /*****************************************
+ * Port-Conf Update
+@@ -1345,6 +1346,7 @@ int mlacp_fsm_update_warmboot(struct CSM* csm, struct mLACPWarmbootTLV* tlv)
+         return MCLAG_ERROR;
+ 
+     time(&csm->peer_warm_reboot_time);
++    tla_trace_event(csm, "mlacp_fsm_update_warmboot");
+     ICCPD_LOG_DEBUG("ICCP_FSM", "RX peer warm reboot: start, sync_state %s",
+         mlacp_state(csm));
+     return 0;
+diff --git a/src/iccpd/src/scheduler.c b/src/iccpd/src/scheduler.c
+index 731f45796..2c59c8a04 100644
+--- a/src/iccpd/src/scheduler.c
++++ b/src/iccpd/src/scheduler.c
+@@ -41,6 +41,7 @@
+ #include "../include/iccp_cmd.h"
+ #include "../include/mlacp_link_handler.h"
+ #include "../include/iccp_netlink.h"
++#include "../include/tla_trace.h"
+ 
+ /******************************************************
+ *
+@@ -166,6 +167,8 @@ int scheduler_csm_read_callback(struct CSM* csm)
+             goto recv_err;
+         }
+         recv_len += len;
++        if (recv_len > 0 && recv_len < sizeof(LDPHdr))
++            tla_trace_partial_header(csm);
+         /*usleep(100);*/
+     }
+ 
+@@ -235,6 +238,8 @@ int scheduler_csm_read_callback(struct CSM* csm)
+         }
+         data_len -= recv_len;
+         pos += recv_len;
++        if (data_len > 0)
++            tla_trace_body_retry(csm);
+         /*usleep(100);*/
+     }
+     if (num_retry > 0)
+@@ -253,6 +258,7 @@ int scheduler_csm_read_callback(struct CSM* csm)
+     return 1;
+ 
+  recv_err:
++    tla_trace_read_error(csm);
+     scheduler_session_disconnect_handler(csm);
+     return MCLAG_ERROR;
+ }
+@@ -414,6 +420,7 @@ void mlacp_sync_send_warmboot_flag()
+     struct System* sys = NULL;
+     struct CSM* csm = NULL;
+     int msg_len = 0;
++    int rc = MCLAG_ERROR;
+ 
+     if ((sys = system_get_instance()) == NULL)
+         return;
+@@ -424,7 +431,13 @@ void mlacp_sync_send_warmboot_flag()
+         {
+             memset(g_csm_buf, 0, CSM_BUFFER_SIZE);
+             msg_len = mlacp_prepare_for_warm_reboot(csm, g_csm_buf, CSM_BUFFER_SIZE);
+-            iccp_csm_send(csm, g_csm_buf, msg_len);
++            if (msg_len > 0)
++                tla_trace_prepare_event(csm,
++                    "mlacp_sync_send_warmboot_flag", "Warmboot",
++                    "Warmboot", -1, -1, false);
++            rc = iccp_csm_send(csm, g_csm_buf, msg_len);
++            if (msg_len > 0)
++                tla_trace_send_result(csm, rc, msg_len);
+         }
+     }
+     ICCPD_LOG_DEBUG("ICCP_FSM", "Send warmboot flag to peer. Start warmboot");
+@@ -848,9 +861,13 @@ void scheduler_session_disconnect_handler(struct CSM* csm)
+         scheduler_csm_socket_cleanup(csm, 1);
+     }
+ 
++    if (!tla_trace_disconnect_prelogged(csm))
++        tla_trace_event(csm, "scheduler_session_disconnect_handler");
++
+     mlacp_peer_disconn_handler(csm);
+     MLACP(csm).current_state = MLACP_STATE_INIT;
+     iccp_csm_status_reset(csm, 0);
++    tla_trace_event(csm, "iccp_csm_status_reset");
+ 
+     time(&csm->connTimePrev);
+     session_conn_thread_unlock(&csm->conn_mutex);
+@@ -893,4 +910,3 @@ void scheduler_csm_socket_cleanup(struct CSM* csm, int location)
+     }
+     csm->sock_fd = -1;
+ }
+-
+

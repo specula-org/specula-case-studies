@@ -1,0 +1,121 @@
+{
+  "schema_version": "2",
+  "system": "sregym",
+  "generated_by": "consolidate",
+  "findings": [
+    {
+      "id": "MC-1",
+      "title": "Cleanup Can Start While Submission Evaluation Is In Flight",
+      "source": "model-checking",
+      "scenario": "1 — Evaluation and teardown have no common completion fence",
+      "severity": "High",
+      "invariant": "NoEvaluationDuringTeardown",
+      "config": "MC_hunt_scenario1.cfg",
+      "counterexample": "spec/output/MC_hunt_scenario1_bfs.out",
+      "affected_code": [
+        "main.py:397",
+        "main.py:411",
+        "sregym/conductor/conductor.py:387",
+        "sregym/conductor/conductor.py:576",
+        "sregym/conductor/conductor.py:603"
+      ],
+      "summary": "Timeout cleanup begins without a common fence with API submission admission, while process-exit handling only snapshots the current evaluation future. The API thread can accept a request after that snapshot but before the driver marks the run as tearing down. Conductor cleanup and submission each perform independent lifecycle checks, so teardown can recover and undeploy the environment while evaluation remains active. A single admission/teardown state machine must close submissions and join every admitted evaluation before cleanup.",
+      "dedup_note": "also covers code-review Scenario 1 (same unsynchronized submission-admission and teardown completion-fence mechanism at the affected driver and Conductor lifecycle sites)"
+    },
+    {
+      "id": "MC-2",
+      "title": "Delayed Duplicate Submission Is Graded in the Next Stage",
+      "source": "model-checking",
+      "scenario": "2 — Submission acknowledgments are not correlated to run or stage",
+      "severity": "Medium",
+      "invariant": "SubmissionOriginMatches",
+      "config": "MC_hunt_scenario2.cfg",
+      "counterexample": "spec/output/MC_hunt_scenario2_bfs.out",
+      "affected_code": [
+        "sregym/conductor/conductor_api.py:25",
+        "sregym/conductor/conductor_api.py:115",
+        "sregym/conductor/conductor_api.py:124",
+        "sregym/conductor/conductor_api.py:139",
+        "sregym/conductor/conductor.py:601"
+      ],
+      "summary": "HTTP and MCP submissions carry solution text but no run, stage, request identity, or idempotency token. Endpoint checks and retries use mutable current state, and Conductor.submit binds a request to the stage current at acceptance. The independent evaluator thread can advance diagnosis to mitigation between endpoint precheck and acceptance, causing a delayed duplicate diagnosis request to be graded as mitigation. Correlated lifecycle tokens must be validated atomically and stale retries must be rejected.",
+      "dedup_note": "also covers code-review Scenario 2 (same untagged delayed-or-duplicate submission mechanism at the affected API schema, retry, and Conductor acceptance sites)"
+    },
+    {
+      "id": "MC-3",
+      "title": "Persisted Baseline Is Reused Across Cluster Replacement",
+      "source": "model-checking",
+      "scenario": "3 — Crash/restart reconciliation trusts an unversioned baseline",
+      "severity": "High",
+      "invariant": "BaselineMatchesCluster",
+      "config": "MC_hunt_scenario3.cfg",
+      "counterexample": "spec/output/MC_hunt_scenario3_bfs.out",
+      "affected_code": [
+        "sregym/paths.py:16",
+        "sregym/service/cluster_state.py:83",
+        "sregym/service/cluster_state.py:100",
+        "sregym/service/cluster_state.py:183",
+        "sregym/conductor/conductor.py:841",
+        "sregym/service/cluster_state.py:227"
+      ],
+      "summary": "SREGym stores every cluster baseline at one home-directory path and serializes no cluster identity, generation, schema version, or completeness marker. After a process crash and cluster replacement, deploy_app accepts the old parseable file and marks it authoritative for the new cluster. Reconciliation then treats legitimate resources absent from the stale baseline as unexpected and can delete them. Baselines must be atomically versioned, bound to a verified live-cluster identity, and rejected or recaptured on any mismatch.",
+      "dedup_note": "partially covers code-review Scenario 3 (same unversioned cross-cluster baseline provenance and stale-baseline deletion mechanism); the distinct partial-capture and incomplete-restoration sites remain CR-3"
+    },
+    {
+      "id": "MC-4",
+      "title": "Pod Restart Temporarily Removes the Fault During Diagnosis",
+      "source": "model-checking",
+      "scenario": "4 — Stop/noise and Khaos reattachment do not establish quiescence",
+      "severity": "High",
+      "invariant": "FaultBeforeDiagnosis",
+      "config": "MC_hunt_scenario4.cfg",
+      "counterexample": "spec/output/MC_hunt_scenario4_bfs.out",
+      "affected_code": [
+        "sregym/conductor/problems/khaos_faults.py:140",
+        "sregym/conductor/problems/khaos_faults.py:147",
+        "sregym/conductor/problems/khaos_faults.py:174",
+        "sregym/conductor/problems/khaos_faults.py:178",
+        "sregym/conductor/conductor.py:298"
+      ],
+      "summary": "Khaos eBPF probes are tied to host PIDs, so a restarted container loses the intended fault until a background monitor resolves its new PID and reinjects. The polling loop can wait five seconds, PID resolution can add delay, and failures are retried later. Diagnosis remains available throughout that healthy interval because the conductor has no continuing fault-effectiveness gate. Stage readiness must track target container generations and pause or fail until reattachment is verified.",
+      "dedup_note": "partially covers code-review Scenario 4 (same Khaos pod-restart reattachment and fault-effectiveness gap); the distinct late noise-apply-after-stop sites remain CR-4"
+    },
+    {
+      "id": "CR-3",
+      "title": "Partial Baseline Observations Are Treated as Authoritative During Reconciliation",
+      "source": "code-review",
+      "scenario": "3 — Crash/restart reconciliation trusts an unversioned, possibly partial baseline",
+      "severity": "High",
+      "invariant": null,
+      "config": null,
+      "counterexample": null,
+      "affected_code": [
+        "sregym/service/cluster_state.py:98",
+        "sregym/service/cluster_state.py:130",
+        "sregym/service/cluster_state.py:184",
+        "sregym/service/cluster_state.py:352",
+        "sregym/service/cluster_state.py:451"
+      ],
+      "summary": "Baseline capture converts per-resource API observation failures into empty collections, so a transient read failure can be serialized as if it were a complete view. Deserialization also defaults omitted collections to empty values and provides no completeness check. Reconciliation then treats the partial snapshot as authoritative, can delete current objects absent from it, and does not recreate deleted baseline objects or restore arbitrary mutations. MC-3 represents stale cross-cluster provenance at overlapping baseline code, but its counterexample does not represent these distinct partial-capture and incomplete-restoration paths."
+    },
+    {
+      "id": "CR-4",
+      "title": "Noise Application Can Complete After Stop Cleanup",
+      "source": "code-review",
+      "scenario": "4 — Stop/noise and Khaos reattachment do not establish quiescence",
+      "severity": "High",
+      "invariant": null,
+      "config": null,
+      "counterexample": null,
+      "affected_code": [
+        "sregym/generators/noise/manager.py:71",
+        "sregym/generators/noise/manager.py:125",
+        "sregym/generators/noise/manager.py:157",
+        "sregym/generators/noise/manager.py:176",
+        "sregym/service/kubectl.py:714",
+        "sregym/conductor/conductor.py:468"
+      ],
+      "summary": "NoiseManager.stop waits only five seconds for the worker, then clears its thread reference and cleans only experiments already recorded. An in-flight kubectl apply can block past that join and is appended to the record only after the command returns, allowing it to complete after cleanup has inspected or cleared the list. The fallback removes finalizers without necessarily deleting that late resource, while evaluation starts immediately after stop returns. MC-4 represents the separate Khaos pod-restart reattachment window, not this late-apply path in NoiseManager."
+    }
+  ]
+}

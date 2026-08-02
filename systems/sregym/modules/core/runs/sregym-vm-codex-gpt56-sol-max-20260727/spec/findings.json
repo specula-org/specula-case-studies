@@ -1,0 +1,80 @@
+{
+  "schema_version": "2",
+  "system": "sregym",
+  "generated_by": "validation-workflow",
+  "findings": [
+    {
+      "id": "MC-1",
+      "title": "Cleanup Can Start While Submission Evaluation Is In Flight",
+      "source": "model-checking",
+      "scenario": "1 — Evaluation and teardown have no common completion fence",
+      "severity": "High",
+      "invariant": "NoEvaluationDuringTeardown",
+      "config": "MC_hunt_scenario1.cfg",
+      "counterexample": "spec/output/MC_hunt_scenario1_bfs.out",
+      "affected_code": [
+        "main.py:397",
+        "main.py:411",
+        "sregym/conductor/conductor.py:387",
+        "sregym/conductor/conductor.py:576",
+        "sregym/conductor/conductor.py:603"
+      ],
+      "summary": "Timeout cleanup begins without a common fence with API submission admission, while process-exit handling only snapshots the current evaluation future. The API thread can accept a request after that snapshot but before the driver marks the run as tearing down. Conductor cleanup and submission each perform independent lifecycle checks, so teardown can recover and undeploy the environment while evaluation remains active. A single admission/teardown state machine must close submissions and join every admitted evaluation before cleanup."
+    },
+    {
+      "id": "MC-2",
+      "title": "Delayed Duplicate Submission Is Graded in the Next Stage",
+      "source": "model-checking",
+      "scenario": "2 — Submission acknowledgments are not correlated to run or stage",
+      "severity": "Medium",
+      "invariant": "SubmissionOriginMatches",
+      "config": "MC_hunt_scenario2.cfg",
+      "counterexample": "spec/output/MC_hunt_scenario2_bfs.out",
+      "affected_code": [
+        "sregym/conductor/conductor_api.py:25",
+        "sregym/conductor/conductor_api.py:115",
+        "sregym/conductor/conductor_api.py:124",
+        "sregym/conductor/conductor_api.py:139",
+        "sregym/conductor/conductor.py:601"
+      ],
+      "summary": "HTTP and MCP submissions carry solution text but no run, stage, request identity, or idempotency token. Endpoint checks and retries use mutable current state, and Conductor.submit binds a request to the stage current at acceptance. The independent evaluator thread can advance diagnosis to mitigation between endpoint precheck and acceptance, causing a delayed duplicate diagnosis request to be graded as mitigation. Correlated lifecycle tokens must be validated atomically and stale retries must be rejected."
+    },
+    {
+      "id": "MC-3",
+      "title": "Persisted Baseline Is Reused Across Cluster Replacement",
+      "source": "model-checking",
+      "scenario": "3 — Crash/restart reconciliation trusts an unversioned baseline",
+      "severity": "High",
+      "invariant": "BaselineMatchesCluster",
+      "config": "MC_hunt_scenario3.cfg",
+      "counterexample": "spec/output/MC_hunt_scenario3_bfs.out",
+      "affected_code": [
+        "sregym/paths.py:16",
+        "sregym/service/cluster_state.py:83",
+        "sregym/service/cluster_state.py:100",
+        "sregym/service/cluster_state.py:183",
+        "sregym/conductor/conductor.py:841",
+        "sregym/service/cluster_state.py:227"
+      ],
+      "summary": "SREGym stores every cluster baseline at one home-directory path and serializes no cluster identity, generation, schema version, or completeness marker. After a process crash and cluster replacement, deploy_app accepts the old parseable file and marks it authoritative for the new cluster. Reconciliation then treats legitimate resources absent from the stale baseline as unexpected and can delete them. Baselines must be atomically versioned, bound to a verified live-cluster identity, and rejected or recaptured on any mismatch."
+    },
+    {
+      "id": "MC-4",
+      "title": "Pod Restart Temporarily Removes the Fault During Diagnosis",
+      "source": "model-checking",
+      "scenario": "4 — Stop/noise and Khaos reattachment do not establish quiescence",
+      "severity": "High",
+      "invariant": "FaultBeforeDiagnosis",
+      "config": "MC_hunt_scenario4.cfg",
+      "counterexample": "spec/output/MC_hunt_scenario4_bfs.out",
+      "affected_code": [
+        "sregym/conductor/problems/khaos_faults.py:140",
+        "sregym/conductor/problems/khaos_faults.py:147",
+        "sregym/conductor/problems/khaos_faults.py:174",
+        "sregym/conductor/problems/khaos_faults.py:178",
+        "sregym/conductor/conductor.py:298"
+      ],
+      "summary": "Khaos eBPF probes are tied to host PIDs, so a restarted container loses the intended fault until a background monitor resolves its new PID and reinjects. The polling loop can wait five seconds, PID resolution can add delay, and failures are retried later. Diagnosis remains available throughout that healthy interval because the conductor has no continuing fault-effectiveness gate. Stage readiness must track target container generations and pause or fail until reattachment is verified."
+    }
+  ]
+}
