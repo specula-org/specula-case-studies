@@ -1,0 +1,110 @@
+{
+  "schema_version": "2",
+  "system": "warmreboot",
+  "generated_by": "validation-workflow",
+  "findings": [
+    {
+      "id": "MC-1",
+      "title": "Concurrent reboot attempts can overwrite ownership and erase a live epoch",
+      "source": "model-checking",
+      "scenario": "Admission, cancellation, retry, and cleanup ownership across two concurrent reboot callers.",
+      "severity": "High",
+      "invariant": "PhaseMonotonicity",
+      "config": "MC_hunt_scenario1.cfg",
+      "counterexample": "spec/output/MC_hunt_scenario1_bfs.out",
+      "affected_code": [
+        "src/sonic-utilities/scripts/fast-reboot:978",
+        "src/sonic-utilities/scripts/fast-reboot:1095",
+        "src/sonic-utilities/scripts/fast-reboot:418",
+        "src/sonic-utilities/scripts/fast-reboot:1304"
+      ],
+      "summary": "Two reboot callers can both pass the read-only in-progress scan before either publishes its flags. The later caller overwrites global ownership and epoch state, while the older caller can still enter irreversible work or execute unscoped cleanup. That cleanup disables the newer attempt's flags because it has no owner-and-epoch compare-and-set. Atomic epoch acquisition, scoped cleanup, and pre-irreversible ownership revalidation are required."
+    },
+    {
+      "id": "MC-2",
+      "title": "Forced orchagent pause failure permits a non-quiescent checkpoint",
+      "source": "model-checking",
+      "scenario": "Forced reboot after orchagent restart-check failure with queued producer work.",
+      "severity": "High",
+      "invariant": "CheckpointAfterQuiescence",
+      "config": "MC_hunt_scenario2.cfg",
+      "counterexample": "spec/output/MC_hunt_scenario2_after_stop_order_bfs.out",
+      "affected_code": [
+        "src/sonic-utilities/scripts/fast-reboot:996",
+        "src/sonic-utilities/scripts/fast-reboot:1289",
+        "src/sonic-utilities/scripts/fast-reboot:1294",
+        "src/sonic-utilities/scripts/fast-reboot:1348",
+        "src/sonic-utilities/scripts/centralize_database:40"
+      ],
+      "summary": "Forced mode converts a failed orchagent readiness check into successful control flow. The reboot then crosses its no-rollback boundary, stops swss, and saves Redis while orch work remains queued and in flight. The snapshot is therefore published without a producer-quiescence proof. Freeze failure must abort or select explicit cold recovery unless an independent producer fence succeeds."
+    },
+    {
+      "id": "MC-3",
+      "title": "READY is published before orchagent completes its freeze fence",
+      "source": "model-checking",
+      "scenario": "Successful orchagent readiness followed by post-reply drain, FDB mutation, pipeline flush, and heartbeat freeze.",
+      "severity": "High",
+      "invariant": "CompleteSameEpochSnapshot",
+      "config": "MC_hunt_scenario3.cfg",
+      "counterexample": "spec/output/MC_hunt_scenario3_fair_bfs.out",
+      "affected_code": [
+        "src/sonic-swss/orchagent/orchdaemon.cpp:1185",
+        "src/sonic-swss/orchagent/orchdaemon.cpp:1217",
+        "src/sonic-swss/orchagent/orchdaemon.cpp:1384",
+        "src/sonic-utilities/scripts/fast-reboot:1294"
+      ],
+      "summary": "Orchagent sends READY from warmRestartCheck before its ring drain, FDB changes, Redis pipeline flush, and heartbeat freeze. The reboot coordinator treats that reply as the completed freeze barrier and can checkpoint immediately. Startup can consequently consume a present, same-epoch dump whose producer fence was incomplete. READY should move after the freeze work or be followed by a required epoch-correlated FROZEN acknowledgement."
+    },
+    {
+      "id": "MC-4",
+      "title": "VID/RID maps are exposed non-reciprocally during replacement",
+      "source": "model-checking",
+      "scenario": "Identity reconciliation and publication of reciprocal VID-to-RID and RID-to-VID maps.",
+      "severity": "High",
+      "invariant": "IdentityMapBijective",
+      "config": "MC_hunt_scenario5.cfg",
+      "counterexample": "spec/output/MC_hunt_scenario5_bfs.out",
+      "affected_code": [
+        "src/sonic-sairedis/syncd/Syncd.cpp:5978",
+        "src/sonic-sairedis/syncd/RedisClient.cpp:664",
+        "src/sonic-sairedis/syncd/RedisClient.cpp:669",
+        "src/sonic-sairedis/syncd/RedisClient.cpp:672"
+      ],
+      "summary": "The reconciled matching is injective, but its two Redis authority maps are replaced through separate commands. After VIDTORID is deleted, RIDTOVID still exposes the old mapping, and later per-pair HSET operations create more crash cuts. A process failure or concurrent observer can therefore see non-reciprocal identity state. Both maps should be published atomically or behind one generation pointer with restart-time validation."
+    },
+    {
+      "id": "MC-5",
+      "title": "fpmsyncd publishes RECONCILED before route output is flushed",
+      "source": "model-checking",
+      "scenario": "Timeout-driven route reconciliation with buffered Redis pipeline output.",
+      "severity": "High",
+      "invariant": "ReconciledImpliesOutputsPublished",
+      "config": "MC_hunt_scenario6.cfg",
+      "counterexample": "spec/output/MC_hunt_scenario6_bfs.out",
+      "affected_code": [
+        "src/sonic-swss/fpmsyncd/fpmsyncd.cpp:203",
+        "src/sonic-swss/fpmsyncd/fpmsyncd.cpp:214",
+        "src/sonic-swss/fpmsyncd/routesync.cpp:3768",
+        "src/sonic-swss/warmrestart/warmRestartHelper.cpp:245"
+      ],
+      "summary": "On timer expiry, fpmsyncd reconciles cached routes and buffers the resulting Redis updates. WarmStartHelper then publishes RECONCILED before control returns to the explicit pipeline flush. Terminal success is visible while none of the modeled derived output is durable. Reconciliation, flush confirmation, and terminal-state publication should be one ordered completion operation."
+    },
+    {
+      "id": "MC-6",
+      "title": "Warmboot finalizer clears flags after timeout with components incomplete",
+      "source": "model-checking",
+      "scenario": "Bounded finalizer wait with incomplete components and no durable recovery output.",
+      "severity": "High",
+      "invariant": "WarmFlagSafeToClear",
+      "config": "MC_hunt_scenario6_flags.cfg",
+      "counterexample": "spec/output/MC_hunt_scenario6_flags_bfs.out",
+      "affected_code": [
+        "files/image_config/warmboot-finalizer/finalize-warmboot.sh:237",
+        "files/image_config/warmboot-finalizer/finalize-warmboot.sh:256",
+        "files/image_config/warmboot-finalizer/finalize-warmboot.sh:165",
+        "files/image_config/warmboot-finalizer/finalize-warmboot.sh:293"
+      ],
+      "summary": "The finalizer polls components for five minutes but treats timeout as a log-only event. It then proceeds through namespace and global finalization, clearing warm and fast flags while fpmsyncd is merely restored, orchagent is still initial, and the attempt is pending. This destroys the evidence needed to distinguish incomplete recovery from success. Timeout should publish an explicit failure and preserve flags until all required terminal states and durable outputs are confirmed."
+    }
+  ]
+}

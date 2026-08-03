@@ -1,0 +1,235 @@
+diff --git a/orchagent/fdborch.cpp b/orchagent/fdborch.cpp
+index 38951991..dc6ae594 100644
+--- a/orchagent/fdborch.cpp
++++ b/orchagent/fdborch.cpp
+@@ -19,6 +19,7 @@
+ #include "directory.h"
+ #include "timer.h"
+ #include "neighorch.h"
++#include "fdb_trace.h"
+ 
+ #define VLAN_PREFIX         "Vlan"
+ 
+@@ -411,12 +412,23 @@ void FdbOrch::update(sai_fdb_event_t        type,
+         return;
+     }
+ 
++#ifdef FDB_TLA_TRACE
++    const string trace_key = to_string(update.entry.bv_id) + ":" +
++                             update.entry.mac.to_string();
++#endif
++
+     switch (type)
+     {
+     case SAI_FDB_EVENT_LEARNED:
+     {
+         SWSS_LOG_INFO("Received LEARN event for bvid=0x%" PRIx64 "mac=%s port=0x%" PRIx64, entry->bv_id, update.entry.mac.to_string().c_str(), bridge_port_id);
+ 
++#ifdef FDB_TLA_TRACE
++        fdb_trace::receiveNotification(fdb_trace::NotificationKind::Learn,
++                                       trace_key, update.port.m_alias);
++        fdb_trace::updateStart(trace_key);
++#endif
++
+         Port learn_port;
+         /* Drop it if port is down */
+         if (m_portsOrch->getPort(update.port.m_alias, learn_port))
+@@ -578,8 +590,18 @@ void FdbOrch::update(sai_fdb_event_t        type,
+             m_portsOrch->setPort(vlan.m_alias, vlan);
+         }
+ 
++#ifdef FDB_TLA_TRACE
++        fdb_trace::updateCounters(trace_key);
++#endif
++
+         storeFdbEntryState(update);
++#ifdef FDB_TLA_TRACE
++        fdb_trace::storeFdbEntryState(trace_key);
++#endif
+         notify(SUBJECT_TYPE_FDB_CHANGE, &update);
++#ifdef FDB_TLA_TRACE
++        fdb_trace::notifyObservers(trace_key);
++#endif
+         if (mac_move_local)
+         {
+             /* Try to add local neighbor entry if exists
+@@ -606,6 +628,12 @@ void FdbOrch::update(sai_fdb_event_t        type,
+         SWSS_LOG_INFO("Received AGE event for bvid=0x%" PRIx64 " mac=%s port=0x%" PRIx64,
+                        entry->bv_id, update.entry.mac.to_string().c_str(), bridge_port_id);
+ 
++#ifdef FDB_TLA_TRACE
++        fdb_trace::receiveNotification(fdb_trace::NotificationKind::Aged,
++                                       trace_key, update.port.m_alias);
++        fdb_trace::updateStart(trace_key);
++#endif
++
+         // SAI_FDB_EVENT_AGED indicates the entry has already been removed by SAI/ASIC,
+         // so we only need to clean up the software state without calling remove_fdb_entry
+ 
+@@ -615,6 +643,9 @@ void FdbOrch::update(sai_fdb_event_t        type,
+         {
+              SWSS_LOG_INFO("FdbOrch AGE notification: mac %s is not present in bv_id 0x%" PRIx64 " bp 0x%" PRIx64,
+                     update.entry.mac.to_string().c_str(), entry->bv_id, bridge_port_id);
++#ifdef FDB_TLA_TRACE
++             fdb_trace::ignoreAged(trace_key);
++#endif
+              break;
+         }
+ 
+@@ -775,8 +806,14 @@ void FdbOrch::update(sai_fdb_event_t        type,
+             SWSS_LOG_DEBUG("Received AGEOUT event, vlan %s, m_fdb_count %d", vlan.m_alias.c_str(), vlan.m_fdb_count);
+             m_portsOrch->setPort(vlan.m_alias, vlan);
+         }
++#ifdef FDB_TLA_TRACE
++        fdb_trace::updateCounters(trace_key);
++#endif
+         auto dest_type = existing_entry->second.dest_type;
+         storeFdbEntryState(update);
++#ifdef FDB_TLA_TRACE
++        fdb_trace::storeFdbEntryState(trace_key);
++#endif
+ 
+         /* Remove local neighbor entry if exists
+          */
+@@ -786,6 +823,9 @@ void FdbOrch::update(sai_fdb_event_t        type,
+         gNeighOrch->processFDBResolve(update.entry);
+ 
+         notify(SUBJECT_TYPE_FDB_CHANGE, &update);
++#ifdef FDB_TLA_TRACE
++        fdb_trace::notifyObservers(trace_key);
++#endif
+ 
+         notifyTunnelOrch(update.port);
+         break;
+@@ -800,6 +840,12 @@ void FdbOrch::update(sai_fdb_event_t        type,
+         SWSS_LOG_INFO("Received MOVE event for bvid=0x%" PRIx64 " mac=%s port=0x%" PRIx64,
+                        entry->bv_id, update.entry.mac.to_string().c_str(), bridge_port_id);
+ 
++#ifdef FDB_TLA_TRACE
++        fdb_trace::receiveNotification(fdb_trace::NotificationKind::Move,
++                                       trace_key, update.port.m_alias);
++        fdb_trace::updateStart(trace_key);
++#endif
++
+         // We should already have such entry
+         if (existing_entry == m_entries.end())
+         {
+@@ -876,10 +922,20 @@ void FdbOrch::update(sai_fdb_event_t        type,
+             m_portsOrch->setPort(vlan.m_alias, vlan);
+         }
+ 
++#ifdef FDB_TLA_TRACE
++        fdb_trace::updateCounters(trace_key);
++#endif
++
+         update.sai_fdb_type = SAI_FDB_ENTRY_TYPE_DYNAMIC;
+         storeFdbEntryState(update);
++#ifdef FDB_TLA_TRACE
++        fdb_trace::storeFdbEntryState(trace_key);
++#endif
+ 
+         notify(SUBJECT_TYPE_FDB_CHANGE, &update);
++#ifdef FDB_TLA_TRACE
++        fdb_trace::notifyObservers(trace_key);
++#endif
+ 
+         if (mac_move_local)
+         {
+@@ -1483,6 +1539,19 @@ void FdbOrch::flushFDBEntries(sai_object_id_t bridge_port_oid,
+ 
+     SWSS_LOG_INFO("Flushing FDB bridge_port_oid: 0x%" PRIx64 ", and bvid_oid:0x%" PRIx64 ".", bridge_port_oid, vlan_oid);
+ 
++#ifdef FDB_TLA_TRACE
++    string trace_scope = bridge_port_exist ? (vlan_exist ? "portvlan" : "port") : "vlan";
++    string trace_port;
++    Port trace_port_object;
++    if (bridge_port_exist &&
++        m_portsOrch->getPortByBridgePortId(bridge_port_oid, trace_port_object))
++    {
++        trace_port = trace_port_object.m_alias;
++    }
++    const uint64_t trace_epoch =
++        fdb_trace::flushRequest(false, trace_scope, trace_port);
++#endif
++
+     rv = sai_fdb_api->flush_fdb_entries(gSwitchId, (uint32_t)attrs.size(), attrs.data());
+     if (SAI_STATUS_SUCCESS != rv)
+     {
+@@ -1500,6 +1569,9 @@ void FdbOrch::flushFDBEntries(sai_object_id_t bridge_port_oid,
+             }
+         }
+     }
++#ifdef FDB_TLA_TRACE
++    fdb_trace::flushResult(trace_epoch, SAI_STATUS_SUCCESS == rv);
++#endif
+ }
+ 
+ /*
+@@ -1673,6 +1745,10 @@ void FdbOrch::flushFdbByVlan(const string &alias)
+     vlan_attr[0].value.oid = vlan.m_vlan_info.vlan_oid;
+     vlan_attr[1].id = SAI_FDB_FLUSH_ATTR_ENTRY_TYPE;
+     vlan_attr[1].value.s32 = SAI_FDB_FLUSH_ENTRY_TYPE_DYNAMIC;
++#ifdef FDB_TLA_TRACE
++    const uint64_t trace_epoch =
++        fdb_trace::flushRequest(true, "vlan", string());
++#endif
+     status = sai_fdb_api->flush_fdb_entries(gSwitchId, 2, vlan_attr);
+ 
+     if (status != SAI_STATUS_SUCCESS)
+@@ -1685,6 +1761,10 @@ void FdbOrch::flushFdbByVlan(const string &alias)
+                     alias.c_str(), vlan.m_vlan_info.vlan_oid);
+     }
+ 
++#ifdef FDB_TLA_TRACE
++    fdb_trace::flushResult(trace_epoch, status == SAI_STATUS_SUCCESS);
++#endif
++
+     return;
+ }
+ 
+diff --git a/tests/mock_tests/Makefile.am b/tests/mock_tests/Makefile.am
+index 157416d9..241a1390 100644
+--- a/tests/mock_tests/Makefile.am
++++ b/tests/mock_tests/Makefile.am
+@@ -213,6 +213,8 @@ tests_SOURCES = aclorch_ut.cpp \
+ 
+ 
+ tests_SOURCES += common/vxlan_ut_helpers.cpp
++tests_SOURCES += $(top_srcdir)/orchagent/fdb_trace.cpp
++tests_SOURCES += fdb_swss_file_redirect.cpp
+ tests_SOURCES += $(FLEX_CTR_DIR)/flex_counter_manager.cpp $(FLEX_CTR_DIR)/flex_counter_stat_manager.cpp $(FLEX_CTR_DIR)/flow_counter_handler.cpp $(FLEX_CTR_DIR)/flowcounterrouteorch.cpp
+ tests_SOURCES += $(DEBUG_CTR_DIR)/debug_counter.cpp $(DEBUG_CTR_DIR)/drop_counter.cpp
+ tests_SOURCES += $(P4_ORCH_DIR)/p4orch.cpp \
+@@ -238,6 +239,7 @@ tests_SOURCES += $(P4_ORCH_DIR)/p4orch.cpp \
+ 
+ tests_CFLAGS = $(DBGFLAGS) $(AM_CFLAGS) $(CFLAGS_COMMON) $(CFLAGS_GTEST) $(CFLAGS_SAI)
+ tests_CPPFLAGS = $(DBGFLAGS) $(AM_CFLAGS) $(CFLAGS_COMMON) $(CFLAGS_GTEST) $(CFLAGS_SAI) $(tests_INCLUDES)
++tests_CPPFLAGS += -DFDB_TLA_TRACE
+ tests_LDFLAGS = -Wl,--wrap=sai_query_stats_st_capability -Wl,--wrap=sai_query_attribute_capability \
+                 -Wl,--wrap=sai_query_attribute_enum_values_capability -Wl,--wrap=sai_metadata_get_attr_metadata
+ tests_LDADD = $(LDADD_GTEST) $(LDADD_SAI) -lnl-genl-3 -lhiredis -lhiredis -lpthread \
+diff --git a/tests/mock_tests/fdborch/fdborch_vxlan_ut.cpp b/tests/mock_tests/fdborch/fdborch_vxlan_ut.cpp
+index ba99e454..6228ac4c 100644
+--- a/tests/mock_tests/fdborch/fdborch_vxlan_ut.cpp
++++ b/tests/mock_tests/fdborch/fdborch_vxlan_ut.cpp
+@@ -3265,6 +3265,20 @@ namespace fdborch_vxlan_ut
+         ASSERT_GE(m_portsOrch->m_portList[VLAN40].m_fdb_count, 0);
+     }
+ 
++    TEST_F(VxlanFdbOrchTest, TraceFlushFDBEntriesFailure)
++    {
++        setUpVlan(m_portsOrch.get());
++        setUpPort(m_portsOrch.get());
++        setUpVlanMember(m_portsOrch.get());
++
++        EXPECT_CALL(*mock_sai_fdb_api, flush_fdb_entries(_, _, _))
++            .WillOnce(testing::Return(SAI_STATUS_FAILURE));
++
++        gFdbOrch->flushFDBEntries(
++            m_portsOrch->m_portList[ETH0].m_bridge_port_id,
++            m_portsOrch->m_portList[VLAN40].m_vlan_info.vlan_oid);
++    }
++
+     // Test 7: updateVlanMember() - VLAN member removal triggers flush
+     TEST_F(VxlanFdbOrchTest, UpdateVlanMemberRemoval)
+     {

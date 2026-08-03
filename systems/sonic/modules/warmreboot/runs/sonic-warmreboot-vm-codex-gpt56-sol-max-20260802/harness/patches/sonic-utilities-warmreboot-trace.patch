@@ -1,0 +1,302 @@
+diff --git a/scripts/fast-reboot b/scripts/fast-reboot
+index 8c0b9981..1af75f1f 100755
+--- a/scripts/fast-reboot
++++ b/scripts/fast-reboot
+@@ -36,6 +36,68 @@ LOG_PATH="/var/log/${REBOOT_TYPE}.txt"
+ UIMAGE_HDR_SIZE=64
+ REQUIRE_TEAMD_RETRY_COUNT=no
+ 
++# Specula trace instrumentation is inert unless the harness exports a client
++# and collector socket.  Test-only path overrides keep trace scenarios away
++# from host reboot state without changing the production defaults.
++if [[ -n "${SPECULA_TRACE_TEST_MODE:-}" ]]; then
++    WARM_DIR="${SPECULA_TRACE_WARM_DIR:-${WARM_DIR}}"
++    SHUTDOWN_ORDER_FILE="${SPECULA_TRACE_SHUTDOWN_ORDER_FILE:-${SHUTDOWN_ORDER_FILE}}"
++fi
++
++function specula_trace_emit()
++{
++    [[ -n "${SPECULA_TRACE_CLIENT:-}" && -n "${SPECULA_TRACE_SOCKET:-}" ]] || return 0
++
++    local -r event_name="$1"
++    shift
++    python3 "${SPECULA_TRACE_CLIENT}" emit \
++        --socket "${SPECULA_TRACE_SOCKET}" \
++        --event "${event_name}" \
++        --owner-token "${SPECULA_TRACE_OWNER_TOKEN}" \
++        --process "${REBOOT_SCRIPT_NAME}@${DEV:-global}" \
++        --pid "${BASHPID}" \
++        "$@" || /bin/true
++}
++
++if [[ -n "${SPECULA_TRACE_CLIENT:-}" && -n "${SPECULA_TRACE_SOCKET:-}" ]]; then
++    SPECULA_TRACE_OWNER_TOKEN="${BASHPID}:$(sed -n 's/^\([^)]*\)) \([^ ]* \)\{19\}\([^ ]*\).*/\3/p' "/proc/${BASHPID}/stat")"
++    export SPECULA_TRACE_OWNER_TOKEN
++fi
++
++function specula_trace_asic()
++{
++    if [[ -n "${DEV:-}" ]]; then
++        echo "asic_${DEV}"
++    else
++        echo "asic_0"
++    fi
++}
++
++function specula_trace_bool()
++{
++    [[ "${1,,}" == "true" || "$1" == "1" ]] && echo true || echo false
++}
++
++function specula_trace_warm_flag()
++{
++    local key
++    while read -r key; do
++        if [[ -n "$key" ]] && \
++           [[ "$(sonic-db-cli -n "${NETNS:-}" STATE_DB hget "$key" enable 2>/dev/null)" == "true" ]]; then
++            echo true
++            return 0
++        fi
++    done < <(sonic-db-cli -n "${NETNS:-}" STATE_DB keys "WARM_RESTART_ENABLE_TABLE|*" 2>/dev/null)
++    echo false
++}
++
++function specula_trace_fast_flag()
++{
++    local value
++    value=$(sonic-db-cli STATE_DB hget "FAST_RESTART_ENABLE_TABLE|system" enable 2>/dev/null)
++    specula_trace_bool "$value"
++}
++
+ EXIT_SUCCESS=0
+ EXIT_FAILURE=1
+ EXIT_NOT_SUPPORTED=2
+@@ -195,8 +257,23 @@ function stop_systemd_service()
+         container kill "${service}$DEV"  &> /dev/null || debug "Docker ${service}$DEV is not running ($?) ..."
+     fi
+ 
+-    systemctl stop ${service_name}
++    local stop_rc=0
++    systemctl stop ${service_name} || stop_rc=$?
+     debug "Stopped $service_name"
++
++    if [[ "$service" == "swss" ]]; then
++        local writer_stopped=true
++        systemctl is-active --quiet "${service_name}" && writer_stopped=false
++        if [[ $stop_rc -eq 0 ]]; then
++            specula_trace_emit "StopSystemdService_Success" \
++                "asic=$(specula_trace_asic)" \
++                "writer_stopped=${writer_stopped}"
++        else
++            specula_trace_emit "StopSystemdService_MaskedFailure" \
++                "asic=$(specula_trace_asic)" \
++                "writer_stopped=${writer_stopped}"
++        fi
++    fi
+ }
+ 
+ # Stops a service or multiple services within the network
+@@ -343,7 +420,9 @@ function clear_boot()
+     # common_clear
+     debug "${REBOOT_SCRIPT_NAME} failure ($?) cleanup ..."
+ 
+-    /sbin/kexec -u -a || /bin/true
++    if [[ -z "${SPECULA_TRACE_TEST_MODE:-}" ]]; then
++        /sbin/kexec -u -a || /bin/true
++    fi
+ 
+     if [[ $NUM_ASIC -eq 1 ]]; then
+         teardown_control_plane_assistant
+@@ -367,6 +446,22 @@ function clear_boot()
+     if [[ "$REBOOT_TYPE" = "fast-reboot" ]]; then
+         sonic-db-cli STATE_DB HSET "FAST_RESTART_ENABLE_TABLE|system" "enable" "false" &>/dev/null || /bin/true
+     fi
++
++    local trace_args=(
++        "warm=$(specula_trace_warm_flag)"
++        "fast=$(specula_trace_fast_flag)"
++    )
++    local asic
++    local dump_path
++    for asic in $(seq 0 $(( NUM_ASIC - 1 ))); do
++        if [[ $NUM_ASIC -eq 1 ]]; then
++            dump_path="${WARM_DIR}/${REDIS_FILE}"
++        else
++            dump_path="${WARM_DIR}${asic}/${REDIS_FILE}"
++        fi
++        trace_args+=("snapshot_present_asic_${asic}=$([[ -f "$dump_path" ]] && echo true || echo false)")
++    done
++    specula_trace_emit "ClearBoot" "${trace_args[@]}"
+ }
+ 
+ function init_warm_reboot_states()
+@@ -887,6 +982,7 @@ function check_warm_restart_in_progress() {
+                 debug "Ignoring warm restart flag for ${key#*|}"
+             else
+                 echo "Warm restart flag for ${key#*|} is set. Please check if a warm restart for ${key#*|} is in progress."
++                specula_trace_emit "CheckWarmRestartInProgress_Reject"
+                 exit "${EXIT_FAILURE}"
+             fi
+         fi
+@@ -897,6 +993,27 @@ function enable_warm_restart() {
+     config warm_restart enable -n "$NETNS" system
+ }
+ 
++function pause_orchagent()
++{
++    # Freeze orchagent for warm restart
++    # Ask orchagent_restart_check to try freeze 5 times with interval of 2 seconds,
++    # it is possible that the orchagent is in transient state and no opportunity to freeze
++    # Note: assume that 2*5 seconds is enough for orchagent to process the request and response to freeze or not
++    local RESTARTCHECK_RC=0
++    debug "Pausing orchagent ..."
++    docker exec -i swss$DEV /usr/bin/orchagent_restart_check -w 2000 -r 5 > /dev/null || RESTARTCHECK_RC=$?
++    if [[ RESTARTCHECK_RC -ne 0 ]]; then
++        error "RESTARTCHECK failed"
++        if [[ x"${FORCE}" == x"yes" ]]; then
++            debug "Ignoring orchagent pausing failure ..."
++            specula_trace_emit "PauseOrchagent_IgnoreFailure" "asic=$(specula_trace_asic)"
++        else
++            exit "${EXIT_ORCHAGENT_SHUTDOWN}"
++        fi
++    fi
++    debug "Orchagent paused successfully"
++}
++
+ function check_conflict_boot_in_fw_update() {
+     # Make sure firmware auto update is not scheduled for a different reboot
+     FIRMWARE_AU_STATUS_DIR="/tmp/firmwareupdate"
+@@ -926,13 +1043,13 @@ parseOptions $@
+ filter_asic_list
+ 
+ # Check root privileges
+-if [[ "$EUID" -ne 0 ]]
++if [[ "$EUID" -ne 0 && -z "${SPECULA_TRACE_TEST_MODE:-}" ]]
+ then
+     echo "This command must be run as root" >&2
+     exit "${EXIT_FAILURE}"
+ fi
+ 
+-if [[ $NUM_ASIC -gt 1 ]]; then
++if [[ $NUM_ASIC -gt 1 && -z "${SPECULA_TRACE_TEST_MODE:-}" ]]; then
+     BACK_END_ASIC_COUNT=$(python3 <<EOF
+ from swsscommon.swsscommon import SonicDBConfig
+ from sonic_py_common.multi_asic import *
+@@ -965,12 +1082,19 @@ fi
+ 
+ check_conflict_boot_in_fw_update
+ 
++if [[ "$REBOOT_TYPE" == "fast-reboot" ]]; then
++    SPECULA_TRACE_REQUEST_KIND="fast_request"
++else
++    SPECULA_TRACE_REQUEST_KIND="warm_request"
++fi
++specula_trace_emit "FastReboot_Request" "kind=${SPECULA_TRACE_REQUEST_KIND}"
+ 
+ # Check reboot type supported
+ BOOT_TYPE_ARG="cold"
+ case "$REBOOT_TYPE" in
+     "fast-reboot")
+         check_warm_restart_in_progress
++        specula_trace_emit "CheckWarmRestartInProgress_Admit"
+         BOOT_TYPE_ARG=$REBOOT_TYPE
+         trap clear_boot EXIT HUP INT QUIT TERM KILL ABRT ALRM
+         sonic-db-cli STATE_DB HSET "FAST_RESTART_ENABLE_TABLE|system" "enable" "true" &>/dev/null
+@@ -978,6 +1102,7 @@ case "$REBOOT_TYPE" in
+         ;;
+     "warm-reboot")
+         execute_in_namespaces all check_warm_restart_in_progress
++        specula_trace_emit "CheckWarmRestartInProgress_Admit"
+         if [[ "$sonic_asic_type" == "mellanox" ]]; then
+             REBOOT_TYPE="fastfast-reboot"
+             BOOT_TYPE_ARG="fastfast"
+@@ -992,6 +1117,7 @@ case "$REBOOT_TYPE" in
+         ;;
+     "express-reboot")
+         check_warm_restart_in_progress
++        specula_trace_emit "CheckWarmRestartInProgress_Admit"
+         BOOT_TYPE_ARG="express"
+         trap clear_boot EXIT HUP INT QUIT TERM KILL ABRT ALRM
+         config warm_restart enable system
+@@ -1002,6 +1128,39 @@ case "$REBOOT_TYPE" in
+         ;;
+ esac
+ 
++specula_trace_emit "EnableWarmRestart" \
++    "warm=$(specula_trace_warm_flag)" \
++    "fast=$(specula_trace_fast_flag)"
++
++case "${SPECULA_TRACE_TEST_STOP:-}" in
++    after_enable)
++        trap - EXIT HUP INT QUIT TERM KILL ABRT ALRM
++        exit "${EXIT_SUCCESS}"
++        ;;
++    signal_after_enable)
++        kill -TERM "${BASHPID}"
++        specula_trace_emit "FastReboot_ContinueAfterSignal"
++        trap - EXIT HUP INT QUIT TERM KILL ABRT ALRM
++        exit "${EXIT_SUCCESS}"
++        ;;
++    after_masked_stops)
++        if [[ $NUM_ASIC -gt 1 ]]; then
++            FORCE=yes
++        fi
++        execute_in_namespaces asic pause_orchagent
++        specula_trace_emit "FastReboot_PauseOrchagentComplete"
++
++        # Match the production no-rollback boundary before exercising the
++        # real service-stop helper under one success and one masked failure.
++        set +e
++        specula_trace_emit "FastReboot_BeginIrreversibleWork"
++        execute_in_namespaces asic stop_systemd_service swss
++
++        trap - EXIT HUP INT QUIT TERM KILL ABRT ALRM
++        exit "${EXIT_SUCCESS}"
++        ;;
++esac
++
+ save_counters_folder
+ 
+ unload_kernel
+@@ -1127,25 +1286,6 @@ if [[ "${REBOOT_TYPE}" = "warm-reboot" || "${REBOOT_TYPE}" = "fastfast-reboot" |
+     fi
+ fi
+ 
+-function pause_orchagent()
+-{
+-    # Freeze orchagent for warm restart
+-    # Ask orchagent_restart_check to try freeze 5 times with interval of 2 seconds,
+-    # it is possible that the orchagent is in transient state and no opportunity to freeze
+-    # Note: assume that 2*5 seconds is enough for orchagent to process the request and response to freeze or not
+-    debug "Pausing orchagent ..."
+-    docker exec -i swss$DEV /usr/bin/orchagent_restart_check -w 2000 -r 5 > /dev/null || RESTARTCHECK_RC=$?
+-    if [[ RESTARTCHECK_RC -ne 0 ]]; then
+-        error "RESTARTCHECK failed"
+-        if [[ x"${FORCE}" == x"yes" ]]; then
+-            debug "Ignoring orchagent pausing failure ..."
+-        else
+-            exit "${EXIT_ORCHAGENT_SHUTDOWN}"
+-        fi
+-    fi
+-    debug "Orchagent paused successfully"
+-}
+-
+ # After orchagent pause, there's no rollback if anything goes wrong on Multi-ASIC devices, force execution
+ if [[ $NUM_ASIC -gt 1 ]]; then
+     FORCE=yes
+@@ -1153,6 +1293,7 @@ fi
+ 
+ if [[ "$REBOOT_TYPE" = "warm-reboot" || "$REBOOT_TYPE" = "fastfast-reboot" || "$REBOOT_TYPE" = "express-reboot" || "$REBOOT_TYPE" = "fast-reboot" ]]; then
+     execute_in_namespaces asic pause_orchagent
++    specula_trace_emit "FastReboot_PauseOrchagentComplete"
+ fi
+ 
+ if [[ "${REBOOT_TYPE}" = "warm-reboot" || "${REBOOT_TYPE}" = "fastfast-reboot" || "${REBOOT_TYPE}" = "express-reboot" ]]; then
+@@ -1163,6 +1304,7 @@ fi
+ # We are fully committed to reboot from this point on because critical
+ # service will go down and we cannot recover from it.
+ set +e
++specula_trace_emit "FastReboot_BeginIrreversibleWork"
+ 
+ if [[ "$REBOOT_TYPE" = "fast-reboot" ]]; then
+     # Clear all routes except of default and connected routes for faster reconciliation time.

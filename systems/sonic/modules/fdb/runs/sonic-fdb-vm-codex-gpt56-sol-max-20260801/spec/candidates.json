@@ -1,0 +1,126 @@
+{
+  "schema_version": "2",
+  "system": "fdb",
+  "generated_by": "consolidate",
+  "findings": [
+    {
+      "id": "MC-1",
+      "title": "A delayed FLUSHED callback deletes a post-flush relearn",
+      "source": "model-checking",
+      "scenario": "Scenario 1 — multi-stage flush protocol",
+      "severity": "High",
+      "invariant": "FlushAckMatchesRequest",
+      "config": "MC_hunt_mc1_stale_flush.cfg",
+      "counterexample": "spec/output/repair_RR003_MC_hunt_mc1_stale_flush_bfs.out",
+      "affected_code": [
+        "orchagent/fdborch.h:84",
+        "orchagent/fdborch.cpp:154",
+        "orchagent/fdborch.cpp:308",
+        "orchagent/fdborch.cpp:1499"
+      ],
+      "summary": "A successful dynamic flush removes generation 1 and marks the cached key with a boolean pending flag. SAI then relearns the same key on the same port; the duplicate path leaves that flag attached to the current semantic incarnation. A delayed FLUSHED callback tests only scope, type, MAC, and the boolean, so it deletes software generation 2 while ASIC/kernel retain it."
+    },
+    {
+      "id": "MC-2",
+      "title": "A delayed AGE event deletes a newer FDB incarnation",
+      "source": "model-checking",
+      "scenario": "Scenario 2 — notification incarnation",
+      "severity": "High",
+      "invariant": "StaleEventCannotDeleteNewer",
+      "config": "MC_hunt_mc2_stale_age.cfg",
+      "counterexample": "spec/output/repair_RR003_MC_hunt_mc2_stale_age_bfs.out",
+      "affected_code": [
+        "orchagent/fdborch.cpp:612",
+        "orchagent/fdborch.cpp:621",
+        "orchagent/fdborch.cpp:630",
+        "orchagent/fdborch.cpp:779"
+      ],
+      "summary": "A generation-1 AGE is delayed until after generation 2 has been learned and committed for the same MAC/BV and bridge port. The AGE handler resolves the notification to the mutable current cache entry and has no same-port incarnation check; even its stale-port branch deliberately continues. It therefore deletes software generation 2 while ASIC/kernel retain the newer entry."
+    },
+    {
+      "id": "MC-3",
+      "title": "VTEP replacement credits the new member to the old endpoint",
+      "source": "model-checking",
+      "scenario": "Scenario 4 — tunnel/NHG graph mutation",
+      "severity": "Medium",
+      "invariant": "TunnelRefExact",
+      "config": "MC_hunt_mc4_vtep_replacement.cfg",
+      "counterexample": "spec/output/repair_RR003_MC_hunt_mc4_vtep_replacement_bfs.out",
+      "affected_code": [
+        "orchagent/l2nhgorch.cpp:620",
+        "orchagent/l2nhgorch.cpp:634",
+        "orchagent/l2nhgorch.cpp:653"
+      ],
+      "summary": "VTEP replacement removes the old member and reference, then successfully creates a member for the new endpoint. The increment still uses the cached old endpoint because the cache is updated only after the loop. The final graph contains the new endpoint while reference accounting credits the old one; a second hunt independently reproduces the mismatch."
+    },
+    {
+      "id": "MC-4",
+      "title": "Bridge-port teardown continues after its FDB flush fails",
+      "source": "model-checking",
+      "scenario": "Scenarios 1 and 4 — flush/topology lifecycle",
+      "severity": "High",
+      "invariant": "NoDanglingTopologyReference",
+      "config": "MC_hunt_mc6_topology_reuse.cfg",
+      "counterexample": "spec/output/repair_RR003_MC_hunt_mc6_topology_reuse_bfs.out",
+      "affected_code": [
+        "orchagent/fdborch.cpp:1443",
+        "orchagent/fdborch.cpp:1486",
+        "orchagent/portsorch.cpp:7506",
+        "orchagent/portsorch.cpp:7510"
+      ],
+      "summary": "PortsOrch begins bridge-port teardown while an ASIC FDB entry still references that port. FdbOrch exposes no flush result and only logs the SAI failure, after which PortsOrch immediately removes the bridge port. Hardware retains an FDB reference to the removed topology generation; the broader scenario-1 hunt independently reaches the same root cause."
+    },
+    {
+      "id": "MC-5",
+      "title": "A delayed LEARN reclassifies a newer MCLAG remote entry as local",
+      "source": "model-checking",
+      "scenario": "Scenario 2 — notification incarnation",
+      "severity": "High",
+      "invariant": "UniqueEffectiveDestination",
+      "config": "MC_hunt_scenario_2_incarnation.cfg",
+      "counterexample": "spec/output/repair_RR003_MC_hunt_scenario_2_incarnation_bfs.out",
+      "affected_code": [
+        "orchagent/fdborch.cpp:439",
+        "orchagent/fdborch.cpp:470",
+        "orchagent/fdborch.cpp:480",
+        "orchagent/fdborch.cpp:500",
+        "orchagent/fdborch.cpp:184"
+      ],
+      "summary": "A local LEARN is queued and its hardware row ages before FdbOrch consumes either notification. A newer same-port MCLAG update then installs the key as remote-owned and SAI static. When the delayed LEARN is finally handled, FdbOrch has no incarnation check: it changes the current row to dynamic, stores the stale notification as FDB_ORIGIN_LEARN, and deletes MCLAG state ownership. The result is independent of repair-failure injection."
+    },
+    {
+      "id": "MC-6",
+      "title": "Deferred SET replay applies an obsolete destination",
+      "source": "model-checking",
+      "scenario": "Scenario 3 — deferred latest intent",
+      "severity": "Medium",
+      "invariant": "LatestDesiredWins",
+      "config": "MC_hunt_scenario_3_deferred.cfg",
+      "counterexample": "spec/output/repair_RR003_MC_hunt_scenario_3_deferred_bfs.out",
+      "affected_code": [
+        "orchagent/fdborch.h:101",
+        "orchagent/fdborch.cpp:1852",
+        "orchagent/fdborch.cpp:1767",
+        "orchagent/fdborch.cpp:2305"
+      ],
+      "summary": "While dependencies are absent, SET p1 and a newer SET p2 are appended as separate saved entries. When the dependency appears, updateVlanMember replays insertion order and publishes p1 while p2 remains the latest desired value. The saved-work representation has no generation-based coalescing, so obsolete intent becomes externally visible."
+    },
+    {
+      "id": "MC-7",
+      "title": "Startup discards the one-shot kernel NHG dump before NVO readiness",
+      "source": "model-checking",
+      "scenario": "Scenario 5 — restart reconstruction",
+      "severity": "High",
+      "invariant": "RestartConverges",
+      "config": "MC_hunt_scenario_5_restart.cfg",
+      "counterexample": "spec/output/repair_RR003_MC_hunt_scenario_5_restart_bfs.out",
+      "affected_code": [
+        "fdbsyncd/fdbsyncd.cpp:89",
+        "fdbsyncd/fdbsyncd.cpp:98",
+        "fdbsyncd/fdbsync.cpp:40",
+        "fdbsyncd/fdbsync.cpp:1138"
+      ],
+      "summary": "After a crash, the startup GETNEXTHOP dump is consumed before EVPN NVO readiness. onMsgNhg discards the record, and AppRestartAssist does not replay the L2 NHG table after configuration becomes ready. Restart settles with kernel state present and APP state absent, with no guaranteed later event to repair the divergence."
+    }
+  ]
+}
