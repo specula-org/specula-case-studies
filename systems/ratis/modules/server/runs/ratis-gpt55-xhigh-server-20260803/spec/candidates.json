@@ -1,0 +1,113 @@
+{
+  "schema_version": "2",
+  "system": "ratis-server",
+  "generated_by": "consolidate",
+  "findings": [
+    {
+      "id": "MC-1",
+      "title": "Async flush failure can advance commit ahead of durable log",
+      "source": "model-checking",
+      "scenario": "Scenario 1 - commit advancement versus durable log state",
+      "severity": "Critical",
+      "invariant": "CommittedImpliesDurableFlush",
+      "config": "MC_hunt_scenario1.cfg",
+      "counterexample": "spec/output/MC_hunt_scenario1_bfs_round7.out",
+      "affected_code": [
+        "ratis-server/src/main/java/org/apache/ratis/server/raftlog/segmented/SegmentedRaftLogWorker.java:407",
+        "ratis-server/src/main/java/org/apache/ratis/server/raftlog/segmented/SegmentedRaftLogWorker.java:415",
+        "ratis-server/src/main/java/org/apache/ratis/server/raftlog/RaftLogBase.java:123",
+        "ratis-server/src/main/java/org/apache/ratis/server/impl/LeaderStateImpl.java:956"
+      ],
+      "summary": "A TLC counterexample shows a leader appending a configuration entry, encountering an async flush failure, and still advancing modeled flush coverage so commit can advance while the local durable log is empty. The source-backed mechanism is that SegmentedRaftLogWorker.asyncFlushOutStream calls updateFlushedIndexIncreasingly(lastWrittenIndex) even when the async flush completed with an exception, while RaftLogBase and LeaderStateImpl rely on flushIndex when advancing commit. This is a model-checking candidate and still needs code-level reproduction.",
+      "dedup_note": "also covers code-review Scenario 1 (same async log flush durability mechanism)"
+    },
+    {
+      "id": "MC-2",
+      "title": "Old leader lease read can race with NOT_LEADER reply handling",
+      "source": "model-checking",
+      "scenario": "Scenario 4 - leader lease and ReadIndex state across leadership change",
+      "severity": "High",
+      "invariant": "NoOldLeaderLeaseRead",
+      "config": "MC_hunt_scenario4.cfg",
+      "counterexample": "spec/output/MC_hunt_scenario4_bfs_round10.out",
+      "affected_code": [
+        "ratis-server/src/main/java/org/apache/ratis/server/leader/LogAppenderDefault.java:95",
+        "ratis-server/src/main/java/org/apache/ratis/server/leader/LogAppenderDefault.java:103",
+        "ratis-server/src/main/java/org/apache/ratis/server/leader/LogAppenderDefault.java:105",
+        "ratis-server/src/main/java/org/apache/ratis/server/leader/LogAppenderDefault.java:106",
+        "ratis-server/src/main/java/org/apache/ratis/server/leader/LogAppenderDefault.java:186",
+        "ratis-server/src/main/java/org/apache/ratis/server/leader/LogAppenderDefault.java:221",
+        "ratis-server/src/main/java/org/apache/ratis/server/impl/LeaderLease.java:68",
+        "ratis-server/src/main/java/org/apache/ratis/server/impl/LeaderStateImpl.java:1214",
+        "ratis-server/src/main/java/org/apache/ratis/server/impl/LeaderStateImpl.java:1249"
+      ],
+      "summary": "A TLC counterexample shows an old leader receiving a NOT_LEADER-style AppendEntries reply, recording the follower response timestamp before handling the reply, extending the leader lease from that timestamp, and serving a ReadIndex request through the lease fast path before demotion. The source-backed race spans LogAppenderDefault timestamp updates, deferred NOT_LEADER handling, LeaderLease extension, and LeaderStateImpl lease fast-path reads. This is a model-checking candidate and still needs code-level reproduction.",
+      "dedup_note": "also covers code-review Scenario 4 (same leader lease and ReadIndex leadership-change mechanism)"
+    },
+    {
+      "id": "CR-2",
+      "title": "Recovered or reformatted voter election evidence may be inconsistent",
+      "source": "code-review",
+      "scenario": "Scenario 2 - Recovered or Reformatted Voter in Election",
+      "severity": "High",
+      "invariant": null,
+      "config": null,
+      "counterexample": null,
+      "affected_code": [
+        "ratis-server/src/main/java/org/apache/ratis/server/impl/ServerState.java:129",
+        "ratis-server/src/main/java/org/apache/ratis/server/storage/RaftStorageImpl.java:95",
+        "ratis-server/src/main/java/org/apache/ratis/server/impl/RaftServerImpl.java:1496",
+        "ratis-server/src/main/java/org/apache/ratis/server/impl/RaftServerImpl.java:1542",
+        "ratis-server/src/main/java/org/apache/ratis/server/impl/VoteContext.java:54",
+        "ratis-server/src/main/java/org/apache/ratis/server/impl/VoteContext.java:136",
+        "ratis-server/src/main/java/org/apache/ratis/server/impl/LeaderElection.java:517",
+        "ratis-server/src/main/java/org/apache/ratis/server/impl/LeaderElection.java:606"
+      ],
+      "summary": "The code-review scenario asks whether crash recovery, term/vote metadata, log state, snapshot state, configuration state, and vote-reply evidence can disagree while still contributing to an election. The modeling brief cites startup recovery that cannot apply log entries because committed status is unknown, empty-storage formatting with default metadata, RequestVote term/vote persistence, current-configuration vote checks, last-log comparisons, and election logic that discounts some empty-log voters. Model checking explored this area and found no violation, so this remains a code-review candidate rather than a duplicate MC finding. Confirmation should decide whether the remaining recovery and mixed-version vote-evidence mechanism maps to a real current bug."
+    },
+    {
+      "id": "CR-3",
+      "title": "Snapshot installation can interleave with append and ReadIndex state",
+      "source": "code-review",
+      "scenario": "Scenario 3 - Snapshot Install vs AppendEntries and ReadIndex",
+      "severity": "High",
+      "invariant": null,
+      "config": null,
+      "counterexample": null,
+      "affected_code": [
+        "ratis-server/src/main/java/org/apache/ratis/server/impl/SnapshotInstallationHandler.java:174",
+        "ratis-server/src/main/java/org/apache/ratis/server/impl/SnapshotInstallationHandler.java:250",
+        "ratis-server/src/main/java/org/apache/ratis/server/impl/SnapshotInstallationHandler.java:272",
+        "ratis-server/src/main/java/org/apache/ratis/server/impl/SnapshotInstallationHandler.java:396",
+        "ratis-server/src/main/java/org/apache/ratis/server/impl/RaftServerImpl.java:1739",
+        "ratis-server/src/main/java/org/apache/ratis/server/impl/RaftServerImpl.java:1099",
+        "ratis-server/src/main/java/org/apache/ratis/server/impl/ServerState.java:425",
+        "ratis-server/src/main/java/org/apache/ratis/server/raftlog/segmented/SegmentedRaftLogWorker.java:261"
+      ],
+      "summary": "The code-review scenario asks whether snapshot installation sub-states can interleave with AppendEntries or ReadIndex so that accepted log or read state is not covered by either the old log or the installed snapshot. The modeling brief cites chunk handling, notification-mode in-progress state, AppendEntries and ReadIndex rejection during snapshot install, state-machine reload, and log worker queue/durable-index reset during snapshot sync. Model checking explored this area and found no violation after spec fixes, so it is not covered by a concrete MC candidate. Confirmation should preserve it as a code-review candidate and decide whether any implementation-level snapshot lifecycle issue is reachable."
+    },
+    {
+      "id": "CR-5",
+      "title": "Reconfiguration catch-up and leader recognition may use inconsistent membership guards",
+      "source": "code-review",
+      "scenario": "Scenario 5 - Reconfiguration, Catch-Up, and Leader Recognition",
+      "severity": "High",
+      "invariant": null,
+      "config": null,
+      "counterexample": null,
+      "affected_code": [
+        "ratis-server/src/main/java/org/apache/ratis/server/impl/LeaderStateImpl.java:518",
+        "ratis-server/src/main/java/org/apache/ratis/server/impl/LeaderStateImpl.java:828",
+        "ratis-server/src/main/java/org/apache/ratis/server/impl/LeaderStateImpl.java:624",
+        "ratis-server/src/main/java/org/apache/ratis/server/impl/RaftConfigurationImpl.java:264",
+        "ratis-server/src/main/java/org/apache/ratis/server/impl/RaftServerImpl.java:1691",
+        "ratis-server/src/main/java/org/apache/ratis/server/impl/ServerState.java:397",
+        "ratis-server/src/main/java/org/apache/ratis/server/impl/VoteContext.java:54",
+        "ratis-server/src/main/java/org/apache/ratis/server/impl/ServerState.java:329",
+        "ratis-server/src/main/java/org/apache/ratis/server/impl/RaftServerImpl.java:1655",
+        "ratis-server/src/main/java/org/apache/ratis/server/impl/SnapshotInstallationHandler.java:182"
+      ],
+      "summary": "The code-review scenario asks whether staged reconfiguration, follower catch-up, old/new joint consensus, durable configuration append, and leader recognition can diverge across RPC paths. The modeling brief cites leader-side staging before old/new configuration append, catch-up gates, immediate in-memory old/new configuration, joint-majority checks, follower in-memory configuration update before append futures complete, RequestVote membership checks, and AppendEntries or InstallSnapshot leader recognition that does not mirror the same guard. Model checking explored this area and found no violation after spec fixes, so it is not represented by a concrete MC candidate. Confirmation should decide whether the remaining configuration and membership-guard mechanism is a real current bug."
+    }
+  ]
+}

@@ -1,0 +1,56 @@
+- **Source**: MC
+- **Novelty**: NEW
+- **Location**: ratis-server/src/main/java/org/apache/ratis/server/raftlog/segmented/SegmentedRaftLogWorker.java:415
+
+## Description
+`SegmentedRaftLogWorker.asyncFlushOutStream` advances `flushIndex` with `updateFlushedIndexIncreasingly(lastWrittenIndex)` even when the async flush future completes with an exception. `RaftLogBase.updateCommitIndex` then bounds commit by this incorrect `flushIndex`, so the leader can commit and reply success for an entry whose local `FileChannel.force(false)` failed.
+
+## Trigger scenario
+Checklist:
+
+1. Did Level 0 or Level 1 alone trigger it: **no**. Level 0 normal public client write succeeded without an async force exception; Level 1 timing-only waiting did not create a `FileChannel.force(false)` failure, and no built-in Ratis failpoint exists at `BufferedWriteChannel.fileChannelForce`.
+2. Level 2 was used only to inject the admissible MC fault: one `IOException` from the leader’s already-opened `FileChannel.force(false)`, corresponding to the counterexample step “async flush completed with exception.” Real API sequence: start simulated Ratis cluster, perform normal client write, then call normal admin `setConfiguration ADD listener`.
+3. Real consumer/caller observing the wrong outcome: the admin client receives success through `RaftServerImpl.replyPendingRequest` at `ratis-server/src/main/java/org/apache/ratis/server/impl/RaftServerImpl.java:1885` / `:1913`, after state-machine apply at `RaftServerImpl.java:1974`; commit is consumed by `StateMachineUpdater.applyLog`.
+4. The bad state was not masked in the observed run. After the failed async force, `flushIndex` and `commitIndex` advanced and the admin client completed successfully. No downstream sync, retry, resend, loopback, or caller guard resolved it before success was exposed.
+
+## Developer intent
+Prior-report search covered upstream GitHub issues, merged/closed PRs, and Apache Jira for this mechanism. I found adjacent async-flush work, but not this failure-path report.
+
+Relevant adjacent history:
+- RATIS-1644 / PR #699 introduced safe async flush and states commit should be updated after flush completion: https://issues.apache.org/jira/browse/RATIS-1644 and https://github.com/apache/ratis/pull/699
+- PR #616 added async flush support: https://github.com/apache/ratis/pull/616
+
+Those do not report the current mechanism where an exceptional async force still advances `flushIndex`. Novelty is therefore `NEW`.
+
+## Reproduction result
+Reproduction test written and executed:
+
+`/home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/repro/test_bugMC-1_async_flush_failure.sh`
+
+Real output:
+
+```text
+[INFO] Running org.apache.ratis.SpeculaAsyncFlushFailureTest
+[INFO] Tests run: 1, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 2.085 s -- in org.apache.ratis.SpeculaAsyncFlushFailureTest
+[INFO] BUILD SUCCESS
+SUREFIRE_OUTPUT: ratis-server/target/surefire-reports/org.apache.ratis.SpeculaAsyncFlushFailureTest-output.txt
+LEVEL0_RESULT=normal public client write before fault injection succeeded; no async force exception/no bug trigger
+LEVEL1_RESULT=timing-only wait around normal operations did not create FileChannel.force IOException; no Ratis failpoint exists at BufferedWriteChannel.fileChannelForce
+LEVEL=2 state injection: injected one IOException from the leader FileChannel.force(false)
+ADMISSIBLE_FAULT=MC counterexample step: async flush completed with exception
+PUBLIC_SEQUENCE=start simulated Ratis cluster; normal client write; normal admin setConfiguration ADD listener
+FORCE_ATTEMPTS=4
+FORCE_FAILURES=1
+TARGET_INDEX=3
+BEFORE_COMMIT=2
+BEFORE_FLUSH=2
+ADMIN_REPLY_SUCCESS=true
+AFTER_COMMIT=6
+AFTER_FLUSH=6
+BUG_TRIGGERED: async force failed, but flushIndex/commitIndex advanced and admin client got success
+```
+
+## Recommendation
+Move `updateFlushedIndexIncreasingly(...)` and write-task completion in `asyncFlushOutStream` behind the successful flush path only. On async flush failure, propagate the failure to waiting write tasks and avoid marking entries durable or commit-eligible. Add a regression test where `FileChannel.force(false)` fails during async flush and assert that `flushIndex`, commit, and client/admin success do not advance for the failed flush coverage.
+
+VERDICT: REPRODUCED

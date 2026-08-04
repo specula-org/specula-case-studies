@@ -1,0 +1,36 @@
+- **Source**: Code Review
+- **Novelty**: KNOWN (cite: https://github.com/apache/ratis/pull/1540; fix-status: unfixed)
+- **Location**: ratis-grpc/src/main/java/org/apache/ratis/grpc/server/GrpcLogAppender.java:842
+
+## Description
+CR-4 is a duplicate of existing upstream reports. PR #1540 / RATIS-2632 reports the same snapshot backpressure mechanism in `GrpcLogAppender.installSnapshot()` / `StreamObserverWithTimeout`: snapshot chunks can be sent without an explicit `isReady()` gate when the outstanding element limit is disabled. Related open PRs also cover the same CR-4 cancellation/resource-retention family: #1363 for `GrpcLogAppender` stream completion/cancel cleanup and #1368 for `GrpcServerProtocolService.ServerRequestStreamObserver` retention.
+
+## Trigger scenario
+A lagging follower requires snapshot installation; the leader streams snapshot chunks; the follower/network is slow; and the install-snapshot outstanding element limit is `0`, disabling the semaphore window. The appendEntries path waits for stream readiness, but the snapshot path has an already-reported gap.
+
+## Developer intent
+Upstream already filed fixes for this exact mechanism:
+https://github.com/apache/ratis/pull/1540, https://github.com/apache/ratis/pull/1363, https://github.com/apache/ratis/pull/1368. Git history also shows adjacent earlier fixes for RATIS-1883, RATIS-1909, RATIS-558, and RATIS-2283, but the matching reports above are still open/unmerged.
+
+## Reproduction result
+Per the bug-confirmation skill, Code Review x already-reported is a Phase-1 drop. I still wrote and executed the requested CR-4 evidence script:
+
+```text
+CR-4 known-status prefilter evidence
+repo_head=7eedc1deed07fc883bfe448b2d33438b7a0e994e
+pr=1540 state=open merged=false title=RATIS-2632. Apply backpressure on install-snapshot chunk loop
+url=https://github.com/apache/ratis/pull/1540
+pr=1363 state=open merged=false title=RATIS-2421. Gracefully cancel stream after complete in GrpcLogAppender
+url=https://github.com/apache/ratis/pull/1363
+pr=1368 state=open merged=false title=RATIS-2426. Fix memory leak in ServerRequestStreamObserver
+url=https://github.com/apache/ratis/pull/1368
+DROPPED_PREFILTER_CONFIRMED: Code Review x known, fix-status=unfixed
+```
+
+Wrote:
+`/home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-grpc-20260803/ratis-grpc/.specula-output/confirmation/CR-4/investigation.md`
+
+## Recommendation
+Do not report CR-4 as a new finding. Track the upstream PRs, especially #1540 for snapshot backpressure, and treat fix status as currently unfixed because the matching PR is open/unmerged.
+
+VERDICT: DROPPED

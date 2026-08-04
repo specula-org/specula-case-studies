@@ -1,0 +1,46 @@
+{
+  "schema_version": "2",
+  "system": "ratis-server",
+  "generated_by": "validation-workflow",
+  "findings": [
+    {
+      "id": "MC-1",
+      "title": "Async flush failure can advance commit ahead of durable log",
+      "source": "model-checking",
+      "scenario": "Scenario 1 - commit advancement versus durable log state",
+      "severity": "Critical",
+      "invariant": "CommittedImpliesDurableFlush",
+      "config": "MC_hunt_scenario1.cfg",
+      "counterexample": "spec/output/MC_hunt_scenario1_bfs_round7.out",
+      "affected_code": [
+        "ratis-server/src/main/java/org/apache/ratis/server/raftlog/segmented/SegmentedRaftLogWorker.java:407",
+        "ratis-server/src/main/java/org/apache/ratis/server/raftlog/segmented/SegmentedRaftLogWorker.java:415",
+        "ratis-server/src/main/java/org/apache/ratis/server/raftlog/RaftLogBase.java:123",
+        "ratis-server/src/main/java/org/apache/ratis/server/impl/LeaderStateImpl.java:956"
+      ],
+      "summary": "A TLC counterexample shows a leader appending a configuration entry, encountering an async flush failure, and still advancing modeled flush coverage so commit can advance while the local durable log is empty. The source-backed mechanism is that SegmentedRaftLogWorker.asyncFlushOutStream calls updateFlushedIndexIncreasingly(lastWrittenIndex) even when the async flush completed with an exception, while RaftLogBase and LeaderStateImpl rely on flushIndex when advancing commit. This is a model-checking candidate and still needs code-level reproduction."
+    },
+    {
+      "id": "MC-2",
+      "title": "Old leader lease read can race with NOT_LEADER reply handling",
+      "source": "model-checking",
+      "scenario": "Scenario 4 - leader lease and ReadIndex state across leadership change",
+      "severity": "High",
+      "invariant": "NoOldLeaderLeaseRead",
+      "config": "MC_hunt_scenario4.cfg",
+      "counterexample": "spec/output/MC_hunt_scenario4_bfs_round10.out",
+      "affected_code": [
+        "ratis-server/src/main/java/org/apache/ratis/server/leader/LogAppenderDefault.java:95",
+        "ratis-server/src/main/java/org/apache/ratis/server/leader/LogAppenderDefault.java:103",
+        "ratis-server/src/main/java/org/apache/ratis/server/leader/LogAppenderDefault.java:105",
+        "ratis-server/src/main/java/org/apache/ratis/server/leader/LogAppenderDefault.java:106",
+        "ratis-server/src/main/java/org/apache/ratis/server/leader/LogAppenderDefault.java:186",
+        "ratis-server/src/main/java/org/apache/ratis/server/leader/LogAppenderDefault.java:221",
+        "ratis-server/src/main/java/org/apache/ratis/server/impl/LeaderLease.java:68",
+        "ratis-server/src/main/java/org/apache/ratis/server/impl/LeaderStateImpl.java:1214",
+        "ratis-server/src/main/java/org/apache/ratis/server/impl/LeaderStateImpl.java:1249"
+      ],
+      "summary": "A TLC counterexample shows an old leader receiving a NOT_LEADER-style AppendEntries reply, recording the follower response timestamp before handling the reply, extending the leader lease from that timestamp, and serving a ReadIndex request through the lease fast path before demotion. The source-backed race spans LogAppenderDefault timestamp updates, deferred NOT_LEADER handling, LeaderLease extension, and LeaderStateImpl lease fast-path reads. This is a model-checking candidate and still needs code-level reproduction."
+    }
+  ]
+}

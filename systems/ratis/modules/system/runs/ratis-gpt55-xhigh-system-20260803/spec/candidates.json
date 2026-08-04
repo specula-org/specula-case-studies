@@ -1,0 +1,164 @@
+{
+  "schema_version": "2",
+  "system": "ratis-system",
+  "generated_by": "consolidate",
+  "findings": [
+    {
+      "id": "MC-1",
+      "title": "Stale AppendEntries SUCCESS after higher-term vote can let an old leader commit an entry absent from the new leader",
+      "source": "model-checking",
+      "scenario": "Scenario 1: In-flight append composition across leader change",
+      "severity": "High",
+      "invariant": "LeaderCompleteness",
+      "config": "MC.cfg",
+      "counterexample": "spec/output/mc/MC_convergence_round3.log",
+      "affected_code": [
+        "ratis-server/src/main/java/org/apache/ratis/server/impl/RaftServerImpl.java:1523",
+        "ratis-server/src/main/java/org/apache/ratis/server/impl/RaftServerImpl.java:1669",
+        "ratis-server/src/main/java/org/apache/ratis/server/impl/RaftServerImpl.java:1730",
+        "ratis-grpc/src/main/java/org/apache/ratis/grpc/server/GrpcLogAppender.java:519",
+        "ratis-server/src/main/java/org/apache/ratis/server/impl/LeaderStateImpl.java:953"
+      ],
+      "summary": "A follower can accept an append and grant a higher-term vote before asynchronous append completion. The append may then return a stale SUCCESS to the old leader, which counts it toward commit. This can commit an entry that is absent from a subsequently elected leader, violating LeaderCompleteness.",
+      "dedup_note": "also covers code-review Scenario 1 (same in-flight append completion across leader change mechanism)"
+    },
+    {
+      "id": "MC-2",
+      "title": "Append compose can return SUCCESS for a mismatched future at the same start index",
+      "source": "model-checking",
+      "scenario": "Scenario 1: In-flight append composition across leader change",
+      "severity": "High",
+      "invariant": "AppendSuccessReflectsLog",
+      "config": "MC_hunt_scenario1.cfg",
+      "counterexample": "spec/output/hunt/MC_hunt_scenario1_sim3.log",
+      "affected_code": [
+        "ratis-server/src/main/java/org/apache/ratis/server/impl/ServerImplUtils.java:150",
+        "ratis-server/src/main/java/org/apache/ratis/server/impl/ServerImplUtils.java:163",
+        "ratis-server/src/main/java/org/apache/ratis/server/impl/RaftServerImpl.java:1713",
+        "ratis-server-api/src/main/java/org/apache/ratis/server/RaftServerConfigKeys.java:475"
+      ],
+      "summary": "Append composition deduplicates in-flight work by starting log index only. A later request with the same index but a different term or value can reuse an older future and receive SUCCESS without storing the exact claimed entry. The acknowledgment can therefore describe follower state that its log does not contain.",
+      "dedup_note": "also covers code-review Scenario 1 (same start-index append composition cache mechanism)"
+    },
+    {
+      "id": "MC-3",
+      "title": "Metadata persist failure can leave an accepted leader term non-durable",
+      "source": "model-checking",
+      "scenario": "Scenario 2: Term, role, and metadata persistence are non-atomic",
+      "severity": "Medium",
+      "invariant": "PersistedTermBeforeAccept",
+      "config": "MC_hunt_scenario2.cfg",
+      "counterexample": "spec/output/hunt/MC_hunt_scenario2.log",
+      "affected_code": [
+        "ratis-server/src/main/java/org/apache/ratis/server/impl/RaftServerImpl.java:642",
+        "ratis-server/src/main/java/org/apache/ratis/server/impl/RaftServerImpl.java:1669",
+        "ratis-server/src/main/java/org/apache/ratis/server/impl/ServerState.java:213",
+        "ratis-server/src/main/java/org/apache/ratis/server/impl/ServerState.java:337"
+      ],
+      "summary": "When metadata persistence fails, the server's volatile term can remain ahead of its durable term. Later same-term leader recognition may skip a persistence retry and accept new-term traffic. A crash can then restore the older term even though the server accepted work in the newer term.",
+      "dedup_note": "also covers code-review Scenario 2 (same non-atomic term and metadata persistence mechanism)"
+    },
+    {
+      "id": "MC-4",
+      "title": "Higher-term step-down event can be dropped by type-only queue deduplication",
+      "source": "model-checking",
+      "scenario": "Scenario 2: Term, role, and metadata persistence are non-atomic",
+      "severity": "Medium",
+      "invariant": "StepDownTermNotLost",
+      "config": "MC_hunt_scenario2.cfg",
+      "counterexample": "spec/output/hunt/MC_hunt_scenario2_rerun2.log",
+      "affected_code": [
+        "ratis-server/src/main/java/org/apache/ratis/server/impl/LeaderStateImpl.java:128",
+        "ratis-server/src/main/java/org/apache/ratis/server/impl/LeaderStateImpl.java:155",
+        "ratis-server/src/main/java/org/apache/ratis/server/impl/LeaderStateImpl.java:507",
+        "ratis-server/src/main/java/org/apache/ratis/server/impl/LeaderStateImpl.java:740"
+      ],
+      "summary": "The leader event queue compares step-down events only by event type. A queued low-term STEP_DOWN can therefore cause a later higher-term STEP_DOWN to be discarded. Queue processing may then persist only the older term and lose the higher term that the leader already observed.",
+      "dedup_note": "also covers code-review Scenario 2 (same type-only step-down event deduplication mechanism)"
+    },
+    {
+      "id": "CR-3",
+      "title": "Snapshot, purge, restart, and configuration frontier interleavings can leave stale or discontinuous follower state",
+      "source": "code-review",
+      "scenario": "Scenario 3: Snapshot, purge, restart, and configuration frontier",
+      "severity": "High",
+      "invariant": null,
+      "config": null,
+      "counterexample": null,
+      "affected_code": [
+        "ratis-server/src/main/java/org/apache/ratis/server/leader/LogAppenderBase.java:225",
+        "ratis-grpc/src/main/java/org/apache/ratis/grpc/server/GrpcLogAppender.java:245",
+        "ratis-server/src/main/java/org/apache/ratis/server/impl/SnapshotInstallationHandler.java:149",
+        "ratis-server/src/main/java/org/apache/ratis/server/impl/SnapshotInstallationHandler.java:193",
+        "ratis-server/src/main/java/org/apache/ratis/server/impl/SnapshotInstallationHandler.java:209",
+        "ratis-server/src/main/java/org/apache/ratis/server/impl/SnapshotInstallationHandler.java:274",
+        "ratis-server/src/main/java/org/apache/ratis/server/impl/ServerState.java:438",
+        "ratis-server/src/main/java/org/apache/ratis/server/raftlog/RaftLogBase.java:263"
+      ],
+      "summary": "Snapshot catch-up spans leader appender decisions, follower snapshot notifications and chunks, configuration payload application, log truncation or reload, and later restart or open. The code-review scenario hypothesizes that notification, purge, leader change, and restart interleavings can leave firstAvailableLogIndex, snapshotIndex or logStart, commitIndex or nextIndex, or configuration state out of sync. The model-checking candidates do not cover this mechanism because they are anchored in append composition and term or step-down persistence sites rather than snapshot frontier handling. Confirmation should check whether a stale configuration or log/snapshot gap can survive snapshot installation, purge, or restart."
+    },
+    {
+      "id": "CR-4",
+      "title": "Joint membership, staged catch-up, and listener promotion can disagree about when a peer is safely caught up",
+      "source": "code-review",
+      "scenario": "Scenario 4: Joint membership, staged catch-up, and listener role transition",
+      "severity": "High",
+      "invariant": null,
+      "config": null,
+      "counterexample": null,
+      "affected_code": [
+        "ratis-server/src/main/java/org/apache/ratis/server/impl/RaftServerImpl.java:1398",
+        "ratis-server/src/main/java/org/apache/ratis/server/impl/RaftServerImpl.java:1443",
+        "ratis-server/src/main/java/org/apache/ratis/server/impl/LeaderStateImpl.java:832",
+        "ratis-server/src/main/java/org/apache/ratis/server/impl/LeaderStateImpl.java:884",
+        "ratis-server/src/main/java/org/apache/ratis/server/impl/LeaderStateImpl.java:956",
+        "ratis-server/src/main/java/org/apache/ratis/server/impl/LeaderStateImpl.java:1041",
+        "ratis-server/src/main/java/org/apache/ratis/server/impl/RaftConfigurationImpl.java:152",
+        "ratis-server/src/main/java/org/apache/ratis/server/impl/PeerConfiguration.java:122",
+        "ratis-server/src/main/java/org/apache/ratis/server/impl/SnapshotInstallationHandler.java:149"
+      ],
+      "summary": "Configuration changes span admin validation, staged catch-up, old/new quorum commit, listener or follower role transitions, and snapshot-carried configuration. The code-review scenario hypothesizes that a peer might be declared caught up, promoted, counted for a new quorum, or allowed into election behavior before it stores the latest configuration log entry or an equivalent snapshot. None of the model-checking candidates cover the setConfiguration, staging, quorum, listener-role, or configuration-from-snapshot sites. Confirmation should preserve this as a separate candidate around configuration catch-up and leader-change interleavings."
+    },
+    {
+      "id": "CR-5",
+      "title": "Client-visible read-index completion can race with delayed append replies, commit, apply, and replied-index flushing",
+      "source": "code-review",
+      "scenario": "Scenario 5: Client-visible commit, read-index, and delayed AppendEntries replies",
+      "severity": "High",
+      "invariant": null,
+      "config": null,
+      "counterexample": null,
+      "affected_code": [
+        "ratis-server/src/main/java/org/apache/ratis/server/impl/RaftServerImpl.java:1119",
+        "ratis-server/src/main/java/org/apache/ratis/server/impl/RaftServerImpl.java:1125",
+        "ratis-server/src/main/java/org/apache/ratis/server/impl/RaftServerImpl.java:1154",
+        "ratis-server/src/main/java/org/apache/ratis/server/impl/ReadRequests.java:58",
+        "ratis-server/src/main/java/org/apache/ratis/server/impl/ReadIndexHeartbeats.java:49",
+        "ratis-server/src/main/java/org/apache/ratis/server/impl/ReadIndexHeartbeats.java:76",
+        "ratis-server/src/main/java/org/apache/ratis/server/raftlog/RaftLogBase.java:122",
+        "ratis-server/src/main/java/org/apache/ratis/server/impl/LeaderStateImpl.java:1015",
+        "ratis-server/src/main/java/org/apache/ratis/server/impl/ReplyFlusher.java:97"
+      ],
+      "summary": "Client-visible reads depend on separate write-index, commit, flush, applied, replied-index, and leader-heartbeat signals. The code-review scenario hypothesizes that delayed AppendEntries replies or read-index heartbeat acknowledgments could satisfy leadership or visibility checks out of order relative to commit and state-machine application. MC-1 involves a stale append success and commit update, but it does not cover the read-index, read queue, heartbeat callId, state-machine apply, or replied-index flushing code sites. Confirmation should check whether a read can complete before the selected read index is durably committed, applied, and protected by current-leader proof under the configured read mode."
+    },
+    {
+      "id": "CR-6",
+      "title": "gRPC appender reconnect, timeout, and old replies can regress or overstate follower progress",
+      "source": "code-review",
+      "scenario": "Scenario 6: gRPC appender progress under reconnect, timeout, and stream reset",
+      "severity": "Medium",
+      "invariant": null,
+      "config": null,
+      "counterexample": null,
+      "affected_code": [
+        "ratis-grpc/src/main/java/org/apache/ratis/grpc/server/GrpcLogAppender.java:215",
+        "ratis-grpc/src/main/java/org/apache/ratis/grpc/server/GrpcLogAppender.java:221",
+        "ratis-grpc/src/main/java/org/apache/ratis/grpc/server/GrpcLogAppender.java:228",
+        "ratis-grpc/src/main/java/org/apache/ratis/grpc/server/GrpcLogAppender.java:448",
+        "ratis-grpc/src/main/java/org/apache/ratis/grpc/server/GrpcLogAppender.java:519",
+        "ratis-server/src/main/java/org/apache/ratis/server/leader/LogAppenderBase.java:193"
+      ],
+      "summary": "Leader-side follower progress is maintained through nextIndex, matchIndex, pending requests, callIds, and stream state. The code-review scenario hypothesizes that reconnect, timeout, stream reset, inconsistency replies, or delayed success replies could regress nextIndex below matched state or advance matchIndex without a follower log justification. The model-checking candidates touch append success handling, but they do not cover the resetClient, timeout, and progress-bound mechanism specific to the gRPC appender. Confirmation should check whether old replies or reconnect paths can produce false catch-up or invalid progress after transport disruption."
+    }
+  ]
+}

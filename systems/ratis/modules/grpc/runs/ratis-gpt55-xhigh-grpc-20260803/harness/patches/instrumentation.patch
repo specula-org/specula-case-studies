@@ -1,0 +1,530 @@
+diff --git a/ratis-grpc/src/main/java/org/apache/ratis/grpc/server/GrpcLogAppender.java b/ratis-grpc/src/main/java/org/apache/ratis/grpc/server/GrpcLogAppender.java
+index 29867b544..10557eb3c 100644
+--- a/ratis-grpc/src/main/java/org/apache/ratis/grpc/server/GrpcLogAppender.java
++++ b/ratis-grpc/src/main/java/org/apache/ratis/grpc/server/GrpcLogAppender.java
+@@ -33,6 +33,7 @@ import org.apache.ratis.server.leader.LogAppenderBase;
+ import org.apache.ratis.server.protocol.TermIndex;
+ import org.apache.ratis.server.raftlog.RaftLog;
+ import org.apache.ratis.server.util.ServerStringUtils;
++import org.apache.ratis.specula.RatisGrpcTrace;
+ import org.apache.ratis.thirdparty.io.grpc.StatusRuntimeException;
+ import org.apache.ratis.thirdparty.io.grpc.stub.CallStreamObserver;
+ import org.apache.ratis.thirdparty.io.grpc.stub.StreamObserver;
+@@ -208,6 +209,8 @@ public class GrpcLogAppender extends LogAppenderBase {
+       getClient().resetConnectBackoff();
+       if (appendLogRequestObserver != null) {
+         appendLogRequestObserver.stop();
++        RatisGrpcTrace.emitCancelAppendStream(getServer().getId(), getFollowerId(), getFollower(),
++            pendingRequests.size(), isFollowerCaughtUpForTrace());
+         appendLogRequestObserver = null;
+       }
+       final int errorCount = replyState.process(event);
+@@ -223,17 +226,34 @@ public class GrpcLogAppender extends LogAppenderBase {
+         BatchLogger.print(BatchLogKey.RESET_CLIENT, f.getId() + "-" + followerNextIndex, suffix ->
+             LOG.warn("{}: Follower failed (request=null, errorCount={}); keep nextIndex ({}) unchanged and retry.{}",
+                 this, errorCount, followerNextIndex, suffix), logMessageBatchDuration);
++        traceStreamReset(request, event);
+         return;
+       }
+       if (request != null && request.isHeartbeat()) {
++        traceStreamReset(request, event);
+         return;
+       }
+       getFollower().computeNextIndex(getNextIndexForError(nextIndex));
++      traceStreamReset(request, event);
+     } catch (IOException ie) {
+       LOG.warn("{}: Failed to resetClient for {}", this, getFollowerId(), ie);
+     }
+   }
+ 
++  private void traceStreamReset(AppendEntriesRequest request, Event event) {
++    final String traceEvent;
++    if (event == Event.ERROR) {
++      traceEvent = "StreamErrorReset";
++    } else if (event == Event.COMPLETE) {
++      traceEvent = "StreamCompleteReset";
++    } else {
++      return;
++    }
++    RatisGrpcTrace.emitStreamReset(traceEvent, getServer().getId(), getFollowerId(),
++        request != null ? request.getCallId() : null, request != null ? request.isHeartbeat() : null,
++        getFollower(), pendingRequests.size(), isFollowerCaughtUpForTrace());
++  }
++
+   private boolean isFollowerCommitBehindLastCommitIndex() {
+     return getRaftLog().getLastCommittedIndex() > getFollower().getCommitIndex();
+   }
+@@ -242,6 +262,10 @@ public class GrpcLogAppender extends LogAppenderBase {
+     if (installSnapshotEnabled) {
+       final SnapshotInfo snapshot = shouldInstallSnapshot();
+       if (snapshot != null) {
++        RatisGrpcTrace.emitTriggerSnapshot(getLeaderState().isFollowerBootstrapping(getFollower())
++                ? "SnapshotAttemptForStagingPeer" : "TriggerSnapshot",
++            getServer().getId(), getFollowerId(), getFollower(), snapshot.getTermIndex().getIndex(),
++            getRaftLog().getStartIndex(), getRaftLog().getNextIndex() - 1, isFollowerCaughtUpForTrace());
+         installSnapshot(snapshot);
+         return true;
+       }
+@@ -249,6 +273,10 @@ public class GrpcLogAppender extends LogAppenderBase {
+       // check installSnapshotNotification
+       final TermIndex firstAvailable = shouldNotifyToInstallSnapshot();
+       if (firstAvailable != null) {
++        RatisGrpcTrace.emitTriggerSnapshot(getLeaderState().isFollowerBootstrapping(getFollower())
++                ? "SnapshotAttemptForStagingPeer" : "TriggerSnapshot",
++            getServer().getId(), getFollowerId(), getFollower(), firstAvailable.getIndex(),
++            getRaftLog().getStartIndex(), getRaftLog().getNextIndex() - 1, isFollowerCaughtUpForTrace());
+         notifyInstallSnapshot(firstAvailable);
+         return true;
+       }
+@@ -341,13 +369,17 @@ public class GrpcLogAppender extends LogAppenderBase {
+   }
+ 
+   static class StreamObservers {
++    private final Object leaderId;
++    private final Object followerId;
+     private final CallStreamObserver<AppendEntriesRequestProto> appendLog;
+     private final CallStreamObserver<AppendEntriesRequestProto> heartbeat;
+     private final TimeDuration waitForReady;
+     private volatile boolean running = true;
+ 
+-    StreamObservers(GrpcServerProtocolClient client, AppendLogResponseHandler handler, boolean separateHeartbeat,
+-        TimeDuration waitTimeMin) {
++    StreamObservers(Object leaderId, Object followerId, GrpcServerProtocolClient client, AppendLogResponseHandler handler,
++        boolean separateHeartbeat, TimeDuration waitTimeMin) {
++      this.leaderId = leaderId;
++      this.followerId = followerId;
+       this.appendLog = client.appendEntries(handler, false);
+       this.heartbeat = separateHeartbeat? client.appendEntries(handler, true): null;
+       this.waitForReady = waitTimeMin.isPositive()? waitTimeMin: TimeDuration.ONE_MILLISECOND;
+@@ -363,9 +395,17 @@ public class GrpcLogAppender extends LogAppenderBase {
+         stream = appendLog;
+       }
+       // stall for stream to be ready.
++      boolean reportedNotReady = false;
+       while (!stream.isReady() && running) {
++        if (!reportedNotReady) {
++          RatisGrpcTrace.emitSetStreamReady(leaderId, followerId, false);
++          reportedNotReady = true;
++        }
+         sleep(waitForReady, isHeartBeat);
+       }
++      if (reportedNotReady && running) {
++        RatisGrpcTrace.emitSetStreamReady(leaderId, followerId, true);
++      }
+       stream.onNext(proto);
+     }
+ 
+@@ -389,6 +429,10 @@ public class GrpcLogAppender extends LogAppenderBase {
+     return CALL_ID_COMPARATOR;
+   }
+ 
++  private boolean isFollowerCaughtUpForTrace() {
++    return !getLeaderState().isFollowerBootstrapping(getFollower());
++  }
++
+   private void appendLog(boolean heartbeat) throws IOException {
+     final AppendEntriesRequestProto pending;
+     final AppendEntriesRequest request;
+@@ -399,13 +443,19 @@ public class GrpcLogAppender extends LogAppenderBase {
+       if (pending == null) {
+         return;
+       }
+-      request = new AppendEntriesRequest(pending, getFollowerId(), grpcServerMetrics);
++      request = new AppendEntriesRequest(pending, getFollowerId(), grpcServerMetrics,
++          RatisGrpcTrace.currentStreamEpoch(getServer().getId(), getFollowerId()));
+       pendingRequests.put(request);
+       increaseNextIndex(pending);
+       if (appendLogRequestObserver == null) {
+         appendLogRequestObserver = new StreamObservers(
+-            getClient(), new AppendLogResponseHandler(), useSeparateHBChannel, getWaitTimeMin());
++            getServer().getId(), getFollowerId(), getClient(), new AppendLogResponseHandler(),
++            useSeparateHBChannel, getWaitTimeMin());
++        RatisGrpcTrace.emitReconnect(getServer().getId(), getFollowerId(), getFollower(), pendingRequests.size(),
++            isFollowerCaughtUpForTrace());
+       }
++      RatisGrpcTrace.emitSendAppend(getServer().getId(), getFollowerId(), pending, getFollower(),
++          pendingRequests.size(), appendLogRequestObserver != null, isFollowerCaughtUpForTrace());
+     }
+ 
+     final TimeDuration remaining = getRemainingWaitTime();
+@@ -453,6 +503,8 @@ public class GrpcLogAppender extends LogAppenderBase {
+           this, heartbeat ? "HEARTBEAT " : "", errorCount, pending);
+       grpcServerMetrics.onRequestTimeout(getFollowerId().toString(), heartbeat);
+       pending.stopRequestTimer();
++      RatisGrpcTrace.emitTimeoutAppend(getServer().getId(), getFollowerId(), cid, heartbeat, getFollower(),
++          pendingRequests.size(), appendLogRequestObserver != null, isFollowerCaughtUpForTrace());
+     }
+   }
+ 
+@@ -508,6 +560,9 @@ public class GrpcLogAppender extends LogAppenderBase {
+ 
+     private void onNextImpl(AppendEntriesRequest request, AppendEntriesReplyProto reply) {
+       final int errorCount = replyState.process(reply.getResult());
++      final boolean oldAfterSnapshot = RatisGrpcTrace.isOldAppendReplyAfterSnapshot(
++          getServer().getId(), getFollowerId(), reply, getFollower());
++      String traceEvent = null;
+ 
+       switch (reply.getResult()) {
+         case SUCCESS:
+@@ -517,6 +572,9 @@ public class GrpcLogAppender extends LogAppenderBase {
+             getFollower().updateNextIndex(reply.getMatchIndex() + 1);
+             getLeaderState().onFollowerSuccessAppendEntries(getFollower());
+           }
++          traceEvent = oldAfterSnapshot ? "OldAppendReplyAfterSnapshot"
++              : !isFollowerCaughtUpForTrace() ? "AppendSuccessForStagingPeer"
++                  : request != null ? "ReceiveSuccessWithRequest" : "ReceiveSuccessWithoutRequest";
+           break;
+         case NOT_LEADER:
+           grpcServerMetrics.onRequestNotLeader(getFollowerId().toString());
+@@ -532,10 +590,16 @@ public class GrpcLogAppender extends LogAppenderBase {
+               this, reply.getResult(), reply.getNextIndex(), errorCount, request, suffix));
+           final long requestFirstIndex = request != null? request.getFirstIndex(): RaftLog.INVALID_LOG_INDEX;
+           updateNextIndex(getNextIndexForInconsistency(requestFirstIndex, reply.getNextIndex()));
++          traceEvent = oldAfterSnapshot ? "OldAppendReplyAfterSnapshot"
++              : request != null ? "ReceiveInconsistencyWithRequest" : "ReceiveInconsistencyWithoutRequest";
+           break;
+         default:
+           throw new IllegalStateException("Unexpected reply result: " + reply.getResult());
+       }
++      if (traceEvent != null) {
++        RatisGrpcTrace.emitReceiveAppend(traceEvent, getServer().getId(), getFollowerId(), reply, getFollower(),
++            pendingRequests.size(), appendLogRequestObserver != null, isFollowerCaughtUpForTrace());
++      }
+       getLeaderState().onAppendEntriesReply(GrpcLogAppender.this, reply);
+       notifyLogAppender();
+     }
+@@ -610,6 +674,12 @@ public class GrpcLogAppender extends LogAppenderBase {
+       }
+     }
+ 
++    int pendingSize() {
++      try (AutoCloseableLock readLock = lock.readLock(caller, LOG::trace)) {
++        return pending.size();
++      }
++    }
++
+     void removePending(InstallSnapshotReplyProto reply) {
+       try (AutoCloseableLock writeLock = lock.writeLock(caller, LOG::trace)) {
+         final int index = Objects.requireNonNull(pending.poll(), "index == null");
+@@ -692,6 +762,8 @@ public class GrpcLogAppender extends LogAppenderBase {
+           getLeaderState().onFollowerCommitIndex(getFollower(), followerSnapshotIndex);
+           increaseNextIndex(followerSnapshotIndex, reply.getResult());
+           removePending(reply);
++          RatisGrpcTrace.emitSnapshotReply("SnapshotAlreadyInstalled", getServer().getId(), getFollowerId(), reply,
++              getFollower(), pendingSize(), isFollowerCaughtUpForTrace());
+           break;
+         case NOT_LEADER:
+           onFollowerTerm(reply.getTerm());
+@@ -710,6 +782,8 @@ public class GrpcLogAppender extends LogAppenderBase {
+           increaseNextIndex(followerSnapshotIndex, reply.getResult());
+           onFollowerCatchup(followerSnapshotIndex);
+           removePending(reply);
++          RatisGrpcTrace.emitSnapshotReply("SnapshotInstalled", getServer().getId(), getFollowerId(), reply,
++              getFollower(), pendingSize(), isFollowerCaughtUpForTrace());
+           break;
+         case SNAPSHOT_UNAVAILABLE:
+           BatchLogger.print(BatchLogKey.SNAPSHOT_UNAVAILABLE,  name,
+@@ -717,6 +791,8 @@ public class GrpcLogAppender extends LogAppenderBase {
+           getFollower().setAttemptedToInstallSnapshot();
+           notifyInstallSnapshotFinished(InstallSnapshotResult.SNAPSHOT_UNAVAILABLE, RaftLog.INVALID_LOG_INDEX);
+           removePending(reply);
++          RatisGrpcTrace.emitSnapshotReply("SnapshotUnavailableOrExpired", getServer().getId(), getFollowerId(), reply,
++              getFollower(), pendingSize(), isFollowerCaughtUpForTrace());
+           break;
+         case UNRECOGNIZED:
+           LOG.error("{}: Reply result {}, {}",
+@@ -725,6 +801,8 @@ public class GrpcLogAppender extends LogAppenderBase {
+         case SNAPSHOT_EXPIRED:
+           LOG.warn("{}: Follower failed since the request expired, {}",
+               name, ServerStringUtils.toInstallSnapshotReplyString(reply));
++          RatisGrpcTrace.emitSnapshotReply("SnapshotUnavailableOrExpired", getServer().getId(), getFollowerId(), reply,
++              getFollower(), pendingSize(), isFollowerCaughtUpForTrace());
+         default:
+           break;
+       }
+@@ -768,15 +846,18 @@ public class GrpcLogAppender extends LogAppenderBase {
+     final InstallSnapshotResponseHandler responseHandler = new InstallSnapshotResponseHandler();
+     StreamObserver<InstallSnapshotRequestProto> snapshotRequestObserver = null;
+     final String requestId = UUID.randomUUID().toString();
++    final String streamName = getFollower().getName() + "-installSnapshot-" + requestId;
++    RatisGrpcTrace.registerStreamName(streamName, getServer().getId(), getFollowerId());
+     try {
+-      snapshotRequestObserver = getClient().installSnapshot(
+-          getFollower().getName() + "-installSnapshot-" + requestId,
++      snapshotRequestObserver = getClient().installSnapshot(streamName,
+           installSnapshotStreamTimeout, maxOutstandingInstallSnapshots, responseHandler);
+       for (InstallSnapshotRequestProto request : newInstallSnapshotRequests(requestId, snapshot)) {
+         if (isRunning()) {
+           snapshotRequestObserver.onNext(request);
+           getFollower().updateLastRpcSendTime(false);
+           responseHandler.addPending(request);
++          RatisGrpcTrace.emitSendSnapshotChunk(getServer().getId(), getFollowerId(), request, getFollower(),
++              responseHandler.pendingSize(), isFollowerCaughtUpForTrace());
+         } else {
+           break;
+         }
+@@ -794,6 +875,8 @@ public class GrpcLogAppender extends LogAppenderBase {
+ 
+     if (responseHandler.hasAllResponse()) {
+       getFollower().setSnapshotIndex(snapshot.getTermIndex().getIndex());
++      RatisGrpcTrace.emitSnapshotInstalled(getServer().getId(), getFollowerId(), snapshot.getTermIndex().getIndex(),
++          getFollower(), responseHandler.pendingSize(), isFollowerCaughtUpForTrace());
+       LOG.info("{}: installed snapshot {} successfully", this, snapshot);
+     }
+   }
+@@ -809,18 +892,21 @@ public class GrpcLogAppender extends LogAppenderBase {
+ 
+     final InstallSnapshotResponseHandler responseHandler = new InstallSnapshotResponseHandler(true);
+     StreamObserver<InstallSnapshotRequestProto> snapshotRequestObserver = null;
++    final String streamName = getFollower().getName() + "-notifyInstallSnapshot";
++    RatisGrpcTrace.registerStreamName(streamName, getServer().getId(), getFollowerId());
+     // prepare and enqueue the notify install snapshot request.
+     final InstallSnapshotRequestProto request = newInstallSnapshotNotificationRequest(firstAvailable);
+     if (LOG.isInfoEnabled()) {
+       LOG.info("{}: send {}", this, ServerStringUtils.toInstallSnapshotRequestString(request));
+     }
+     try {
+-      snapshotRequestObserver = getClient().installSnapshot(getFollower().getName() + "-notifyInstallSnapshot",
+-          requestTimeoutDuration, 0, responseHandler);
++      snapshotRequestObserver = getClient().installSnapshot(streamName, requestTimeoutDuration, 0, responseHandler);
+ 
+       snapshotRequestObserver.onNext(request);
+       getFollower().updateLastRpcSendTime(false);
+       responseHandler.addPending(request);
++      RatisGrpcTrace.emitSendSnapshotChunk(getServer().getId(), getFollowerId(), request, getFollower(),
++          responseHandler.pendingSize(), isFollowerCaughtUpForTrace());
+       snapshotRequestObserver.onCompleted();
+     } catch (Exception e) {
+       GrpcUtil.warn(LOG, () -> this + ": Failed to notify follower to install snapshot.", e);
+@@ -839,6 +925,7 @@ public class GrpcLogAppender extends LogAppenderBase {
+     private volatile Timekeeper.Context timerContext;
+ 
+     private final long callId;
++    private final long streamEpoch;
+     private final TermIndex previousLog;
+     private final int entriesCount;
+ 
+@@ -848,7 +935,13 @@ public class GrpcLogAppender extends LogAppenderBase {
+     private volatile Timestamp sendTime;
+ 
+     AppendEntriesRequest(AppendEntriesRequestProto proto, RaftPeerId followerId, GrpcServerMetrics grpcServerMetrics) {
++      this(proto, followerId, grpcServerMetrics, 0L);
++    }
++
++    AppendEntriesRequest(AppendEntriesRequestProto proto, RaftPeerId followerId, GrpcServerMetrics grpcServerMetrics,
++        long streamEpoch) {
+       this.callId = proto.getServerRequest().getCallId();
++      this.streamEpoch = streamEpoch;
+       this.previousLog = proto.hasPreviousLog()? TermIndex.valueOf(proto.getPreviousLog()): null;
+       this.entriesCount = proto.getEntriesCount();
+       this.firstEntry = entriesCount > 0? TermIndex.valueOf(proto.getEntries(0)): null;
+@@ -870,6 +963,14 @@ public class GrpcLogAppender extends LogAppenderBase {
+       return Optional.ofNullable(firstEntry).map(TermIndex::getIndex).orElse(RaftLog.INVALID_LOG_INDEX);
+     }
+ 
++    long getLastIndex() {
++      return Optional.ofNullable(lastEntry).map(TermIndex::getIndex).orElse(RaftLog.INVALID_LOG_INDEX);
++    }
++
++    long getStreamEpoch() {
++      return streamEpoch;
++    }
++
+     Timestamp getSendTime() {
+       return sendTime;
+     }
+@@ -903,6 +1004,10 @@ public class GrpcLogAppender extends LogAppenderBase {
+       return logRequests.size();
+     }
+ 
++    int size() {
++      return logRequests.size() + heartbeats.size();
++    }
++
+     void clear() {
+       logRequests.clear();
+       heartbeats.clear();
+diff --git a/ratis-grpc/src/main/java/org/apache/ratis/grpc/server/GrpcServerProtocolService.java b/ratis-grpc/src/main/java/org/apache/ratis/grpc/server/GrpcServerProtocolService.java
+index a13e74b89..df96ebf7d 100644
+--- a/ratis-grpc/src/main/java/org/apache/ratis/grpc/server/GrpcServerProtocolService.java
++++ b/ratis-grpc/src/main/java/org/apache/ratis/grpc/server/GrpcServerProtocolService.java
+@@ -24,6 +24,7 @@ import org.apache.ratis.protocol.RaftPeerId;
+ import org.apache.ratis.server.RaftServer;
+ import org.apache.ratis.server.protocol.RaftServerProtocol;
+ import org.apache.ratis.server.util.ServerStringUtils;
++import org.apache.ratis.specula.RatisGrpcTrace;
+ import org.apache.ratis.thirdparty.com.google.protobuf.MessageOrBuilder;
+ import org.apache.ratis.thirdparty.io.grpc.Status;
+ import org.apache.ratis.thirdparty.io.grpc.StatusRuntimeException;
+@@ -184,12 +185,26 @@ class GrpcServerProtocolService extends RaftServerProtocolServiceImplBase {
+     public void onError(Throwable t) {
+       GrpcUtil.warn(LOG, () -> getId() + ": "+ op + " onError, lastRequest: " + getPreviousRequestString(), t);
+       if (isClosed.compareAndSet(false, true)) {
++        traceStreamCancellation();
+         Status status = Status.fromThrowable(t);
+         if (status != null && status.getCode() != Status.Code.CANCELLED) {
+           responseObserver.onCompleted();
+         }
+       }
+     }
++
++    private void traceStreamCancellation() {
++      if (op != RaftServerProtocol.Op.APPEND_ENTRIES) {
++        return;
++      }
++      final PendingServerRequest<REQUEST> previous = previousOnNext.get();
++      if (previous == null || !(previous.getRequest() instanceof AppendEntriesRequestProto)) {
++        return;
++      }
++      final AppendEntriesRequestProto append = (AppendEntriesRequestProto) previous.getRequest();
++      RatisGrpcTrace.emitCancelAppendStreamWeak(RaftPeerId.valueOf(append.getServerRequest().getRequestorId()),
++          getId());
++    }
+   }
+ 
+   private final Supplier<RaftPeerId> idSupplier;
+diff --git a/ratis-grpc/src/main/java/org/apache/ratis/grpc/util/StreamObserverWithTimeout.java b/ratis-grpc/src/main/java/org/apache/ratis/grpc/util/StreamObserverWithTimeout.java
+index 3cc754e56..5fce1e142 100644
+--- a/ratis-grpc/src/main/java/org/apache/ratis/grpc/util/StreamObserverWithTimeout.java
++++ b/ratis-grpc/src/main/java/org/apache/ratis/grpc/util/StreamObserverWithTimeout.java
+@@ -18,6 +18,7 @@
+ package org.apache.ratis.grpc.util;
+ 
+ import org.apache.ratis.protocol.exceptions.TimeoutIOException;
++import org.apache.ratis.specula.RatisGrpcTrace;
+ import org.apache.ratis.thirdparty.io.grpc.ClientInterceptor;
+ import org.apache.ratis.thirdparty.io.grpc.stub.StreamObserver;
+ import org.apache.ratis.util.JavaUtils;
+@@ -82,8 +83,13 @@ public final class StreamObserverWithTimeout<T> implements StreamObserver<T> {
+       return;
+     }
+     boolean acquired = false;
++    boolean reportedBlock = false;
+     for (; !acquired && !isClose.get(); ) {
+       try {
++        if (!reportedBlock && semaphore.availablePermits() == 0) {
++          RatisGrpcTrace.emitSnapshotBackpressureBlock(name, semaphore.used());
++          reportedBlock = true;
++        }
+         acquired = semaphore.tryAcquire(timeout.getDuration(), timeout.getUnit());
+       } catch (InterruptedException e) {
+         Thread.currentThread().interrupt();
+@@ -109,6 +115,7 @@ public final class StreamObserverWithTimeout<T> implements StreamObserver<T> {
+ 
+   private void handleTimeout(int id, TimeDuration timeout, StringSupplier request) {
+     if (id > responseCount.getAsInt()) {
++      RatisGrpcTrace.emitResourceExhausted(name);
+       onError(new TimeoutIOException(name + ": Timed out " + timeout + " for sending request " + request));
+     }
+   }
+diff --git a/ratis-server/src/main/java/org/apache/ratis/server/impl/LeaderStateImpl.java b/ratis-server/src/main/java/org/apache/ratis/server/impl/LeaderStateImpl.java
+index 7e4c97e82..32c1e3ac8 100644
+--- a/ratis-server/src/main/java/org/apache/ratis/server/impl/LeaderStateImpl.java
++++ b/ratis-server/src/main/java/org/apache/ratis/server/impl/LeaderStateImpl.java
+@@ -52,6 +52,7 @@ import org.apache.ratis.server.raftlog.LogEntryHeader;
+ import org.apache.ratis.server.raftlog.LogProtoUtils;
+ import org.apache.ratis.server.raftlog.RaftLog;
+ import org.apache.ratis.server.util.ServerStringUtils;
++import org.apache.ratis.specula.RatisGrpcTrace;
+ import org.apache.ratis.statemachine.TransactionContext;
+ import org.apache.ratis.util.CodeInjectionForTesting;
+ import org.apache.ratis.util.CollectionUtils;
+@@ -543,6 +544,8 @@ class LeaderStateImpl implements LeaderState {
+     } else {
+       // update the LeaderState's sender list
+       Collection<LogAppender> newAppenders = addSenders(allNew);
++      newAppenders.forEach(appender ->
++          RatisGrpcTrace.emitAddStagingPeer(server.getId(), appender.getFollowerId(), appender.getFollower()));
+ 
+       // set the staging state
+       stagingState = configurationStagingState;
+@@ -721,6 +724,8 @@ class LeaderStateImpl implements LeaderState {
+ 
+     Optional.ofNullable(getPeer(info.getId()))
+         .ifPresent(peer -> addAndStartSenders(Collections.singleton(peer)));
++    getLogAppender(info.getId()).ifPresent(appender ->
++        RatisGrpcTrace.emitRestartAppender(server.getId(), info.getId(), appender.getFollower()));
+   }
+ 
+   /**
+@@ -872,14 +877,31 @@ class LeaderStateImpl implements LeaderState {
+           .filter(follower -> !isCaughtUp(follower))
+           .map(FollowerInfoImpl.class::cast)
+           .collect(Collectors.toList());
+-      final EnumSet<BootStrapProgress> reports = laggingFollowers.stream()
+-          .map(follower -> checkProgress(follower, commitIndex))
+-          .collect(Collectors.toCollection(() -> EnumSet.noneOf(BootStrapProgress.class)));
++      final Map<FollowerInfoImpl, BootStrapProgress> progressReports = new HashMap<>();
++      final EnumSet<BootStrapProgress> reports = EnumSet.noneOf(BootStrapProgress.class);
++      laggingFollowers.forEach(follower -> {
++        final BootStrapProgress progress = checkProgress(follower, commitIndex);
++        progressReports.put(follower, progress);
++        reports.add(progress);
++      });
+       if (reports.contains(BootStrapProgress.NOPROGRESS)) {
+         stagingState.fail(BootStrapProgress.NOPROGRESS);
++        progressReports.forEach((follower, progress) -> {
++          if (progress == BootStrapProgress.NOPROGRESS) {
++            RatisGrpcTrace.emitCheckProgress(server.getId(), follower.getId(), "Stale", false,
++                follower.hasAttemptedToInstallSnapshot());
++          }
++        });
+       } else if (!reports.contains(BootStrapProgress.PROGRESSING)) {
++        progressReports.forEach((follower, progress) -> {
++          if (progress == BootStrapProgress.CAUGHTUP) {
++            RatisGrpcTrace.emitCheckProgress(server.getId(), follower.getId(), "Fresh", true,
++                follower.hasAttemptedToInstallSnapshot());
++          }
++        });
+         // all caught up!
+         applyOldNewConf(stagingState);
++        RatisGrpcTrace.emitApplyStagingConfiguration(server.getId(), commitIndex);
+         this.stagingState = null;
+         laggingFollowers.stream()
+             .filter(f -> server.getRaftConf().containsInConf(f.getId()))
+@@ -1020,6 +1042,7 @@ class LeaderStateImpl implements LeaderState {
+ 
+       if (server.getState().updateCommitIndex(majority, currentTerm, true)) {
+         updateCommit(entriesToCommit);
++        RatisGrpcTrace.emitAdvanceCommitIndex(server.getId(), majority);
+       }
+     }
+     watchRequests.update(ReplicationLevel.ALL, min);
+diff --git a/ratis-server/src/main/java/org/apache/ratis/server/impl/RaftServerImpl.java b/ratis-server/src/main/java/org/apache/ratis/server/impl/RaftServerImpl.java
+index f4e740407..f0f778cc5 100644
+--- a/ratis-server/src/main/java/org/apache/ratis/server/impl/RaftServerImpl.java
++++ b/ratis-server/src/main/java/org/apache/ratis/server/impl/RaftServerImpl.java
+@@ -96,6 +96,7 @@ import org.apache.ratis.server.raftlog.RaftLog;
+ import org.apache.ratis.server.raftlog.RaftLogIOException;
+ import org.apache.ratis.server.storage.RaftStorage;
+ import org.apache.ratis.server.storage.RaftStorageDirectory;
++import org.apache.ratis.specula.RatisGrpcTrace;
+ import org.apache.ratis.statemachine.SnapshotInfo;
+ import org.apache.ratis.statemachine.StateMachine;
+ import org.apache.ratis.statemachine.TransactionContext;
+@@ -1678,6 +1679,8 @@ class RaftServerImpl implements RaftServer.Division,
+       //      3. There is a gap between the local log and the entries
+       // In any of these scenarios, we should return an INCONSISTENCY reply
+       // back to leader so that the leader can update this follower's next index.
++      final boolean snapshotInProgress = snapshotInstallationHandler.getInProgressInstallSnapshotIndex()
++          != RaftLog.INVALID_LOG_INDEX;
+       final long inconsistencyReplyNextIndex = checkInconsistentAppendEntries(previous, entries);
+       if (inconsistencyReplyNextIndex > RaftLog.INVALID_LOG_INDEX) {
+         final AppendEntriesReplyProto reply = toAppendEntriesReplyProto(
+@@ -1685,6 +1688,8 @@ class RaftServerImpl implements RaftServer.Division,
+             AppendResult.INCONSISTENCY, callId, RaftLog.INVALID_LOG_INDEX, isHeartbeat);
+         LOG.info("{}: appendEntries* reply {}", getMemberId(), toAppendEntriesReplyString(reply));
+         followerState.ifPresent(fs -> fs.updateLastRpcTime(FollowerState.UpdateType.APPEND_COMPLETE));
++        RatisGrpcTrace.emitFollowerAppendReply(snapshotInProgress ? "FollowerSnapshotInProgress"
++            : "FollowerAppendInconsistency", leaderId, getId(), proto, reply);
+         return future.thenApply(dummy -> reply);
+       }
+ 
+@@ -1727,6 +1732,7 @@ class RaftServerImpl implements RaftServer.Division,
+           nextIndex, AppendResult.SUCCESS, callId, matchIndex, isHeartbeat);
+       logAppendEntries(isHeartbeat, () -> getMemberId()
+           + ": appendEntries* reply " + toAppendEntriesReplyString(reply));
++      RatisGrpcTrace.emitFollowerAppendReply("FollowerAppendSuccess", leaderId, getId(), proto, reply);
+       return reply;
+     });
+   }

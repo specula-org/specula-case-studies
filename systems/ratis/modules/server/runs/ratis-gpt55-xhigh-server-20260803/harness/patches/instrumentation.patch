@@ -1,0 +1,396 @@
+diff --git a/ratis-server/src/main/java/org/apache/ratis/server/impl/LeaderElection.java b/ratis-server/src/main/java/org/apache/ratis/server/impl/LeaderElection.java
+index 385d33833..7ac2a227c 100644
+--- a/ratis-server/src/main/java/org/apache/ratis/server/impl/LeaderElection.java
++++ b/ratis-server/src/main/java/org/apache/ratis/server/impl/LeaderElection.java
+@@ -203,6 +203,9 @@ final class LeaderElection implements Runnable {
+   private ResultAndTerm logAndReturn(Phase phase, Result result, Map<RaftPeerId, RequestVoteReplyProto> responses,
+       List<Exception> exceptions, Long newTerm) {
+     final ResultAndTerm resultAndTerm = new ResultAndTerm(result, newTerm);
++    if (phase == Phase.ELECTION && (result == Result.PASSED || result == Result.SINGLE_MODE_PASSED)) {
++      SpeculaTrace.emit(server.getMemberId(), "LeaderElection.waitForResults.pass");
++    }
+     LOG.info("{}: {} {} received {} response(s) and {} exception(s):",
+         this, phase, resultAndTerm, responses.size(), exceptions.size());
+     int i = 0;
+@@ -488,6 +491,10 @@ final class LeaderElection implements Runnable {
+     for (final RaftPeer peer : others) {
+       final RequestVoteRequestProto r = ServerProtoUtils.toRequestVoteRequestProto(
+           server.getMemberId(), peer.getId(), electionTerm, lastEntry, phase == Phase.PRE_VOTE);
++      if (phase == Phase.ELECTION) {
++        SpeculaTrace.emit(server.getMemberId(), "LeaderElection.submitRequestVote",
++            "msg.source", server.getId(), "msg.peer", peer.getId());
++      }
+       voteExecutor.submit(() -> server.requestVote(r));
+       submitted++;
+     }
+diff --git a/ratis-server/src/main/java/org/apache/ratis/server/impl/LeaderStateImpl.java b/ratis-server/src/main/java/org/apache/ratis/server/impl/LeaderStateImpl.java
+index 7e4c97e82..8143d533a 100644
+--- a/ratis-server/src/main/java/org/apache/ratis/server/impl/LeaderStateImpl.java
++++ b/ratis-server/src/main/java/org/apache/ratis/server/impl/LeaderStateImpl.java
+@@ -487,6 +487,7 @@ class LeaderStateImpl implements LeaderState {
+     pendingRequests.close();
+     watchRequests.close();
+     leaderTracer.close();
++    SpeculaTrace.emit(server.getMemberId(), "LeaderStateImpl.stop");
+     return f;
+   }
+ 
+@@ -548,6 +549,8 @@ class LeaderStateImpl implements LeaderState {
+       stagingState = configurationStagingState;
+ 
+       newAppenders.forEach(LogAppender::start);
++      allNew.stream().findFirst().ifPresent(peer ->
++          SpeculaTrace.emit(server, "LeaderStateImpl.startSetConfiguration", "msg.peer", peer.getId()));
+     }
+ 
+     return pending;
+@@ -605,6 +608,10 @@ class LeaderStateImpl implements LeaderState {
+   @Override
+   public void onFollowerCommitIndex(FollowerInfo follower, long commitIndex) {
+     if (follower.updateCommitIndex(commitIndex)) {
++      final RaftConfigurationImpl conf = server.getRaftConf();
++      if (conf.isTransitional() && follower.getMatchIndex() >= conf.getLogEntryIndex()) {
++        SpeculaTrace.emit(server, "LeaderStateImpl.configAck", "msg.peer", follower.getId());
++      }
+       commitIndexChanged();
+     }
+   }
+@@ -628,6 +635,9 @@ class LeaderStateImpl implements LeaderState {
+     final RaftConfigurationImpl oldNewConf = stage.generateOldNewConf(current, nextIndex);
+     // apply the (old, new) configuration to log, and use it as the current conf
+     appendConfiguration(oldNewConf);
++    if (stagingState != null) {
++      SpeculaTrace.emit(server, "LeaderStateImpl.applyOldNewConf");
++    }
+ 
+     notifySenders();
+   }
+@@ -1019,6 +1029,7 @@ class LeaderStateImpl implements LeaderState {
+       final LogEntryHeader[] entriesToCommit = raftLog.getEntries(oldLastCommitted + 1, majority + 1);
+ 
+       if (server.getState().updateCommitIndex(majority, currentTerm, true)) {
++        SpeculaTrace.emit(server, "LeaderStateImpl.updateCommit", "index", raftLog.getLastCommittedIndex());
+         updateCommit(entriesToCommit);
+       }
+     }
+@@ -1034,6 +1045,7 @@ class LeaderStateImpl implements LeaderState {
+   private void checkAndUpdateConfiguration() {
+     final RaftConfigurationImpl conf = server.getRaftConf();
+     if (conf.isTransitional()) {
++      SpeculaTrace.emit(server, "LeaderStateImpl.commitOldNewConf");
+       replicateNewConf();
+     } else { // the (new) log entry has been committed
+       pendingRequests.replySetConfiguration(server::newSuccessReply);
+@@ -1201,7 +1213,11 @@ class LeaderStateImpl implements LeaderState {
+ 
+     // if lease is enabled, check lease first
+     // if we allow leader to skip the leadership check heartbeat, we can return immediately
+-    if (!leaderHeartbeatCheckEnabled || hasLease()) {
++    final boolean leaseFastPath = leaderHeartbeatCheckEnabled && hasLease();
++    if (!leaderHeartbeatCheckEnabled || leaseFastPath) {
++      if (leaseFastPath) {
++        SpeculaTrace.emit(server, "LeaderStateImpl.getReadIndex.leaseFastPath", "index", readIndex);
++      }
+       return CompletableFuture.completedFuture(readIndex);
+     }
+ 
+@@ -1223,7 +1239,11 @@ class LeaderStateImpl implements LeaderState {
+   }
+ 
+   boolean getAndSetLeaseEnabled(boolean newValue) {
+-    return lease.getAndSetEnabled(newValue);
++    final boolean old = lease.getAndSetEnabled(newValue);
++    if (!old && newValue) {
++      SpeculaTrace.emit(server, "LeaderLease.enableForTarget");
++    }
++    return old;
+   }
+ 
+   boolean hasLease() {
+@@ -1240,7 +1260,11 @@ class LeaderStateImpl implements LeaderState {
+     final CurrentOldFollowerInfos info = followerInfoMap.getFollowerInfos(conf);
+     lease.extend(info.getCurrent(), info.getOld(), peers -> conf.hasMajority(peers, server.getId()));
+ 
+-    return checkLeaderLease();
++    final boolean extended = checkLeaderLease();
++    if (extended) {
++      SpeculaTrace.emit(server, "LeaderLease.extend");
++    }
++    return extended;
+   }
+ 
+   private boolean checkLeaderLease() {
+diff --git a/ratis-server/src/main/java/org/apache/ratis/server/impl/RaftServerImpl.java b/ratis-server/src/main/java/org/apache/ratis/server/impl/RaftServerImpl.java
+index f4e740407..8a5c4c22c 100644
+--- a/ratis-server/src/main/java/org/apache/ratis/server/impl/RaftServerImpl.java
++++ b/ratis-server/src/main/java/org/apache/ratis/server/impl/RaftServerImpl.java
+@@ -1103,14 +1103,17 @@ class RaftServerImpl implements RaftServer.Division,
+   private CompletableFuture<ReadIndexReplyProto> sendReadIndexAsync(RaftClientRequest clientRequest) {
+     final long installSnapshot = snapshotInstallationHandler.getInProgressInstallSnapshotIndex();
+     if (installSnapshot != RaftLog.INVALID_LOG_INDEX) {
++      SpeculaTrace.emit(this, "RaftServerImpl.sendReadIndexAsync", "index", state.getLog().getLastCommittedIndex());
+       return JavaUtils.completeExceptionally(getReadException("get", installSnapshot, false));
+     }
+     final RaftPeerId leaderId = getInfo().getLeaderId();
+     if (leaderId == null) {
++      SpeculaTrace.emit(this, "RaftServerImpl.sendReadIndexAsync", "index", state.getLog().getLastCommittedIndex());
+       return JavaUtils.completeExceptionally(new ReadIndexException(getMemberId() + ": Leader is unknown."));
+     }
+     final ReadIndexRequestProto request = toReadIndexRequestProto(clientRequest, getMemberId(), leaderId);
+     try {
++      SpeculaTrace.emit(this, "RaftServerImpl.sendReadIndexAsync", "index", state.getLog().getLastCommittedIndex());
+       return getServerRpc().async().readIndexAsync(request);
+     } catch (IOException e) {
+       return JavaUtils.completeExceptionally(e);
+@@ -1539,6 +1542,12 @@ class RaftServerImpl implements RaftServer.Division,
+     if (future != null) {
+       future.join();
+     }
++    if (phase == Phase.ELECTION) {
++      if (reply.getServerReply().getSuccess()) {
++        SpeculaTrace.emitVoteReplyLastEntryKind(this);
++        SpeculaTrace.emit(this, "RaftServerImpl.requestVote.grant", "msg.source", candidateId);
++      }
++    }
+     return reply;
+   }
+ 
+@@ -1685,10 +1694,16 @@ class RaftServerImpl implements RaftServer.Division,
+             AppendResult.INCONSISTENCY, callId, RaftLog.INVALID_LOG_INDEX, isHeartbeat);
+         LOG.info("{}: appendEntries* reply {}", getMemberId(), toAppendEntriesReplyString(reply));
+         followerState.ifPresent(fs -> fs.updateLastRpcTime(FollowerState.UpdateType.APPEND_COMPLETE));
++        if (snapshotInstallationHandler.getInProgressInstallSnapshotIndex() != RaftLog.INVALID_LOG_INDEX) {
++          SpeculaTrace.emit(this, "RaftServerImpl.appendEntries.rejectSnapshot",
++              "msg.source", leaderId,
++              "msg.index", entries.isEmpty() ? RaftLog.INVALID_LOG_INDEX : entries.get(0).getIndex());
++        }
+         return future.thenApply(dummy -> reply);
+       }
+ 
+       state.updateConfiguration(entries);
++      SpeculaTrace.emitFollowerConfigurationUpdate(this, entries);
+     }
+     future.join();
+     final CompletableFuture<Void> appendFuture = entries.isEmpty()? CompletableFuture.completedFuture(null)
+@@ -1727,6 +1742,8 @@ class RaftServerImpl implements RaftServer.Division,
+           nextIndex, AppendResult.SUCCESS, callId, matchIndex, isHeartbeat);
+       logAppendEntries(isHeartbeat, () -> getMemberId()
+           + ": appendEntries* reply " + toAppendEntriesReplyString(reply));
++      SpeculaTrace.emit(getMemberId(), "RaftServerImpl.appendEntries.success",
++          "msg.source", leaderId, "msg.index", matchIndex);
+       return reply;
+     });
+   }
+diff --git a/ratis-server/src/main/java/org/apache/ratis/server/impl/ServerState.java b/ratis-server/src/main/java/org/apache/ratis/server/impl/ServerState.java
+index ad3210d63..bb3dfc6cc 100644
+--- a/ratis-server/src/main/java/org/apache/ratis/server/impl/ServerState.java
++++ b/ratis-server/src/main/java/org/apache/ratis/server/impl/ServerState.java
+@@ -234,6 +234,7 @@ class ServerState {
+       term = currentTerm.incrementAndGet();
+       votedFor = getMemberId().getPeerId();
+       persistMetadata();
++      SpeculaTrace.emit(server, "ServerState.initElection.ELECTION");
+     } else {
+       throw new IllegalArgumentException("Unexpected phase " + phase);
+     }
+diff --git a/ratis-server/src/main/java/org/apache/ratis/server/impl/SnapshotInstallationHandler.java b/ratis-server/src/main/java/org/apache/ratis/server/impl/SnapshotInstallationHandler.java
+index e92d2ffd4..f7a715bc1 100644
+--- a/ratis-server/src/main/java/org/apache/ratis/server/impl/SnapshotInstallationHandler.java
++++ b/ratis-server/src/main/java/org/apache/ratis/server/impl/SnapshotInstallationHandler.java
+@@ -230,12 +230,16 @@ class SnapshotInstallationHandler {
+         final StateMachine stateMachine = server.getStateMachine();
+         snapshotManager.appendSnapshot(request, stateMachine);
+         nextChunkIndex.incrementAndGet();
++        SpeculaTrace.emit(server, "SnapshotInstallationHandler.checkAndInstallSnapshot.appendChunk",
++            "msg.source", leaderId, "index", lastIncludedIndex);
+         // update the committed index
+         // re-load the state machine if this is the last chunk
+         if (snapshotChunkRequest.getDone()) {
+           stateMachine.pause(); // pause the SM right before publishing the snapshot atomically
+           snapshotManager.finalizeSnapshot(request);
+           state.reloadStateMachine(lastIncluded);
++          SpeculaTrace.emit(server, "SnapshotInstallationHandler.checkAndInstallSnapshot.finalChunkPublish",
++              "msg.source", leaderId, "index", lastIncludedIndex);
+           chunk0CallId.set(-1);
+         }
+       } finally {
+@@ -287,6 +291,8 @@ class SnapshotInstallationHandler {
+           return future.thenApply(dummy -> reply);
+         }
+         server.getState().getReadRequests().fail(server.getReadException("wait for", firstAvailableLogIndex, true));
++        SpeculaTrace.emit(server, "SnapshotInstallationHandler.notifyStateMachineToInstallSnapshot",
++            "msg.source", leaderId, "index", firstAvailableLogIndex);
+ 
+         final RaftPeerProto leaderProto;
+         if (!request.hasLastRaftConfigurationLogEntryProto()) {
+@@ -381,6 +387,8 @@ class SnapshotInstallationHandler {
+         server.getStateMachine().event().notifySnapshotInstalled(
+             InstallSnapshotResult.SNAPSHOT_INSTALLED, latestInstalledIndex, server.getPeer());
+         installedIndex.set(latestInstalledIndex);
++        SpeculaTrace.emit(server, "SnapshotInstallationHandler.notifyStateMachine.complete",
++            "msg.source", leaderId, "index", latestInstalledIndex);
+         final InstallSnapshotReplyProto reply = toInstallSnapshotReplyProto(leaderId, getMemberId(),
+             currentTerm, InstallSnapshotResult.SNAPSHOT_INSTALLED, latestInstalledSnapshotTermIndex.getIndex());
+         return future.thenApply(dummy -> reply);
+diff --git a/ratis-server/src/main/java/org/apache/ratis/server/leader/LogAppenderDefault.java b/ratis-server/src/main/java/org/apache/ratis/server/leader/LogAppenderDefault.java
+index 66c35873a..e33cefa85 100644
+--- a/ratis-server/src/main/java/org/apache/ratis/server/leader/LogAppenderDefault.java
++++ b/ratis-server/src/main/java/org/apache/ratis/server/leader/LogAppenderDefault.java
+@@ -23,6 +23,7 @@ import org.apache.ratis.proto.RaftProtos.InstallSnapshotReplyProto;
+ import org.apache.ratis.proto.RaftProtos.InstallSnapshotRequestProto;
+ import org.apache.ratis.rpc.CallId;
+ import org.apache.ratis.server.RaftServer;
++import org.apache.ratis.server.impl.SpeculaTrace;
+ import org.apache.ratis.server.raftlog.RaftLog;
+ import org.apache.ratis.server.raftlog.RaftLogIOException;
+ import org.apache.ratis.server.util.ServerStringUtils;
+@@ -95,11 +96,17 @@ class LogAppenderDefault extends LogAppenderBase {
+         final Timestamp sendTime = Timestamp.currentTime();
+         getFollower().updateLastRpcSendTime(request.getEntriesCount() == 0);
+         final AppendEntriesRequestProto proto = request;
++        final long firstIndex = proto.getEntriesCount() > 0
++            ? proto.getEntries(0).getIndex() : RaftLog.INVALID_LOG_INDEX;
++        SpeculaTrace.emit(getServer(), "LeaderStateImpl.sendAppendEntries",
++            "msg.source", getServer().getId(), "msg.peer", getFollowerId(), "msg.index", firstIndex);
+         final AppendEntriesReplyProto reply = getServerRpc().appendEntries(proto);
+-        final long first = proto.getEntriesCount() > 0 ? proto.getEntries(0).getIndex() : RaftLog.INVALID_LOG_INDEX;
+-        requestFirstIndex.set(first);
++        requestFirstIndex.set(firstIndex);
+         getFollower().updateLastRpcResponseTime();
+         getFollower().updateLastRespondedAppendEntriesSendTime(sendTime);
++        SpeculaTrace.emit(getServer(), "LogAppenderDefault.receiveAppendEntriesReply.timestamp",
++            "msg.peer", getFollowerId(),
++            "result", SpeculaTrace.appendResult(reply.getResult(), reply.getTerm(), getServer().getInfo().getCurrentTerm()));
+ 
+         getLeaderState().onFollowerCommitIndex(getFollower(), reply.getFollowerCommit());
+         return new AppendEntriesResult(reply, proto);
+@@ -168,6 +175,7 @@ class LogAppenderDefault extends LogAppenderBase {
+               case ALREADY_INSTALLED:
+               case SNAPSHOT_EXPIRED:
+                 getFollower().setAttemptedToInstallSnapshot();
++                SpeculaTrace.emit(getServer(), "LeaderStateImpl.markAttemptedSnapshot", "msg.peer", getFollowerId());
+                 break;
+               default:
+                 break;
+diff --git a/ratis-server/src/main/java/org/apache/ratis/server/raftlog/RaftLogBase.java b/ratis-server/src/main/java/org/apache/ratis/server/raftlog/RaftLogBase.java
+index 48b410147..bb03cc602 100644
+--- a/ratis-server/src/main/java/org/apache/ratis/server/raftlog/RaftLogBase.java
++++ b/ratis-server/src/main/java/org/apache/ratis/server/raftlog/RaftLogBase.java
+@@ -24,6 +24,7 @@ import org.apache.ratis.protocol.RaftGroupMemberId;
+ import org.apache.ratis.protocol.exceptions.StateMachineException;
+ import org.apache.ratis.server.RaftConfiguration;
+ import org.apache.ratis.server.RaftServerConfigKeys;
++import org.apache.ratis.server.impl.SpeculaTrace;
+ import org.apache.ratis.server.protocol.TermIndex;
+ import org.apache.ratis.statemachine.TransactionContext;
+ import org.apache.ratis.thirdparty.com.google.protobuf.ByteString;
+@@ -229,6 +230,7 @@ public abstract class RaftLogBase implements RaftLog {
+     try(AutoCloseableLock writeLock = writeLock()) {
+       nextIndex = getNextIndex();
+       entry = LogProtoUtils.toLogEntryProto(newCommitIndex, term, nextIndex);
++      SpeculaTrace.emit(memberId, this, "RaftLogBase.appendMetadata");
+       appendEntry(entry);
+     }
+     lastMetadataEntry.set(entry);
+diff --git a/ratis-server/src/main/java/org/apache/ratis/server/raftlog/segmented/SegmentedRaftLog.java b/ratis-server/src/main/java/org/apache/ratis/server/raftlog/segmented/SegmentedRaftLog.java
+index a6ea6e3ca..3d247fc55 100644
+--- a/ratis-server/src/main/java/org/apache/ratis/server/raftlog/segmented/SegmentedRaftLog.java
++++ b/ratis-server/src/main/java/org/apache/ratis/server/raftlog/segmented/SegmentedRaftLog.java
+@@ -22,6 +22,7 @@ import org.apache.ratis.metrics.Timekeeper;
+ import org.apache.ratis.protocol.RaftGroupMemberId;
+ import org.apache.ratis.server.RaftServer;
+ import org.apache.ratis.server.RaftServerConfigKeys;
++import org.apache.ratis.server.impl.SpeculaTrace;
+ import org.apache.ratis.server.metrics.SegmentedRaftLogMetrics;
+ import org.apache.ratis.server.protocol.TermIndex;
+ import org.apache.ratis.server.raftlog.LogEntryHeader;
+@@ -194,6 +195,7 @@ public final class SegmentedRaftLog extends RaftLogBase {
+   }
+ 
+   private final ServerLogMethods server;
++  private final RaftServer.Division division;
+   private final RaftStorage storage;
+   private final StateMachine stateMachine;
+   private final SegmentedRaftLogCache cache;
+@@ -210,6 +212,7 @@ public final class SegmentedRaftLog extends RaftLogBase {
+     this.metrics = new SegmentedRaftLogMetrics(b.memberId);
+ 
+     this.server = newServerLogMethods(b.server, b.notifyTruncatedLogEntry, b.getTransactionContext);
++    this.division = b.server;
+     this.storage = b.storage;
+     this.stateMachine = b.stateMachine;
+     this.segmentMaxSize = RaftServerConfigKeys.Log.segmentSizeMax(b.properties).getSize();
+@@ -431,6 +434,7 @@ public final class SegmentedRaftLog extends RaftLogBase {
+       // to statemachine first and then to the cache. Not following the order
+       // will leave a spurious entry in the cache.
+       cache.verifyAppendEntryIndex(entry);
++      SpeculaTrace.emitAppendEntryCacheAndQueue(division, entry);
+       CompletableFuture<Long> writeFuture =
+           fileLogWorker.writeLogEntry(entry, context).getFuture();
+       if (stateMachineCachingEnabled) {
+diff --git a/ratis-server/src/main/java/org/apache/ratis/server/raftlog/segmented/SegmentedRaftLogWorker.java b/ratis-server/src/main/java/org/apache/ratis/server/raftlog/segmented/SegmentedRaftLogWorker.java
+index cac35f55b..3da918cfd 100644
+--- a/ratis-server/src/main/java/org/apache/ratis/server/raftlog/segmented/SegmentedRaftLogWorker.java
++++ b/ratis-server/src/main/java/org/apache/ratis/server/raftlog/segmented/SegmentedRaftLogWorker.java
+@@ -25,6 +25,7 @@ import org.apache.ratis.protocol.RaftGroupMemberId;
+ import org.apache.ratis.protocol.exceptions.TimeoutIOException;
+ import org.apache.ratis.server.RaftServer;
+ import org.apache.ratis.server.RaftServerConfigKeys;
++import org.apache.ratis.server.impl.SpeculaTrace;
+ import org.apache.ratis.server.metrics.SegmentedRaftLogMetrics;
+ import org.apache.ratis.server.raftlog.LogProtoUtils;
+ import org.apache.ratis.server.raftlog.RaftLog;
+@@ -376,19 +377,23 @@ class SegmentedRaftLogWorker {
+         if (stateMachineDataPolicy.isSync()) {
+           stateMachineDataPolicy.getFromFuture(f, () -> this + "-flushStateMachineData");
+         }
+-        flushBatchSize = (int)(lastWrittenIndex - flushIndex.get());
++        final long flushCovered = lastWrittenIndex;
++        flushBatchSize = (int)(flushCovered - flushIndex.get());
++        SpeculaTrace.emit(server, "SegmentedRaftLogWorker.flushIfNecessary.start", "index", flushCovered);
+         if (unsafeFlush) {
+           // unsafe-flush: call updateFlushedIndexIncreasingly() without waiting the underlying FileChannel.force(..).
+           unsafeFlushOutStream();
+           updateFlushedIndexIncreasingly();
++          SpeculaTrace.emit(server, "SegmentedRaftLogWorker.asyncFlushOutStream.complete", "index", flushCovered);
+         } else if (asyncFlush) {
+-          asyncFlushOutStream(f);
++          asyncFlushOutStream(f, flushCovered);
+         } else {
+           flushOutStream();
+           if (!stateMachineDataPolicy.isSync()) {
+             IOUtils.getFromFuture(f, () -> this + "-flushStateMachineData");
+           }
+           updateFlushedIndexIncreasingly();
++          SpeculaTrace.emit(server, "SegmentedRaftLogWorker.asyncFlushOutStream.complete", "index", flushCovered);
+         }
+       }
+     }
+@@ -399,12 +404,18 @@ class SegmentedRaftLogWorker {
+     out.asyncFlush(flushExecutor).whenComplete((v, e) -> logSyncTimerContext.stop());
+   }
+ 
+-  private void asyncFlushOutStream(CompletableFuture<Void> stateMachineFlush) throws IOException {
++  private void asyncFlushOutStream(CompletableFuture<Void> stateMachineFlush, long flushCovered) throws IOException {
+     final Timekeeper.Context logSyncTimerContext = raftLogMetrics.getSyncTimer().time();
+     out.asyncFlush(flushExecutor)
+         .thenCombine(stateMachineFlush, (async, sm) -> async)
+         .whenComplete((v, e) -> {
++          if (e != null) {
++            SpeculaTrace.emit(server, "SegmentedRaftLogWorker.asyncFlushOutStream.fail", "index", flushCovered);
++          }
+           updateFlushedIndexIncreasingly(lastWrittenIndex);
++          if (e == null) {
++            SpeculaTrace.emit(server, "SegmentedRaftLogWorker.asyncFlushOutStream.complete", "index", flushCovered);
++          }
+           logSyncTimerContext.stop();
+         });
+   }
+@@ -558,6 +569,7 @@ class SegmentedRaftLogWorker {
+       out.write(entry);
+       lastWrittenIndex = entry.getIndex();
+       pendingFlushNum++;
++      SpeculaTrace.emit(server, "SegmentedRaftLogWorker.WriteLog.execute", "index", entry.getIndex());
+       flushIfNecessary();
+     }
+ 

@@ -1,0 +1,56 @@
+- **Source**: Code Review
+- **Novelty**: NEW
+- **Location**: ratis-server/src/main/java/org/apache/ratis/server/impl/ServerState.java:330
+
+## Description
+
+CR-5 is not a current Ratis bug. The apparent mismatch is intentional joint-consensus behavior: `RequestVote` only accepts candidates in the current/new configuration, while `AppendEntries`/`InstallSnapshot` may continue recognizing the same-term current leader so an old-conf leader can finish transitional replication before stepping down after the final stable new configuration commits.
+
+The downstream consumers also use the correct guards: transitional commit uses old+new majorities, removed leaders close after final new-conf commit, and stale uncommitted configuration changes are handled by NotLeader/truncation recovery.
+
+## Trigger scenario
+
+I tested the reachable scenarios for this mechanism:
+
+1. Normal client `setConfiguration` removing the current leader.
+2. Timing-assisted stale-old-leader path where a config entry is persisted but not committed.
+3. Reachable state-injection of a transitional single-to-HA configuration.
+
+## Developer intent
+
+Relevant intent is already encoded in upstream tests and comments. `RaftConfigurationImpl.hasMajority` requires both old and new majorities during transitional configs; `LeaderStateImpl.checkAndUpdateConfiguration` closes a leader not in the final new conf only after the stable new-conf entry commits. Adjacent prior work was checked and is not the same mechanism: RATIS-2274 / PR #1246, RATIS-2154 / PR #1148, and RATIS-2008 / PR #1024.
+
+## Reproduction result
+
+Repro test written and executed:
+
+`/home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/repro/test_bugCR-5_membership_guards.sh`
+
+Real output excerpt:
+
+```text
+CR-5 reproduction attempt on 7eedc1deed07fc883bfe448b2d33438b7a0e994e
+
+== Level 0 public API: testLeaderStepDown ==
+maven-exit: 0
+Tests run: 1, Failures: 0, Errors: 0, Skipped: 0
+
+== Level 1 timing assistance: testRevertConfigurationChange ==
+maven-exit: 0
+Tests run: 1, Failures: 0, Errors: 0, Skipped: 0
+
+== Level 2 reachable state injection: testLeaderElectionWhenChangeFromSingleToHA ==
+maven-exit: 0
+Tests run: 1, Failures: 0, Errors: 0, Skipped: 0
+
+Level 3 source patch: not applied.
+Reason: after Levels 0-2, the only way to force a bad old-only leader outcome would be to fabricate an old-only higher-term leader that RequestVote cannot elect under VoteContext.checkConf; that is an unreachable precondition, not a sound CR-5 reproduction.
+
+CR-5 result: no reproduced live harm from reconfiguration catch-up, leader recognition, or RequestVote membership guards.
+```
+
+## Recommendation
+
+No code fix for CR-5. If maintainers want clearer future auditing, add a focused regression/comment explaining that old-conf same-term leader recognition is allowed during joint consensus, while new elections remain current-conf guarded.
+
+VERDICT: FALSE POSITIVE

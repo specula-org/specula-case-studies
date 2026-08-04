@@ -1,0 +1,1807 @@
+diff --git a/ratis-grpc/src/main/java/org/apache/ratis/grpc/server/GrpcLogAppender.java b/ratis-grpc/src/main/java/org/apache/ratis/grpc/server/GrpcLogAppender.java
+index 29867b544..74da0e102 100644
+--- a/ratis-grpc/src/main/java/org/apache/ratis/grpc/server/GrpcLogAppender.java
++++ b/ratis-grpc/src/main/java/org/apache/ratis/grpc/server/GrpcLogAppender.java
+@@ -30,6 +30,7 @@ import org.apache.ratis.server.RaftServerConfigKeys;
+ import org.apache.ratis.server.leader.FollowerInfo;
+ import org.apache.ratis.server.leader.LeaderState;
+ import org.apache.ratis.server.leader.LogAppenderBase;
++import org.apache.ratis.server.impl.SpeculaTrace;
+ import org.apache.ratis.server.protocol.TermIndex;
+ import org.apache.ratis.server.raftlog.RaftLog;
+ import org.apache.ratis.server.util.ServerStringUtils;
+@@ -223,12 +224,15 @@ public class GrpcLogAppender extends LogAppenderBase {
+         BatchLogger.print(BatchLogKey.RESET_CLIENT, f.getId() + "-" + followerNextIndex, suffix ->
+             LOG.warn("{}: Follower failed (request=null, errorCount={}); keep nextIndex ({}) unchanged and retry.{}",
+                 this, errorCount, followerNextIndex, suffix), logMessageBatchDuration);
++        SpeculaTrace.resetClient(f);
+         return;
+       }
+       if (request != null && request.isHeartbeat()) {
++        SpeculaTrace.resetClient(f);
+         return;
+       }
+       getFollower().computeNextIndex(getNextIndexForError(nextIndex));
++      SpeculaTrace.resetClient(f);
+     } catch (IOException ie) {
+       LOG.warn("{}: Failed to resetClient for {}", this, getFollowerId(), ie);
+     }
+@@ -402,6 +406,7 @@ public class GrpcLogAppender extends LogAppenderBase {
+       request = new AppendEntriesRequest(pending, getFollowerId(), grpcServerMetrics);
+       pendingRequests.put(request);
+       increaseNextIndex(pending);
++      SpeculaTrace.grpcAppendLog(getServer(), getFollower(), pending.getEntriesList());
+       if (appendLogRequestObserver == null) {
+         appendLogRequestObserver = new StreamObservers(
+             getClient(), new AppendLogResponseHandler(), useSeparateHBChannel, getWaitTimeMin());
+@@ -453,6 +458,7 @@ public class GrpcLogAppender extends LogAppenderBase {
+           this, heartbeat ? "HEARTBEAT " : "", errorCount, pending);
+       grpcServerMetrics.onRequestTimeout(getFollowerId().toString(), heartbeat);
+       pending.stopRequestTimer();
++      SpeculaTrace.timeoutAppendRequest(getFollower());
+     }
+   }
+ 
+@@ -513,10 +519,12 @@ public class GrpcLogAppender extends LogAppenderBase {
+         case SUCCESS:
+           grpcServerMetrics.onRequestSuccess(getFollowerId().toString(), reply.getIsHearbeat());
+           getLeaderState().onFollowerCommitIndex(getFollower(), reply.getFollowerCommit());
+-          if (getFollower().updateMatchIndex(reply.getMatchIndex())) {
++          final boolean updatedMatch = getFollower().updateMatchIndex(reply.getMatchIndex());
++          if (updatedMatch) {
+             getFollower().updateNextIndex(reply.getMatchIndex() + 1);
+             getLeaderState().onFollowerSuccessAppendEntries(getFollower());
+           }
++          SpeculaTrace.appendResponseSuccess(getServer(), getFollower(), reply, request == null && updatedMatch);
+           break;
+         case NOT_LEADER:
+           grpcServerMetrics.onRequestNotLeader(getFollowerId().toString());
+@@ -772,6 +780,7 @@ public class GrpcLogAppender extends LogAppenderBase {
+       snapshotRequestObserver = getClient().installSnapshot(
+           getFollower().getName() + "-installSnapshot-" + requestId,
+           installSnapshotStreamTimeout, maxOutstandingInstallSnapshots, responseHandler);
++      SpeculaTrace.installSnapshotNotify(getServer(), getFollower());
+       for (InstallSnapshotRequestProto request : newInstallSnapshotRequests(requestId, snapshot)) {
+         if (isRunning()) {
+           snapshotRequestObserver.onNext(request);
+@@ -821,6 +830,7 @@ public class GrpcLogAppender extends LogAppenderBase {
+       snapshotRequestObserver.onNext(request);
+       getFollower().updateLastRpcSendTime(false);
+       responseHandler.addPending(request);
++      SpeculaTrace.installSnapshotNotify(getServer(), getFollower());
+       snapshotRequestObserver.onCompleted();
+     } catch (Exception e) {
+       GrpcUtil.warn(LOG, () -> this + ": Failed to notify follower to install snapshot.", e);
+diff --git a/ratis-server/src/main/java/org/apache/ratis/server/impl/LeaderStateImpl.java b/ratis-server/src/main/java/org/apache/ratis/server/impl/LeaderStateImpl.java
+index 7e4c97e82..f2cfd58e4 100644
+--- a/ratis-server/src/main/java/org/apache/ratis/server/impl/LeaderStateImpl.java
++++ b/ratis-server/src/main/java/org/apache/ratis/server/impl/LeaderStateImpl.java
+@@ -438,6 +438,7 @@ class LeaderStateImpl implements LeaderState {
+         server.getId().toString(), null);
+     // Initialize startup log entry and append it to the RaftLog
+     startupLogEntry.get();
++    SpeculaTrace.markBootstrapIndex(server, startupLogEntry.get().startIndex);
+     processor.start();
+ 
+     if (replyFlusher != null) {
+@@ -627,7 +628,8 @@ class LeaderStateImpl implements LeaderState {
+     final long nextIndex = state.getLog().getNextIndex();
+     final RaftConfigurationImpl oldNewConf = stage.generateOldNewConf(current, nextIndex);
+     // apply the (old, new) configuration to log, and use it as the current conf
+-    appendConfiguration(oldNewConf);
++    final long logIndex = appendConfiguration(oldNewConf);
++    SpeculaTrace.applyOldNewConf(server, logIndex);
+ 
+     notifySenders();
+   }
+@@ -737,6 +739,7 @@ class LeaderStateImpl implements LeaderState {
+ 
+   void submitStepDownEvent(long term, StepDownReason reason) {
+     eventQueue.submit(new StateUpdateEvent(StateUpdateEvent.Type.STEP_DOWN, () -> stepDown(term, reason)));
++    SpeculaTrace.submitStepDownEvent(server, term);
+   }
+ 
+   private void stepDown(long term, StepDownReason reason) {
+@@ -744,6 +747,7 @@ class LeaderStateImpl implements LeaderState {
+       lease.getAndSetEnabled(false);
+       server.changeToFollowerAndPersistMetadata(term, false, reason)
+           .get(5, TimeUnit.SECONDS);
++      SpeculaTrace.stepDown(server);
+       pendingStepDown.complete(server::newSuccessReply);
+     } catch(Exception e) {
+       pendingStepDown.completeExceptionally(e);
+@@ -883,7 +887,10 @@ class LeaderStateImpl implements LeaderState {
+         this.stagingState = null;
+         laggingFollowers.stream()
+             .filter(f -> server.getRaftConf().containsInConf(f.getId()))
+-            .forEach(FollowerInfoImpl::catchUp);
++            .forEach(f -> {
++              f.catchUp();
++              SpeculaTrace.followerCaughtUp(server, f);
++            });
+       }
+     }
+   }
+@@ -1069,7 +1076,8 @@ class LeaderStateImpl implements LeaderState {
+         .build();
+     // stop the LogAppender if the corresponding follower and listener is no longer in the conf
+     updateSenders(newConf);
+-    appendConfiguration(newConf);
++    final long logIndex = appendConfiguration(newConf);
++    SpeculaTrace.replicateNewConf(server, logIndex);
+     notifySenders();
+   }
+ 
+@@ -1191,6 +1199,7 @@ class LeaderStateImpl implements LeaderState {
+ 
+     // if group contains only one member, fast path
+     if (server.getRaftConf().isSingleton()) {
++      SpeculaTrace.getReadIndex(server, readIndex);
+       return CompletableFuture.completedFuture(readIndex);
+     }
+ 
+@@ -1202,6 +1211,7 @@ class LeaderStateImpl implements LeaderState {
+     // if lease is enabled, check lease first
+     // if we allow leader to skip the leadership check heartbeat, we can return immediately
+     if (!leaderHeartbeatCheckEnabled || hasLease()) {
++      SpeculaTrace.getReadIndex(server, readIndex);
+       return CompletableFuture.completedFuture(readIndex);
+     }
+ 
+@@ -1211,9 +1221,11 @@ class LeaderStateImpl implements LeaderState {
+ 
+     // the readIndex is already acknowledged before
+     if (listener == null) {
++      SpeculaTrace.getReadIndex(server, readIndex);
+       return CompletableFuture.completedFuture(readIndex);
+     }
+ 
++    SpeculaTrace.getReadIndex(server, readIndex);
+     return listener.getFuture();
+   }
+ 
+diff --git a/ratis-server/src/main/java/org/apache/ratis/server/impl/RaftServerImpl.java b/ratis-server/src/main/java/org/apache/ratis/server/impl/RaftServerImpl.java
+index f4e740407..285cdb505 100644
+--- a/ratis-server/src/main/java/org/apache/ratis/server/impl/RaftServerImpl.java
++++ b/ratis-server/src/main/java/org/apache/ratis/server/impl/RaftServerImpl.java
+@@ -295,7 +295,7 @@ class RaftServerImpl implements RaftServer.Division,
+     this.snapshotRequestHandler = new SnapshotManagementRequestHandler(this);
+     this.snapshotInstallationHandler = new SnapshotInstallationHandler(this, properties);
+     this.appendLogTermIndices = RaftServerConfigKeys.Log.appendEntriesComposeEnabled(properties) ?
+-        new NavigableIndices() : null;
++        new NavigableIndices(this) : null;
+ 
+     this.serverExecutor = ConcurrentUtils.newThreadPoolWithMax(
+         RaftServerConfigKeys.ThreadPool.serverCached(properties),
+@@ -392,6 +392,10 @@ class RaftServerImpl implements RaftServer.Division,
+     return transferLeadership;
+   }
+ 
++  SnapshotInstallationHandler getSnapshotInstallationHandler() {
++    return snapshotInstallationHandler;
++  }
++
+   RaftServerRpc getServerRpc() {
+     return proxy.getServerRpc();
+   }
+@@ -656,6 +660,7 @@ class RaftServerImpl implements RaftServer.Division,
+ 
+     // start sending AppendEntries RPC to followers
+     leader.start();
++    SpeculaTrace.changeToLeader(this);
+   }
+ 
+   @Override
+@@ -919,6 +924,7 @@ class RaftServerImpl implements RaftServer.Division,
+       if (pending == null) {
+         return getResourceUnavailableReply("add a pending write request", request, cacheEntry, context);
+       }
++      SpeculaTrace.appendTransaction(this, request, context.getLogEntry());
+     }
+     leaderState.notifySenders();
+     return pending.getFuture();
+@@ -1147,8 +1153,11 @@ class RaftServerImpl implements RaftServer.Division,
+       return replyFuture
+           .thenCompose(readIndex -> getState().getReadRequests().waitToAdvance(readIndex,
+               () -> getReadException("add", snapshotInstallationHandler.getInProgressInstallSnapshotIndex(), false)))
+-          .thenCompose(readIndex -> isDummyRead(request)
+-              ? CompletableFuture.completedFuture(newSuccessReply(request)) : queryStateMachine(request))
++          .thenCompose(readIndex -> {
++            SpeculaTrace.completeRead(this, readIndex);
++            return isDummyRead(request)
++                ? CompletableFuture.completedFuture(newSuccessReply(request)) : queryStateMachine(request);
++          })
+           .exceptionally(e -> readException2Reply(request, e));
+     } else {
+       throw new IllegalStateException("Unexpected read option: " + readOption);
+@@ -1452,6 +1461,11 @@ class RaftServerImpl implements RaftServer.Division,
+       getRaftServer().addRaftPeers(listenersInNewConf);
+       // add staging state into the leaderState
+       pending = leaderState.startSetConfiguration(request, serversInNewConf);
++      serversInNewConf.stream()
++          .map(RaftPeer::getId)
++          .filter(id -> !current.containsInConf(id))
++          .findFirst()
++          .ifPresent(id -> SpeculaTrace.setConfigurationStart(this, id));
+     }
+     return pending.getFuture();
+   }
+@@ -1531,6 +1545,9 @@ class RaftServerImpl implements RaftServer.Division,
+       }
+       reply = toRequestVoteReplyProto(candidateId, getMemberId(),
+           voteGranted, state.getCurrentTerm(), shouldShutdown, state.getLastEntry(), callId);
++      if (phase == Phase.ELECTION && voteGranted) {
++        SpeculaTrace.requestVoteGrant(this, candidateId);
++      }
+       if (LOG.isInfoEnabled()) {
+         LOG.info("{} replies to {} vote request: {}. Peer's state: {}",
+             getMemberId(), phase, toRequestVoteReplyString(reply), state);
+@@ -1662,6 +1679,7 @@ class RaftServerImpl implements RaftServer.Division,
+       try {
+         future = changeToFollowerAndPersistMetadata(leaderTerm, true, Op.APPEND_ENTRIES);
+       } catch (IOException e) {
++        SpeculaTrace.persistFailure(this, leaderId, leaderTerm);
+         return JavaUtils.completeExceptionally(e);
+       }
+       state.setLeader(leaderId, Op.APPEND_ENTRIES);
+@@ -1683,6 +1701,7 @@ class RaftServerImpl implements RaftServer.Division,
+         final AppendEntriesReplyProto reply = toAppendEntriesReplyProto(
+             leaderId, getMemberId(), currentTerm, followerCommit, inconsistencyReplyNextIndex,
+             AppendResult.INCONSISTENCY, callId, RaftLog.INVALID_LOG_INDEX, isHeartbeat);
++        SpeculaTrace.inconsistencyReply(this);
+         LOG.info("{}: appendEntries* reply {}", getMemberId(), toAppendEntriesReplyString(reply));
+         followerState.ifPresent(fs -> fs.updateLastRpcTime(FollowerState.UpdateType.APPEND_COMPLETE));
+         return future.thenApply(dummy -> reply);
+@@ -1714,6 +1733,9 @@ class RaftServerImpl implements RaftServer.Division,
+       } else if (LOG.isDebugEnabled()) {
+         LOG.debug("{}: appendEntries* succeeded: {}", getMemberId(), toLogEntryTermIndexString(entries));
+       }
++      if (t == null && !isHeartbeat) {
++        SpeculaTrace.completePhysicalAppend(this, entries);
++      }
+       followerState.ifPresent(fs -> fs.updateLastRpcTime(FollowerState.UpdateType.APPEND_COMPLETE));
+       timer.stop();
+     }, getServerExecutor()).thenApply(v -> {
+@@ -1725,6 +1747,9 @@ class RaftServerImpl implements RaftServer.Division,
+       final AppendEntriesReplyProto reply = toAppendEntriesReplyProto(leaderId, getMemberId(),
+           currentTerm, updated? commitIndex : state.getLog().getLastCommittedIndex(),
+           nextIndex, AppendResult.SUCCESS, callId, matchIndex, isHeartbeat);
++      if (!isHeartbeat) {
++        SpeculaTrace.appendEntriesReplyOriginal(this, reply, entries);
++      }
+       logAppendEntries(isHeartbeat, () -> getMemberId()
+           + ": appendEntries* reply " + toAppendEntriesReplyString(reply));
+       return reply;
+diff --git a/ratis-server/src/main/java/org/apache/ratis/server/impl/ReplyFlusher.java b/ratis-server/src/main/java/org/apache/ratis/server/impl/ReplyFlusher.java
+index 109fbe5cf..fde9ea0f7 100644
+--- a/ratis-server/src/main/java/org/apache/ratis/server/impl/ReplyFlusher.java
++++ b/ratis-server/src/main/java/org/apache/ratis/server/impl/ReplyFlusher.java
+@@ -141,6 +141,7 @@ public class ReplyFlusher {
+     }
+     repliedIndex.updateToMax(maxIndex, s ->
+         LOG.debug("{}: flushed {} replies, {}", id, numReplies, s));
++    SpeculaTrace.replyFlusher(id, maxIndex);
+ 
+     last.complete();
+     for (HeldReply held : toFlush) {
+diff --git a/ratis-server/src/main/java/org/apache/ratis/server/impl/ServerImplUtils.java b/ratis-server/src/main/java/org/apache/ratis/server/impl/ServerImplUtils.java
+index 434f98d68..b5d9f9c01 100644
+--- a/ratis-server/src/main/java/org/apache/ratis/server/impl/ServerImplUtils.java
++++ b/ratis-server/src/main/java/org/apache/ratis/server/impl/ServerImplUtils.java
+@@ -124,6 +124,11 @@ public final class ServerImplUtils {
+     private final NavigableMap<Long, ConsecutiveIndices> map = new TreeMap<>();
+     private final AtomicReference<CompletableFuture<Void>> future
+         = new AtomicReference<>(CompletableFuture.completedFuture(null));
++    private final RaftServer.Division owner;
++
++    NavigableIndices(RaftServer.Division owner) {
++      this.owner = owner;
++    }
+ 
+     boolean contains(TermIndex ti) {
+       final Long term = getTerm(ti.getIndex());
+@@ -145,9 +150,14 @@ public final class ServerImplUtils {
+     CompletableFuture<Void> append(List<LogEntryProto> entries,
+         Function<List<LogEntryProto>, CompletableFuture<Void>> appendLog) {
+       final List<ConsecutiveIndices> entriesTermIndices = ConsecutiveIndices.convert(entries);
+-      return alreadyExists(entriesTermIndices) ? future.get()
+-          : future.updateAndGet(f -> f.thenComposeAsync(ignored -> appendLog.apply(entries)))
+-              .whenComplete((v, e) -> removeExisting(entriesTermIndices));
++      if (alreadyExists(entriesTermIndices)) {
++        SpeculaTrace.composeExisting(owner, null, entries);
++        return future.get();
++      }
++      final CompletableFuture<Void> updated = future.updateAndGet(
++          f -> f.thenComposeAsync(ignored -> appendLog.apply(entries)));
++      SpeculaTrace.registerInFlight(owner, null, entries);
++      return updated.whenComplete((v, e) -> removeExisting(entriesTermIndices));
+     }
+ 
+     private synchronized boolean alreadyExists(List<ConsecutiveIndices> entriesTermIndices) {
+diff --git a/ratis-server/src/main/java/org/apache/ratis/server/impl/ServerState.java b/ratis-server/src/main/java/org/apache/ratis/server/impl/ServerState.java
+index ad3210d63..260d0db6a 100644
+--- a/ratis-server/src/main/java/org/apache/ratis/server/impl/ServerState.java
++++ b/ratis-server/src/main/java/org/apache/ratis/server/impl/ServerState.java
+@@ -139,6 +139,8 @@ class ServerState {
+     final RaftStorageMetadata metadata = log.get().loadMetadata();
+     currentTerm.set(metadata.getTerm());
+     votedFor = metadata.getVotedFor();
++    SpeculaTrace.recordLoadedMetadata(server, metadata);
++    SpeculaTrace.restart(server);
+   }
+ 
+   RaftGroupMemberId getMemberId() {
+@@ -234,6 +236,7 @@ class ServerState {
+       term = currentTerm.incrementAndGet();
+       votedFor = getMemberId().getPeerId();
+       persistMetadata();
++      SpeculaTrace.initElection(server);
+     } else {
+       throw new IllegalArgumentException("Unexpected phase " + phase);
+     }
+@@ -241,7 +244,12 @@ class ServerState {
+   }
+ 
+   void persistMetadata() throws IOException {
+-    getLog().persistMetadata(RaftStorageMetadata.valueOf(currentTerm.get(), votedFor));
++    final RaftStorageMetadata metadata = RaftStorageMetadata.valueOf(currentTerm.get(), votedFor);
++    getLog().persistMetadata(metadata);
++    SpeculaTrace.recordPersistedMetadata(server, metadata);
++    if (Boolean.getBoolean("specula.trace.persist.events")) {
++      SpeculaTrace.persistMetadata(server);
++    }
+   }
+ 
+   RaftPeerId getVotedFor() {
+@@ -392,6 +400,7 @@ class ServerState {
+ 
+   void truncate(long logIndex) {
+     configurationManager.removeConfigurations(logIndex);
++    SpeculaTrace.purgeLog(server, logIndex);
+   }
+ 
+   void updateConfiguration(List<LogEntryProto> entries) throws IOException {
+@@ -407,11 +416,15 @@ class ServerState {
+ 
+     if (changed && server.getRole().getCurrentRole() == RaftPeerRole.LISTENER) {
+       server.changeToFollowerAndPersistMetadata(getCurrentTerm(), true, "setRaftConf").join();
++      SpeculaTrace.promoteListener(server);
+     }
+   }
+ 
+   boolean updateCommitIndex(long majorityIndex, long curTerm, boolean isLeader) {
+     if (getLog().updateCommitIndex(majorityIndex, curTerm, isLeader)) {
++      if (isLeader) {
++        SpeculaTrace.updateCommit(server, getLog().getLastCommittedIndex());
++      }
+       getStateMachineUpdater().notifyUpdater();
+       return true;
+     }
+diff --git a/ratis-server/src/main/java/org/apache/ratis/server/impl/SnapshotInstallationHandler.java b/ratis-server/src/main/java/org/apache/ratis/server/impl/SnapshotInstallationHandler.java
+index e92d2ffd4..b774bdeba 100644
+--- a/ratis-server/src/main/java/org/apache/ratis/server/impl/SnapshotInstallationHandler.java
++++ b/ratis-server/src/main/java/org/apache/ratis/server/impl/SnapshotInstallationHandler.java
+@@ -206,6 +206,7 @@ class SnapshotInstallationHandler {
+       if (snapshotChunkRequest.getRequestIndex() == 0) {
+         nextChunkIndex.set(0);
+         chunk0CallId.set(request.getServerRequest().getCallId());
++        SpeculaTrace.snapshotChunk0(server);
+       } else if (nextChunkIndex.get() != snapshotChunkRequest.getRequestIndex()) {
+         throw new IOException("Snapshot request already failed at chunk index " + nextChunkIndex.get()
+                 + "; ignoring request with chunk index " + snapshotChunkRequest.getRequestIndex());
+@@ -236,6 +237,7 @@ class SnapshotInstallationHandler {
+           stateMachine.pause(); // pause the SM right before publishing the snapshot atomically
+           snapshotManager.finalizeSnapshot(request);
+           state.reloadStateMachine(lastIncluded);
++          SpeculaTrace.snapshotFinalize(server);
+           chunk0CallId.set(-1);
+         }
+       } finally {
+@@ -374,6 +376,7 @@ class SnapshotInstallationHandler {
+       if (latestInstalledSnapshotTermIndex.getIndex() > INVALID_LOG_INDEX) {
+         server.getStateMachine().pause();
+         state.reloadStateMachine(latestInstalledSnapshotTermIndex);
++        SpeculaTrace.snapshotReload(server);
+         LOG.info("{}: InstallSnapshot notification result: {}, at index: {}", getMemberId(),
+             InstallSnapshotResult.SNAPSHOT_INSTALLED, latestInstalledSnapshotTermIndex);
+         inProgressInstallSnapshotIndex.set(INVALID_LOG_INDEX);
+diff --git a/ratis-server/src/main/java/org/apache/ratis/server/impl/SpeculaTrace.java b/ratis-server/src/main/java/org/apache/ratis/server/impl/SpeculaTrace.java
+new file mode 100644
+index 000000000..13a0250d2
+--- /dev/null
++++ b/ratis-server/src/main/java/org/apache/ratis/server/impl/SpeculaTrace.java
+@@ -0,0 +1,1162 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.ratis.server.impl;
++
++import org.apache.ratis.proto.RaftProtos.AppendEntriesReplyProto;
++import org.apache.ratis.proto.RaftProtos.AppendEntriesReplyProto.AppendResult;
++import org.apache.ratis.proto.RaftProtos.LogEntryProto;
++import org.apache.ratis.proto.RaftProtos.RaftConfigurationProto;
++import org.apache.ratis.protocol.Message;
++import org.apache.ratis.protocol.RaftClientRequest;
++import org.apache.ratis.protocol.RaftPeer;
++import org.apache.ratis.protocol.RaftPeerId;
++import org.apache.ratis.server.RaftServer;
++import org.apache.ratis.server.leader.FollowerInfo;
++import org.apache.ratis.server.raftlog.RaftLog;
++import org.apache.ratis.server.storage.RaftStorageMetadata;
++import org.apache.ratis.util.JavaUtils;
++
++import java.io.BufferedWriter;
++import java.io.IOException;
++import java.io.UncheckedIOException;
++import java.nio.charset.StandardCharsets;
++import java.nio.file.Files;
++import java.nio.file.Path;
++import java.nio.file.Paths;
++import java.nio.file.StandardOpenOption;
++import java.time.Instant;
++import java.util.ArrayList;
++import java.util.Collection;
++import java.util.Comparator;
++import java.util.LinkedHashMap;
++import java.util.LinkedHashSet;
++import java.util.List;
++import java.util.Map;
++import java.util.Optional;
++import java.util.Set;
++import java.util.TreeSet;
++import java.util.concurrent.atomic.AtomicLong;
++
++/**
++ * Lightweight NDJSON trace emitter for Specula trace validation.
++ *
++ * <p>The emitter is disabled unless a test calls {@link #reset(String, Collection)}.
++ * It intentionally keeps the event schema close to spec/instrumentation-spec.md.
++ */
++public final class SpeculaTrace {
++  private static final String NONE = "none";
++  private static final String CONFIG_OLD_NEW = "CONFIG_OLD_NEW";
++  private static final String CONFIG_NEW = "CONFIG_NEW";
++
++  private static final Object LOCK = new Object();
++  private static final Map<String, String> RAW_TO_MODEL = new LinkedHashMap<>();
++  private static final Map<String, String> TRACE_ROLE = new LinkedHashMap<>();
++  private static final Map<String, Long> INDEX_OFFSET = new LinkedHashMap<>();
++  private static final Map<String, Long> PERSISTED_TERM = new LinkedHashMap<>();
++  private static final Map<String, String> PERSISTED_VOTE = new LinkedHashMap<>();
++  private static final Map<String, Map<Long, Long>> RAW_TO_LOGICAL_INDEX = new LinkedHashMap<>();
++  private static final Map<String, Long> LOGICAL_END = new LinkedHashMap<>();
++  private static final Map<String, Long> LAST_COMMIT = new LinkedHashMap<>();
++  private static final Map<String, Long> LAST_APPLIED = new LinkedHashMap<>();
++  private static final Map<String, Long> LAST_REPLY_MATCH = new LinkedHashMap<>();
++  private static final Map<String, Long> RESET_COUNT = new LinkedHashMap<>();
++  private static final Map<String, List<Map<String, Object>>> PENDING_CANDIDATES = new LinkedHashMap<>();
++  private static final Set<String> PENDING_LEADERS = new LinkedHashSet<>();
++  private static final Set<String> PENDING_REQUESTS = new LinkedHashSet<>();
++  private static final Set<String> COMPOSED_PENDING = new LinkedHashSet<>();
++  private static final AtomicLong TRACE_COUNT = new AtomicLong();
++
++  private static BufferedWriter writer;
++  private static Path output;
++  private static boolean enabled;
++
++  private SpeculaTrace() {
++  }
++
++  public static void reset(String tracePath, Collection<RaftPeer> peers) throws IOException {
++    synchronized (LOCK) {
++      closeLocked();
++      RAW_TO_MODEL.clear();
++      TRACE_ROLE.clear();
++      INDEX_OFFSET.clear();
++      PERSISTED_TERM.clear();
++      PERSISTED_VOTE.clear();
++      RAW_TO_LOGICAL_INDEX.clear();
++      LOGICAL_END.clear();
++      LAST_COMMIT.clear();
++      LAST_APPLIED.clear();
++      LAST_REPLY_MATCH.clear();
++      RESET_COUNT.clear();
++      PENDING_CANDIDATES.clear();
++      PENDING_LEADERS.clear();
++      PENDING_REQUESTS.clear();
++      COMPOSED_PENDING.clear();
++      TRACE_COUNT.set(0);
++
++      if (tracePath == null || tracePath.isEmpty()) {
++        enabled = false;
++        output = null;
++        return;
++      }
++
++      output = Paths.get(tracePath);
++      Files.createDirectories(output.getParent());
++      writer = Files.newBufferedWriter(output, StandardCharsets.UTF_8,
++          StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING, StandardOpenOption.WRITE);
++      enabled = true;
++
++      final TreeSet<RaftPeer> sorted = new TreeSet<>(Comparator.comparing(p -> p.getId().toString()));
++      sorted.addAll(peers);
++      int i = 1;
++      for (RaftPeer peer : sorted) {
++        RAW_TO_MODEL.put(peer.getId().toString(), "s" + i++);
++        TRACE_ROLE.put(peer.getId().toString(), "FOLLOWER");
++        RAW_TO_LOGICAL_INDEX.put(peer.getId().toString(), new LinkedHashMap<>());
++        LOGICAL_END.put(peer.getId().toString(), 0L);
++        LAST_COMMIT.put(peer.getId().toString(), 0L);
++        LAST_APPLIED.put(peer.getId().toString(), 0L);
++        LAST_REPLY_MATCH.put(peer.getId().toString(), 0L);
++        RESET_COUNT.put(peer.getId().toString(), 0L);
++      }
++
++      final Map<String, Object> config = new LinkedHashMap<>();
++      config.put("servers", new ArrayList<>(RAW_TO_MODEL.values()));
++      writeEnvelope("config", "config", config);
++    }
++  }
++
++  public static void close() {
++    synchronized (LOCK) {
++      closeLocked();
++    }
++  }
++
++  private static void closeLocked() {
++    if (writer != null) {
++      try {
++        writer.flush();
++        writer.close();
++      } catch (IOException e) {
++        throw new UncheckedIOException(e);
++      } finally {
++        writer = null;
++        enabled = false;
++      }
++    } else {
++      enabled = false;
++    }
++  }
++
++  public static void recordLoadedMetadata(RaftServer.Division server, RaftStorageMetadata metadata) {
++    if (!enabled || server == null || metadata == null) {
++      return;
++    }
++    synchronized (LOCK) {
++      PERSISTED_TERM.put(raw(server), metadata.getTerm());
++      PERSISTED_VOTE.put(raw(server), raw(metadata.getVotedFor()));
++    }
++  }
++
++  public static void recordPersistedMetadata(RaftServer.Division server, RaftStorageMetadata metadata) {
++    recordLoadedMetadata(server, metadata);
++  }
++
++  public static void markBootstrapIndex(RaftServer.Division server, long index) {
++    if (!enabled || server == null || index <= RaftLog.INVALID_LOG_INDEX) {
++      return;
++    }
++    markBootstrapIndex(raw(server), index);
++  }
++
++  private static void markBootstrapIndex(String raw, long index) {
++    if (!enabled || raw == null || index <= RaftLog.INVALID_LOG_INDEX) {
++      return;
++    }
++    synchronized (LOCK) {
++      INDEX_OFFSET.merge(raw, index, Math::max);
++    }
++  }
++
++  public static void initElection(RaftServer.Division server) {
++    final String raw = raw(server);
++    if (!enabled || raw == null) {
++      return;
++    }
++    final Map<String, Object> event = event(server, "ServerState_initElection_ELECTION");
++    event.put("state", coreState(server));
++    synchronized (LOCK) {
++      PENDING_CANDIDATES.computeIfAbsent(raw, k -> new ArrayList<>()).add(event);
++    }
++  }
++
++  public static void requestVoteGrant(RaftServer.Division voter, RaftPeerId candidate) {
++    if (!isTraceCandidate(candidate)) {
++      return;
++    }
++    flushPendingCandidate(candidate);
++    clearPendingCandidate(voter);
++    rememberRole(voter, "FOLLOWER");
++    final Map<String, Object> event = event(voter, "RaftServerImpl_requestVote_Grant");
++    event.put("candidate", nid(candidate));
++    event.put("state", coreState(voter));
++    emit(event);
++  }
++
++  public static void changeToLeader(RaftServer.Division server) {
++    markBootstrapIndex(server, safeLogEnd(server));
++    flushPendingCandidate(server);
++    final String raw = raw(server);
++    if (!enabled || raw == null) {
++      return;
++    }
++    synchronized (LOCK) {
++      PENDING_LEADERS.add(raw);
++    }
++  }
++
++  public static void persistFailure(RaftServer.Division server, RaftPeerId leader, long newTerm) {
++    final Map<String, Object> event = event(server, "RaftServerImpl_changeToFollowerAndPersistMetadata_PersistFailure");
++    event.put("leader", nid(leader));
++    event.put("newTerm", newTerm);
++    event.put("state", coreState(server));
++    emit(event);
++  }
++
++  public static void persistMetadata(RaftServer.Division server) {
++    emit(server, "ServerState_persistMetadata", coreState(server));
++  }
++
++  public static void submitStepDownEvent(RaftServer.Division server, long observedTerm) {
++    flushPendingLeader(server);
++    final Map<String, Object> event = event(server, "LeaderStateImpl_submitStepDownEvent");
++    event.put("observedTerm", observedTerm);
++    event.put("state", coreState(server));
++    emit(event);
++  }
++
++  public static void stepDown(RaftServer.Division server) {
++    flushPendingLeader(server);
++    rememberRole(server, "FOLLOWER");
++    emit(server, "LeaderStateImpl_stepDown", coreState(server));
++  }
++
++  public static void appendTransaction(RaftServer.Division server, RaftClientRequest request, LogEntryProto entry) {
++    final String value = clientValue(request);
++    if (!isEntryValue(value)) {
++      return;
++    }
++    flushPendingLeader(server);
++    final long logicalIndex = noteTraceableEntry(server, entry.getIndex());
++    final Map<String, Object> event = event(server, "RaftServerImpl_appendTransaction");
++    event.put("value", value);
++    final Map<String, Object> state = logState(server);
++    state.remove("logStart");
++    removeSnapshotFrontier(state);
++    putEntryState(state, server, entry, value);
++    state.put("logEnd", logicalIndex);
++    state.put("flushIndex", logicalIndex);
++    event.put("state", state);
++    emit(event);
++  }
++
++  public static void grpcAppendLog(RaftServer.Division leader, FollowerInfo follower, List<LogEntryProto> entries) {
++    if (entries != null && !entries.isEmpty()
++        && CONFIG_NEW.equals(valueOf(entries.get(0)))
++        && !Boolean.getBoolean("specula.trace.config.events")) {
++      markBootstrapIndex(raw(follower.getId()), entries.get(0).getIndex());
++    }
++    final LogEntryProto entry = firstTraceable(leader, entries);
++    if (entry == null) {
++      return;
++    }
++    flushPendingLeader(leader);
++    noteTraceableEntry(raw(follower.getId()), entry.getIndex());
++    synchronized (LOCK) {
++      PENDING_REQUESTS.add(raw(follower.getId()));
++    }
++    final Map<String, Object> event = event(leader, "GrpcLogAppender_appendLog");
++    event.put("follower", nid(follower.getId()));
++    final Map<String, Object> state = coreState(leader);
++    putFollowerProgress(state, follower);
++    event.put("state", state);
++    emit(event);
++  }
++
++  public static void registerInFlight(RaftServer.Division follower, RaftPeerId leader, List<LogEntryProto> entries) {
++    final LogEntryProto entry = firstTraceable(follower, entries);
++    if (entry == null) {
++      return;
++    }
++    flushPendingCandidate(follower);
++    noteTraceableEntry(follower, entry.getIndex());
++    final Map<String, Object> event = event(follower, "RaftServerImpl_appendEntriesAsync_RegisterInFlight");
++    final RaftPeerId effectiveLeader = leader != null ? leader : Optional.ofNullable(asImpl(follower))
++        .map(impl -> impl.getState().getLeaderId()).orElse(null);
++    if (effectiveLeader != null) {
++      event.put("leader", nid(effectiveLeader));
++    }
++    final Map<String, Object> state = coreState(follower);
++    state.put("acceptedLeaderTerm", entry.getTerm());
++    putEntryState(state, follower, entry, valueOf(entry));
++    event.put("state", state);
++    emit(event);
++  }
++
++  public static void composeExisting(RaftServer.Division follower, RaftPeerId leader, List<LogEntryProto> entries) {
++    final LogEntryProto entry = firstTraceable(follower, entries);
++    if (entry == null) {
++      return;
++    }
++    flushPendingCandidate(follower);
++    noteTraceableEntry(follower, entry.getIndex());
++    synchronized (LOCK) {
++      COMPOSED_PENDING.add(raw(follower));
++    }
++    final Map<String, Object> event = event(follower, "ServerImplUtils_NavigableIndices_append_ComposeExisting");
++    final RaftPeerId effectiveLeader = leader != null ? leader : Optional.ofNullable(asImpl(follower))
++        .map(impl -> impl.getState().getLeaderId()).orElse(null);
++    if (effectiveLeader != null) {
++      event.put("leader", nid(effectiveLeader));
++    }
++    final Map<String, Object> state = coreState(follower);
++    putEntryState(state, follower, entry, valueOf(entry));
++    event.put("state", state);
++    emit(event);
++  }
++
++  public static void inconsistencyReply(RaftServer.Division follower) {
++    flushPendingCandidate(follower);
++    final Map<String, Object> state = coreState(follower);
++    state.put("lastReplyResult", "INCONSISTENCY");
++    emit(follower, "RaftServerImpl_appendEntriesAsync_InconsistencyReply", state);
++  }
++
++  public static void completePhysicalAppend(RaftServer.Division follower, List<LogEntryProto> entries) {
++    final LogEntryProto entry = firstTraceable(follower, entries);
++    if (entry == null) {
++      return;
++    }
++    noteTraceableEntry(follower, entry.getIndex());
++    final Map<String, Object> state = logState(follower);
++    state.remove("logStart");
++    state.remove("commitIndex");
++    state.remove("appliedIndex");
++    removeSnapshotFrontier(state);
++    putEntryState(state, follower, entry, valueOf(entry));
++    emit(follower, "SegmentedRaftLog_appendImpl_CompletePhysicalAppend", state);
++  }
++
++  public static void appendEntriesReplyOriginal(RaftServer.Division follower, AppendEntriesReplyProto reply,
++      List<LogEntryProto> entries) {
++    if (firstTraceable(follower, entries) == null) {
++      return;
++    }
++    final Map<String, Object> state = coreState(follower);
++    state.put("lastReplyResult", reply.getResult().name());
++    emit(follower, "RaftServerImpl_appendEntriesAsync_ReplyOriginal", state);
++    if (!hasComposedPending(follower)) {
++      removeExisting(follower);
++    }
++  }
++
++  public static void appendEntriesReplyComposed(RaftServer.Division follower, AppendEntriesReplyProto reply,
++      List<LogEntryProto> entries) {
++    if (firstTraceable(follower, entries) == null) {
++      return;
++    }
++    final Map<String, Object> state = coreState(follower);
++    state.put("lastReplyResult", reply.getResult().name());
++    emit(follower, "RaftServerImpl_appendEntriesAsync_ReplyComposed", state);
++    synchronized (LOCK) {
++      COMPOSED_PENDING.remove(raw(follower));
++    }
++    removeExisting(follower);
++  }
++
++  private static void removeExisting(RaftServer.Division follower) {
++    emit(follower, "ServerImplUtils_NavigableIndices_removeExisting", coreState(follower));
++  }
++
++  public static void appendResponseSuccess(RaftServer.Division leader, FollowerInfo follower,
++      AppendEntriesReplyProto reply, boolean oldStream) {
++    if (reply.getResult() != AppendResult.SUCCESS || reply.getMatchIndex() <= RaftLog.INVALID_LOG_INDEX) {
++      return;
++    }
++    final long modelMatch = logicalAtOrBefore(follower.getId(), reply.getMatchIndex());
++    if (modelMatch <= 0) {
++      return;
++    }
++    if (!recordReplyMatch(follower.getId(), modelMatch)) {
++      return;
++    }
++    removePendingRequest(follower.getId());
++    flushPendingLeader(leader);
++    final Map<String, Object> event = event(leader, oldStream
++        ? "GrpcLogAppender_AppendLogResponseHandler_onNext_SUCCESS_OldStream"
++        : "GrpcLogAppender_AppendLogResponseHandler_onNext_SUCCESS");
++    event.put("follower", nid(follower.getId()));
++    event.put("matchIndex", modelMatch);
++    final Map<String, Object> state = coreState(leader);
++    putFollowerProgress(state, follower);
++    event.put("state", state);
++    emit(event);
++  }
++
++  public static void timeoutAppendRequest(FollowerInfo follower) {
++    if (!removePendingRequest(follower.getId())) {
++      return;
++    }
++    final Map<String, Object> event = rawNodeEvent(follower.getId(), "GrpcLogAppender_timeoutAppendRequest");
++    final Map<String, Object> state = new LinkedHashMap<>();
++    state.put("lastReplyResult", "INCONSISTENCY");
++    putLocalProgress(state, follower);
++    event.put("state", state);
++    emit(event);
++  }
++
++  public static void resetClient(FollowerInfo follower) {
++    if (!hasTraceLeader() || !removePendingRequest(follower.getId()) || !recordReset(follower.getId())) {
++      return;
++    }
++    final Map<String, Object> event = rawNodeEvent(follower.getId(), "GrpcLogAppender_resetClient");
++    final Map<String, Object> state = new LinkedHashMap<>();
++    state.put("lastReplyResult", "INCONSISTENCY");
++    putLocalProgress(state, follower);
++    event.put("state", state);
++    emit(event);
++  }
++
++  public static void updateCommit(RaftServer.Division leader, long commitIndex) {
++    final long modelCommit = logicalAtOrBefore(leader, commitIndex);
++    if (modelCommit <= 0) {
++      return;
++    }
++    if (!recordCommit(leader, modelCommit)) {
++      return;
++    }
++    flushPendingLeader(leader);
++    final Map<String, Object> event = event(leader, "LeaderStateImpl_updateCommit");
++    event.put("commitIndex", modelCommit);
++    final Map<String, Object> state = logState(leader);
++    state.remove("logStart");
++    removeSnapshotFrontier(state);
++    state.put("commitIndex", modelCommit);
++    event.put("state", state);
++    emit(event);
++  }
++
++  public static void applyEntry(RaftServer.Division server, long appliedIndex) {
++    final RaftServerImpl impl = asImpl(server);
++    if (impl == null || !impl.getInfo().isLeader()) {
++      return;
++    }
++    final long modelApplied = logicalAtOrBefore(server, appliedIndex);
++    if (modelApplied <= 0) {
++      return;
++    }
++    if (!recordApplied(server, modelApplied)) {
++      return;
++    }
++    flushPendingLeader(server);
++    final Map<String, Object> state = logState(server);
++    state.remove("logStart");
++    removeSnapshotFrontier(state);
++    state.put("appliedIndex", modelApplied);
++    emit(server, "StateMachineUpdater_applyEntry", state);
++  }
++
++  public static void replyFlusher(Object id, long repliedIndex) {
++    final String raw = String.valueOf(id);
++    final long modelReplied = modelIndex(raw, repliedIndex, 0);
++    if (modelReplied <= 0) {
++      return;
++    }
++    final Map<String, Object> event = rawNodeEvent(raw, "ReplyFlusher_flush");
++    final Map<String, Object> state = new LinkedHashMap<>();
++    state.put("repliedIndex", modelReplied);
++    event.put("state", state);
++    emit(event);
++  }
++
++  public static void getReadIndex(RaftServer.Division leader, long readIndex) {
++    if (!Boolean.getBoolean("specula.trace.read.events")) {
++      return;
++    }
++    final long modelRead = logicalAtOrBefore(leader, readIndex);
++    if (modelRead <= 0) {
++      return;
++    }
++    flushPendingLeader(leader);
++    final Map<String, Object> state = logState(leader);
++    state.put("pendingReadIndex", modelRead);
++    emit(leader, "LeaderStateImpl_getReadIndex", state);
++  }
++
++  public static void completeRead(RaftServer.Division leader, long readIndex) {
++    if (!Boolean.getBoolean("specula.trace.read.events")) {
++      return;
++    }
++    final long modelRead = logicalAtOrBefore(leader, readIndex);
++    if (modelRead <= 0) {
++      return;
++    }
++    flushPendingLeader(leader);
++    final Map<String, Object> state = logState(leader);
++    state.put("readCompletedIndex", modelRead);
++    state.put("pendingReadIndex", 0L);
++    emit(leader, "ReadRequests_waitToAdvance_CompleteRead", state);
++  }
++
++  public static void installSnapshotNotify(RaftServer.Division leader, FollowerInfo follower) {
++    flushPendingLeader(leader);
++    final Map<String, Object> event = event(leader, "GrpcLogAppender_installSnapshot_Notify");
++    event.put("follower", nid(follower.getId()));
++    final Map<String, Object> state = coreState(leader);
++    putFollowerProgress(state, follower);
++    event.put("state", state);
++    emit(event);
++  }
++
++  public static void snapshotChunk0(RaftServer.Division follower) {
++    emit(follower, "SnapshotInstallationHandler_checkAndInstallSnapshot_Chunk0", new LinkedHashMap<>());
++  }
++
++  public static void snapshotFinalize(RaftServer.Division follower) {
++    emit(follower, "SnapshotInstallationHandler_checkAndInstallSnapshot_Finalize", new LinkedHashMap<>());
++  }
++
++  public static void snapshotReload(RaftServer.Division follower) {
++    emit(follower, "SnapshotInstallationHandler_notifyStateMachineToInstallSnapshot_Reload", new LinkedHashMap<>());
++  }
++
++  public static void purgeLog(RaftServer.Division server, long purgeTo) {
++    purgeLog(raw(server), purgeTo, logState(server));
++  }
++
++  public static void purgeLog(RaftPeerId server, long purgeTo) {
++    purgeLog(raw(server), purgeTo, new LinkedHashMap<>());
++  }
++
++  private static void purgeLog(String raw, long purgeTo, Map<String, Object> state) {
++    final long modelPurgeTo = logicalAtOrBefore(raw, purgeTo);
++    if (modelPurgeTo <= 0) {
++      return;
++    }
++    final Map<String, Object> event = rawNodeEvent(raw, "ConfigurationManager_removeConfigurations_PurgeLog");
++    event.put("purgeTo", modelPurgeTo);
++    event.put("state", state);
++    emit(event);
++  }
++
++  public static void restart(RaftServer.Division server) {
++    synchronized (LOCK) {
++      PENDING_LEADERS.remove(raw(server));
++    }
++    rememberRole(server, "FOLLOWER");
++    emit(server, "RaftLogBase_open_Restart", coreState(server));
++  }
++
++  public static void setConfigurationStart(RaftServer.Division leader, RaftPeerId newPeer) {
++    if (!Boolean.getBoolean("specula.trace.config.events")) {
++      return;
++    }
++    flushPendingLeader(leader);
++    final Map<String, Object> event = event(leader, "RaftServerImpl_setConfigurationAsync_Start");
++    event.put("newPeer", nid(newPeer));
++    event.put("state", coreState(leader));
++    emit(event);
++  }
++
++  public static void followerCaughtUp(RaftServer.Division leader, FollowerInfo follower) {
++    if (!Boolean.getBoolean("specula.trace.config.events")) {
++      return;
++    }
++    flushPendingLeader(leader);
++    final Map<String, Object> event = event(leader, "LeaderStateImpl_checkProgress_CaughtUp");
++    event.put("follower", nid(follower.getId()));
++    final Map<String, Object> state = coreState(leader);
++    state.put("followerCaughtUp", true);
++    putFollowerProgress(state, follower);
++    event.put("state", state);
++    emit(event);
++  }
++
++  public static void applyOldNewConf(RaftServer.Division leader, long index) {
++    if (!Boolean.getBoolean("specula.trace.config.events")) {
++      markBootstrapIndex(leader, index);
++      return;
++    }
++    flushPendingLeader(leader);
++    final Map<String, Object> state = logState(leader);
++    state.put("configLogIndex", modelIndex(leader, index, 0));
++    state.put("observedEntryIndex", modelIndex(leader, index, 1));
++    state.put("observedEntryTerm", safeTerm(leader));
++    state.put("observedEntryValue", CONFIG_OLD_NEW);
++    emit(leader, "LeaderStateImpl_applyOldNewConf", state);
++  }
++
++  public static void replicateNewConf(RaftServer.Division leader, long index) {
++    if (!Boolean.getBoolean("specula.trace.config.events")) {
++      return;
++    }
++    flushPendingLeader(leader);
++    final Map<String, Object> state = logState(leader);
++    state.put("configLogIndex", modelIndex(leader, index, 0));
++    state.put("observedEntryIndex", modelIndex(leader, index, 1));
++    state.put("observedEntryTerm", safeTerm(leader));
++    state.put("observedEntryValue", CONFIG_NEW);
++    emit(leader, "LeaderStateImpl_replicateNewConf", state);
++  }
++
++  public static void promoteListener(RaftServer.Division server) {
++    if (!Boolean.getBoolean("specula.trace.config.events")) {
++      return;
++    }
++    final Map<String, Object> state = coreState(server);
++    state.put("peerRole", "FOLLOWER");
++    emit(server, "ServerState_updateConfiguration_PromoteListener", state);
++  }
++
++  private static void emit(RaftServer.Division server, String name, Map<String, Object> state) {
++    final Map<String, Object> event = event(server, name);
++    event.put("state", state);
++    emit(event);
++  }
++
++  private static void emit(Map<String, Object> event) {
++    if (!enabled) {
++      return;
++    }
++    synchronized (LOCK) {
++      if (!enabled || writer == null) {
++        return;
++      }
++      try {
++        writeEnvelope("trace", "event", event);
++        TRACE_COUNT.incrementAndGet();
++      } catch (IOException e) {
++        throw new UncheckedIOException(e);
++      }
++    }
++  }
++
++  private static void flushPendingLeader(RaftServer.Division server) {
++    final String raw = raw(server);
++    if (!enabled || raw == null) {
++      return;
++    }
++    final boolean flush;
++    synchronized (LOCK) {
++      flush = PENDING_LEADERS.remove(raw);
++      if (flush) {
++        TRACE_ROLE.put(raw, "LEADER");
++      }
++    }
++    if (flush) {
++      emit(server, "RaftServerImpl_changeToLeader", coreState(server));
++    }
++  }
++
++  private static void flushPendingCandidate(RaftServer.Division server) {
++    flushPendingCandidate(raw(server));
++  }
++
++  private static void flushPendingCandidate(RaftPeerId id) {
++    flushPendingCandidate(raw(id));
++  }
++
++  private static void flushPendingCandidate(String raw) {
++    if (!enabled || raw == null) {
++      return;
++    }
++    final List<Map<String, Object>> pending;
++    synchronized (LOCK) {
++      pending = PENDING_CANDIDATES.remove(raw);
++    }
++    if (pending == null || pending.isEmpty()) {
++      return;
++    }
++    for (Map<String, Object> event : pending) {
++      rememberRole(raw, "CANDIDATE");
++      emit(event);
++    }
++  }
++
++  private static void clearPendingCandidate(RaftServer.Division server) {
++    final String raw = raw(server);
++    if (!enabled || raw == null) {
++      return;
++    }
++    synchronized (LOCK) {
++      PENDING_CANDIDATES.remove(raw);
++    }
++  }
++
++  private static boolean removePendingRequest(RaftPeerId id) {
++    final String raw = raw(id);
++    if (!enabled || raw == null) {
++      return false;
++    }
++    synchronized (LOCK) {
++      return PENDING_REQUESTS.remove(raw);
++    }
++  }
++
++  private static boolean recordReset(RaftPeerId id) {
++    final String raw = raw(id);
++    if (!enabled || raw == null) {
++      return false;
++    }
++    synchronized (LOCK) {
++      final long count = RESET_COUNT.getOrDefault(raw, 0L);
++      if (count >= 4L) {
++        return false;
++      }
++      RESET_COUNT.put(raw, count + 1L);
++      return true;
++    }
++  }
++
++  private static boolean hasTraceLeader() {
++    synchronized (LOCK) {
++      return TRACE_ROLE.containsValue("LEADER") || !PENDING_LEADERS.isEmpty();
++    }
++  }
++
++  private static Map<String, Object> event(RaftServer.Division server, String name) {
++    return rawNodeEvent(raw(server), name);
++  }
++
++  private static Map<String, Object> rawNodeEvent(RaftPeerId id, String name) {
++    return rawNodeEvent(raw(id), name);
++  }
++
++  private static Map<String, Object> rawNodeEvent(String raw, String name) {
++    final Map<String, Object> event = new LinkedHashMap<>();
++    event.put("name", name);
++    event.put("nid", nid(raw));
++    return event;
++  }
++
++  private static void writeEnvelope(String tag, String payloadName, Object payload) throws IOException {
++    final Map<String, Object> envelope = new LinkedHashMap<>();
++    envelope.put("tag", tag);
++    envelope.put("ts", Instant.now().toString());
++    envelope.put(payloadName, payload);
++    writeJson(envelope);
++    writer.newLine();
++    writer.flush();
++  }
++
++  private static Map<String, Object> coreState(RaftServer.Division server) {
++    final Map<String, Object> state = new LinkedHashMap<>();
++    final RaftServerImpl impl = asImpl(server);
++    if (impl == null) {
++      return state;
++    }
++    state.put("role", impl.getRole().getCurrentRole() != null
++        ? impl.getRole().getCurrentRole().name() : "FOLLOWER");
++    state.put("currentTerm", impl.getState().getCurrentTerm());
++    state.put("persistedTerm", PERSISTED_TERM.getOrDefault(raw(server), impl.getState().getCurrentTerm()));
++    state.put("votedFor", nidOrNone(impl.getState().getVotedFor()));
++    state.put("leaderId", nidOrNone(impl.getState().getLeaderId()));
++    return state;
++  }
++
++  private static Map<String, Object> logState(RaftServer.Division server) {
++    final Map<String, Object> state = coreState(server);
++    final RaftServerImpl impl = asImpl(server);
++    if (impl == null) {
++      return state;
++    }
++    final String raw = raw(server);
++    try {
++      final RaftLog log = impl.getState().getLog();
++      state.put("logStart", logicalLogStart(raw, log.getStartIndex()));
++      state.put("logEnd", logicalEnd(raw));
++      state.put("flushIndex", logicalAtOrBefore(raw, log.getFlushIndex()));
++      state.put("commitIndex", logicalAtOrBefore(raw, log.getLastCommittedIndex()));
++      state.put("appliedIndex", logicalAtOrBefore(raw, impl.getState().getLastAppliedIndex()));
++      state.put("snapshotIndex", logicalAtOrBefore(raw, impl.getState().getSnapshotIndex()));
++      state.put("installedSnapshotIndex", logicalAtOrBefore(raw, impl.getState().getLatestInstalledSnapshotIndex()));
++    } catch (RuntimeException e) {
++      state.put("traceStateError", JavaUtils.getClassSimpleName(e.getClass()));
++    }
++    return state;
++  }
++
++  private static Map<String, Object> snapshotState(RaftServer.Division server) {
++    final Map<String, Object> state = logState(server);
++    final RaftServerImpl impl = asImpl(server);
++    return state;
++  }
++
++  private static void removeSnapshotFrontier(Map<String, Object> state) {
++    state.remove("snapshotIndex");
++    state.remove("installedSnapshotIndex");
++  }
++
++  private static void putFollowerProgress(Map<String, Object> state, FollowerInfo follower) {
++    state.put("followerNextIndex", logicalNextIndex(follower.getId(), follower.getNextIndex()));
++    state.put("followerMatchIndex", logicalAtOrBefore(follower.getId(), follower.getMatchIndex()));
++  }
++
++  private static void putLocalProgress(Map<String, Object> state, FollowerInfo follower) {
++    state.put("nextIndex", logicalNextIndex(follower.getId(), follower.getNextIndex()));
++    state.put("matchIndex", logicalAtOrBefore(follower.getId(), follower.getMatchIndex()));
++  }
++
++  private static void putEntryState(Map<String, Object> state, RaftServer.Division server, LogEntryProto entry,
++      String value) {
++    if (entry == null || value == null) {
++      return;
++    }
++    state.put("observedEntryIndex", logicalEntryIndex(server, entry.getIndex()));
++    state.put("observedEntryTerm", entry.getTerm());
++    state.put("observedEntryValue", value);
++  }
++
++  private static LogEntryProto firstTraceable(RaftServer.Division server, List<LogEntryProto> entries) {
++    if (entries == null || entries.isEmpty()) {
++      return null;
++    }
++    for (LogEntryProto entry : entries) {
++      final String value = valueOf(entry);
++      if (isConfigValue(value) && !Boolean.getBoolean("specula.trace.config.events")) {
++        markBootstrapIndex(server, entry.getIndex());
++        continue;
++      }
++      if (isEntryValue(value) || isConfigValue(value) && Boolean.getBoolean("specula.trace.config.events")) {
++        return entry;
++      }
++    }
++    return null;
++  }
++
++  private static String valueOf(LogEntryProto entry) {
++    if (entry == null) {
++      return NONE;
++    }
++    if (entry.hasConfigurationEntry()) {
++      final RaftConfigurationProto conf = entry.getConfigurationEntry();
++      return conf.getOldPeersCount() > 0 || conf.getOldListenersCount() > 0 ? CONFIG_OLD_NEW : CONFIG_NEW;
++    }
++    if (entry.hasStateMachineLogEntry()) {
++      final String data = entry.getStateMachineLogEntry().getLogData().toStringUtf8();
++      return isEntryValue(data) ? data : NONE;
++    }
++    return NONE;
++  }
++
++  private static String clientValue(RaftClientRequest request) {
++    return Optional.ofNullable(request)
++        .map(RaftClientRequest::getMessage)
++        .map(Message::getContent)
++        .map(content -> content.toStringUtf8())
++        .filter(SpeculaTrace::isEntryValue)
++        .orElse(null);
++  }
++
++  private static boolean isEntryValue(String value) {
++    return "v1".equals(value) || "v2".equals(value);
++  }
++
++  private static boolean isConfigValue(String value) {
++    return CONFIG_OLD_NEW.equals(value) || CONFIG_NEW.equals(value);
++  }
++
++  private static long noteTraceableEntry(RaftServer.Division server, long rawIndex) {
++    return noteTraceableEntry(raw(server), rawIndex);
++  }
++
++  private static long noteTraceableEntry(String raw, long rawIndex) {
++    if (!enabled || raw == null || rawIndex <= RaftLog.INVALID_LOG_INDEX) {
++      return 0L;
++    }
++    synchronized (LOCK) {
++      final Map<Long, Long> entries = RAW_TO_LOGICAL_INDEX.computeIfAbsent(raw, key -> new LinkedHashMap<>());
++      final Long existing = entries.get(rawIndex);
++      if (existing != null) {
++        return existing;
++      }
++      final long logical = LOGICAL_END.getOrDefault(raw, 0L) + 1;
++      entries.put(rawIndex, logical);
++      LOGICAL_END.put(raw, logical);
++      return logical;
++    }
++  }
++
++  private static long logicalEntryIndex(RaftServer.Division server, long rawIndex) {
++    return logicalEntryIndex(raw(server), rawIndex);
++  }
++
++  private static long logicalEntryIndex(String raw, long rawIndex) {
++    if (raw == null || rawIndex <= RaftLog.INVALID_LOG_INDEX) {
++      return 0L;
++    }
++    synchronized (LOCK) {
++      return RAW_TO_LOGICAL_INDEX.getOrDefault(raw, new LinkedHashMap<>()).getOrDefault(rawIndex, 0L);
++    }
++  }
++
++  private static long logicalAtOrBefore(RaftServer.Division server, long rawIndex) {
++    return logicalAtOrBefore(raw(server), rawIndex);
++  }
++
++  private static long logicalAtOrBefore(RaftPeerId id, long rawIndex) {
++    return logicalAtOrBefore(raw(id), rawIndex);
++  }
++
++  private static long logicalAtOrBefore(String raw, long rawIndex) {
++    if (raw == null || rawIndex <= RaftLog.INVALID_LOG_INDEX) {
++      return 0L;
++    }
++    synchronized (LOCK) {
++      long logical = 0L;
++      for (Map.Entry<Long, Long> entry : RAW_TO_LOGICAL_INDEX.getOrDefault(raw, new LinkedHashMap<>()).entrySet()) {
++        if (entry.getKey() <= rawIndex) {
++          logical = Math.max(logical, entry.getValue());
++        }
++      }
++      return logical;
++    }
++  }
++
++  private static long logicalEnd(String raw) {
++    synchronized (LOCK) {
++      return LOGICAL_END.getOrDefault(raw, 0L);
++    }
++  }
++
++  private static long logicalNextIndex(RaftPeerId id, long rawNextIndex) {
++    return logicalNextIndex(raw(id), rawNextIndex);
++  }
++
++  private static long logicalNextIndex(String raw, long rawNextIndex) {
++    if (rawNextIndex <= RaftLog.LEAST_VALID_LOG_INDEX) {
++      return 1L;
++    }
++    return Math.max(1L, logicalAtOrBefore(raw, rawNextIndex - 1) + 1);
++  }
++
++  private static long logicalLogStart(String raw, long rawStartIndex) {
++    if (rawStartIndex <= RaftLog.LEAST_VALID_LOG_INDEX) {
++      return 1L;
++    }
++    return Math.max(1L, logicalAtOrBefore(raw, rawStartIndex - 1) + 1);
++  }
++
++  private static boolean recordCommit(RaftServer.Division server, long logicalIndex) {
++    return recordMonotonic(LAST_COMMIT, raw(server), logicalIndex);
++  }
++
++  private static boolean recordApplied(RaftServer.Division server, long logicalIndex) {
++    return recordMonotonic(LAST_APPLIED, raw(server), logicalIndex);
++  }
++
++  private static boolean recordReplyMatch(RaftPeerId id, long logicalIndex) {
++    return recordMonotonic(LAST_REPLY_MATCH, raw(id), logicalIndex);
++  }
++
++  private static boolean hasComposedPending(RaftServer.Division server) {
++    synchronized (LOCK) {
++      return COMPOSED_PENDING.contains(raw(server));
++    }
++  }
++
++  private static boolean recordMonotonic(Map<String, Long> store, String raw, long logicalIndex) {
++    if (!enabled || raw == null || logicalIndex <= 0) {
++      return false;
++    }
++    synchronized (LOCK) {
++      final long previous = store.getOrDefault(raw, 0L);
++      if (logicalIndex <= previous) {
++        return false;
++      }
++      store.put(raw, logicalIndex);
++      return true;
++    }
++  }
++
++  private static long safeLogEnd(RaftServer.Division server) {
++    final RaftServerImpl impl = asImpl(server);
++    if (impl == null) {
++      return RaftLog.INVALID_LOG_INDEX;
++    }
++    try {
++      return impl.getState().getLog().getNextIndex() - 1;
++    } catch (RuntimeException e) {
++      return RaftLog.INVALID_LOG_INDEX;
++    }
++  }
++
++  private static long safeTerm(RaftServer.Division server) {
++    final RaftServerImpl impl = asImpl(server);
++    return impl != null ? impl.getState().getCurrentTerm() : 0;
++  }
++
++  private static long modelIndex(RaftServer.Division server, long real, long min) {
++    return modelIndex(raw(server), real, min);
++  }
++
++  private static long modelIndex(RaftPeerId id, long real, long min) {
++    return modelIndex(raw(id), real, min);
++  }
++
++  private static long modelIndex(String raw, long real, long min) {
++    if (real <= RaftLog.INVALID_LOG_INDEX) {
++      return Math.max(0L, min == 0L ? 0L : min);
++    }
++    final long translated = real - INDEX_OFFSET.getOrDefault(raw, 0L);
++    return Math.max(min, translated);
++  }
++
++  private static long modelLogStart(String raw, long real) {
++    if (real <= RaftLog.LEAST_VALID_LOG_INDEX) {
++      return 1L;
++    }
++    return Math.max(1L, real - INDEX_OFFSET.getOrDefault(raw, 0L));
++  }
++
++  private static String nid(RaftPeerId id) {
++    return nid(raw(id));
++  }
++
++  private static String nid(String raw) {
++    if (raw == null || raw.isEmpty() || "null".equals(raw)) {
++      return NONE;
++    }
++    return RAW_TO_MODEL.computeIfAbsent(raw, key -> "s" + (RAW_TO_MODEL.size() + 1));
++  }
++
++  private static String nidOrNone(RaftPeerId id) {
++    return nidOrNone(raw(id));
++  }
++
++  private static String nidOrNone(String raw) {
++    if (raw == null || raw.isEmpty() || "null".equals(raw)) {
++      return NONE;
++    }
++    return nid(raw);
++  }
++
++  private static void rememberRole(RaftServer.Division server, String role) {
++    rememberRole(raw(server), role);
++  }
++
++  private static void rememberRole(String raw, String role) {
++    if (!enabled || raw == null || role == null) {
++      return;
++    }
++    synchronized (LOCK) {
++      TRACE_ROLE.put(raw, role);
++    }
++  }
++
++  private static boolean isTraceCandidate(RaftPeerId id) {
++    final String raw = raw(id);
++    synchronized (LOCK) {
++      return PENDING_CANDIDATES.containsKey(raw) || "CANDIDATE".equals(TRACE_ROLE.get(raw));
++    }
++  }
++
++  private static String raw(RaftServer.Division server) {
++    return server != null ? raw(server.getId()) : null;
++  }
++
++  private static String raw(RaftPeerId id) {
++    return id != null ? id.toString() : null;
++  }
++
++  private static RaftServerImpl asImpl(RaftServer.Division server) {
++    return server instanceof RaftServerImpl ? (RaftServerImpl) server : null;
++  }
++
++  private static void writeJson(Object value) throws IOException {
++    if (value == null) {
++      writer.write("null");
++    } else if (value instanceof String) {
++      writeString((String) value);
++    } else if (value instanceof Number || value instanceof Boolean) {
++      writer.write(String.valueOf(value));
++    } else if (value instanceof Map) {
++      writer.write('{');
++      boolean first = true;
++      for (Map.Entry<?, ?> entry : ((Map<?, ?>) value).entrySet()) {
++        if (!first) {
++          writer.write(',');
++        }
++        first = false;
++        writeString(String.valueOf(entry.getKey()));
++        writer.write(':');
++        writeJson(entry.getValue());
++      }
++      writer.write('}');
++    } else if (value instanceof Iterable) {
++      writer.write('[');
++      boolean first = true;
++      for (Object element : (Iterable<?>) value) {
++        if (!first) {
++          writer.write(',');
++        }
++        first = false;
++        writeJson(element);
++      }
++      writer.write(']');
++    } else {
++      writeString(String.valueOf(value));
++    }
++  }
++
++  private static void writeString(String value) throws IOException {
++    writer.write('"');
++    for (int i = 0; i < value.length(); i++) {
++      final char c = value.charAt(i);
++      switch (c) {
++        case '"':
++          writer.write("\\\"");
++          break;
++        case '\\':
++          writer.write("\\\\");
++          break;
++        case '\b':
++          writer.write("\\b");
++          break;
++        case '\f':
++          writer.write("\\f");
++          break;
++        case '\n':
++          writer.write("\\n");
++          break;
++        case '\r':
++          writer.write("\\r");
++          break;
++        case '\t':
++          writer.write("\\t");
++          break;
++        default:
++          if (c < 0x20) {
++            writer.write(String.format("\\u%04x", (int) c));
++          } else {
++            writer.write(c);
++          }
++      }
++    }
++    writer.write('"');
++  }
++}
+diff --git a/ratis-server/src/main/java/org/apache/ratis/server/impl/StateMachineUpdater.java b/ratis-server/src/main/java/org/apache/ratis/server/impl/StateMachineUpdater.java
+index 041693195..c1368149e 100644
+--- a/ratis-server/src/main/java/org/apache/ratis/server/impl/StateMachineUpdater.java
++++ b/ratis-server/src/main/java/org/apache/ratis/server/impl/StateMachineUpdater.java
+@@ -262,9 +262,13 @@ class StateMachineUpdater implements Runnable {
+             return null;
+           });
+           applyLogFutures = applyLogFutures.thenCombine(exceptionHandledFuture, (v, message) -> null);
+-          f.thenAccept(m -> notifyAppliedIndex(incremented));
++          f.thenAccept(m -> {
++            notifyAppliedIndex(incremented);
++            SpeculaTrace.applyEntry(server, incremented);
++          });
+         } else {
+           notifyAppliedIndex(incremented);
++          SpeculaTrace.applyEntry(server, incremented);
+         }
+       } else {
+         LOG.debug("{}: logEntry {} is null. There may be snapshot to load. state:{}",
+diff --git a/ratis-server/src/main/java/org/apache/ratis/server/raftlog/RaftLogBase.java b/ratis-server/src/main/java/org/apache/ratis/server/raftlog/RaftLogBase.java
+index 48b410147..a727cb90c 100644
+--- a/ratis-server/src/main/java/org/apache/ratis/server/raftlog/RaftLogBase.java
++++ b/ratis-server/src/main/java/org/apache/ratis/server/raftlog/RaftLogBase.java
+@@ -24,6 +24,7 @@ import org.apache.ratis.protocol.RaftGroupMemberId;
+ import org.apache.ratis.protocol.exceptions.StateMachineException;
+ import org.apache.ratis.server.RaftConfiguration;
+ import org.apache.ratis.server.RaftServerConfigKeys;
++import org.apache.ratis.server.impl.SpeculaTrace;
+ import org.apache.ratis.server.protocol.TermIndex;
+ import org.apache.ratis.statemachine.TransactionContext;
+ import org.apache.ratis.thirdparty.com.google.protobuf.ByteString;
+@@ -338,6 +339,8 @@ public abstract class RaftLogBase implements RaftLog {
+       updatePurgeIndex(purged);
+       if (e != null) {
+         LOG.warn(getName() + ": Failed to purge " + adjustedIndex, e);
++      } else {
++        SpeculaTrace.purgeLog(memberId.getPeerId(), adjustedIndex);
+       }
+     });
+   }
+diff --git a/ratis-test/src/test/java/org/apache/ratis/grpc/TestSpeculaTraceHarnessWithGrpc.java b/ratis-test/src/test/java/org/apache/ratis/grpc/TestSpeculaTraceHarnessWithGrpc.java
+new file mode 100644
+index 000000000..8446b7d76
+--- /dev/null
++++ b/ratis-test/src/test/java/org/apache/ratis/grpc/TestSpeculaTraceHarnessWithGrpc.java
+@@ -0,0 +1,186 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.ratis.grpc;
++
++import org.apache.ratis.BaseTest;
++import org.apache.ratis.RaftTestUtil;
++import org.apache.ratis.client.RaftClient;
++import org.apache.ratis.conf.RaftProperties;
++import org.apache.ratis.protocol.RaftClientReply;
++import org.apache.ratis.protocol.RaftPeerId;
++import org.apache.ratis.server.RaftServer;
++import org.apache.ratis.server.RaftServerConfigKeys;
++import org.apache.ratis.server.impl.MiniRaftCluster;
++import org.apache.ratis.server.impl.SpeculaTrace;
++import org.apache.ratis.server.raftlog.RaftLog;
++import org.apache.ratis.statemachine.SnapshotInfo;
++import org.apache.ratis.statemachine.StateMachine;
++import org.apache.ratis.statemachine.impl.SimpleStateMachine4Testing;
++import org.apache.ratis.util.JavaUtils;
++import org.apache.ratis.util.SizeInBytes;
++import org.apache.ratis.util.TimeDuration;
++import org.apache.ratis.util.function.CheckedConsumer;
++import org.junit.jupiter.api.Assertions;
++import org.junit.jupiter.api.Test;
++import org.junit.jupiter.api.Timeout;
++
++import java.nio.file.Files;
++import java.nio.file.Path;
++import java.nio.file.Paths;
++import java.util.concurrent.CompletableFuture;
++import java.util.concurrent.TimeUnit;
++
++import static org.apache.ratis.RaftTestUtil.waitForLeader;
++import static org.apache.ratis.server.RaftServerConfigKeys.Read.Option.LINEARIZABLE;
++
++@Timeout(180)
++public class TestSpeculaTraceHarnessWithGrpc extends BaseTest
++    implements MiniRaftClusterWithGrpc.FactoryGet {
++  {
++    final RaftProperties properties = getProperties();
++    properties.setClass(MiniRaftCluster.STATEMACHINE_CLASS_KEY,
++        SimpleStateMachine4Testing.class, StateMachine.class);
++    RaftServerConfigKeys.Read.setOption(properties, LINEARIZABLE);
++    RaftServerConfigKeys.Rpc.setRequestTimeout(properties, TimeDuration.valueOf(800, TimeUnit.MILLISECONDS));
++    RaftServerConfigKeys.Rpc.setTimeoutMin(properties, TimeDuration.valueOf(150, TimeUnit.MILLISECONDS));
++    RaftServerConfigKeys.Rpc.setTimeoutMax(properties, TimeDuration.valueOf(300, TimeUnit.MILLISECONDS));
++    RaftServerConfigKeys.Snapshot.setAutoTriggerEnabled(properties, false);
++    RaftServerConfigKeys.Log.setPurgeGap(properties, 1);
++    RaftServerConfigKeys.Log.setPurgePreservationLogNum(properties, 0);
++    RaftServerConfigKeys.Log.setPurgeUptoSnapshotIndex(properties, true);
++    RaftServerConfigKeys.Log.setSegmentSizeMax(properties, SizeInBytes.valueOf(1));
++    GrpcConfigKeys.Server.setHeartbeatChannel(properties, false);
++  }
++
++  @Test
++  public void testSpeculaNormalConsensusAndRead() throws Exception {
++    runScenario("normal-consensus-read", cluster -> {
++      final RaftServer.Division leader = waitForLeader(cluster);
++      try (RaftClient client = cluster.createClient(leader.getId())) {
++        RaftTestUtil.assertSuccessReply(client.io().send(new RaftTestUtil.SimpleMessage("v1")));
++        RaftTestUtil.assertSuccessReply(client.io().send(new RaftTestUtil.SimpleMessage("v2")));
++      }
++      waitForApplied(cluster, 2);
++    });
++  }
++
++  @Test
++  public void testSpeculaLeaderLossAndRestart() throws Exception {
++    runScenario("leader-loss-restart", cluster -> {
++      final RaftServer.Division firstLeader = waitForLeader(cluster);
++      try (RaftClient client = cluster.createClient(firstLeader.getId())) {
++        RaftTestUtil.assertSuccessReply(client.io().send(new RaftTestUtil.SimpleMessage("v1")));
++      }
++
++      final RaftPeerId oldLeaderId = firstLeader.getId();
++      cluster.killServer(oldLeaderId);
++
++      final RaftServer.Division newLeader = waitForLeader(cluster);
++      try (RaftClient client = cluster.createClient(newLeader.getId())) {
++        RaftTestUtil.assertSuccessReply(client.io().send(new RaftTestUtil.SimpleMessage("v2")));
++      }
++
++      cluster.restartServer(oldLeaderId, false);
++      waitForLeader(cluster);
++      waitForApplied(cluster, 2);
++    });
++  }
++
++  @Test
++  public void testSpeculaGrpcReconnectAfterTimeout() throws Exception {
++    runScenario("grpc-reconnect-timeout", cluster -> {
++      final RaftServer.Division leader = waitForLeader(cluster);
++      final String leaderId = leader.getId().toString();
++      CompletableFuture<RaftClientReply> replyFuture;
++      try (RaftClient client = cluster.createClient(leader.getId())) {
++        cluster.setBlockRequestsFrom(leaderId, true);
++        replyFuture = client.async().send(new RaftTestUtil.SimpleMessage("v1"));
++        TimeDuration.valueOf(1600, TimeUnit.MILLISECONDS).sleep();
++        cluster.setBlockRequestsFrom(leaderId, false);
++        RaftTestUtil.assertSuccessReply(replyFuture.get(30, TimeUnit.SECONDS));
++      } finally {
++        cluster.setBlockRequestsFrom(leaderId, false);
++      }
++      waitForApplied(cluster, 1);
++    });
++  }
++
++  @Test
++  public void testSpeculaSnapshotCatchup() throws Exception {
++    RaftServerConfigKeys.Snapshot.setAutoTriggerEnabled(getProperties(), true);
++    RaftServerConfigKeys.Snapshot.setAutoTriggerThreshold(getProperties(), 2);
++    runScenario("snapshot-catchup", cluster -> {
++      final RaftServer.Division leader = waitForLeader(cluster);
++      final RaftPeerId slowFollower = cluster.getFollowers().get(0).getId();
++      cluster.killServer(slowFollower);
++
++      try (RaftClient client = cluster.createClient(leader.getId())) {
++        RaftTestUtil.assertSuccessReply(client.io().send(new RaftTestUtil.SimpleMessage("v1")));
++        RaftTestUtil.assertSuccessReply(client.io().send(new RaftTestUtil.SimpleMessage("v2")));
++        RaftTestUtil.assertSuccessReply(client.io().send(new RaftTestUtil.SimpleMessage("v1")));
++        RaftTestUtil.assertSuccessReply(client.io().send(new RaftTestUtil.SimpleMessage("v2")));
++      }
++
++      JavaUtils.attempt(() -> Assertions.assertNotNull(leader.getStateMachine().getLatestSnapshot()),
++          30, TimeDuration.ONE_SECOND, "leader latest snapshot", LOG);
++      final SnapshotInfo snapshot = leader.getStateMachine().getLatestSnapshot();
++      final long snapshotIndex = snapshot.getIndex();
++      Assertions.assertTrue(snapshotIndex > RaftLog.INVALID_LOG_INDEX);
++      leader.getRaftLog().purge(snapshotIndex).get(30, TimeUnit.SECONDS);
++      JavaUtils.attempt(() -> Assertions.assertTrue(leader.getRaftLog().getStartIndex()
++          > RaftLog.LEAST_VALID_LOG_INDEX), 30, TimeDuration.ONE_SECOND, "leader purge after snapshot", LOG);
++
++      cluster.restartServer(slowFollower, false);
++      waitForLeader(cluster);
++      JavaUtils.attempt(() -> {
++        Assertions.assertTrue(cluster.getDivision(slowFollower).getInfo().getLastAppliedIndex() >= snapshotIndex);
++      }, 30, TimeDuration.ONE_SECOND, "snapshot catch-up applied", LOG);
++    });
++  }
++
++  private void runScenario(String name, CheckedConsumer<MiniRaftClusterWithGrpc, Exception> scenario) throws Exception {
++    final Path traceFile = traceDir().resolve(name + ".ndjson");
++    Files.createDirectories(traceFile.getParent());
++    final MiniRaftClusterWithGrpc cluster = newCluster(3);
++    SpeculaTrace.reset(traceFile.toString(), cluster.getGroup().getPeers());
++    try {
++      cluster.start();
++      scenario.accept(cluster);
++    } finally {
++      try {
++        cluster.shutdown();
++      } finally {
++        SpeculaTrace.close();
++      }
++    }
++  }
++
++  private Path traceDir() {
++    return Paths.get(System.getProperty("specula.trace.dir", "target/specula-traces"));
++  }
++
++  private void waitForApplied(MiniRaftClusterWithGrpc cluster, long logicalIndex) throws Exception {
++    JavaUtils.attempt(() -> {
++      for (RaftServer.Division server : cluster.iterateDivisions()) {
++        if (server.getInfo().isAlive()) {
++          Assertions.assertTrue(server.getInfo().getLastAppliedIndex() >= logicalIndex);
++        }
++      }
++    }, 30, TimeDuration.ONE_SECOND, "wait for applied index " + logicalIndex, LOG);
++  }
++}

@@ -1,0 +1,46 @@
+- **Source**: MC
+- **Novelty**: NEW
+- **Location**: `ratis-grpc/src/main/java/org/apache/ratis/grpc/server/GrpcLogAppender.java:592`
+
+## Description
+A stale gRPC `INCONSISTENCY` append reply can still lower follower `nextIndex` after snapshot progress has already recorded `snapshotIndex=S`, `matchIndex=S`, and `nextIndex=S+1`. The defect is real at the shared follower-progress state, but the live consequence is currently masked: the next append construction refuses to append below the available boundary and snapshot retry restores `nextIndex`.
+
+## Trigger scenario
+1. Snapshot progress records follower state at `snapshotIndex=23`, `matchIndex=23`, `nextIndex=24`.
+2. A previously computed append `INCONSISTENCY` reply arrives later with `requestFirstIndex=24` and `replyNextIndex=23`.
+3. `GrpcLogAppender` computes the inconsistency next index and calls `setNextIndex`, lowering `nextIndex` to `23`.
+4. `LogAppenderBase.newAppendEntriesRequest` observes the lowered state and returns `null`.
+5. `LogAppender.shouldInstallSnapshot` retries snapshot work and snapshot completion restores `nextIndex=24`.
+
+## Developer intent
+Open/closed issue and PR search plus fetched git history found adjacent work, including [PR #926](https://github.com/apache/ratis/pull/926), [PR #573](https://github.com/apache/ratis/pull/573), [PR #504](https://github.com/apache/ratis/pull/504), [PR #939](https://github.com/apache/ratis/pull/939), and [PR #1250](https://github.com/apache/ratis/pull/1250). None reports this exact stale `INCONSISTENCY` reply after snapshot-progress mechanism. The local `getNextIndexForInconsistency` comment says `nextIndex` should ideally stay above `matchIndex`, but its `requestFirstIndex` exception still permits this regression.
+
+## Reproduction result
+Reproduction test written and executed:
+
+`/home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-grpc-20260803/ratis-grpc/.specula-output/repro/test_bugMC-1_snapshot_stale_inconsistency.sh`
+
+Command:
+
+```bash
+timeout 12m /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-grpc-20260803/ratis-grpc/.specula-output/repro/test_bugMC-1_snapshot_stale_inconsistency.sh
+```
+
+Output excerpt:
+
+```text
+LEVEL0: reachable setup uses normal snapshot progress; snapshotIndex=23, matchIndex=23, nextIndex=24, leaderStartIndex=24, leaderNextIndex=33
+LEVEL1: timing-only was not sufficient to force reply reordering in this unit harness; escalating to Level2 with the reachable stale-reply order.
+LEVEL2: injected reachable stale INCONSISTENCY order; requestFirstIndex=24, replyNextIndex=23
+BUG_STATE: stale INCONSISTENCY replyNextIndex=23 overwrote snapshot boundary nextIndex=24; observed nextIndex=23, snapshotIndex=23, matchIndex=23
+MASK_TRIGGER: newAppendEntriesRequest returned null and shouldInstallSnapshot returned (t:1, i:23); the next appender loop would retry snapshot work
+MASK_RESOLUTION: completing the snapshot retry restores nextIndex=24
+LEVEL3: not used because Level2 proved the bad state and the normal snapshot retry mask.
+[INFO] Tests run: 1, Failures: 0, Errors: 0, Skipped: 0
+[INFO] BUILD SUCCESS
+```
+
+## Recommendation
+Clamp stale `INCONSISTENCY` handling to the recorded snapshot boundary, e.g. ignore or clamp append replies whose request range is older than current snapshot progress so `nextIndex` cannot fall below `snapshotIndex + 1`.
+
+VERDICT: MASKED

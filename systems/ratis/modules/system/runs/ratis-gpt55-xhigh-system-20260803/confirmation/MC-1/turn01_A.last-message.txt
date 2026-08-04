@@ -1,0 +1,66 @@
+- **Source**: MC
+- **Novelty**: NEW
+- **Location**: ratis-server/src/main/java/org/apache/ratis/server/impl/RaftServerImpl.java:1754
+
+Checklist before `REPRODUCED`:
+
+1. Did Level 0 or Level 1 alone trigger it? **no**.
+2. Level 3 hooks were used only to expose admissible counterexample steps: CE State 9 `appendEntriesAsync_RegisterInFlight(s3)` and CE State 10 `requestVote_Grant(s3,s1)`. The runtime sequence was: real client write to old leader -> real gRPC `AppendEntries` reaches target follower before RaftLog append -> real `RequestVote` grants/persists higher term -> old append completes and returns stale `SUCCESS`.
+3. Real consumer/caller observing the wrong outcome: the old-leader client receives a successful `RaftClientReply` through pending request completion (`ratis-server/src/main/java/org/apache/ratis/server/impl/PendingRequest.java:90`; called from `LeaderStateImpl.replyPendingRequest`).
+4. The bad state is not masked before observation. Later new-leader sync can remove the stale entry from the target follower, but the old leader has already returned success for log index 1; that is a permanent client-visible safety violation, not a repair.
+
+## Description
+
+Confirmed. A follower can grant and persist a higher-term vote after accepting an old leader’s append but before the async RaftLog append completes. The old append completion still builds `AppendResult.SUCCESS` using the stale captured term. The gRPC leader-side handler then treats that `SUCCESS` as valid follower progress and advances match/commit, allowing the old leader to reply success for an entry absent from the new leader.
+
+Prior-report search covered upstream issues, PRs, Jira text search, and git history. Adjacent fixes such as RATIS-2605/#1519 and RATIS-2154/#1148 do not cover this in-flight append completion after higher-term vote mechanism.
+
+## Trigger scenario
+
+A 3-node gRPC cluster is partitioned by timing only:
+
+- old leader appends client entry `(t:2, i:1)`;
+- target follower accepts old leader’s `AppendEntries` but is held before `state.getLog().append(entries)`;
+- target grants and persists higher-term vote for candidate `s1`;
+- target then completes the old append and returns stale `SUCCESS`;
+- old leader commits/replies success;
+- candidate becomes leader in term 3 without the entry.
+
+## Developer intent
+
+Raft Leader Completeness requires any entry committed in a term to be present in all later leaders. A follower that has moved to a higher election term should not emit a stale old-term append success that an old leader can count toward commit.
+
+## Reproduction result
+
+Executed:
+
+```text
+/home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-system-20260803/ratis-system/.specula-output/repro/test_bugMC-1_stale_append_success.sh
+```
+
+Real output excerpts:
+
+```text
+MC-1 trigger reached
+oldLeader=s0 oldTerm=2
+candidateNewLeader=s1 term=3
+targetVotedFor=s1 targetTerm=3
+blockedEntry=(t:2, i:1)
+oldLeaderReplySuccess=true replyLogIndex=1 replier=s0
+oldLeaderCommittedIndex=1
+newLeaderContainsEntry=false
+targetContainsEntryBeforeNewLeader=true
+targetContainsEntryAfterNewLeaderSync=false
+[INFO] Tests run: 1, Failures: 0, Errors: 0, Skipped: 0
+[INFO] BUILD SUCCESS
+MC-1 reproduction exit_status=0
+```
+
+Artifacts written:
+`repro/test_bugMC-1_stale_append_success.sh`, `confirmation/MC-1/investigation.md`, `confirmation/MC-1/repro-MC-1.log`.
+
+## Recommendation
+
+Recheck follower term/leader recognition after async append completion and before returning `SUCCESS`; if current term advanced, return the current term and do not report old-leader success. Also harden `GrpcLogAppender` so `SUCCESS` replies are ignored unless they match the leader’s current term/epoch.
+
+VERDICT: REPRODUCED

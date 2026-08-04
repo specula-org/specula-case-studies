@@ -1,0 +1,40 @@
+- **Source**: Code Review
+- **Novelty**: KNOWN (cite: https://github.com/apache/ratis/pull/1246 and https://github.com/apache/ratis/pull/1331; fix-status: fixed)
+- **Location**: ratis-server/src/main/java/org/apache/ratis/server/impl/LeaderStateImpl.java:832
+
+## Description
+CR-4 duplicates upstream-reported Ratis defects. PR #1246 reports the same staged catch-up mechanism: a newly added peer can be treated as caught up while still missing timely configuration-change logs due to `stagingCatchupGap`. PR #1331 covers the listener role-transition and snapshot-carried configuration sites also named by CR-4.
+
+## Trigger scenario
+Normal `setConfiguration` can stage a new peer/listener, catch it up by log replication or snapshot, then enter joint consensus and final configuration commit. The already-reported unsafe case is a log-based catch-up path where the new peer is close enough to the commit index but has not received the latest configuration log entry.
+
+## Developer intent
+Upstream PR #1246 states the fix intent directly: `CAUGHTUP` should only complete after the follower receives the latest configuration logs. The current checkout contains that guard at `LeaderStateImpl.java:841`. PR #1331 fixes listener promotion by changing role only when a real configuration entry is applied, including snapshot-carried configuration.
+
+## Reproduction result
+Command executed:
+```text
+timeout 2m /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-system-20260803/ratis-system/.specula-output/repro/test_bugCR-4_known_prefilter.sh
+```
+
+Output:
+```text
+CR-4 known-status prefilter evidence
+worktree=7eedc1deed07fc883bfe448b2d33438b7a0e994e
+upstream PR #1246 commit:
+c1301b082c3f9359dc510e6f5c26ff0d7a8a7e21 RATIS-2274. Newly added peer may retain outdated configuration after membership change, causing election failure. (#1246)
+upstream PR #1331 commit:
+d7370f897f43aa31d44beb3bf61933430bfb8355 RATIS-2378. fix listener role transition (#1331)
+current checkProgress latest-config guard:
+841:        && follower.getMatchIndex() >= server.getRaftConf().getLogEntryIndex()
+current listener promotion on configuration application:
+418:      server.changeToFollowerAndPersistMetadata(getCurrentTerm(), true, "setRaftConf").join();
+current snapshot-carried configuration uses updateConfiguration:
+156:          state.updateConfiguration(Collections.singletonList(proto));
+RESULT: KNOWN fixed upstream; code-review prefilter applies; no live reproduction attempted.
+```
+
+## Recommendation
+No new bug report for CR-4. For any older branch missing the fixes, backport PR #1246 and PR #1331 together so staged catch-up, listener promotion, and snapshot-carried configuration all share the fixed configuration-safety behavior.
+
+VERDICT: DROPPED
