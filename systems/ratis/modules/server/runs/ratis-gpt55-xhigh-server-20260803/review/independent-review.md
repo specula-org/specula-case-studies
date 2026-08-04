@@ -21,10 +21,3 @@ Additional focused validation was run for MC-1 after the original run:
 
 The focused validation strengthens the original MC-1 result because it covers
 repeated force failures, not just a single failed force call.
-
-Recommended outward-facing use:
-
-- Report MC-1 as a reproduced Critical bug, with the Level 2 storage-fault
-  injection disclosed.
-- Do not count MC-2 as a confirmed bug; at most mention it as a masked
-  hardening candidate if the audience wants secondary findings.
