@@ -19,9 +19,3 @@ full Ratis state space. The final main `MC.cfg` check is a 30-minute convergence
 recheck, not a completed full-state search. The run is best used as a source of
 confirmed bug reports plus supporting modeling artifacts, not as a claim that no
 other Ratis bugs exist.
-
-Recommended outward-facing use:
-
-- Report MC-1, MC-3, and MC-4 as reproduced findings.
-- Mention MC-4's timing-hook nature explicitly.
-- Do not count MC-2 as a confirmed external bug without a stronger reproduction.
