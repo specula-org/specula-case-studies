@@ -12,7 +12,7 @@ Three focused runs were added for Apache Ratis at source commit `7eedc1deed07fc8
 - `modules/server/runs/ratis-gpt55-xhigh-server-20260803`
 - `modules/grpc/runs/ratis-gpt55-xhigh-grpc-20260803`
 
-The raw Phase 4 outputs are preserved in each run directory. The conclusions are in each run's `review/independent-review.md`.
+The raw Phase 4 outputs are preserved in each run directory.
 
 ## Reviewed findings
 
