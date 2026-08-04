@@ -1,0 +1,45 @@
+- **Source**: MC
+- **Novelty**: NEW
+- **Location**: `ratis-server/src/main/java/org/apache/ratis/server/impl/LeaderStateImpl.java:129`
+
+## Description
+`LeaderStateImpl.StateUpdateEvent.equals` compares only `StateUpdateEvent.Type`. `EventQueue.submit` then uses `queue.contains(event)` to avoid duplicates, so an already queued low-term `STEP_DOWN` causes a later higher-term `STEP_DOWN` to be dropped before its captured term can execute.
+
+## Trigger scenario
+A leader has a caught-up follower and receives two higher-term `NOT_LEADER` reports before the event processor drains the first `STEP_DOWN`. The first report enqueues `STEP_DOWN(term=2)`. The second report reaches `LeaderStateImpl.onFollowerTerm(..., term=3)`, matching the counterexample’s later higher-term step-down step, but the queue discards it because another `STEP_DOWN` type is already present.
+
+## Developer intent
+`onFollowerTerm` is intended to step down and persist metadata when a caught-up follower reports a higher term. `VoteContext.checkTerm` relies on the server’s current term to reject stale vote requests; losing the highest observed step-down term breaks that assumption.
+
+## Reproduction result
+Executed: `/home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-system-20260803/ratis-system/.specula-output/repro/test_bugMC-4_stepdown_event_dedup.sh`
+
+```text
+repro: MC-4 higher-term STEP_DOWN dropped by type-only EventQueue dedup
+command: timeout 20m ./mvnw -pl ratis-test -am -DskipShade -Drat.skip=true -Dcheckstyle.skip=true -Dspotbugs.skip=true -Djacoco.skip=true -DfailIfNoTests=false -Dtest=TestLeaderStepDownEventQueueDedup#testHigherTermStepDownDroppedByTypeOnlyDedup test
+[INFO] Running org.apache.ratis.server.impl.TestLeaderStepDownEventQueueDedup
+[INFO] Tests run: 1, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 1.763 s -- in org.apache.ratis.server.impl.TestLeaderStepDownEventQueueDedup
+[INFO] BUILD SUCCESS
+```
+
+Surefire captured output:
+
+```text
+LEVEL 0: normal cluster start and leader election reached term 1; pure black-box run does not deterministically overlap two queued STEP_DOWN events.
+LEVEL 1: using the Ratis CodeInjectionForTesting hook to block one EventQueue.poll.
+LEVEL 3: the only source change is the test hook before EventQueue.poll; core logic is unchanged.
+LEVEL 2: submitted caught-up follower terms 2 then 3 through LeaderStateImpl.onFollowerTerm; this instantiates CE State 5 and State 11.
+OBSERVED: after draining STEP_DOWN queue currentTerm=2, expected=3 if the higher-term STEP_DOWN had not been dropped.
+OBSERVED: requestVote(term=2) success=true, replyTerm=2; correct high-term state would reject this stale candidate with term 3.
+```
+
+Checklist:
+1. Did Level 0 or Level 1 alone trigger it? **no**.
+2. Level 2/3 was used. The injected sequence is admissible: CE State 5 queues the first step-down; CE State 11 observes a later higher-term step-down while the first remains queued. The concrete test sequence is real `LeaderStateImpl.onFollowerTerm(caughtUpFollower, 2)` then `LeaderStateImpl.onFollowerTerm(caughtUpFollower, 3)`, with only a timing hook before `EventQueue.poll`.
+3. Real consumer/caller: `RaftServerImpl.requestVote` at `ratis-server/src/main/java/org/apache/ratis/server/impl/RaftServerImpl.java:1500`, via `VoteContext.checkTerm` at `ratis-server/src/main/java/org/apache/ratis/server/impl/VoteContext.java:75`, observes the wrong stale term and grants `requestVote(term=2)`.
+4. The bad state is not masked by an internal resend/merge/loopback. It persists the lower term until an unrelated future higher-term RPC happens to repair it; the repro shows a real vote request consuming the stale term first.
+
+## Recommendation
+Make step-down queue coalescing term-aware. For duplicate `STEP_DOWN` events, retain or replace with the maximum observed term and corresponding reason instead of dropping later same-type events solely by `Type`.
+
+VERDICT: REPRODUCED

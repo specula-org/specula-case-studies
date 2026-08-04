@@ -1,0 +1,49 @@
+- **Source**: MC
+- **Novelty**: NEW
+- **Location**: ratis-server/src/main/java/org/apache/ratis/server/leader/LogAppenderDefault.java:106
+
+## Description
+
+The source ordering matches the model concern: `LogAppenderDefault` records `lastRespondedAppendEntriesSendTime(sendTime)` before `handleReply` processes `NOT_LEADER` and calls `onFollowerTerm`. That timestamp can feed `LeaderStateImpl.hasLease()` and the lease fast path in `getReadIndex()`.
+
+I did not reproduce a stale read. In the executable reproduction, the old server was demoted to `FOLLOWER`, and the real linearizable read path returned `ReadIndexException: Leader is unknown` instead of returning the old state.
+
+## Trigger scenario
+
+The repro creates a 3-node simulated-RPC Ratis cluster, enables linearizable read with leader lease, commits value `1` on the old leader, partitions the old leader, waits for a replacement leader, commits value `2` on the new leader, then tries old-leader reads. Level 3 also temporarily delays `LogAppenderDefault` after the suspected timestamp update point, but the marker for the exact NOT_LEADER-after-timestamp window did not fire.
+
+## Developer intent
+
+Linearizable reads should not be served by an old leader after another leader has committed newer state. If a server is no longer leader or does not know a valid leader for ReadIndex forwarding, it should reject instead of serving a local stale state-machine query.
+
+## Reproduction result
+
+Executed:
+
+```text
+/home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/repro/test_bugMC-2_old_leader_lease_read.sh
+```
+
+Key output:
+
+```text
+MC2_REPRO_START 2026-08-04T11:34:26Z
+HEAD=7eedc1deed07fc883bfe448b2d33438b7a0e994e
+LEVEL0_COMMAND_STATUS=0
+LEVEL1_COMMAND_STATUS=0
+LEVEL3_PATCH=delay_after_updateLastRespondedAppendEntriesSendTime_for_NOT_LEADER
+LEVEL3_COMMAND_STATUS=0
+MC2_REPRO_END 2026-08-04T11:37:26Z
+```
+
+Surefire result excerpt:
+
+```text
+MC2_RESULT level=LEVEL3 attempt=6 staleReadObserved=false replacementLeaderObserved=true oldLeaseExpiredBeforeReplacement=true oldLeaderFinalRole=FOLLOWER newLeaderId=s2 notLeaderTimestampObserved=false readAttempts=218 staleValue=-1 detail="first=FAILED_REPLY exception=org.apache.ratis.protocol.exceptions.ReadIndexException: s1@group-FD3ADB2F0A87: Leader is unknown.; last=FAILED_REPLY exception=org.apache.ratis.protocol.exceptions.ReadIndexException: s1@group-FD3ADB2F0A87: Leader is unknown."
+```
+
+## Recommendation
+
+Keep a regression test around this leadership-change read path. For extra hardening, consider moving `NOT_LEADER` handling before lease timestamp updates, or updating `lastRespondedAppendEntriesSendTime` only for replies that can legitimately renew leadership evidence.
+
+VERDICT: MASKED

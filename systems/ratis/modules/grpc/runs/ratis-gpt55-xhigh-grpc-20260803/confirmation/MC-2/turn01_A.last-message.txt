@@ -1,0 +1,76 @@
+- **Source**: MC
+- **Novelty**: NEW
+- **Location**: ratis-server/src/main/java/org/apache/ratis/server/impl/LeaderStateImpl.java:725
+
+## Description
+
+The counterexample’s state shape maps to real Ratis fields: snapshot installation can advance `snapshotIndex`, `matchIndex`, `nextIndex`, and `attemptedSnapshot` on a staging follower. However, the specific failing MC transition does not match current implementation reachability.
+
+`LeaderStateImpl.restart()` removes the sender, then recreates one only if `getPeer(info.getId())` finds that peer in the current Raft configuration. A staging-only peer is introduced before old-new config application, so it is not returned by `server.getRaftConf().getPeer(...)`. In the reproduction, restart removed the staging appenders but did not create a fresh `FollowerInfoImpl`, so the modeled reset branch is over-permitted.
+
+I wrote:
+`/home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-grpc-20260803/ratis-grpc/.specula-output/confirmation/MC-2/investigation.md`
+
+For `PENDING REPAIR`, I also wrote:
+`/home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-grpc-20260803/ratis-grpc/.specula-output/confirmation/MC-2/repair-request.body.md`
+
+## Trigger scenario
+
+The MC trace reaches:
+
+```text
+State 5: MCAddStagingPeer(F2)
+State 6: MCSnapshotAlreadyInstalled(F2,1)
+  F2 attemptedSnapshot = TRUE
+  F2 snapshotIndex = 1
+  F2 matchIndex = 1
+  F2 nextIndex = 2
+State 8: MCRestartAppender(F2)
+  F2 attemptedSnapshot = FALSE
+  F2 snapshotIndex = 0
+  F2 matchIndex = -1
+  F2 nextIndex = 0
+```
+
+The real reproduction reaches staging snapshot progress, then restarts staging appenders through the existing test hook after public `setConfiguration`.
+
+## Developer intent
+
+`startSetConfiguration()` bootstraps new peers as staging appenders before they are applied into the current configuration. `restart()` is guarded by `getPeer(info.getId())`, so current code only recreates appenders for peers already present in `server.getRaftConf()`.
+
+Prior-report search checked upstream GitHub issue/PR search and local git history. No exact report was found for this modeled mechanism. Adjacent known fixed issue: RATIS-2283 / PR #1250, about restarted gRPC appenders leaving `catchup=false`, not about recreating a staging peer `FollowerInfoImpl` and discarding snapshot/index progress:
+https://issues.apache.org/jira/browse/RATIS-2283
+https://github.com/apache/ratis/pull/1250
+
+## Reproduction result
+
+Executed:
+
+```text
+COMMAND: timeout 12m ./mvnw -pl ratis-test -am -DskipShade -DskipRat -Dcheckstyle.skip -Dspotbugs.skip -Dfindbugs.skip -Dtest=TestSpeculaMC2StagingRestartProgress -DfailIfNoTests=false -Dspecula.ratis.grpc.trace.dir=/home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-grpc-20260803/ratis-grpc/.specula-output/repro/MC-2-traces -Dsurefire.useFile=false test
+[INFO] Running org.apache.ratis.grpc.TestSpeculaMC2StagingRestartProgress
+[INFO] Tests run: 2, Failures: 0, Errors: 0, Skipped: 0
+[INFO] BUILD SUCCESS
+```
+
+Key real trace output:
+
+```json
+{"event":"SnapshotInstalled","node":"L","follower":"F2","snapshotIndex":31,"matchIndex":31,"nextIndex":32,"state":{"matchIndex":31,"nextIndex":32,"snapshotIndex":31,"attemptedSnapshot":true,"caughtUp":false}}
+{"event":"SnapshotInstalled","node":"L","follower":"F1","snapshotIndex":31,"matchIndex":31,"nextIndex":32,"state":{"matchIndex":31,"nextIndex":32,"snapshotIndex":31,"attemptedSnapshot":true,"caughtUp":false}}
+```
+
+Surefire output confirms the restart was attempted, but the modeled replacement/reset did not occur:
+
+```text
+LeaderStateImpl.java:restart(722)) - s0@group-1CE20A15E010-LeaderStateImpl: Restarting GrpcLogAppender for s0@group-1CE20A15E010->s1
+LeaderStateImpl.java:restart(722)) - s0@group-1CE20A15E010-LeaderStateImpl: Restarting GrpcLogAppender for s0@group-1CE20A15E010->s2
+MC2_LEVEL1_ATTEMPT: snapshot progress observed before restart; appenders before restart=[s1, s2]
+MC2_LEVEL1_ARTIFACT: restart stopped staging appenders but did not create replacement FollowerInfo; appenders after restart=[], RestartAppender events=0
+```
+
+## Recommendation
+
+Repair the MC action: split or constrain `MCRestartAppender` so a staging-only peer cannot take the replacement/reinitialization branch unless it is present in the current Raft configuration, matching `LeaderStateImpl.getPeer`. A separate model branch can represent the current implementation’s staging restart behavior: stop/remove the appender without recreating `FollowerInfoImpl`.
+
+VERDICT: PENDING REPAIR

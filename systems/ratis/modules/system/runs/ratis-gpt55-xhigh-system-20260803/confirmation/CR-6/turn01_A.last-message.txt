@@ -1,0 +1,44 @@
+- **Source**: Code Review
+- **Novelty**: NEW
+- **Location**: `ratis-grpc/src/main/java/org/apache/ratis/grpc/server/GrpcLogAppender.java:207`
+
+## Description
+CR-6 在当前代码上是 false positive。`resetClient`、timeout、delayed old reply 都可达，但当前实现没有把 `nextIndex` 回退到 `matchIndex` 以下，也没有让 delayed success reply 造成错误的 follower progress 或错误 linearizable read。旧 success reply 在 follower 完成 append 后返回时，推进 `matchIndex` 是有日志依据的；heartbeat reply 的 `matchIndex` 为 invalid，不能推进。
+
+## Trigger scenario
+Level 0 用公开 `RaftClient` 写入、停/重启 follower、gRPC reconnect/catch-up。Level 1 用现有 test hook 阻塞一个 follower 的真实 `AppendEntries` handler 超过 appender timeout，再解除阻塞，让 timed-out request 的 success reply 迟到返回。
+
+## Developer intent
+相关历史问题已被报告并修复，但不是当前 delayed-old-reply overstatement 机制：[#875](https://github.com/apache/ratis/pull/875) 处理 heartbeat failure 不应把 restarting follower 的 `nextIndex` 置 0，[#914](https://github.com/apache/ratis/pull/914) 处理 `nextIndex > matchIndex`，[#939](https://github.com/apache/ratis/pull/939) 处理 `GrpcLogAppender.resetClient` 降低 `nextIndex` 时遵守 `matchIndex + 1`。当前代码也体现了这个意图：error path clamp 到 `matchIndex + 1`，`matchIndex`/`nextIndex` 更新是 max-only，read-index ack 有 commit/callId 过滤。
+
+## Reproduction result
+Test written and executed: `/home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-system-20260803/ratis-system/.specula-output/repro/test_bugCR-6_grpc_progress.sh`
+
+Command:
+```bash
+timeout 12m /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-system-20260803/ratis-system/.specula-output/repro/test_bugCR-6_grpc_progress.sh
+```
+
+Real output excerpt:
+```text
+Tests run: 2, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 9.298 s -- in org.apache.ratis.grpc.TestSpeculaCR6GrpcProgress
+CR6_PROGRESS level0 follower=s0 matchIndex=10 nextIndex=11
+CR6_PROGRESS level0 follower=s1 matchIndex=10 nextIndex=11
+CR6_LEVEL0_PASS_NO_BUG follower_restart_reconnect count=5 leader=s2 restartedFollower=s0
+Timed out appendEntries, errorCount=1, request=AppendEntriesRequest:cid=10:entry=(t:1, i:3)
+Timed out appendEntries, errorCount=2, request=AppendEntriesRequest:cid=12:entry=(t:1, i:4)
+Timed out HEARTBEAT appendEntries, errorCount=3, request=AppendEntriesRequest:cid=15:HEARTBEAT
+Timed out HEARTBEAT appendEntries, errorCount=4, request=AppendEntriesRequest:cid=17:HEARTBEAT
+CR6_PROGRESS level1 follower=s1 matchIndex=4 nextIndex=5
+CR6_PROGRESS level1 follower=s2 matchIndex=4 nextIndex=5
+CR6_LEVEL1_PASS_NO_BUG timed_out_old_reply beforeTimeouts=0 afterTimeouts=4 slowFollower=s1 leader=s0
+BUILD SUCCESS
+CR6_LEVEL2_NOT_USED Level 1 already creates the reachable delayed old-reply precondition via a real gRPC cluster; direct state injection would call private handler state.
+CR6_LEVEL3_NOT_USED No source patch was needed; patching GrpcLogAppender would create the symptom rather than exercise production logic.
+CR6_REPRO_DONE status=PASS_NO_BUG
+```
+
+## Recommendation
+No production fix for CR-6 as stated. Keep or add a regression test around delayed old reply after appender timeout, because it documents the intended safeguards: `nextIndex >= matchIndex + 1`, exact read-only result after delayed reply, and no progress overstatement.
+
+VERDICT: FALSE POSITIVE

@@ -1,0 +1,205 @@
+{
+  "schema_version": "2",
+  "system": "ratis-system",
+  "generated_by": "validation-workflow",
+  "generated_at": "2026-08-04T03:16:00Z",
+  "summary": {
+    "trace_validation": "PASS",
+    "final_mc_convergence": "NO_NEW_INVARIANT_VIOLATION_IN_TIMEBOX",
+    "case_c_findings": 4,
+    "case_a_fixes": 1,
+    "case_b_spec_fixes": 4
+  },
+  "verification": {
+    "sany": {
+      "status": "PASS",
+      "log": "output/sany_after_snapshot_already_installed.log"
+    },
+    "traces": [
+      {
+        "name": "normal-consensus-read.ndjson",
+        "status": "PASS",
+        "log": "output/trace/normal-consensus-read.after-snapshot-fix.log"
+      },
+      {
+        "name": "leader-loss-restart.ndjson",
+        "status": "PASS",
+        "log": "output/trace/leader-loss-restart.after-snapshot-fix.log"
+      },
+      {
+        "name": "grpc-reconnect-timeout.ndjson",
+        "status": "PASS",
+        "log": "output/trace/grpc-reconnect-timeout.after-snapshot-fix.log"
+      },
+      {
+        "name": "snapshot-catchup.ndjson",
+        "status": "PASS",
+        "log": "output/trace/snapshot-catchup.after-snapshot-fix.log"
+      }
+    ],
+    "final_mc": {
+      "status": "NO_NEW_INVARIANT_VIOLATION_IN_TIMEBOX",
+      "config": "MC.cfg",
+      "log": "output/mc/MC_convergence_round13.log",
+      "exit_code": 124,
+      "timebox_seconds": 1800,
+      "depth": 16,
+      "states_generated": 96239275,
+      "distinct_states": 13766616
+    }
+  },
+  "findings": [
+    {
+      "id": "MC-1",
+      "title": "Stale AppendEntries SUCCESS after higher-term vote can let an old leader commit an entry absent from the new leader",
+      "source": "model-checking",
+      "scenario": "Scenario 1: In-flight append composition across leader change",
+      "severity": "High",
+      "status": "MODEL_CHECKED_SOURCE_CONFIRMED",
+      "harness_reproduced": false,
+      "invariant": "LeaderCompleteness",
+      "config": "MC.cfg",
+      "counterexample": "spec/output/mc/MC_convergence_round3.log",
+      "configs": [
+        "MC.cfg",
+        "MC_hunt_scenario1.cfg"
+      ],
+      "evidence": [
+        "output/mc/MC_convergence_round3.log",
+        "output/mc/MC_convergence_round3_trace.json",
+        "output/hunt/MC_hunt_scenario1_sim.log",
+        "output/hunt/MC_hunt_scenario1_sim2.log"
+      ],
+      "affected_code": [
+        "ratis-server/src/main/java/org/apache/ratis/server/impl/RaftServerImpl.java:1523",
+        "ratis-server/src/main/java/org/apache/ratis/server/impl/RaftServerImpl.java:1669",
+        "ratis-server/src/main/java/org/apache/ratis/server/impl/RaftServerImpl.java:1730",
+        "ratis-grpc/src/main/java/org/apache/ratis/grpc/server/GrpcLogAppender.java:519",
+        "ratis-server/src/main/java/org/apache/ratis/server/impl/LeaderStateImpl.java:953"
+      ],
+      "summary": "A follower can accept an append and grant a higher-term vote before asynchronous append completion. The append may then return a stale SUCCESS to the old leader, which counts it toward commit. This can commit an entry that is absent from a subsequently elected leader, violating LeaderCompleteness.",
+      "recommendation": "Recheck follower term and leader state after append future completion, reject stale success replies, and validate reply term before leader progress updates."
+    },
+    {
+      "id": "MC-2",
+      "title": "Append compose can return SUCCESS for a mismatched future at the same start index",
+      "source": "model-checking",
+      "scenario": "Scenario 1: In-flight append composition across leader change",
+      "severity": "High",
+      "status": "MODEL_CHECKED_SOURCE_CONFIRMED",
+      "harness_reproduced": false,
+      "invariant": "AppendSuccessReflectsLog",
+      "config": "MC_hunt_scenario1.cfg",
+      "counterexample": "spec/output/hunt/MC_hunt_scenario1_sim3.log",
+      "configs": [
+        "MC_hunt_scenario1.cfg"
+      ],
+      "evidence": [
+        "output/hunt/MC_hunt_scenario1_sim3.log",
+        "output/hunt/MC_hunt_scenario1_sim3_trace.json"
+      ],
+      "affected_code": [
+        "ratis-server/src/main/java/org/apache/ratis/server/impl/ServerImplUtils.java:150",
+        "ratis-server/src/main/java/org/apache/ratis/server/impl/ServerImplUtils.java:163",
+        "ratis-server/src/main/java/org/apache/ratis/server/impl/RaftServerImpl.java:1713",
+        "ratis-server-api/src/main/java/org/apache/ratis/server/RaftServerConfigKeys.java:475"
+      ],
+      "summary": "Append composition deduplicates in-flight work by starting log index only. A later request with the same index but a different term or value can reuse an older future and receive SUCCESS without storing the exact claimed entry. The acknowledgment can therefore describe follower state that its log does not contain.",
+      "recommendation": "Deduplicate by full term/index range or reject same-index mismatches; only reply SUCCESS after the follower contains the exact acknowledged term/value."
+    },
+    {
+      "id": "MC-3",
+      "title": "Metadata persist failure can leave an accepted leader term non-durable",
+      "source": "model-checking",
+      "scenario": "Scenario 2: Term, role, and metadata persistence are non-atomic",
+      "severity": "Medium",
+      "status": "MODEL_CHECKED_SOURCE_CONFIRMED",
+      "harness_reproduced": false,
+      "invariant": "PersistedTermBeforeAccept",
+      "config": "MC_hunt_scenario2.cfg",
+      "counterexample": "spec/output/hunt/MC_hunt_scenario2.log",
+      "configs": [
+        "MC_hunt_scenario2.cfg"
+      ],
+      "evidence": [
+        "output/hunt/MC_hunt_scenario2.log",
+        "output/hunt/MC_hunt_scenario2_trace.json",
+        "output/hunt/MC_hunt_scenario2_rerun.log",
+        "output/hunt/MC_hunt_scenario2_rerun_trace.json"
+      ],
+      "affected_code": [
+        "ratis-server/src/main/java/org/apache/ratis/server/impl/RaftServerImpl.java:642",
+        "ratis-server/src/main/java/org/apache/ratis/server/impl/RaftServerImpl.java:1669",
+        "ratis-server/src/main/java/org/apache/ratis/server/impl/ServerState.java:213",
+        "ratis-server/src/main/java/org/apache/ratis/server/impl/ServerState.java:337"
+      ],
+      "summary": "When metadata persistence fails, the server's volatile term can remain ahead of its durable term. Later same-term leader recognition may skip a persistence retry and accept new-term traffic. A crash can then restore the older term even though the server accepted work in the newer term.",
+      "recommendation": "Track dirty metadata after persist failure and require successful retry before accepting same-term leader requests or returning successful follower responses."
+    },
+    {
+      "id": "MC-4",
+      "title": "Higher-term step-down event can be dropped by type-only queue deduplication",
+      "source": "model-checking",
+      "scenario": "Scenario 2: Term, role, and metadata persistence are non-atomic",
+      "severity": "Medium",
+      "status": "MODEL_CHECKED_SOURCE_CONFIRMED",
+      "harness_reproduced": false,
+      "invariant": "StepDownTermNotLost",
+      "config": "MC_hunt_scenario2.cfg",
+      "counterexample": "spec/output/hunt/MC_hunt_scenario2_rerun2.log",
+      "configs": [
+        "MC_hunt_scenario2.cfg"
+      ],
+      "evidence": [
+        "output/hunt/MC_hunt_scenario2_rerun2.log",
+        "output/hunt/MC_hunt_scenario2_rerun2_trace.json"
+      ],
+      "affected_code": [
+        "ratis-server/src/main/java/org/apache/ratis/server/impl/LeaderStateImpl.java:128",
+        "ratis-server/src/main/java/org/apache/ratis/server/impl/LeaderStateImpl.java:155",
+        "ratis-server/src/main/java/org/apache/ratis/server/impl/LeaderStateImpl.java:507",
+        "ratis-server/src/main/java/org/apache/ratis/server/impl/LeaderStateImpl.java:740"
+      ],
+      "summary": "The leader event queue compares step-down events only by event type. A queued low-term STEP_DOWN can therefore cause a later higher-term STEP_DOWN to be discarded. Queue processing may then persist only the older term and lose the higher term that the leader already observed.",
+      "recommendation": "Include term in step-down event identity, replace pending step-down with the maximum observed term, or persist the higher term before queue de-duplication can discard it."
+    }
+  ],
+  "not_reproduced_or_spec_fixes": [
+    {
+      "area": "old-stream SUCCESS without follower contents",
+      "disposition": "CASE_A_FIXED",
+      "evidence": [
+        "output/mc/MC_convergence_round1.log",
+        "output/mc/MC_convergence_round2.log"
+      ]
+    },
+    {
+      "area": "global follower progress reused across leaders",
+      "disposition": "CASE_B_FIXED",
+      "evidence": [
+        "output/mc/MC_convergence_round4.log"
+      ]
+    },
+    {
+      "area": "compose map lifetime after reply",
+      "disposition": "CASE_B_FIXED",
+      "evidence": [
+        "output/hunt/MC_hunt_scenario1_sim4.log"
+      ]
+    },
+    {
+      "area": "stale queued step-down across leader-state replacement",
+      "disposition": "CASE_B_FIXED",
+      "evidence": [
+        "output/hunt/MC_hunt_scenario2_rerun3.log"
+      ]
+    },
+    {
+      "area": "snapshot notification already installed path",
+      "disposition": "CASE_B_FIXED",
+      "evidence": [
+        "output/hunt/MC_hunt_scenario3.log"
+      ]
+    }
+  ]
+}

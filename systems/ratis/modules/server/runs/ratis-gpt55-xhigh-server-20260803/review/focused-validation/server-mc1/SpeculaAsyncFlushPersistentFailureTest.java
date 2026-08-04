@@ -1,0 +1,302 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.ratis;
+
+import org.apache.ratis.client.RaftClient;
+import org.apache.ratis.conf.RaftProperties;
+import org.apache.ratis.protocol.RaftClientReply;
+import org.apache.ratis.protocol.RaftPeer;
+import org.apache.ratis.protocol.SetConfigurationRequest;
+import org.apache.ratis.server.RaftServer;
+import org.apache.ratis.server.RaftServerConfigKeys;
+import org.apache.ratis.server.raftlog.RaftLog;
+import org.apache.ratis.server.simulation.MiniRaftClusterWithSimulatedRpc;
+import org.junit.jupiter.api.Assertions;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.Timeout;
+
+import java.io.IOException;
+import java.lang.reflect.Field;
+import java.nio.ByteBuffer;
+import java.nio.MappedByteBuffer;
+import java.nio.channels.FileChannel;
+import java.nio.channels.FileLock;
+import java.nio.channels.ReadableByteChannel;
+import java.nio.channels.WritableByteChannel;
+import java.util.List;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.BooleanSupplier;
+import java.util.stream.Collectors;
+
+public class SpeculaAsyncFlushPersistentFailureTest extends BaseTest {
+  @Test
+  @Timeout(120)
+  public void asyncFlushStillAdvancesCommitWhenEveryForceFails() throws Exception {
+    final RaftProperties properties = new RaftProperties();
+    ReadOnlyRequestTests.CounterStateMachine.setProperties(properties);
+    RaftServerConfigKeys.Log.setAsyncFlushEnabled(properties, true);
+    RaftServerConfigKeys.Log.setForceSyncNum(properties, 1);
+
+    final MiniRaftClusterWithSimulatedRpc cluster = MiniRaftClusterWithSimulatedRpc.FACTORY.newCluster(
+        new String[] {"s1", "s2"}, new String[] {"s3"}, properties);
+    ForceFailure failure = null;
+    try {
+      cluster.start();
+      final RaftServer.Division leader = RaftTestUtil.waitForLeader(cluster);
+      final RaftLog leaderLog = leader.getRaftLog();
+
+      try (RaftClient client = cluster.createClient(leader.getId())) {
+        final RaftClientReply ready = client.io().send(ReadOnlyRequestTests.INCREMENT);
+        Assertions.assertTrue(ready.isSuccess(), () -> "leader readiness write failed: " + ready);
+
+        failure = installForceFailure(leaderLog);
+        final ForceFailure installed = failure;
+        final long targetIndex = leaderLog.getNextIndex();
+        final long beforeCommit = leaderLog.getLastCommittedIndex();
+        final long beforeFlush = leaderLog.getFlushIndex();
+        final List<RaftPeer> added = cluster.getListeners().stream()
+            .map(RaftServer.Division::getPeer)
+            .collect(Collectors.toList());
+
+        final RaftClientReply reply = client.admin().setConfiguration(SetConfigurationRequest.Arguments.newBuilder()
+            .setServersInNewConf(added)
+            .setMode(SetConfigurationRequest.Mode.ADD)
+            .build());
+
+        waitFor(() -> installed.failures.get() > 0, "injected FileChannel.force failure");
+        waitFor(() -> leaderLog.getLastCommittedIndex() >= targetIndex, "leader commit reaches failed-force entry");
+
+        final long afterCommit = leaderLog.getLastCommittedIndex();
+        final long afterFlush = leaderLog.getFlushIndex();
+        System.out.println("LEVEL=2");
+        System.out.println("FAULT=all FileChannel.force(false) calls after installation throw IOException");
+        System.out.println("TARGET_INDEX=" + targetIndex);
+        System.out.println("BEFORE_COMMIT=" + beforeCommit);
+        System.out.println("BEFORE_FLUSH=" + beforeFlush);
+        System.out.println("FORCE_ATTEMPTS=" + installed.attempts.get());
+        System.out.println("FORCE_FAILURES=" + installed.failures.get());
+        System.out.println("SUCCESSFUL_FORCE_AFTER_INSTALL=0");
+        System.out.println("ADMIN_REPLY_SUCCESS=" + reply.isSuccess());
+        System.out.println("AFTER_COMMIT=" + afterCommit);
+        System.out.println("AFTER_FLUSH=" + afterFlush);
+
+        Assertions.assertTrue(reply.isSuccess(), () -> "admin reply should expose success if the defect is present: "
+            + reply);
+        Assertions.assertTrue(installed.failures.get() > 0, "the injected force failure did not fire");
+        Assertions.assertEquals(installed.attempts.get(), installed.failures.get(),
+            "all force attempts after installation should fail");
+        Assertions.assertTrue(afterFlush >= targetIndex,
+            () -> "flushIndex did not advance to failed-force entry: " + afterFlush + " < " + targetIndex);
+        Assertions.assertTrue(afterCommit >= targetIndex,
+            () -> "commitIndex did not advance to failed-force entry: " + afterCommit + " < " + targetIndex);
+        System.out.println("OBSERVED: no successful force after installation, but flushIndex/commitIndex advanced "
+            + "and the admin client received success");
+      } finally {
+        if (failure != null) {
+          failure.restore();
+        }
+      }
+    } finally {
+      cluster.shutdown();
+    }
+  }
+
+  private static void waitFor(BooleanSupplier condition, String description) throws Exception {
+    final long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
+    AssertionError last = null;
+    while (System.nanoTime() < deadline) {
+      try {
+        if (condition.getAsBoolean()) {
+          return;
+        }
+      } catch (AssertionError e) {
+        last = e;
+      }
+      Thread.sleep(100);
+    }
+    if (last != null) {
+      throw last;
+    }
+    Assertions.fail("Timed out waiting for " + description);
+  }
+
+  private static ForceFailure installForceFailure(RaftLog log) throws Exception {
+    final Object worker = getField(log, "fileLogWorker");
+    final Object segmentedOut = getField(worker, "out");
+    final Object buffered = getField(segmentedOut, "out");
+    final FileChannel original = (FileChannel) getField(buffered, "fileChannel");
+    final ForceFailure failure = new ForceFailure(buffered, original);
+    setField(buffered, "fileChannel", failure.channel);
+    return failure;
+  }
+
+  private static Object getField(Object target, String name) throws Exception {
+    Class<?> c = target.getClass();
+    while (c != null) {
+      try {
+        final Field f = c.getDeclaredField(name);
+        f.setAccessible(true);
+        return f.get(target);
+      } catch (NoSuchFieldException e) {
+        c = c.getSuperclass();
+      }
+    }
+    throw new NoSuchFieldException(target.getClass().getName() + "." + name);
+  }
+
+  private static void setField(Object target, String name, Object value) throws Exception {
+    Class<?> c = target.getClass();
+    while (c != null) {
+      try {
+        final Field f = c.getDeclaredField(name);
+        f.setAccessible(true);
+        f.set(target, value);
+        return;
+      } catch (NoSuchFieldException e) {
+        c = c.getSuperclass();
+      }
+    }
+    throw new NoSuchFieldException(target.getClass().getName() + "." + name);
+  }
+
+  private static final class ForceFailure {
+    private final Object buffered;
+    private final FileChannel original;
+    private final FailingFileChannel channel;
+    private final AtomicInteger attempts = new AtomicInteger();
+    private final AtomicInteger failures = new AtomicInteger();
+
+    private ForceFailure(Object buffered, FileChannel original) {
+      this.buffered = buffered;
+      this.original = original;
+      this.channel = new FailingFileChannel(original, attempts, failures);
+    }
+
+    @SuppressWarnings("unchecked")
+    private void restore() throws Exception {
+      setField(buffered, "fileChannel", original);
+      final AtomicReference<CompletableFuture<Void>> flushFuture =
+          (AtomicReference<CompletableFuture<Void>>) getField(buffered, "flushFuture");
+      flushFuture.set(CompletableFuture.completedFuture(null));
+    }
+  }
+
+  private static final class FailingFileChannel extends FileChannel {
+    private final FileChannel delegate;
+    private final AtomicInteger attempts;
+    private final AtomicInteger failures;
+
+    private FailingFileChannel(FileChannel delegate, AtomicInteger attempts, AtomicInteger failures) {
+      this.delegate = delegate;
+      this.attempts = attempts;
+      this.failures = failures;
+    }
+
+    @Override
+    public int read(ByteBuffer dst) throws IOException {
+      return delegate.read(dst);
+    }
+
+    @Override
+    public long read(ByteBuffer[] dsts, int offset, int length) throws IOException {
+      return delegate.read(dsts, offset, length);
+    }
+
+    @Override
+    public int write(ByteBuffer src) throws IOException {
+      return delegate.write(src);
+    }
+
+    @Override
+    public long write(ByteBuffer[] srcs, int offset, int length) throws IOException {
+      return delegate.write(srcs, offset, length);
+    }
+
+    @Override
+    public long position() throws IOException {
+      return delegate.position();
+    }
+
+    @Override
+    public FileChannel position(long newPosition) throws IOException {
+      delegate.position(newPosition);
+      return this;
+    }
+
+    @Override
+    public long size() throws IOException {
+      return delegate.size();
+    }
+
+    @Override
+    public FileChannel truncate(long size) throws IOException {
+      delegate.truncate(size);
+      return this;
+    }
+
+    @Override
+    public void force(boolean metaData) throws IOException {
+      attempts.incrementAndGet();
+      failures.incrementAndGet();
+      throw new IOException("injected persistent FileChannel.force(false) failure for MC-1 focused validation");
+    }
+
+    @Override
+    public long transferTo(long position, long count, WritableByteChannel target) throws IOException {
+      return delegate.transferTo(position, count, target);
+    }
+
+    @Override
+    public long transferFrom(ReadableByteChannel src, long position, long count) throws IOException {
+      return delegate.transferFrom(src, position, count);
+    }
+
+    @Override
+    public int read(ByteBuffer dst, long position) throws IOException {
+      return delegate.read(dst, position);
+    }
+
+    @Override
+    public int write(ByteBuffer src, long position) throws IOException {
+      return delegate.write(src, position);
+    }
+
+    @Override
+    public MappedByteBuffer map(MapMode mode, long position, long size) throws IOException {
+      return delegate.map(mode, position, size);
+    }
+
+    @Override
+    public FileLock lock(long position, long size, boolean shared) throws IOException {
+      return delegate.lock(position, size, shared);
+    }
+
+    @Override
+    public FileLock tryLock(long position, long size, boolean shared) throws IOException {
+      return delegate.tryLock(position, size, shared);
+    }
+
+    @Override
+    protected void implCloseChannel() throws IOException {
+      delegate.close();
+    }
+  }
+}

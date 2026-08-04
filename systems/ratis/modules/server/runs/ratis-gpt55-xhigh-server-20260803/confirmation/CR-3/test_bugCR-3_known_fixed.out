@@ -1,0 +1,1066 @@
+CR-3 known-fixed verification
+HEAD: 7eedc1deed07fc883bfe448b2d33438b7a0e994e
+
+Known upstream reports/fixes covering this mechanism:
+d430b4d45 RATIS-2430. Write snapshot to temporary path until finish (#1372)
+0355d33e0 RATIS-2511. Follower should throw ReadException if it is installing snapshot (#1444)
+54a991623 RATIS-2148. Snapshot transfer may cause followers to trigger reloadStateMachine incorrectly (#1145)
+d1e76cf2b RATIS-2148. Snapshot transfer may cause followers to trigger reloadStateMachine incorrectly (#1145)
+7167fafe7 RATIS-1481. make state upgradate in notifyStateMachineToInstallSnapshot serialized (#573)
+b735bb520 RATIS-1402. do not send extra rpc calls to follower when the follower is still installing a snapshot (#504)
+
+Current guard sites:
+ratis-server/src/main/java/org/apache/ratis/server/raftlog/segmented/SegmentedRaftLogWorker.java:262:  void syncWithSnapshot(long lastSnapshotIndex) {
+ratis-server/src/main/java/org/apache/ratis/server/impl/RaftServerImpl.java:1099:  ReadException getReadException(String op, long installSnapshot, boolean started) {
+ratis-server/src/main/java/org/apache/ratis/server/impl/RaftServerImpl.java:1104:    final long installSnapshot = snapshotInstallationHandler.getInProgressInstallSnapshotIndex();
+ratis-server/src/main/java/org/apache/ratis/server/impl/RaftServerImpl.java:1107:      return JavaUtils.completeExceptionally(getReadException("get", installSnapshot, false));
+ratis-server/src/main/java/org/apache/ratis/server/impl/RaftServerImpl.java:1151:          .thenCompose(readIndex -> getState().getReadRequests().waitToAdvance(readIndex,
+ratis-server/src/main/java/org/apache/ratis/server/impl/RaftServerImpl.java:1152:              () -> getReadException("add", snapshotInstallationHandler.getInProgressInstallSnapshotIndex(), false)))
+ratis-server/src/main/java/org/apache/ratis/server/impl/RaftServerImpl.java:1338:      final long installSnapshot = snapshotInstallationHandler.getInProgressInstallSnapshotIndex();
+ratis-server/src/main/java/org/apache/ratis/server/impl/RaftServerImpl.java:1690:      final long inconsistencyReplyNextIndex = checkInconsistentAppendEntries(previous, entries);
+ratis-server/src/main/java/org/apache/ratis/server/impl/RaftServerImpl.java:1697:        if (snapshotInstallationHandler.getInProgressInstallSnapshotIndex() != RaftLog.INVALID_LOG_INDEX) {
+ratis-server/src/main/java/org/apache/ratis/server/impl/RaftServerImpl.java:1756:  private long checkInconsistentAppendEntries(TermIndex previous, List<LogEntryProto> entries) {
+ratis-server/src/main/java/org/apache/ratis/server/impl/RaftServerImpl.java:1758:    final long installSnapshot = snapshotInstallationHandler.getInProgressInstallSnapshotIndex();
+ratis-server/src/main/java/org/apache/ratis/server/impl/SnapshotInstallationHandler.java:105:  long getInProgressInstallSnapshotIndex() {
+ratis-server/src/main/java/org/apache/ratis/server/impl/SnapshotInstallationHandler.java:231:        snapshotManager.appendSnapshot(request, stateMachine);
+ratis-server/src/main/java/org/apache/ratis/server/impl/SnapshotInstallationHandler.java:239:          snapshotManager.finalizeSnapshot(request);
+ratis-server/src/main/java/org/apache/ratis/server/impl/SnapshotInstallationHandler.java:293:        server.getState().getReadRequests().fail(server.getReadException("wait for", firstAvailableLogIndex, true));
+ratis-server/src/main/java/org/apache/ratis/server/impl/SnapshotInstallationHandler.java:358:      final long inProgressInstallSnapshotIndexValue = getInProgressInstallSnapshotIndex();
+ratis-server/src/main/java/org/apache/ratis/server/impl/SnapshotInstallationHandler.java:362:          getInProgressInstallSnapshotIndex(), firstAvailableLogIndex);
+ratis-server/src/main/java/org/apache/ratis/server/impl/SnapshotInstallationHandler.java:382:        state.reloadStateMachine(latestInstalledSnapshotTermIndex);
+
+Running upstream regression for follower ReadIndex during snapshot installation:
+Picked up JAVA_TOOL_OPTIONS: -Djava.io.tmpdir=/home/ubuntu/specula-ratis-issue123-20260803/tmp/server -XX:+PerfDisableSharedMem
+[INFO] Scanning for projects...
+[INFO] ------------------------------------------------------------------------
+[INFO] Detecting the operating system and CPU architecture
+[INFO] ------------------------------------------------------------------------
+[INFO] os.detected.name: linux
+[INFO] os.detected.arch: x86_64
+[INFO] os.detected.bitness: 64
+[INFO] os.detected.version: 6.8
+[INFO] os.detected.version.major: 6
+[INFO] os.detected.version.minor: 8
+[INFO] os.detected.release: ubuntu
+[INFO] os.detected.release.version: 24.04
+[INFO] os.detected.release.like.ubuntu: true
+[INFO] os.detected.release.like.debian: true
+[INFO] os.detected.classifier: linux-x86_64
+[WARNING] This build will only read from the build cache, since the clean lifecycle is not part of the build invocation.
+[INFO] ------------------------------------------------------------------------
+[INFO] Reactor Build Order:
+[INFO] 
+[INFO] Apache Ratis                                                       [pom]
+[INFO] Apache Ratis Protocols                                             [jar]
+[INFO] Apache Ratis Common                                                [jar]
+[INFO] Apache Ratis Client                                                [jar]
+[INFO] Apache Ratis Server API                                            [jar]
+[INFO] Apache Ratis Metrics API                                           [jar]
+[INFO] Apache Ratis Metrics Default Implementation                        [jar]
+[INFO] Apache Ratis Server                                                [jar]
+[INFO] Apache Ratis gRPC Support                                          [jar]
+[INFO] Apache Ratis Netty Support                                         [jar]
+[INFO] Apache Ratis Tracing - OpenTelemetry                               [jar]
+[INFO] Apache Ratis Shell                                                 [jar]
+[INFO] Apache Ratis Test                                                  [jar]
+[INFO] 
+[INFO] -----------------------< org.apache.ratis:ratis >-----------------------
+[INFO] Building Apache Ratis 3.3.0-SNAPSHOT                              [1/13]
+[INFO]   from pom.xml
+[INFO] --------------------------------[ pom ]---------------------------------
+[INFO] 
+[INFO] --- enforcer:3.6.3:enforce (enforce-maven-version) @ ratis ---
+[INFO] Rule 0: org.apache.maven.enforcer.rules.version.RequireMavenVersion passed
+[INFO] 
+[INFO] --- enforcer:3.6.3:enforce (enforce-java-version) @ ratis ---
+[INFO] Rule 0: org.apache.maven.enforcer.rules.version.RequireJavaVersion passed
+[INFO] 
+[INFO] --- jacoco:0.8.15:prepare-agent (default-prepare-agent) @ ratis ---
+[INFO] argLine set to -javaagent:/home/ubuntu/.m2/repository/org/jacoco/org.jacoco.agent/0.8.15/org.jacoco.agent-0.8.15-runtime.jar=destfile=/home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/target/jacoco.exec,includes=org.apache.ratis.*
+[INFO] 
+[INFO] --- build-helper:3.6.1:add-source (add-source) @ ratis ---
+[INFO] Source directory: /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/target/generated-sources added.
+[INFO] 
+[INFO] --- enforcer:3.6.3:enforce (bannedImports-finalizers) @ ratis ---
+[INFO] Rule 0: org.apache.maven.plugins.enforcer.RestrictImports passed
+[INFO] 
+[INFO] --- remote-resources:3.3.0:process (process-resource-bundles) @ ratis ---
+[INFO] Preparing remote bundle org.apache.apache.resources:apache-jar-resource-bundle:1.8
+[INFO] Copying 3 resources from 1 bundle.
+[INFO] 
+[INFO] --- hadoops:3.4.3:version-info (version-info) @ ratis ---
+[INFO] SCM: GIT
+[INFO] Computed MD5: a9d65318c1d3b4c37bebba1dde730a4
+[INFO] 
+[INFO] --------------------< org.apache.ratis:ratis-proto >--------------------
+[INFO] Building Apache Ratis Protocols 3.3.0-SNAPSHOT                    [2/13]
+[INFO]   from ratis-proto/pom.xml
+[INFO] --------------------------------[ jar ]---------------------------------
+[INFO] 
+[INFO] --- enforcer:3.6.3:enforce (enforce-maven-version) @ ratis-proto ---
+[INFO] 
+[INFO] --- enforcer:3.6.3:enforce (enforce-java-version) @ ratis-proto ---
+[INFO] 
+[INFO] --- jacoco:0.8.15:prepare-agent (default-prepare-agent) @ ratis-proto ---
+[INFO] argLine set to -javaagent:/home/ubuntu/.m2/repository/org/jacoco/org.jacoco.agent/0.8.15/org.jacoco.agent-0.8.15-runtime.jar=destfile=/home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-proto/target/jacoco.exec,includes=org.apache.ratis.*
+[INFO] 
+[INFO] --- build-helper:3.6.1:add-source (add-source) @ ratis-proto ---
+[INFO] Source directory: /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-proto/target/generated-sources added.
+[INFO] 
+[INFO] --- protobuf:0.6.1:compile (compile-protobuf) @ ratis-proto ---
+[INFO] Compiling 6 proto file(s) to /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-proto/target/generated-sources
+[INFO] 
+[INFO] --- protobuf:0.6.1:compile-custom (compile-grpc) @ ratis-proto ---
+[INFO] Compiling 6 proto file(s) to /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-proto/target/generated-sources
+[INFO] 
+[INFO] --- enforcer:3.6.3:enforce (bannedImports-finalizers) @ ratis-proto ---
+[INFO] Rule 0: org.apache.maven.plugins.enforcer.RestrictImports passed
+[INFO] 
+[INFO] --- replacer:1.5.3:replace (default) @ ratis-proto ---
+[INFO] Replacement run on 19 files.
+[INFO] 
+[INFO] --- remote-resources:3.3.0:process (process-resource-bundles) @ ratis-proto ---
+[INFO] Preparing remote bundle org.apache.apache.resources:apache-jar-resource-bundle:1.8
+[INFO] Copying 3 resources from 1 bundle.
+[INFO] 
+[INFO] --- hadoops:3.4.3:version-info (version-info) @ ratis-proto ---
+[INFO] SCM: GIT
+[INFO] Computed MD5: d41d8cd98f0b24e980998ecf8427e
+[INFO] 
+[INFO] --- resources:3.5.0:resources (default-resources) @ ratis-proto ---
+[INFO] skip non existing resourceDirectory /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-proto/src/main/resources
+[INFO] Copying 1 resource from ../src/main/resources to target/classes
+[INFO] Copying 6 resources from src/main/proto to target/classes
+[INFO] Copying 6 resources from src/main/proto to target/classes
+[INFO] Copying 3 resources from target/maven-shared-archive-resources to target/classes
+[INFO] 
+[INFO] --- compiler:3.15.0:compile (default-compile) @ ratis-proto ---
+[INFO] Compiling 19 source files with javac [forked debug release 8] to target/classes
+[WARNING] Unable to autodetect 'javac' path, using 'javac' from the environment.
+[INFO] 
+[INFO] --- resources:3.5.0:testResources (default-testResources) @ ratis-proto ---
+[INFO] skip non existing resourceDirectory /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-proto/src/test/resources
+[INFO] Copying 3 resources from target/maven-shared-archive-resources to target/test-classes
+[INFO] 
+[INFO] --- compiler:3.15.0:testCompile (default-testCompile) @ ratis-proto ---
+[INFO] No sources to compile
+[INFO] 
+[INFO] --- surefire:3.5.6:test (default-test) @ ratis-proto ---
+[INFO] Skipped
+[INFO] 
+[INFO] -------------------< org.apache.ratis:ratis-common >--------------------
+[INFO] Building Apache Ratis Common 3.3.0-SNAPSHOT                       [3/13]
+[INFO]   from ratis-common/pom.xml
+[INFO] --------------------------------[ jar ]---------------------------------
+[INFO] 
+[INFO] --- enforcer:3.6.3:enforce (enforce-maven-version) @ ratis-common ---
+[INFO] 
+[INFO] --- enforcer:3.6.3:enforce (enforce-java-version) @ ratis-common ---
+[INFO] 
+[INFO] --- jacoco:0.8.15:prepare-agent (default-prepare-agent) @ ratis-common ---
+[INFO] argLine set to -javaagent:/home/ubuntu/.m2/repository/org/jacoco/org.jacoco.agent/0.8.15/org.jacoco.agent-0.8.15-runtime.jar=destfile=/home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-common/target/jacoco.exec,includes=org.apache.ratis.*
+[INFO] 
+[INFO] --- build-helper:3.6.1:add-source (add-source) @ ratis-common ---
+[INFO] Source directory: /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-common/target/generated-sources added.
+[INFO] 
+[INFO] --- enforcer:3.6.3:enforce (bannedImports-finalizers) @ ratis-common ---
+[INFO] Rule 0: org.apache.maven.plugins.enforcer.RestrictImports passed
+[INFO] 
+[INFO] --- remote-resources:3.3.0:process (process-resource-bundles) @ ratis-common ---
+[INFO] Preparing remote bundle org.apache.apache.resources:apache-jar-resource-bundle:1.8
+[INFO] Copying 3 resources from 1 bundle.
+[INFO] 
+[INFO] --- hadoops:3.4.3:version-info (version-info) @ ratis-common ---
+[INFO] SCM: GIT
+[INFO] Computed MD5: d41d8cd98f0b24e980998ecf8427e
+[INFO] 
+[INFO] --- resources:3.5.0:resources (default-resources) @ ratis-common ---
+[INFO] skip non existing resourceDirectory /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-common/src/main/resources
+[INFO] Copying 1 resource from ../src/main/resources to target/classes
+[INFO] Copying 3 resources from target/maven-shared-archive-resources to target/classes
+[INFO] 
+[INFO] --- compiler:3.15.0:compile (default-compile) @ ratis-common ---
+[INFO] Compiling 164 source files with javac [forked debug release 8] to target/classes
+[WARNING] Unable to autodetect 'javac' path, using 'javac' from the environment.
+[WARNING] Picked up JAVA_TOOL_OPTIONS: -Djava.io.tmpdir=/home/ubuntu/specula-ratis-issue123-20260803/tmp/server -XX:+PerfDisableSharedMem
+/home/ubuntu/.m2/repository/org/apache/ratis/ratis-thirdparty-misc/1.1.0/ratis-thirdparty-misc-1.1.0.jar(/org/apache/ratis/thirdparty/com/google/common/collect/Interner.class): warning: Cannot find annotation method 'value()' in type 'DoNotMock': class file for com.google.errorprone.annotations.DoNotMock not found
+/home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-common/src/main/java/org/apache/ratis/conf/ConfUtils.java:[177,57] [varargs] Varargs method could cause heap pollution from non-reifiable varargs parameter assertions
+[WARNING] /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-common/src/main/java/org/apache/ratis/conf/ConfUtils.java:[184,57] [varargs] Varargs method could cause heap pollution from non-reifiable varargs parameter assertions
+[WARNING] /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-common/src/main/java/org/apache/ratis/conf/ConfUtils.java:[192,85] [varargs] Varargs method could cause heap pollution from non-reifiable varargs parameter assertions
+[WARNING] /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-common/src/main/java/org/apache/ratis/conf/ConfUtils.java:[199,54] [varargs] Varargs method could cause heap pollution from non-reifiable varargs parameter assertions
+[WARNING] /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-common/src/main/java/org/apache/ratis/conf/ConfUtils.java:[206,56] [varargs] Varargs method could cause heap pollution from non-reifiable varargs parameter assertions
+[WARNING] /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-common/src/main/java/org/apache/ratis/conf/ConfUtils.java:[213,54] [varargs] Varargs method could cause heap pollution from non-reifiable varargs parameter assertions
+[WARNING] /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-common/src/main/java/org/apache/ratis/conf/ConfUtils.java:[220,54] [varargs] Varargs method could cause heap pollution from non-reifiable varargs parameter assertions
+[WARNING] /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-common/src/main/java/org/apache/ratis/conf/ConfUtils.java:[228,69] [varargs] Varargs method could cause heap pollution from non-reifiable varargs parameter assertions
+[WARNING] /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-common/src/main/java/org/apache/ratis/conf/ConfUtils.java:[237,70] [varargs] Varargs method could cause heap pollution from non-reifiable varargs parameter assertions
+[WARNING] /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-common/src/main/java/org/apache/ratis/conf/ConfUtils.java:[247,98] [varargs] Varargs method could cause heap pollution from non-reifiable varargs parameter assertions
+[WARNING] /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-common/src/main/java/org/apache/ratis/conf/ConfUtils.java:[264,18] [varargs] Varargs method could cause heap pollution from non-reifiable varargs parameter assertions
+[WARNING] /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-common/src/main/java/org/apache/ratis/conf/ConfUtils.java:[272,51] [varargs] Varargs method could cause heap pollution from non-reifiable varargs parameter assertions
+[WARNING] /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-common/src/main/java/org/apache/ratis/conf/ConfUtils.java:[292,35] [varargs] Varargs method could cause heap pollution from non-reifiable varargs parameter assertions
+[WARNING] /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-common/src/main/java/org/apache/ratis/conf/ConfUtils.java:[299,35] [varargs] Varargs method could cause heap pollution from non-reifiable varargs parameter assertions
+[WARNING] /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-common/src/main/java/org/apache/ratis/conf/ConfUtils.java:[306,32] [varargs] Varargs method could cause heap pollution from non-reifiable varargs parameter assertions
+[WARNING] /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-common/src/main/java/org/apache/ratis/conf/ConfUtils.java:[313,34] [varargs] Varargs method could cause heap pollution from non-reifiable varargs parameter assertions
+[WARNING] /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-common/src/main/java/org/apache/ratis/conf/ConfUtils.java:[320,32] [varargs] Varargs method could cause heap pollution from non-reifiable varargs parameter assertions
+[WARNING] /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-common/src/main/java/org/apache/ratis/conf/ConfUtils.java:[327,32] [varargs] Varargs method could cause heap pollution from non-reifiable varargs parameter assertions
+[WARNING] /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-common/src/main/java/org/apache/ratis/conf/ConfUtils.java:[335,18] [varargs] Varargs method could cause heap pollution from non-reifiable varargs parameter assertions
+[WARNING] /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-common/src/main/java/org/apache/ratis/conf/ConfUtils.java:[343,40] [varargs] Varargs method could cause heap pollution from non-reifiable varargs parameter assertions
+[WARNING] /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-common/src/main/java/org/apache/ratis/conf/ConfUtils.java:[355,18] [varargs] Varargs method could cause heap pollution from non-reifiable varargs parameter assertions
+[WARNING] /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-common/src/main/java/org/apache/ratis/conf/RaftProperties.java:[107,12] [fallthrough] possible fall-through into case
+[WARNING] /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-common/src/main/java/org/apache/ratis/util/Daemon.java:[24,13] [this-escape] possible 'this' escape before subclass is fully initialized
+[WARNING] /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-common/src/main/java/org/apache/ratis/util/Daemon.java:[30,11] [this-escape] possible 'this' escape before subclass is fully initialized
+[WARNING] /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-common/src/main/java/org/apache/ratis/io/CloseAsync.java:[24,7] [try] auto-closeable resource CloseAsync<REPLY> has a member method close() that could throw InterruptedException
+  where REPLY is a type-variable:
+    REPLY extends Object declared in interface CloseAsync
+[WARNING] /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-common/src/main/java/org/apache/ratis/io/CorruptedFileException.java:[23,7] [serial] serializable class CorruptedFileException has no definition of serialVersionUID
+[WARNING] /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-common/src/main/java/org/apache/ratis/protocol/exceptions/AlreadyClosedException.java:[23,7] [serial] serializable class AlreadyClosedException has no definition of serialVersionUID
+[WARNING] /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-common/src/main/java/org/apache/ratis/protocol/exceptions/NotLeaderException.java:[27,7] [serial] serializable class NotLeaderException has no definition of serialVersionUID
+[WARNING] /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-common/src/main/java/org/apache/ratis/protocol/exceptions/NotLeaderException.java:[28,25] [serial] non-transient instance field of a serializable class declared with a non-serializable type
+[WARNING] /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-common/src/main/java/org/apache/ratis/protocol/exceptions/NotLeaderException.java:[30,37] [serial] non-transient instance field of a serializable class declared with a non-serializable type
+[WARNING] /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-common/src/main/java/org/apache/ratis/protocol/exceptions/NotReplicatedException.java:[25,7] [serial] serializable class NotReplicatedException has no definition of serialVersionUID
+[WARNING] /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-common/src/main/java/org/apache/ratis/protocol/exceptions/NotReplicatedException.java:[30,38] [serial] non-transient instance field of a serializable class declared with a non-serializable type
+[WARNING] /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-common/src/main/java/org/apache/ratis/protocol/exceptions/StateMachineException.java:[22,7] [serial] serializable class StateMachineException has no definition of serialVersionUID
+[WARNING] /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-common/src/main/java/org/apache/ratis/protocol/exceptions/DataStreamException.java:[22,7] [serial] serializable class DataStreamException has no definition of serialVersionUID
+[WARNING] /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-common/src/main/java/org/apache/ratis/protocol/exceptions/ServerNotReadyException.java:[23,7] [serial] serializable class ServerNotReadyException has no definition of serialVersionUID
+[WARNING] /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-common/src/main/java/org/apache/ratis/protocol/exceptions/LeaderNotReadyException.java:[30,7] [serial] serializable class LeaderNotReadyException has no definition of serialVersionUID
+[WARNING] /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-common/src/main/java/org/apache/ratis/protocol/exceptions/LeaderSteppingDownException.java:[20,7] [serial] serializable class LeaderSteppingDownException has no definition of serialVersionUID
+[WARNING] /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-common/src/main/java/org/apache/ratis/protocol/exceptions/TransferLeadershipException.java:[20,7] [serial] serializable class TransferLeadershipException has no definition of serialVersionUID
+[WARNING] /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-common/src/main/java/org/apache/ratis/protocol/exceptions/ReadException.java:[23,7] [serial] serializable class ReadException has no definition of serialVersionUID
+[WARNING] /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-common/src/main/java/org/apache/ratis/protocol/exceptions/ReadIndexException.java:[24,7] [serial] serializable class ReadIndexException has no definition of serialVersionUID
+[WARNING] /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-common/src/main/java/org/apache/ratis/protocol/exceptions/GroupMismatchException.java:[24,7] [serial] serializable class GroupMismatchException has no definition of serialVersionUID
+[WARNING] /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-common/src/main/java/org/apache/ratis/protocol/exceptions/RaftRetryFailureException.java:[26,7] [serial] serializable class RaftRetryFailureException has no definition of serialVersionUID
+[WARNING] /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-common/src/main/java/org/apache/ratis/protocol/exceptions/ReconfigurationInProgressException.java:[20,7] [serial] serializable class ReconfigurationInProgressException has no definition of serialVersionUID
+[WARNING] /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-common/src/main/java/org/apache/ratis/protocol/exceptions/ReconfigurationTimeoutException.java:[20,7] [serial] serializable class ReconfigurationTimeoutException has no definition of serialVersionUID
+[WARNING] /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-common/src/main/java/org/apache/ratis/protocol/exceptions/ResourceUnavailableException.java:[23,7] [serial] serializable class ResourceUnavailableException has no definition of serialVersionUID
+[WARNING] /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-common/src/main/java/org/apache/ratis/protocol/exceptions/SetConfigurationException.java:[20,7] [serial] serializable class SetConfigurationException has no definition of serialVersionUID
+[WARNING] /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-common/src/main/java/org/apache/ratis/protocol/exceptions/StaleReadException.java:[23,7] [serial] serializable class StaleReadException has no definition of serialVersionUID
+[WARNING] /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-common/src/main/java/org/apache/ratis/protocol/exceptions/StreamException.java:[23,7] [serial] serializable class StreamException has no definition of serialVersionUID
+[WARNING] /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-common/src/main/java/org/apache/ratis/util/DataBlockingQueue.java:[55,26] [try] auto-closeable resource auto is never referenced in body of corresponding try statement
+[WARNING] /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-common/src/main/java/org/apache/ratis/util/DataBlockingQueue.java:[62,26] [try] auto-closeable resource auto is never referenced in body of corresponding try statement
+[WARNING] /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-common/src/main/java/org/apache/ratis/util/DataBlockingQueue.java:[69,26] [try] auto-closeable resource auto is never referenced in body of corresponding try statement
+[WARNING] /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-common/src/main/java/org/apache/ratis/util/DataBlockingQueue.java:[78,26] [try] auto-closeable resource auto is never referenced in body of corresponding try statement
+[WARNING] /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-common/src/main/java/org/apache/ratis/util/DataBlockingQueue.java:[96,26] [try] auto-closeable resource auto is never referenced in body of corresponding try statement
+[WARNING] /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-common/src/main/java/org/apache/ratis/util/DataBlockingQueue.java:[113,26] [try] auto-closeable resource auto is never referenced in body of corresponding try statement
+[WARNING] /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-common/src/main/java/org/apache/ratis/util/DataBlockingQueue.java:[124,26] [try] auto-closeable resource auto is never referenced in body of corresponding try statement
+[WARNING] /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-common/src/main/java/org/apache/ratis/util/DataBlockingQueue.java:[138,26] [try] auto-closeable resource auto is never referenced in body of corresponding try statement
+[WARNING] /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-common/src/main/java/org/apache/ratis/util/DataBlockingQueue.java:[157,26] [try] auto-closeable resource auto is never referenced in body of corresponding try statement
+[WARNING] /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-common/src/main/java/org/apache/ratis/util/DataBlockingQueue.java:[168,26] [try] auto-closeable resource auto is never referenced in body of corresponding try statement
+[WARNING] /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-common/src/main/java/org/apache/ratis/util/NetUtils.java:[197,26] [try] auto-closeable resource ignored is never referenced in body of corresponding try statement
+[WARNING] /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-common/src/main/java/org/apache/ratis/util/OpenCloseState.java:[27,17] [serial] serializable class OpenTrace has no definition of serialVersionUID
+[WARNING] /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-common/src/main/java/org/apache/ratis/util/OpenCloseState.java:[33,17] [serial] serializable class CloseTrace has no definition of serialVersionUID
+[WARNING] /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-common/src/main/java/org/apache/ratis/util/PureJavaCrc32C.java:[80,6] [fallthrough] possible fall-through into case
+[WARNING] /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-common/src/main/java/org/apache/ratis/util/PureJavaCrc32C.java:[81,6] [fallthrough] possible fall-through into case
+[WARNING] /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-common/src/main/java/org/apache/ratis/util/PureJavaCrc32C.java:[82,6] [fallthrough] possible fall-through into case
+[WARNING] /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-common/src/main/java/org/apache/ratis/util/PureJavaCrc32C.java:[83,6] [fallthrough] possible fall-through into case
+[WARNING] /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-common/src/main/java/org/apache/ratis/util/PureJavaCrc32C.java:[84,6] [fallthrough] possible fall-through into case
+[WARNING] /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-common/src/main/java/org/apache/ratis/util/PureJavaCrc32C.java:[85,6] [fallthrough] possible fall-through into case
+[WARNING] /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-common/src/main/java/org/apache/ratis/util/PureJavaCrc32C.java:[39,9] [this-escape] possible 'this' escape before subclass is fully initialized
+[WARNING] /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-common/src/main/java/org/apache/ratis/util/ResourceSemaphore.java:[31,7] [serial] serializable class ResourceSemaphore has no definition of serialVersionUID
+[INFO] 
+[INFO] --- resources:3.5.0:testResources (default-testResources) @ ratis-common ---
+[INFO] Copying 2 resources from src/test/resources to target/test-classes
+[INFO] Copying 3 resources from target/maven-shared-archive-resources to target/test-classes
+[INFO] 
+[INFO] --- compiler:3.15.0:testCompile (default-testCompile) @ ratis-common ---
+[INFO] Compiling 12 source files with javac [forked debug release 8] to target/test-classes
+[WARNING] Unable to autodetect 'javac' path, using 'javac' from the environment.
+[WARNING] Picked up JAVA_TOOL_OPTIONS: -Djava.io.tmpdir=/home/ubuntu/specula-ratis-issue123-20260803/tmp/server -XX:+PerfDisableSharedMem
+/home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-common/src/test/java/org/apache/ratis/BaseTest.java:[135,35] [varargs] Varargs method could cause heap pollution from non-reifiable varargs parameter expectedCauseClasses
+[WARNING] /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-common/src/test/java/org/apache/ratis/util/TestNetUtils.java:[35,50] [deprecation] createLocalServerAddress(int) in NetUtils has been deprecated
+[WARNING] /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-common/src/test/java/org/apache/ratis/util/TestNetUtils.java:[52,22] [try] auto-closeable resource ignored is never referenced in body of corresponding try statement
+[INFO] 
+[INFO] --- surefire:3.5.6:test (default-test) @ ratis-common ---
+[INFO] Using auto detected provider org.apache.maven.surefire.junitplatform.JUnitPlatformProvider
+[INFO] Using auto detected provider org.apache.maven.surefire.junitplatform.JUnitPlatformProvider
+[INFO] 
+[INFO] -------------------< org.apache.ratis:ratis-client >--------------------
+[INFO] Building Apache Ratis Client 3.3.0-SNAPSHOT                       [4/13]
+[INFO]   from ratis-client/pom.xml
+[INFO] --------------------------------[ jar ]---------------------------------
+[INFO] 
+[INFO] --- enforcer:3.6.3:enforce (enforce-maven-version) @ ratis-client ---
+[INFO] 
+[INFO] --- enforcer:3.6.3:enforce (enforce-java-version) @ ratis-client ---
+[INFO] 
+[INFO] --- jacoco:0.8.15:prepare-agent (default-prepare-agent) @ ratis-client ---
+[INFO] argLine set to -javaagent:/home/ubuntu/.m2/repository/org/jacoco/org.jacoco.agent/0.8.15/org.jacoco.agent-0.8.15-runtime.jar=destfile=/home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-client/target/jacoco.exec,includes=org.apache.ratis.*
+[INFO] 
+[INFO] --- build-helper:3.6.1:add-source (add-source) @ ratis-client ---
+[INFO] Source directory: /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-client/target/generated-sources added.
+[INFO] 
+[INFO] --- enforcer:3.6.3:enforce (bannedImports-finalizers) @ ratis-client ---
+[INFO] Rule 0: org.apache.maven.plugins.enforcer.RestrictImports passed
+[INFO] 
+[INFO] --- remote-resources:3.3.0:process (process-resource-bundles) @ ratis-client ---
+[INFO] Preparing remote bundle org.apache.apache.resources:apache-jar-resource-bundle:1.8
+[INFO] Copying 3 resources from 1 bundle.
+[INFO] 
+[INFO] --- hadoops:3.4.3:version-info (version-info) @ ratis-client ---
+[INFO] SCM: GIT
+[INFO] Computed MD5: d41d8cd98f0b24e980998ecf8427e
+[INFO] 
+[INFO] --- resources:3.5.0:resources (default-resources) @ ratis-client ---
+[INFO] skip non existing resourceDirectory /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-client/src/main/resources
+[INFO] Copying 1 resource from ../src/main/resources to target/classes
+[INFO] Copying 3 resources from target/maven-shared-archive-resources to target/classes
+[INFO] 
+[INFO] --- compiler:3.15.0:compile (default-compile) @ ratis-client ---
+[INFO] Compiling 41 source files with javac [forked debug release 8] to target/classes
+[WARNING] Unable to autodetect 'javac' path, using 'javac' from the environment.
+[WARNING] Picked up JAVA_TOOL_OPTIONS: -Djava.io.tmpdir=/home/ubuntu/specula-ratis-issue123-20260803/tmp/server -XX:+PerfDisableSharedMem
+/home/ubuntu/.m2/repository/org/apache/ratis/ratis-thirdparty-misc/1.1.0/ratis-thirdparty-misc-1.1.0.jar(/org/apache/ratis/thirdparty/com/google/common/cache/Cache.class): warning: Cannot find annotation method 'value()' in type 'DoNotMock': class file for com.google.errorprone.annotations.DoNotMock not found
+/home/ubuntu/.m2/repository/org/apache/ratis/ratis-thirdparty-misc/1.1.0/ratis-thirdparty-misc-1.1.0.jar(/org/apache/ratis/thirdparty/com/google/common/cache/Cache.class): warning: Cannot find annotation method 'value()' in type 'CompatibleWith': class file for com.google.errorprone.annotations.CompatibleWith not found
+/home/ubuntu/.m2/repository/org/apache/ratis/ratis-thirdparty-misc/1.1.0/ratis-thirdparty-misc-1.1.0.jar(/org/apache/ratis/thirdparty/com/google/common/cache/Cache.class): warning: Cannot find annotation method 'value()' in type 'CompatibleWith'
+/home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-client/src/main/java/org/apache/ratis/client/api/MessageOutputStream.java:[27,7] [try] auto-closeable resource MessageOutputStream has a member method close() that could throw InterruptedException
+[WARNING] /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-client/src/main/java/org/apache/ratis/client/api/DataStreamOutput.java:[33,7] [try] auto-closeable resource DataStreamOutput has a member method close() that could throw InterruptedException
+[WARNING] /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-client/src/main/java/org/apache/ratis/client/DataStreamOutputRpc.java:[26,7] [try] auto-closeable resource DataStreamOutputRpc has a member method close() that could throw InterruptedException
+[WARNING] /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-client/src/main/java/org/apache/ratis/client/impl/RaftClientImpl.java:[82,6] [deprecation] expireAfterAccess(long,TimeUnit) in CacheBuilder has been deprecated
+  where K,V are type-variables:
+    K extends Object declared in class CacheBuilder
+    V extends Object declared in class CacheBuilder
+[WARNING] /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-client/src/main/java/org/apache/ratis/client/impl/MessageStreamImpl.java:[45,2] [try] auto-closeable resource MessageStreamImpl.MessageOutputStreamImpl has a member method close() that could throw InterruptedException
+[WARNING] /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-client/src/main/java/org/apache/ratis/client/impl/DataStreamClientImpl.java:[101,15] [try] auto-closeable resource DataStreamClientImpl.DataStreamOutputImpl has a member method close() that could throw InterruptedException
+[INFO] 
+[INFO] --- resources:3.5.0:testResources (default-testResources) @ ratis-client ---
+[INFO] skip non existing resourceDirectory /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-client/src/test/resources
+[INFO] Copying 3 resources from target/maven-shared-archive-resources to target/test-classes
+[INFO] 
+[INFO] --- compiler:3.15.0:testCompile (default-testCompile) @ ratis-client ---
+[INFO] No sources to compile
+[INFO] 
+[INFO] --- surefire:3.5.6:test (default-test) @ ratis-client ---
+[INFO] Skipped
+[INFO] 
+[INFO] -----------------< org.apache.ratis:ratis-server-api >------------------
+[INFO] Building Apache Ratis Server API 3.3.0-SNAPSHOT                   [5/13]
+[INFO]   from ratis-server-api/pom.xml
+[INFO] --------------------------------[ jar ]---------------------------------
+[INFO] 
+[INFO] --- enforcer:3.6.3:enforce (enforce-maven-version) @ ratis-server-api ---
+[INFO] 
+[INFO] --- enforcer:3.6.3:enforce (enforce-java-version) @ ratis-server-api ---
+[INFO] 
+[INFO] --- jacoco:0.8.15:prepare-agent (default-prepare-agent) @ ratis-server-api ---
+[INFO] argLine set to -javaagent:/home/ubuntu/.m2/repository/org/jacoco/org.jacoco.agent/0.8.15/org.jacoco.agent-0.8.15-runtime.jar=destfile=/home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-server-api/target/jacoco.exec,includes=org.apache.ratis.*
+[INFO] 
+[INFO] --- build-helper:3.6.1:add-source (add-source) @ ratis-server-api ---
+[INFO] Source directory: /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-server-api/target/generated-sources added.
+[INFO] 
+[INFO] --- enforcer:3.6.3:enforce (bannedImports-finalizers) @ ratis-server-api ---
+[INFO] Rule 0: org.apache.maven.plugins.enforcer.RestrictImports passed
+[INFO] 
+[INFO] --- remote-resources:3.3.0:process (process-resource-bundles) @ ratis-server-api ---
+[INFO] Preparing remote bundle org.apache.apache.resources:apache-jar-resource-bundle:1.8
+[INFO] Copying 3 resources from 1 bundle.
+[INFO] 
+[INFO] --- hadoops:3.4.3:version-info (version-info) @ ratis-server-api ---
+[INFO] SCM: GIT
+[INFO] Computed MD5: d41d8cd98f0b24e980998ecf8427e
+[INFO] 
+[INFO] --- resources:3.5.0:resources (default-resources) @ ratis-server-api ---
+[INFO] skip non existing resourceDirectory /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-server-api/src/main/resources
+[INFO] Copying 1 resource from ../src/main/resources to target/classes
+[INFO] Copying 3 resources from target/maven-shared-archive-resources to target/classes
+[INFO] 
+[INFO] --- compiler:3.15.0:compile (default-compile) @ ratis-server-api ---
+[INFO] Compiling 39 source files with javac [forked debug release 8] to target/classes
+[WARNING] Unable to autodetect 'javac' path, using 'javac' from the environment.
+[WARNING] Picked up JAVA_TOOL_OPTIONS: -Djava.io.tmpdir=/home/ubuntu/specula-ratis-issue123-20260803/tmp/server -XX:+PerfDisableSharedMem
+/home/ubuntu/.m2/repository/org/apache/ratis/ratis-thirdparty-misc/1.1.0/ratis-thirdparty-misc-1.1.0.jar(/org/apache/ratis/thirdparty/com/google/common/collect/Iterables.class): warning: Cannot find annotation method 'replacement()' in type 'InlineMe': class file for com.google.errorprone.annotations.InlineMe not found
+/home/ubuntu/.m2/repository/org/apache/ratis/ratis-thirdparty-misc/1.1.0/ratis-thirdparty-misc-1.1.0.jar(/org/apache/ratis/thirdparty/com/google/common/collect/Iterables.class): warning: Cannot find annotation method 'staticImports()' in type 'InlineMe'
+/home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-server-api/src/main/java/org/apache/ratis/server/raftlog/RaftLogIOException.java:[25,7] [serial] serializable class RaftLogIOException has no definition of serialVersionUID
+[WARNING] /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-server-api/src/main/java/org/apache/ratis/server/RaftServerRpcWithProxy.java:[42,8] [this-escape] possible 'this' escape before subclass is fully initialized
+[INFO] 
+[INFO] --- resources:3.5.0:testResources (default-testResources) @ ratis-server-api ---
+[INFO] skip non existing resourceDirectory /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-server-api/src/test/resources
+[INFO] Copying 3 resources from target/maven-shared-archive-resources to target/test-classes
+[INFO] 
+[INFO] --- compiler:3.15.0:testCompile (default-testCompile) @ ratis-server-api ---
+[INFO] No sources to compile
+[INFO] 
+[INFO] --- surefire:3.5.6:test (default-test) @ ratis-server-api ---
+[INFO] Skipped
+[INFO] 
+[INFO] -----------------< org.apache.ratis:ratis-metrics-api >-----------------
+[INFO] Building Apache Ratis Metrics API 3.3.0-SNAPSHOT                  [6/13]
+[INFO]   from ratis-metrics-api/pom.xml
+[INFO] --------------------------------[ jar ]---------------------------------
+[INFO] 
+[INFO] --- enforcer:3.6.3:enforce (enforce-maven-version) @ ratis-metrics-api ---
+[INFO] 
+[INFO] --- enforcer:3.6.3:enforce (enforce-java-version) @ ratis-metrics-api ---
+[INFO] 
+[INFO] --- jacoco:0.8.15:prepare-agent (default-prepare-agent) @ ratis-metrics-api ---
+[INFO] argLine set to -javaagent:/home/ubuntu/.m2/repository/org/jacoco/org.jacoco.agent/0.8.15/org.jacoco.agent-0.8.15-runtime.jar=destfile=/home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-metrics-api/target/jacoco.exec,includes=org.apache.ratis.*
+[INFO] 
+[INFO] --- build-helper:3.6.1:add-source (add-source) @ ratis-metrics-api ---
+[INFO] Source directory: /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-metrics-api/target/generated-sources added.
+[INFO] 
+[INFO] --- enforcer:3.6.3:enforce (bannedImports-finalizers) @ ratis-metrics-api ---
+[INFO] Rule 0: org.apache.maven.plugins.enforcer.RestrictImports passed
+[INFO] 
+[INFO] --- remote-resources:3.3.0:process (process-resource-bundles) @ ratis-metrics-api ---
+[INFO] Preparing remote bundle org.apache.apache.resources:apache-jar-resource-bundle:1.8
+[INFO] Copying 3 resources from 1 bundle.
+[INFO] 
+[INFO] --- hadoops:3.4.3:version-info (version-info) @ ratis-metrics-api ---
+[INFO] SCM: GIT
+[INFO] Computed MD5: d41d8cd98f0b24e980998ecf8427e
+[INFO] 
+[INFO] --- resources:3.5.0:resources (default-resources) @ ratis-metrics-api ---
+[INFO] skip non existing resourceDirectory /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-metrics-api/src/main/resources
+[INFO] Copying 1 resource from ../src/main/resources to target/classes
+[INFO] Copying 3 resources from target/maven-shared-archive-resources to target/classes
+[INFO] 
+[INFO] --- compiler:3.15.0:compile (default-compile) @ ratis-metrics-api ---
+[INFO] Compiling 7 source files with javac [forked debug release 8] to target/classes
+[WARNING] Unable to autodetect 'javac' path, using 'javac' from the environment.
+[INFO] 
+[INFO] --- resources:3.5.0:testResources (default-testResources) @ ratis-metrics-api ---
+[INFO] skip non existing resourceDirectory /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-metrics-api/src/test/resources
+[INFO] Copying 3 resources from target/maven-shared-archive-resources to target/test-classes
+[INFO] 
+[INFO] --- compiler:3.15.0:testCompile (default-testCompile) @ ratis-metrics-api ---
+[INFO] No sources to compile
+[INFO] 
+[INFO] --- surefire:3.5.6:test (default-test) @ ratis-metrics-api ---
+[INFO] Skipped
+[INFO] 
+[INFO] ---------------< org.apache.ratis:ratis-metrics-default >---------------
+[INFO] Building Apache Ratis Metrics Default Implementation 3.3.0-SNAPSHOT [7/13]
+[INFO]   from ratis-metrics-default/pom.xml
+[INFO] --------------------------------[ jar ]---------------------------------
+[INFO] 
+[INFO] --- enforcer:3.6.3:enforce (enforce-maven-version) @ ratis-metrics-default ---
+[INFO] 
+[INFO] --- enforcer:3.6.3:enforce (enforce-java-version) @ ratis-metrics-default ---
+[INFO] 
+[INFO] --- jacoco:0.8.15:prepare-agent (default-prepare-agent) @ ratis-metrics-default ---
+[INFO] argLine set to -javaagent:/home/ubuntu/.m2/repository/org/jacoco/org.jacoco.agent/0.8.15/org.jacoco.agent-0.8.15-runtime.jar=destfile=/home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-metrics-default/target/jacoco.exec,includes=org.apache.ratis.*
+[INFO] 
+[INFO] --- build-helper:3.6.1:add-source (add-source) @ ratis-metrics-default ---
+[INFO] Source directory: /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-metrics-default/target/generated-sources added.
+[INFO] 
+[INFO] --- enforcer:3.6.3:enforce (bannedImports-finalizers) @ ratis-metrics-default ---
+[INFO] Rule 0: org.apache.maven.plugins.enforcer.RestrictImports passed
+[INFO] 
+[INFO] --- remote-resources:3.3.0:process (process-resource-bundles) @ ratis-metrics-default ---
+[INFO] Preparing remote bundle org.apache.apache.resources:apache-jar-resource-bundle:1.8
+[INFO] Copying 3 resources from 1 bundle.
+[INFO] 
+[INFO] --- hadoops:3.4.3:version-info (version-info) @ ratis-metrics-default ---
+[INFO] SCM: GIT
+[INFO] Computed MD5: d41d8cd98f0b24e980998ecf8427e
+[INFO] 
+[INFO] --- resources:3.5.0:resources (default-resources) @ ratis-metrics-default ---
+[INFO] Copying 1 resource from src/main/resources to target/classes
+[INFO] Copying 1 resource from ../src/main/resources to target/classes
+[INFO] Copying 3 resources from target/maven-shared-archive-resources to target/classes
+[INFO] 
+[INFO] --- compiler:3.15.0:compile (default-compile) @ ratis-metrics-default ---
+[INFO] Compiling 7 source files with javac [forked debug release 8] to target/classes
+[WARNING] Unable to autodetect 'javac' path, using 'javac' from the environment.
+[WARNING] Picked up JAVA_TOOL_OPTIONS: -Djava.io.tmpdir=/home/ubuntu/specula-ratis-issue123-20260803/tmp/server -XX:+PerfDisableSharedMem
+/home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-metrics-default/src/main/java/org/apache/ratis/metrics/impl/RatisMetricRegistryImpl.java:[108,27] [rawtypes] found raw type: Gauge
+  missing type arguments for generic class Gauge<T>
+  where T is a type-variable:
+    T extends Object declared in interface Gauge
+[INFO] 
+[INFO] --- resources:3.5.0:testResources (default-testResources) @ ratis-metrics-default ---
+[INFO] skip non existing resourceDirectory /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-metrics-default/src/test/resources
+[INFO] Copying 3 resources from target/maven-shared-archive-resources to target/test-classes
+[INFO] 
+[INFO] --- compiler:3.15.0:testCompile (default-testCompile) @ ratis-metrics-default ---
+[INFO] No sources to compile
+[INFO] 
+[INFO] --- surefire:3.5.6:test (default-test) @ ratis-metrics-default ---
+[INFO] Using auto detected provider org.apache.maven.surefire.junitplatform.JUnitPlatformProvider
+[INFO] 
+[INFO] -------------------< org.apache.ratis:ratis-server >--------------------
+[INFO] Building Apache Ratis Server 3.3.0-SNAPSHOT                       [8/13]
+[INFO]   from ratis-server/pom.xml
+[INFO] --------------------------------[ jar ]---------------------------------
+[INFO] 
+[INFO] --- enforcer:3.6.3:enforce (enforce-maven-version) @ ratis-server ---
+[INFO] 
+[INFO] --- enforcer:3.6.3:enforce (enforce-java-version) @ ratis-server ---
+[INFO] 
+[INFO] --- jacoco:0.8.15:prepare-agent (default-prepare-agent) @ ratis-server ---
+[INFO] argLine set to -javaagent:/home/ubuntu/.m2/repository/org/jacoco/org.jacoco.agent/0.8.15/org.jacoco.agent-0.8.15-runtime.jar=destfile=/home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-server/target/jacoco.exec,includes=org.apache.ratis.*
+[INFO] 
+[INFO] --- build-helper:3.6.1:add-source (add-source) @ ratis-server ---
+[INFO] Source directory: /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-server/target/generated-sources added.
+[INFO] 
+[INFO] --- enforcer:3.6.3:enforce (bannedImports-finalizers) @ ratis-server ---
+[INFO] Rule 0: org.apache.maven.plugins.enforcer.RestrictImports passed
+[INFO] 
+[INFO] --- remote-resources:3.3.0:process (process-resource-bundles) @ ratis-server ---
+[INFO] Preparing remote bundle org.apache.apache.resources:apache-jar-resource-bundle:1.8
+[INFO] Copying 3 resources from 1 bundle.
+[INFO] 
+[INFO] --- hadoops:3.4.3:version-info (version-info) @ ratis-server ---
+[INFO] SCM: GIT
+[INFO] Computed MD5: d41d8cd98f0b24e980998ecf8427e
+[INFO] 
+[INFO] --- resources:3.5.0:resources (default-resources) @ ratis-server ---
+[INFO] skip non existing resourceDirectory /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-server/src/main/resources
+[INFO] Copying 1 resource from ../src/main/resources to target/classes
+[INFO] Copying 3 resources from target/maven-shared-archive-resources to target/classes
+[INFO] 
+[INFO] --- compiler:3.15.0:compile (default-compile) @ ratis-server ---
+[INFO] Compiling 76 source files with javac [forked debug release 8] to target/classes
+[WARNING] Unable to autodetect 'javac' path, using 'javac' from the environment.
+[WARNING] Picked up JAVA_TOOL_OPTIONS: -Djava.io.tmpdir=/home/ubuntu/specula-ratis-issue123-20260803/tmp/server -XX:+PerfDisableSharedMem
+/home/ubuntu/.m2/repository/org/apache/ratis/ratis-thirdparty-misc/1.1.0/ratis-thirdparty-misc-1.1.0.jar(/org/apache/ratis/thirdparty/com/google/common/cache/Cache.class): warning: Cannot find annotation method 'value()' in type 'DoNotMock': class file for com.google.errorprone.annotations.DoNotMock not found
+/home/ubuntu/.m2/repository/org/apache/ratis/ratis-thirdparty-misc/1.1.0/ratis-thirdparty-misc-1.1.0.jar(/org/apache/ratis/thirdparty/com/google/common/cache/Cache.class): warning: Cannot find annotation method 'value()' in type 'CompatibleWith': class file for com.google.errorprone.annotations.CompatibleWith not found
+/home/ubuntu/.m2/repository/org/apache/ratis/ratis-thirdparty-misc/1.1.0/ratis-thirdparty-misc-1.1.0.jar(/org/apache/ratis/thirdparty/com/google/common/cache/Cache.class): warning: Cannot find annotation method 'value()' in type 'CompatibleWith'
+/home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-server/src/main/java/org/apache/ratis/server/impl/LeaderElection.java:[383,23] [try] auto-closeable resource ignored is never referenced in body of corresponding try statement
+[WARNING] /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-server/src/main/java/org/apache/ratis/server/impl/RetryCacheImpl.java:[184,8] [deprecation] expireAfterWrite(long,TimeUnit) in CacheBuilder has been deprecated
+  where K,V are type-variables:
+    K extends Object declared in class CacheBuilder
+    V extends Object declared in class CacheBuilder
+[WARNING] /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-server/src/main/java/org/apache/ratis/server/impl/WriteIndexCache.java:[45,8] [deprecation] expireAfterAccess(long,TimeUnit) in CacheBuilder has been deprecated
+  where K,V are type-variables:
+    K extends Object declared in class CacheBuilder
+    V extends Object declared in class CacheBuilder
+[WARNING] /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-server/src/main/java/org/apache/ratis/server/impl/LeaderStateImpl.java:[1389,44] [deprecation] notifyFollowerSlowness(RoleInfoProto) in LeaderEventApi has been deprecated
+[WARNING] /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-server/src/main/java/org/apache/ratis/server/impl/LeaderTracer.java:[44,29] [try] auto-closeable resource ignored is never referenced in body of corresponding try statement
+[WARNING] /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-server/src/main/java/org/apache/ratis/server/impl/LeaderTracer.java:[55,29] [try] auto-closeable resource ignored is never referenced in body of corresponding try statement
+[WARNING] /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-server/src/main/java/org/apache/ratis/server/impl/LeaderTracer.java:[61,29] [try] auto-closeable resource ignored is never referenced in body of corresponding try statement
+[WARNING] /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-server/src/main/java/org/apache/ratis/server/impl/LeaderTracer.java:[67,29] [try] auto-closeable resource ignored is never referenced in body of corresponding try statement
+[WARNING] /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-server/src/main/java/org/apache/ratis/server/impl/StateMachineUpdater.java:[290,33] [try] auto-closeable resource ignored is never referenced in body of corresponding try statement
+[WARNING] /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-server/src/main/java/org/apache/ratis/server/leader/LogAppenderBase.java:[76,34] [this-escape] possible 'this' escape before subclass is fully initialized
+[WARNING] /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-server/src/main/java/org/apache/ratis/server/metrics/RaftLogMetricsBase.java:[37,61] [this-escape] possible 'this' escape before subclass is fully initialized
+[WARNING] /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-server/src/main/java/org/apache/ratis/server/metrics/RaftLogMetricsBase.java:[38,63] [this-escape] possible 'this' escape before subclass is fully initialized
+[WARNING] /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-server/src/main/java/org/apache/ratis/server/metrics/RaftLogMetricsBase.java:[39,67] [this-escape] possible 'this' escape before subclass is fully initialized
+[WARNING] /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-server/src/main/java/org/apache/ratis/server/metrics/SegmentedRaftLogMetrics.java:[84,51] [this-escape] possible 'this' escape before subclass is fully initialized
+[WARNING] /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-server/src/main/java/org/apache/ratis/server/metrics/SegmentedRaftLogMetrics.java:[85,50] [this-escape] possible 'this' escape before subclass is fully initialized
+[WARNING] /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-server/src/main/java/org/apache/ratis/server/metrics/SegmentedRaftLogMetrics.java:[86,54] [this-escape] possible 'this' escape before subclass is fully initialized
+[WARNING] /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-server/src/main/java/org/apache/ratis/server/metrics/SegmentedRaftLogMetrics.java:[87,58] [this-escape] possible 'this' escape before subclass is fully initialized
+[WARNING] /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-server/src/main/java/org/apache/ratis/server/metrics/SegmentedRaftLogMetrics.java:[89,57] [this-escape] possible 'this' escape before subclass is fully initialized
+[WARNING] /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-server/src/main/java/org/apache/ratis/server/metrics/SegmentedRaftLogMetrics.java:[90,55] [this-escape] possible 'this' escape before subclass is fully initialized
+[WARNING] /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-server/src/main/java/org/apache/ratis/server/metrics/SegmentedRaftLogMetrics.java:[91,57] [this-escape] possible 'this' escape before subclass is fully initialized
+[WARNING] /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-server/src/main/java/org/apache/ratis/server/metrics/SegmentedRaftLogMetrics.java:[92,51] [this-escape] possible 'this' escape before subclass is fully initialized
+[WARNING] /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-server/src/main/java/org/apache/ratis/server/metrics/SegmentedRaftLogMetrics.java:[94,55] [this-escape] possible 'this' escape before subclass is fully initialized
+[WARNING] /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-server/src/main/java/org/apache/ratis/server/metrics/SegmentedRaftLogMetrics.java:[95,55] [this-escape] possible 'this' escape before subclass is fully initialized
+[WARNING] /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-server/src/main/java/org/apache/ratis/server/metrics/SegmentedRaftLogMetrics.java:[96,58] [this-escape] possible 'this' escape before subclass is fully initialized
+[WARNING] /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-server/src/main/java/org/apache/ratis/server/metrics/SegmentedRaftLogMetrics.java:[97,52] [this-escape] possible 'this' escape before subclass is fully initialized
+[WARNING] /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-server/src/main/java/org/apache/ratis/server/metrics/SegmentedRaftLogMetrics.java:[99,73] [this-escape] possible 'this' escape before subclass is fully initialized
+[WARNING] /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-server/src/main/java/org/apache/ratis/server/metrics/SegmentedRaftLogMetrics.java:[101,72] [this-escape] possible 'this' escape before subclass is fully initialized
+[WARNING] /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-server/src/main/java/org/apache/ratis/server/raftlog/RaftLogBase.java:[124,26] [try] auto-closeable resource writeLock is never referenced in body of corresponding try statement
+[WARNING] /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-server/src/main/java/org/apache/ratis/server/raftlog/RaftLogBase.java:[157,26] [try] auto-closeable resource writeLock is never referenced in body of corresponding try statement
+[WARNING] /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-server/src/main/java/org/apache/ratis/server/raftlog/RaftLogBase.java:[176,26] [try] auto-closeable resource writeLock is never referenced in body of corresponding try statement
+[WARNING] /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-server/src/main/java/org/apache/ratis/server/raftlog/RaftLogBase.java:[230,26] [try] auto-closeable resource writeLock is never referenced in body of corresponding try statement
+[WARNING] /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-server/src/main/java/org/apache/ratis/server/raftlog/RaftLogBase.java:[257,26] [try] auto-closeable resource writeLock is never referenced in body of corresponding try statement
+[WARNING] /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-server/src/main/java/org/apache/ratis/server/raftlog/RaftLogBase.java:[77,43] [this-escape] possible 'this' escape before subclass is fully initialized
+[WARNING] /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-server/src/main/java/org/apache/ratis/server/raftlog/RaftLogBase.java:[97,43] [this-escape] possible 'this' escape before subclass is fully initialized
+[WARNING] /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-server/src/main/java/org/apache/ratis/server/raftlog/memory/MemoryRaftLog.java:[105,26] [try] auto-closeable resource readLock is never referenced in body of corresponding try statement
+[WARNING] /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-server/src/main/java/org/apache/ratis/server/raftlog/memory/MemoryRaftLog.java:[118,26] [try] auto-closeable resource readLock is never referenced in body of corresponding try statement
+[WARNING] /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-server/src/main/java/org/apache/ratis/server/raftlog/memory/MemoryRaftLog.java:[126,26] [try] auto-closeable resource readLock is never referenced in body of corresponding try statement
+[WARNING] /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-server/src/main/java/org/apache/ratis/server/raftlog/memory/MemoryRaftLog.java:[143,26] [try] auto-closeable resource writeLock is never referenced in body of corresponding try statement
+[WARNING] /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-server/src/main/java/org/apache/ratis/server/raftlog/memory/MemoryRaftLog.java:[153,27] [try] auto-closeable resource writeLock is never referenced in body of corresponding try statement
+[WARNING] /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-server/src/main/java/org/apache/ratis/server/raftlog/memory/MemoryRaftLog.java:[163,26] [try] auto-closeable resource readLock is never referenced in body of corresponding try statement
+[WARNING] /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-server/src/main/java/org/apache/ratis/server/raftlog/memory/MemoryRaftLog.java:[171,26] [try] auto-closeable resource writeLock is never referenced in body of corresponding try statement
+[WARNING] /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-server/src/main/java/org/apache/ratis/server/raftlog/memory/MemoryRaftLog.java:[189,26] [try] auto-closeable resource writeLock is never referenced in body of corresponding try statement
+[WARNING] /home/ubuntu/.m2/repository/org/apache/ratis/ratis-thirdparty-misc/1.1.0/ratis-thirdparty-misc-1.1.0.jar(/org/apache/ratis/thirdparty/com/google/common/util/concurrent/ListenableFuture.class): warning: Cannot find annotation method 'value()' in type 'DoNotMock'
+/home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-server/src/main/java/org/apache/ratis/server/raftlog/segmented/SegmentedRaftLogCache.java:[249,28] [try] auto-closeable resource readLock is never referenced in body of corresponding try statement
+[WARNING] /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-server/src/main/java/org/apache/ratis/server/raftlog/segmented/SegmentedRaftLogCache.java:[259,28] [try] auto-closeable resource readLock is never referenced in body of corresponding try statement
+[WARNING] /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-server/src/main/java/org/apache/ratis/server/raftlog/segmented/SegmentedRaftLogCache.java:[265,28] [try] auto-closeable resource readLock is never referenced in body of corresponding try statement
+[WARNING] /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-server/src/main/java/org/apache/ratis/server/raftlog/segmented/SegmentedRaftLogCache.java:[276,28] [try] auto-closeable resource readLock is never referenced in body of corresponding try statement
+[WARNING] /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-server/src/main/java/org/apache/ratis/server/raftlog/segmented/SegmentedRaftLogCache.java:[299,28] [try] auto-closeable resource writeLock is never referenced in body of corresponding try statement
+[WARNING] /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-server/src/main/java/org/apache/ratis/server/raftlog/segmented/SegmentedRaftLogCache.java:[306,28] [try] auto-closeable resource writeLock is never referenced in body of corresponding try statement
+[WARNING] /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-server/src/main/java/org/apache/ratis/server/raftlog/segmented/SegmentedRaftLogCache.java:[315,28] [try] auto-closeable resource writeLock is never referenced in body of corresponding try statement
+[WARNING] /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-server/src/main/java/org/apache/ratis/server/raftlog/segmented/SegmentedRaftLogCache.java:[365,29] [try] auto-closeable resource writeLock is never referenced in body of corresponding try statement
+[WARNING] /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-server/src/main/java/org/apache/ratis/server/raftlog/segmented/SegmentedRaftLogCache.java:[590,27] [try] auto-closeable resource readLock is never referenced in body of corresponding try statement
+[WARNING] /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-server/src/main/java/org/apache/ratis/server/raftlog/segmented/SegmentedRaftLogCache.java:[600,27] [try] auto-closeable resource readLock is never referenced in body of corresponding try statement
+[WARNING] /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-server/src/main/java/org/apache/ratis/server/raftlog/segmented/SegmentedRaftLogCache.java:[609,27] [try] auto-closeable resource readLock is never referenced in body of corresponding try statement
+[WARNING] /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-server/src/main/java/org/apache/ratis/server/raftlog/segmented/SegmentedRaftLogCache.java:[616,27] [try] auto-closeable resource readLock is never referenced in body of corresponding try statement
+[WARNING] /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-server/src/main/java/org/apache/ratis/server/raftlog/segmented/SegmentedRaftLogCache.java:[675,26] [try] auto-closeable resource readLock is never referenced in body of corresponding try statement
+[WARNING] /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-server/src/main/java/org/apache/ratis/server/raftlog/segmented/CacheInvalidationPolicy.java:[52,28] [try] auto-closeable resource readLock is never referenced in body of corresponding try statement
+[WARNING] /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-server/src/main/java/org/apache/ratis/server/raftlog/segmented/SegmentedRaftLog.java:[265,35] [try] auto-closeable resource ignored is never referenced in body of corresponding try statement
+[WARNING] /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-server/src/main/java/org/apache/ratis/server/raftlog/segmented/SegmentedRaftLog.java:[253,26] [try] auto-closeable resource writeLock is never referenced in body of corresponding try statement
+[WARNING] /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-server/src/main/java/org/apache/ratis/server/raftlog/segmented/SegmentedRaftLog.java:[287,27] [try] auto-closeable resource readLock is never referenced in body of corresponding try statement
+[WARNING] /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-server/src/main/java/org/apache/ratis/server/raftlog/segmented/SegmentedRaftLog.java:[337,29] [try] auto-closeable resource ignored is never referenced in body of corresponding try statement
+[WARNING] /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-server/src/main/java/org/apache/ratis/server/raftlog/segmented/SegmentedRaftLog.java:[350,26] [try] auto-closeable resource readLock is never referenced in body of corresponding try statement
+[WARNING] /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-server/src/main/java/org/apache/ratis/server/raftlog/segmented/SegmentedRaftLog.java:[358,26] [try] auto-closeable resource readLock is never referenced in body of corresponding try statement
+[WARNING] /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-server/src/main/java/org/apache/ratis/server/raftlog/segmented/SegmentedRaftLog.java:[366,26] [try] auto-closeable resource readLock is never referenced in body of corresponding try statement
+[WARNING] /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-server/src/main/java/org/apache/ratis/server/raftlog/segmented/SegmentedRaftLog.java:[374,26] [try] auto-closeable resource writeLock is never referenced in body of corresponding try statement
+[WARNING] /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-server/src/main/java/org/apache/ratis/server/raftlog/segmented/SegmentedRaftLog.java:[387,27] [try] auto-closeable resource writeLock is never referenced in body of corresponding try statement
+[WARNING] /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-server/src/main/java/org/apache/ratis/server/raftlog/segmented/SegmentedRaftLog.java:[406,26] [try] auto-closeable resource writeLock is never referenced in body of corresponding try statement
+[WARNING] /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-server/src/main/java/org/apache/ratis/server/raftlog/segmented/SegmentedRaftLog.java:[473,26] [try] auto-closeable resource writeLock is never referenced in body of corresponding try statement
+[WARNING] /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-server/src/main/java/org/apache/ratis/server/raftlog/segmented/SegmentedRaftLog.java:[538,26] [try] auto-closeable resource writeLock is never referenced in body of corresponding try statement
+[WARNING] /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-server/src/main/java/org/apache/ratis/server/raftlog/segmented/SegmentedRaftLogWorker.java:[491,35] [try] auto-closeable resource ignored is never referenced in body of corresponding try statement
+[WARNING] /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-server/src/main/java/org/apache/ratis/server/raftlog/segmented/SegmentedRaftLogWorker.java:[280,31] [try] auto-closeable resource ignored is never referenced in body of corresponding try statement
+[WARNING] /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-server/src/main/java/org/apache/ratis/server/raftlog/segmented/SegmentedRaftLogWorker.java:[317,42] [try] auto-closeable resource ignored is never referenced in body of corresponding try statement
+[WARNING] /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-server/src/main/java/org/apache/ratis/server/raftlog/segmented/SegmentedRaftLogWorker.java:[373,33] [try] auto-closeable resource ignored is never referenced in body of corresponding try statement
+[WARNING] /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-server/src/main/java/org/apache/ratis/server/raftlog/segmented/SegmentedRaftLogWorker.java:[424,31] [try] auto-closeable resource ignored is never referenced in body of corresponding try statement
+[WARNING] /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-server/src/main/java/org/apache/ratis/server/raftlog/segmented/SegmentedRaftLogOutputStream.java:[68,28] [this-escape] possible 'this' escape before subclass is fully initialized
+[WARNING] /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-server/src/main/java/org/apache/ratis/server/raftlog/segmented/SegmentedRaftLogOutputStream.java:[165,37] [this-escape] previous possible 'this' escape happens here via invocation
+[WARNING] /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-server/src/main/java/org/apache/ratis/server/raftlog/segmented/SegmentedRaftLogReader.java:[219,22] [try] auto-closeable resource ignored is never referenced in body of corresponding try statement
+[WARNING] /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-server/src/main/java/org/apache/ratis/statemachine/impl/BaseStateMachine.java:[66,27] [this-escape] possible 'this' escape before subclass is fully initialized
+[INFO] 
+[INFO] --- resources:3.5.0:testResources (default-testResources) @ ratis-server ---
+[INFO] skip non existing resourceDirectory /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-server/src/test/resources
+[INFO] Copying 3 resources from target/maven-shared-archive-resources to target/test-classes
+[INFO] 
+[INFO] --- compiler:3.15.0:testCompile (default-testCompile) @ ratis-server ---
+[INFO] Compiling 54 source files with javac [forked debug release 8] to target/test-classes
+[WARNING] Unable to autodetect 'javac' path, using 'javac' from the environment.
+[WARNING] Picked up JAVA_TOOL_OPTIONS: -Djava.io.tmpdir=/home/ubuntu/specula-ratis-issue123-20260803/tmp/server -XX:+PerfDisableSharedMem
+/home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-server/src/test/java/org/apache/ratis/InstallSnapshotFromLeaderTests.java:[71,45] [this-escape] possible 'this' escape before subclass is fully initialized
+[WARNING] /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-server/src/test/java/org/apache/ratis/statemachine/impl/SimpleStateMachine4Testing.java:[173,89] [this-escape] possible 'this' escape before subclass is fully initialized
+[WARNING] /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-server/src/test/java/org/apache/ratis/RaftTestUtil.java:[574,26] [try] auto-closeable resource readLock is never referenced in body of corresponding try statement
+[WARNING] /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-server/src/test/java/org/apache/ratis/server/impl/DelayLocalExecutionInjection.java:[35,42] [this-escape] possible 'this' escape before subclass is fully initialized
+[WARNING] /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-server/src/test/java/org/apache/ratis/InstallSnapshotNotificationTests.java:[72,45] [this-escape] possible 'this' escape before subclass is fully initialized
+[WARNING] /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-server/src/test/java/org/apache/ratis/LogAppenderTests.java:[151,22] [rawtypes] found raw type: Gauge
+  missing type arguments for generic class Gauge<T>
+  where T is a type-variable:
+    T extends Object declared in interface Gauge
+[WARNING] /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-server/src/test/java/org/apache/ratis/LogAppenderTests.java:[157,6] [rawtypes] found raw type: Gauge
+  missing type arguments for generic class Gauge<T>
+  where T is a type-variable:
+    T extends Object declared in interface Gauge
+[WARNING] [rawtypes] found raw type: Gauge
+[WARNING]   missing type arguments for generic class Gauge<T>
+  where T is a type-variable:
+    T extends Object declared in interface Gauge
+/home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-server/src/test/java/org/apache/ratis/LogAppenderTests.java:[70,45] [this-escape] possible 'this' escape before subclass is fully initialized
+[WARNING] /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-server/src/test/java/org/apache/ratis/MessageStreamApiTests.java:[66,28] [try] auto-closeable resource MessageOutputStream has a member method close() that could throw InterruptedException
+[WARNING] /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-server/src/test/java/org/apache/ratis/RaftAsyncExceptionTests.java:[50,17] [this-escape] possible 'this' escape before subclass is fully initialized
+[WARNING] /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-server/src/test/java/org/apache/ratis/RaftAsyncTests.java:[220,4] [rawtypes] found raw type: CompletableFuture
+  missing type arguments for generic class CompletableFuture<T>
+  where T is a type-variable:
+    T extends Object declared in class CompletableFuture
+[WARNING] /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-server/src/test/java/org/apache/ratis/RaftAsyncTests.java:[220,38] [rawtypes] found raw type: CompletableFuture
+  missing type arguments for generic class CompletableFuture<T>
+  where T is a type-variable:
+    T extends Object declared in class CompletableFuture
+[WARNING] /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-server/src/test/java/org/apache/ratis/RaftAsyncTests.java:[87,17] [this-escape] possible 'this' escape before subclass is fully initialized
+[WARNING] /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-server/src/test/java/org/apache/ratis/RaftBasicTests.java:[502,6] [rawtypes] found raw type: Gauge
+  missing type arguments for generic class Gauge<T>
+  where T is a type-variable:
+    T extends Object declared in interface Gauge
+[WARNING] /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-server/src/test/java/org/apache/ratis/RaftBasicTests.java:[504,6] [rawtypes] found raw type: Gauge
+  missing type arguments for generic class Gauge<T>
+  where T is a type-variable:
+    T extends Object declared in interface Gauge
+[WARNING] /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-server/src/test/java/org/apache/ratis/RaftBasicTests.java:[533,4] [rawtypes] found raw type: Gauge
+  missing type arguments for generic class Gauge<T>
+  where T is a type-variable:
+    T extends Object declared in interface Gauge
+[WARNING] /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-server/src/test/java/org/apache/ratis/RaftBasicTests.java:[537,6] [rawtypes] found raw type: Gauge
+  missing type arguments for generic class Gauge<T>
+  where T is a type-variable:
+    T extends Object declared in interface Gauge
+[WARNING] /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-server/src/test/java/org/apache/ratis/RaftBasicTests.java:[540,6] [rawtypes] found raw type: Gauge
+  missing type arguments for generic class Gauge<T>
+  where T is a type-variable:
+    T extends Object declared in interface Gauge
+[WARNING] /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-server/src/test/java/org/apache/ratis/RaftBasicTests.java:[547,17] [rawtypes] found raw type: Gauge
+  missing type arguments for generic class Gauge<T>
+  where T is a type-variable:
+    T extends Object declared in interface Gauge
+[WARNING] /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-server/src/test/java/org/apache/ratis/RaftBasicTests.java:[83,63] [this-escape] possible 'this' escape before subclass is fully initialized
+[WARNING] /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-server/src/test/java/org/apache/ratis/RaftExceptionBaseTest.java:[59,70] [this-escape] possible 'this' escape before subclass is fully initialized
+[WARNING] /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-server/src/test/java/org/apache/ratis/RequestLimitAsyncBaseTest.java:[56,44] [this-escape] possible 'this' escape before subclass is fully initialized
+[WARNING] /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-server/src/test/java/org/apache/ratis/TestReConfigProperty.java:[46,17] [this-escape] possible 'this' escape before subclass is fully initialized
+[WARNING] /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-server/src/test/java/org/apache/ratis/server/impl/PreAppendLeaderStepDownTest.java:[69,45] [this-escape] possible 'this' escape before subclass is fully initialized
+[WARNING] /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-server/src/test/java/org/apache/ratis/server/impl/RaftReconfigurationBaseTest.java:[83,59] [this-escape] possible 'this' escape before subclass is fully initialized
+[WARNING] /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-server/src/test/java/org/apache/ratis/server/impl/RaftStateMachineExceptionTests.java:[86,45] [this-escape] possible 'this' escape before subclass is fully initialized
+[WARNING] /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-server/src/test/java/org/apache/ratis/server/impl/TestLogAppenderMetrics.java:[56,4] [rawtypes] found raw type: Gauge
+  missing type arguments for generic class Gauge<T>
+  where T is a type-variable:
+    T extends Object declared in interface Gauge
+[WARNING] /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-server/src/test/java/org/apache/ratis/server/impl/TestLogAppenderMetrics.java:[59,4] [rawtypes] found raw type: Gauge
+  missing type arguments for generic class Gauge<T>
+  where T is a type-variable:
+    T extends Object declared in interface Gauge
+[WARNING] /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-server/src/test/java/org/apache/ratis/server/impl/TestLogAppenderMetrics.java:[62,4] [rawtypes] found raw type: Gauge
+  missing type arguments for generic class Gauge<T>
+  where T is a type-variable:
+    T extends Object declared in interface Gauge
+[WARNING] /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-server/src/test/java/org/apache/ratis/server/impl/TestRetryCacheMetrics.java:[115,24] [rawtypes] found raw type: Gauge
+  missing type arguments for generic class Gauge<T>
+  where T is a type-variable:
+    T extends Object declared in interface Gauge
+[WARNING] /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-server/src/test/java/org/apache/ratis/server/impl/TestRetryCacheMetrics.java:[118,30] [rawtypes] found raw type: Gauge
+  missing type arguments for generic class Gauge<T>
+  where T is a type-variable:
+    T extends Object declared in interface Gauge
+[WARNING] /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-server/src/test/java/org/apache/ratis/server/metrics/ServerMetricsTestUtils.java:[31,9] [rawtypes] found raw type: Gauge
+  missing type arguments for generic class Gauge<T>
+  where T is a type-variable:
+    T extends Object declared in interface Gauge
+[WARNING] /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-server/src/test/java/org/apache/ratis/server/metrics/ServerMetricsTestUtils.java:[32,28] [rawtypes] found raw type: Gauge
+  missing type arguments for generic class Gauge<T>
+  where T is a type-variable:
+    T extends Object declared in interface Gauge
+[WARNING] /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-server/src/test/java/org/apache/ratis/server/metrics/ServerMetricsTestUtils.java:[41,9] [rawtypes] found raw type: Gauge
+  missing type arguments for generic class Gauge<T>
+  where T is a type-variable:
+    T extends Object declared in interface Gauge
+[WARNING] /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-server/src/test/java/org/apache/ratis/server/metrics/ServerMetricsTestUtils.java:[49,28] [rawtypes] found raw type: Gauge
+  missing type arguments for generic class Gauge<T>
+  where T is a type-variable:
+    T extends Object declared in interface Gauge
+[WARNING] /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-server/src/test/java/org/apache/ratis/server/metrics/TestLeaderElectionMetrics.java:[57,28] [rawtypes] found raw type: Gauge
+  missing type arguments for generic class Gauge<T>
+  where T is a type-variable:
+    T extends Object declared in interface Gauge
+[WARNING] /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-server/src/test/java/org/apache/ratis/server/storage/RaftStorageTestUtils.java:[63,26] [try] auto-closeable resource readlock is never referenced in body of corresponding try statement
+[WARNING] /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-server/src/test/java/org/apache/ratis/statemachine/RaftSnapshotBaseTest.java:[74,42] [this-escape] possible 'this' escape before subclass is fully initialized
+[INFO] 
+[INFO] --- surefire:3.5.6:test (default-test) @ ratis-server ---
+[INFO] Using auto detected provider org.apache.maven.surefire.junitplatform.JUnitPlatformProvider
+[INFO] Using auto detected provider org.apache.maven.surefire.junitplatform.JUnitPlatformProvider
+[INFO] 
+[INFO] --------------------< org.apache.ratis:ratis-grpc >---------------------
+[INFO] Building Apache Ratis gRPC Support 3.3.0-SNAPSHOT                 [9/13]
+[INFO]   from ratis-grpc/pom.xml
+[INFO] --------------------------------[ jar ]---------------------------------
+[INFO] 
+[INFO] --- enforcer:3.6.3:enforce (enforce-maven-version) @ ratis-grpc ---
+[INFO] 
+[INFO] --- enforcer:3.6.3:enforce (enforce-java-version) @ ratis-grpc ---
+[INFO] 
+[INFO] --- jacoco:0.8.15:prepare-agent (default-prepare-agent) @ ratis-grpc ---
+[INFO] argLine set to -javaagent:/home/ubuntu/.m2/repository/org/jacoco/org.jacoco.agent/0.8.15/org.jacoco.agent-0.8.15-runtime.jar=destfile=/home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-grpc/target/jacoco.exec,includes=org.apache.ratis.*
+[INFO] 
+[INFO] --- build-helper:3.6.1:add-source (add-source) @ ratis-grpc ---
+[INFO] Source directory: /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-grpc/target/generated-sources added.
+[INFO] 
+[INFO] --- enforcer:3.6.3:enforce (bannedImports-finalizers) @ ratis-grpc ---
+[INFO] Rule 0: org.apache.maven.plugins.enforcer.RestrictImports passed
+[INFO] 
+[INFO] --- remote-resources:3.3.0:process (process-resource-bundles) @ ratis-grpc ---
+[INFO] Preparing remote bundle org.apache.apache.resources:apache-jar-resource-bundle:1.8
+[INFO] Copying 3 resources from 1 bundle.
+[INFO] 
+[INFO] --- hadoops:3.4.3:version-info (version-info) @ ratis-grpc ---
+[INFO] SCM: GIT
+[INFO] Computed MD5: d41d8cd98f0b24e980998ecf8427e
+[INFO] 
+[INFO] --- resources:3.5.0:resources (default-resources) @ ratis-grpc ---
+[INFO] skip non existing resourceDirectory /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-grpc/src/main/resources
+[INFO] Copying 1 resource from ../src/main/resources to target/classes
+[INFO] Copying 3 resources from target/maven-shared-archive-resources to target/classes
+[INFO] 
+[INFO] --- compiler:3.15.0:compile (default-compile) @ ratis-grpc ---
+[INFO] Compiling 24 source files with javac [forked debug release 8] to target/classes
+[WARNING] Unable to autodetect 'javac' path, using 'javac' from the environment.
+[WARNING] Picked up JAVA_TOOL_OPTIONS: -Djava.io.tmpdir=/home/ubuntu/specula-ratis-issue123-20260803/tmp/server -XX:+PerfDisableSharedMem
+/home/ubuntu/.m2/repository/org/apache/ratis/ratis-thirdparty-misc/1.1.0/ratis-thirdparty-misc-1.1.0.jar(/org/apache/ratis/thirdparty/io/grpc/netty/NettyServerBuilder.class): warning: Cannot find annotation method 'replacement()' in type 'InlineMe': class file for com.google.errorprone.annotations.InlineMe not found
+/home/ubuntu/.m2/repository/org/apache/ratis/ratis-thirdparty-misc/1.1.0/ratis-thirdparty-misc-1.1.0.jar(/org/apache/ratis/thirdparty/io/grpc/netty/NettyServerBuilder.class): warning: Cannot find annotation method 'replacement()' in type 'InlineMe'
+/home/ubuntu/.m2/repository/org/apache/ratis/ratis-thirdparty-misc/1.1.0/ratis-thirdparty-misc-1.1.0.jar(/org/apache/ratis/thirdparty/io/grpc/netty/NettyChannelBuilder.class): warning: Cannot find annotation method 'replacement()' in type 'InlineMe'
+/home/ubuntu/.m2/repository/org/apache/ratis/ratis-thirdparty-misc/1.1.0/ratis-thirdparty-misc-1.1.0.jar(/org/apache/ratis/thirdparty/io/grpc/ForwardingChannelBuilder2.class): warning: Cannot find annotation method 'value()' in type 'DoNotCall': class file for com.google.errorprone.annotations.DoNotCall not found
+/home/ubuntu/.m2/repository/org/apache/ratis/ratis-thirdparty-misc/1.1.0/ratis-thirdparty-misc-1.1.0.jar(/org/apache/ratis/thirdparty/io/grpc/ForwardingChannelBuilder2.class): warning: Cannot find annotation method 'value()' in type 'DoNotCall'
+/home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-grpc/src/main/java/org/apache/ratis/grpc/metrics/GrpcServerMetrics.java:[54,54] [this-escape] possible 'this' escape before subclass is fully initialized
+[WARNING] /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-grpc/src/main/java/org/apache/ratis/grpc/metrics/GrpcServerMetrics.java:[55,64] [this-escape] possible 'this' escape before subclass is fully initialized
+[WARNING] /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-grpc/src/main/java/org/apache/ratis/grpc/metrics/GrpcServerMetrics.java:[57,82] [this-escape] possible 'this' escape before subclass is fully initialized
+[WARNING] /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-grpc/src/main/java/org/apache/ratis/grpc/server/GrpcLogAppender.java:[728,8] [fallthrough] possible fall-through into case
+[WARNING] /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-grpc/src/main/java/org/apache/ratis/grpc/server/GrpcLogAppender.java:[595,29] [try] auto-closeable resource writeLock is never referenced in body of corresponding try statement
+[WARNING] /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-grpc/src/main/java/org/apache/ratis/grpc/server/GrpcLogAppender.java:[614,29] [try] auto-closeable resource writeLock is never referenced in body of corresponding try statement
+[WARNING] /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-grpc/src/main/java/org/apache/ratis/grpc/server/GrpcLogAppender.java:[659,29] [try] auto-closeable resource readLock is never referenced in body of corresponding try statement
+[WARNING] /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-grpc/src/main/java/org/apache/ratis/grpc/server/GrpcLogAppender.java:[207,27] [try] auto-closeable resource writeLock is never referenced in body of corresponding try statement
+[WARNING] /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-grpc/src/main/java/org/apache/ratis/grpc/server/GrpcLogAppender.java:[395,27] [try] auto-closeable resource writeLock is never referenced in body of corresponding try statement
+[WARNING] /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-grpc/src/main/java/org/apache/ratis/grpc/server/GrpcLogAppender.java:[573,27] [try] auto-closeable resource writeLock is never referenced in body of corresponding try statement
+[WARNING] /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-grpc/src/main/java/org/apache/ratis/grpc/server/GrpcLogAppender.java:[175,39] [this-escape] possible 'this' escape before subclass is fully initialized
+[INFO] 
+[INFO] --- resources:3.5.0:testResources (default-testResources) @ ratis-grpc ---
+[INFO] skip non existing resourceDirectory /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-grpc/src/test/resources
+[INFO] Copying 3 resources from target/maven-shared-archive-resources to target/test-classes
+[INFO] 
+[INFO] --- compiler:3.15.0:testCompile (default-testCompile) @ ratis-grpc ---
+[INFO] Compiling 2 source files with javac [forked debug release 8] to target/test-classes
+[WARNING] Unable to autodetect 'javac' path, using 'javac' from the environment.
+[INFO] 
+[INFO] --- surefire:3.5.6:test (default-test) @ ratis-grpc ---
+[INFO] Using auto detected provider org.apache.maven.surefire.junitplatform.JUnitPlatformProvider
+[INFO] Using auto detected provider org.apache.maven.surefire.junitplatform.JUnitPlatformProvider
+[INFO] 
+[INFO] --------------------< org.apache.ratis:ratis-netty >--------------------
+[INFO] Building Apache Ratis Netty Support 3.3.0-SNAPSHOT               [10/13]
+[INFO]   from ratis-netty/pom.xml
+[INFO] --------------------------------[ jar ]---------------------------------
+[INFO] 
+[INFO] --- enforcer:3.6.3:enforce (enforce-maven-version) @ ratis-netty ---
+[INFO] 
+[INFO] --- enforcer:3.6.3:enforce (enforce-java-version) @ ratis-netty ---
+[INFO] 
+[INFO] --- jacoco:0.8.15:prepare-agent (default-prepare-agent) @ ratis-netty ---
+[INFO] argLine set to -javaagent:/home/ubuntu/.m2/repository/org/jacoco/org.jacoco.agent/0.8.15/org.jacoco.agent-0.8.15-runtime.jar=destfile=/home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-netty/target/jacoco.exec,includes=org.apache.ratis.*
+[INFO] 
+[INFO] --- build-helper:3.6.1:add-source (add-source) @ ratis-netty ---
+[INFO] Source directory: /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-netty/target/generated-sources added.
+[INFO] 
+[INFO] --- enforcer:3.6.3:enforce (bannedImports-finalizers) @ ratis-netty ---
+[INFO] Rule 0: org.apache.maven.plugins.enforcer.RestrictImports passed
+[INFO] 
+[INFO] --- remote-resources:3.3.0:process (process-resource-bundles) @ ratis-netty ---
+[INFO] Preparing remote bundle org.apache.apache.resources:apache-jar-resource-bundle:1.8
+[INFO] Copying 3 resources from 1 bundle.
+[INFO] 
+[INFO] --- hadoops:3.4.3:version-info (version-info) @ ratis-netty ---
+[INFO] SCM: GIT
+[INFO] Computed MD5: d41d8cd98f0b24e980998ecf8427e
+[INFO] 
+[INFO] --- resources:3.5.0:resources (default-resources) @ ratis-netty ---
+[INFO] skip non existing resourceDirectory /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-netty/src/main/resources
+[INFO] Copying 1 resource from ../src/main/resources to target/classes
+[INFO] Copying 3 resources from target/maven-shared-archive-resources to target/classes
+[INFO] 
+[INFO] --- compiler:3.15.0:compile (default-compile) @ ratis-netty ---
+[INFO] Compiling 17 source files with javac [forked debug release 8] to target/classes
+[WARNING] Unable to autodetect 'javac' path, using 'javac' from the environment.
+[WARNING] Picked up JAVA_TOOL_OPTIONS: -Djava.io.tmpdir=/home/ubuntu/specula-ratis-issue123-20260803/tmp/server -XX:+PerfDisableSharedMem
+/home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-netty/src/main/java/org/apache/ratis/netty/client/NettyClientStreamRpc.java:[369,61] [try] auto-closeable resource ignored is never referenced in body of corresponding try statement
+[WARNING] /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-netty/src/main/java/org/apache/ratis/netty/server/DataStreamManagement.java:[319,33] [try] auto-closeable resource ignore is never referenced in body of corresponding try statement
+[WARNING] /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-netty/src/main/java/org/apache/ratis/netty/server/NettyServerStreamRpc.java:[241,35] [try] auto-closeable resource autoReset is never referenced in body of corresponding try statement
+[INFO] 
+[INFO] --- resources:3.5.0:testResources (default-testResources) @ ratis-netty ---
+[INFO] skip non existing resourceDirectory /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-netty/src/test/resources
+[INFO] Copying 3 resources from target/maven-shared-archive-resources to target/test-classes
+[INFO] 
+[INFO] --- compiler:3.15.0:testCompile (default-testCompile) @ ratis-netty ---
+[INFO] Compiling 1 source file with javac [forked debug release 8] to target/test-classes
+[WARNING] Unable to autodetect 'javac' path, using 'javac' from the environment.
+[INFO] 
+[INFO] --- surefire:3.5.6:test (default-test) @ ratis-netty ---
+[INFO] Skipped
+[INFO] 
+[INFO] -----------------< org.apache.ratis:ratis-trace-otel >------------------
+[INFO] Building Apache Ratis Tracing - OpenTelemetry 3.3.0-SNAPSHOT     [11/13]
+[INFO]   from ratis-trace-otel/pom.xml
+[INFO] --------------------------------[ jar ]---------------------------------
+[INFO] 
+[INFO] --- enforcer:3.6.3:enforce (enforce-maven-version) @ ratis-trace-otel ---
+[INFO] 
+[INFO] --- enforcer:3.6.3:enforce (enforce-java-version) @ ratis-trace-otel ---
+[INFO] 
+[INFO] --- jacoco:0.8.15:prepare-agent (default-prepare-agent) @ ratis-trace-otel ---
+[INFO] argLine set to -javaagent:/home/ubuntu/.m2/repository/org/jacoco/org.jacoco.agent/0.8.15/org.jacoco.agent-0.8.15-runtime.jar=destfile=/home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-trace-otel/target/jacoco.exec,includes=org.apache.ratis.*
+[INFO] 
+[INFO] --- build-helper:3.6.1:add-source (add-source) @ ratis-trace-otel ---
+[INFO] Source directory: /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-trace-otel/target/generated-sources added.
+[INFO] 
+[INFO] --- enforcer:3.6.3:enforce (bannedImports-finalizers) @ ratis-trace-otel ---
+[INFO] Rule 0: org.apache.maven.plugins.enforcer.RestrictImports passed
+[INFO] 
+[INFO] --- remote-resources:3.3.0:process (process-resource-bundles) @ ratis-trace-otel ---
+[INFO] Preparing remote bundle org.apache.apache.resources:apache-jar-resource-bundle:1.8
+[INFO] Copying 3 resources from 1 bundle.
+[INFO] 
+[INFO] --- hadoops:3.4.3:version-info (version-info) @ ratis-trace-otel ---
+[INFO] SCM: GIT
+[INFO] Computed MD5: d41d8cd98f0b24e980998ecf8427e
+[INFO] 
+[INFO] --- resources:3.5.0:resources (default-resources) @ ratis-trace-otel ---
+[INFO] Copying 1 resource from src/main/resources to target/classes
+[INFO] Copying 1 resource from ../src/main/resources to target/classes
+[INFO] Copying 3 resources from target/maven-shared-archive-resources to target/classes
+[INFO] 
+[INFO] --- compiler:3.15.0:compile (default-compile) @ ratis-trace-otel ---
+[INFO] Compiling 3 source files with javac [forked debug release 8] to target/classes
+[WARNING] Unable to autodetect 'javac' path, using 'javac' from the environment.
+[INFO] 
+[INFO] --- resources:3.5.0:testResources (default-testResources) @ ratis-trace-otel ---
+[INFO] skip non existing resourceDirectory /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-trace-otel/src/test/resources
+[INFO] Copying 3 resources from target/maven-shared-archive-resources to target/test-classes
+[INFO] 
+[INFO] --- compiler:3.15.0:testCompile (default-testCompile) @ ratis-trace-otel ---
+[INFO] No sources to compile
+[INFO] 
+[INFO] --- surefire:3.5.6:test (default-test) @ ratis-trace-otel ---
+[INFO] Using auto detected provider org.apache.maven.surefire.junitplatform.JUnitPlatformProvider
+[INFO] 
+[INFO] --------------------< org.apache.ratis:ratis-shell >--------------------
+[INFO] Building Apache Ratis Shell 3.3.0-SNAPSHOT                       [12/13]
+[INFO]   from ratis-shell/pom.xml
+[INFO] --------------------------------[ jar ]---------------------------------
+[INFO] 
+[INFO] --- enforcer:3.6.3:enforce (enforce-maven-version) @ ratis-shell ---
+[INFO] 
+[INFO] --- enforcer:3.6.3:enforce (enforce-java-version) @ ratis-shell ---
+[INFO] 
+[INFO] --- jacoco:0.8.15:prepare-agent (default-prepare-agent) @ ratis-shell ---
+[INFO] argLine set to -javaagent:/home/ubuntu/.m2/repository/org/jacoco/org.jacoco.agent/0.8.15/org.jacoco.agent-0.8.15-runtime.jar=destfile=/home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-shell/target/jacoco.exec,includes=org.apache.ratis.*
+[INFO] 
+[INFO] --- build-helper:3.6.1:add-source (add-source) @ ratis-shell ---
+[INFO] Source directory: /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-shell/target/generated-sources added.
+[INFO] 
+[INFO] --- enforcer:3.6.3:enforce (bannedImports-finalizers) @ ratis-shell ---
+[INFO] Rule 0: org.apache.maven.plugins.enforcer.RestrictImports passed
+[INFO] 
+[INFO] --- remote-resources:3.3.0:process (process-resource-bundles) @ ratis-shell ---
+[INFO] Preparing remote bundle org.apache.apache.resources:apache-jar-resource-bundle:1.8
+[INFO] Copying 3 resources from 1 bundle.
+[INFO] 
+[INFO] --- hadoops:3.4.3:version-info (version-info) @ ratis-shell ---
+[INFO] SCM: GIT
+[INFO] Computed MD5: d41d8cd98f0b24e980998ecf8427e
+[INFO] 
+[INFO] --- resources:3.5.0:resources (default-resources) @ ratis-shell ---
+[INFO] skip non existing resourceDirectory /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-shell/src/main/resources
+[INFO] Copying 1 resource from ../src/main/resources to target/classes
+[INFO] Copying 3 resources from target/maven-shared-archive-resources to target/classes
+[INFO] 
+[INFO] --- compiler:3.15.0:compile (default-compile) @ ratis-shell ---
+[INFO] Compiling 24 source files with javac [forked debug release 8] to target/classes
+[WARNING] Unable to autodetect 'javac' path, using 'javac' from the environment.
+[WARNING] Picked up JAVA_TOOL_OPTIONS: -Djava.io.tmpdir=/home/ubuntu/specula-ratis-issue123-20260803/tmp/server -XX:+PerfDisableSharedMem
+/home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-shell/src/main/java/org/apache/ratis/shell/cli/AbstractShell.java:[43,28] [this-escape] possible 'this' escape before subclass is fully initialized
+[WARNING] /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-shell/src/main/java/org/apache/ratis/shell/cli/sh/command/AbstractRatisCommand.java:[90,20] [deprecation] build() in Builder has been deprecated
+[WARNING] /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-shell/src/main/java/org/apache/ratis/shell/cli/sh/election/PauseCommand.java:[93,12] [deprecation] build() in Builder has been deprecated
+[WARNING] /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-shell/src/main/java/org/apache/ratis/shell/cli/sh/election/ResumeCommand.java:[93,12] [deprecation] build() in Builder has been deprecated
+[WARNING] /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-shell/src/main/java/org/apache/ratis/shell/cli/sh/election/TransferCommand.java:[143,12] [deprecation] build() in Builder has been deprecated
+[WARNING] /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-shell/src/main/java/org/apache/ratis/shell/cli/sh/election/TransferCommand.java:[149,12] [deprecation] build() in Builder has been deprecated
+[WARNING] /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-shell/src/main/java/org/apache/ratis/shell/cli/sh/local/RaftMetaConfCommand.java:[160,12] [deprecation] build() in Builder has been deprecated
+[WARNING] /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-shell/src/main/java/org/apache/ratis/shell/cli/sh/local/RaftMetaConfCommand.java:[167,12] [deprecation] build() in Builder has been deprecated
+[WARNING] /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-shell/src/main/java/org/apache/ratis/shell/cli/sh/peer/AddCommand.java:[169,12] [deprecation] build() in Builder has been deprecated
+[WARNING] /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-shell/src/main/java/org/apache/ratis/shell/cli/sh/peer/AddCommand.java:[174,12] [deprecation] build() in Builder has been deprecated
+[WARNING] /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-shell/src/main/java/org/apache/ratis/shell/cli/sh/peer/AddCommand.java:[179,12] [deprecation] build() in Builder has been deprecated
+[WARNING] /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-shell/src/main/java/org/apache/ratis/shell/cli/sh/peer/AddCommand.java:[184,12] [deprecation] build() in Builder has been deprecated
+[WARNING] /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-shell/src/main/java/org/apache/ratis/shell/cli/sh/peer/RemoveCommand.java:[103,12] [deprecation] build() in Builder has been deprecated
+[WARNING] /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-shell/src/main/java/org/apache/ratis/shell/cli/sh/peer/RemoveCommand.java:[107,12] [deprecation] build() in Builder has been deprecated
+[WARNING] /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-shell/src/main/java/org/apache/ratis/shell/cli/sh/peer/SetPriorityCommand.java:[101,12] [deprecation] build() in Builder has been deprecated
+[WARNING] /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-shell/src/main/java/org/apache/ratis/shell/cli/sh/snapshot/TakeSnapshotCommand.java:[100,12] [deprecation] build() in Builder has been deprecated
+[WARNING] /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-shell/src/main/java/org/apache/ratis/shell/cli/sh/snapshot/TakeSnapshotCommand.java:[105,12] [deprecation] build() in Builder has been deprecated
+[INFO] 
+[INFO] --- resources:3.5.0:testResources (default-testResources) @ ratis-shell ---
+[INFO] skip non existing resourceDirectory /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-shell/src/test/resources
+[INFO] Copying 3 resources from target/maven-shared-archive-resources to target/test-classes
+[INFO] 
+[INFO] --- compiler:3.15.0:testCompile (default-testCompile) @ ratis-shell ---
+[INFO] No sources to compile
+[INFO] 
+[INFO] --- surefire:3.5.6:test (default-test) @ ratis-shell ---
+[INFO] Skipped
+[INFO] 
+[INFO] --------------------< org.apache.ratis:ratis-test >---------------------
+[INFO] Building Apache Ratis Test 3.3.0-SNAPSHOT                        [13/13]
+[INFO]   from ratis-test/pom.xml
+[INFO] --------------------------------[ jar ]---------------------------------
+[INFO] 
+[INFO] --- enforcer:3.6.3:enforce (enforce-maven-version) @ ratis-test ---
+[INFO] 
+[INFO] --- enforcer:3.6.3:enforce (enforce-java-version) @ ratis-test ---
+[INFO] 
+[INFO] --- jacoco:0.8.15:prepare-agent (default-prepare-agent) @ ratis-test ---
+[INFO] argLine set to -javaagent:/home/ubuntu/.m2/repository/org/jacoco/org.jacoco.agent/0.8.15/org.jacoco.agent-0.8.15-runtime.jar=destfile=/home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-test/target/jacoco.exec,includes=org.apache.ratis.*
+[INFO] 
+[INFO] --- build-helper:3.6.1:add-source (add-source) @ ratis-test ---
+[INFO] Source directory: /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-test/target/generated-sources added.
+[INFO] 
+[INFO] --- enforcer:3.6.3:enforce (bannedImports-finalizers) @ ratis-test ---
+[INFO] Rule 0: org.apache.maven.plugins.enforcer.RestrictImports passed
+[INFO] 
+[INFO] --- remote-resources:3.3.0:process (process-resource-bundles) @ ratis-test ---
+[INFO] Preparing remote bundle org.apache.apache.resources:apache-jar-resource-bundle:1.8
+[INFO] Copying 3 resources from 1 bundle.
+[INFO] 
+[INFO] --- hadoops:3.4.3:version-info (version-info) @ ratis-test ---
+[INFO] SCM: GIT
+[INFO] Computed MD5: d41d8cd98f0b24e980998ecf8427e
+[INFO] 
+[INFO] --- resources:3.5.0:resources (default-resources) @ ratis-test ---
+[INFO] skip non existing resourceDirectory /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-test/src/main/resources
+[INFO] Copying 1 resource from ../src/main/resources to target/classes
+[INFO] Copying 3 resources from target/maven-shared-archive-resources to target/classes
+[INFO] 
+[INFO] --- compiler:3.15.0:compile (default-compile) @ ratis-test ---
+[INFO] No sources to compile
+[INFO] 
+[INFO] --- resources:3.5.0:testResources (default-testResources) @ ratis-test ---
+[INFO] Copying 15 resources from src/test/resources to target/test-classes
+[INFO] Copying 3 resources from target/maven-shared-archive-resources to target/test-classes
+[INFO] 
+[INFO] --- compiler:3.15.0:testCompile (default-testCompile) @ ratis-test ---
+[INFO] Compiling 165 source files with javac [forked debug release 8] to target/test-classes
+[WARNING] Unable to autodetect 'javac' path, using 'javac' from the environment.
+[WARNING] Picked up JAVA_TOOL_OPTIONS: -Djava.io.tmpdir=/home/ubuntu/specula-ratis-issue123-20260803/tmp/server -XX:+PerfDisableSharedMem
+/home/ubuntu/.m2/repository/org/apache/ratis/ratis-thirdparty-misc/1.1.0/ratis-thirdparty-misc-1.1.0.jar(/org/apache/ratis/thirdparty/io/grpc/netty/NettyServerBuilder.class): warning: Cannot find annotation method 'replacement()' in type 'InlineMe': class file for com.google.errorprone.annotations.InlineMe not found
+/home/ubuntu/.m2/repository/org/apache/ratis/ratis-thirdparty-misc/1.1.0/ratis-thirdparty-misc-1.1.0.jar(/org/apache/ratis/thirdparty/io/grpc/netty/NettyServerBuilder.class): warning: Cannot find annotation method 'replacement()' in type 'InlineMe'
+/home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-test/src/test/java/org/apache/ratis/RaftLogTruncateTests.java:[79,42] [this-escape] possible 'this' escape before subclass is fully initialized
+[WARNING] /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-test/src/test/java/org/apache/ratis/TestRaftServerSlownessDetection.java:[94,22] [rawtypes] found raw type: Gauge
+  missing type arguments for generic class Gauge<T>
+  where T is a type-variable:
+    T extends Object declared in interface Gauge
+[WARNING] /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-test/src/test/java/org/apache/ratis/TestRaftServerSlownessDetection.java:[99,4] [rawtypes] found raw type: Gauge
+  missing type arguments for generic class Gauge<T>
+  where T is a type-variable:
+    T extends Object declared in interface Gauge
+[WARNING] [rawtypes] found raw type: Gauge
+[WARNING]   missing type arguments for generic class Gauge<T>
+  where T is a type-variable:
+    T extends Object declared in interface Gauge
+/home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-test/src/test/java/org/apache/ratis/TestRaftServerSlownessDetection.java:[62,52] [this-escape] possible 'this' escape before subclass is fully initialized
+[WARNING] /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-test/src/test/java/org/apache/ratis/datastream/DataStreamClusterTests.java:[115,37] [try] auto-closeable resource DataStreamClientImpl.DataStreamOutputImpl has a member method close() that could throw InterruptedException
+[WARNING] /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-test/src/test/java/org/apache/ratis/datastream/DataStreamClusterTests.java:[209,37] [try] auto-closeable resource DataStreamClientImpl.DataStreamOutputImpl has a member method close() that could throw InterruptedException
+[WARNING] /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-test/src/test/java/org/apache/ratis/datastream/DataStreamClusterTests.java:[64,19] [this-escape] possible 'this' escape before subclass is fully initialized
+[WARNING] /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-test/src/test/java/org/apache/ratis/datastream/TestDataStreamDisabled.java:[46,25] [try] auto-closeable resource DataStreamOutput has a member method close() that could throw InterruptedException
+[WARNING] /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-test/src/test/java/org/apache/ratis/datastream/TestDataStreamSslWithRpcTypeGrpcAndDataStreamTypeNetty.java:[47,68] [this-escape] possible 'this' escape before subclass is fully initialized
+[WARNING] /home/ubuntu/.m2/repository/org/apache/ratis/ratis-thirdparty-misc/1.1.0/ratis-thirdparty-misc-1.1.0.jar(/org/apache/ratis/thirdparty/io/grpc/ForwardingServerBuilder.class): warning: Cannot find annotation method 'value()' in type 'DoNotCall': class file for com.google.errorprone.annotations.DoNotCall not found
+/home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-test/src/test/java/org/apache/ratis/grpc/TestRaftAsyncWithGrpcTracing.java:[37,44] [this-escape] possible 'this' escape before subclass is fully initialized
+[WARNING] /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-test/src/test/java/org/apache/ratis/grpc/TestRaftWithGrpc.java:[50,17] [this-escape] possible 'this' escape before subclass is fully initialized
+[WARNING] /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-test/src/test/java/org/apache/ratis/grpc/TestRetryCacheWithGrpc.java:[60,17] [this-escape] possible 'this' escape before subclass is fully initialized
+[WARNING] /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-test/src/test/java/org/apache/ratis/grpc/TestRetryCacheWithGrpcTracing.java:[40,44] [this-escape] possible 'this' escape before subclass is fully initialized
+[WARNING] /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-test/src/test/java/org/apache/ratis/server/ServerRestartTests.java:[80,45] [this-escape] possible 'this' escape before subclass is fully initialized
+[WARNING] /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-test/src/test/java/org/apache/ratis/shell/cli/sh/ElectionCommandIntegrationTest.java:[49,45] [this-escape] possible 'this' escape before subclass is fully initialized
+[WARNING] /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-test/src/test/java/org/apache/ratis/shell/cli/sh/GroupCommandIntegrationTest.java:[50,45] [this-escape] possible 'this' escape before subclass is fully initialized
+[WARNING] /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-test/src/test/java/org/apache/ratis/shell/cli/sh/PeerCommandIntegrationTest.java:[53,45] [this-escape] possible 'this' escape before subclass is fully initialized
+[WARNING] /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-test/src/test/java/org/apache/ratis/shell/cli/sh/SnapshotCommandIntegrationTest.java:[50,45] [this-escape] possible 'this' escape before subclass is fully initialized
+[WARNING] /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-test/src/test/java/org/apache/ratis/grpc/server/TestGrpcServerMetrics.java:[112,10] [rawtypes] found raw type: Gauge
+  missing type arguments for generic class Gauge<T>
+  where T is a type-variable:
+    T extends Object declared in interface Gauge
+[WARNING] /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-test/src/test/java/org/apache/ratis/netty/TestTlsConfWithNetty.java:[199,25] [try] auto-closeable resource server is never referenced in body of corresponding try statement
+[WARNING] /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-test/src/test/java/org/apache/ratis/netty/client/TestNettyDataStreamReconnectWithGrpcCluster.java:[45,19] [this-escape] possible 'this' escape before subclass is fully initialized
+[WARNING] /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-test/src/test/java/org/apache/ratis/server/raftlog/TestRaftLogMetrics.java:[61,17] [this-escape] possible 'this' escape before subclass is fully initialized
+[WARNING] /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-test/src/test/java/org/apache/ratis/server/raftlog/segmented/TestLogSegment.java:[302,41] [try] auto-closeable resource ignored is never referenced in body of corresponding try statement
+[WARNING] /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-test/src/test/java/org/apache/ratis/server/storage/TestRaftStorage.java:[115,21] [try] auto-closeable resource ignored is never referenced in body of corresponding try statement
+[WARNING] /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-test/src/test/java/org/apache/ratis/shell/cli/sh/TestRatisShell.java:[49,44] [rawtypes] found raw type: Class
+  missing type arguments for generic class Class<T>
+  where T is a type-variable:
+    T extends Object declared in class Class
+[WARNING] /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-test/src/test/java/org/apache/ratis/util/TestPeerProxyMap.java:[126,29] [try] auto-closeable resource ignored is never referenced in body of corresponding try statement
+[WARNING] /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-test/src/test/java/org/apache/ratis/util/TestReferenceCountedObject.java:[117,31] [try] auto-closeable resource ignore is never referenced in body of corresponding try statement
+[WARNING] /home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-server-20260803/ratis-server/.specula-output/confirmation/CR-3/worktree/ratis-test/src/test/java/org/apache/ratis/util/TestReferenceCountedObject.java:[193,31] [try] auto-closeable resource ignore is never referenced in body of corresponding try statement
+[INFO] 
+[INFO] --- surefire:3.5.6:test (default-test) @ ratis-test ---
+[INFO] Using auto detected provider org.apache.maven.surefire.junitplatform.JUnitPlatformProvider
+[INFO] Using auto detected provider org.apache.maven.surefire.junitplatform.JUnitPlatformProvider
+[INFO] Using auto detected provider org.apache.maven.surefire.junitplatform.JUnitPlatformProvider
+[INFO] 
+[INFO] -------------------------------------------------------
+[INFO]  T E S T S
+[INFO] -------------------------------------------------------
+Picked up JAVA_TOOL_OPTIONS: -Djava.io.tmpdir=/home/ubuntu/specula-ratis-issue123-20260803/tmp/server -XX:+PerfDisableSharedMem
+[INFO] Running org.apache.ratis.grpc.TestLinearizableReadWithGrpc
+[INFO] Tests run: 1, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 3.080 s -- in org.apache.ratis.grpc.TestLinearizableReadWithGrpc
+[INFO] 
+[INFO] Results:
+[INFO] 
+[INFO] Tests run: 1, Failures: 0, Errors: 0, Skipped: 0
+[INFO] 
+[INFO] ------------------------------------------------------------------------
+[INFO] Reactor Summary for Apache Ratis 3.3.0-SNAPSHOT:
+[INFO] 
+[INFO] Apache Ratis ....................................... SUCCESS [  0.699 s]
+[INFO] Apache Ratis Protocols ............................. SUCCESS [  3.746 s]
+[INFO] Apache Ratis Common ................................ SUCCESS [  2.791 s]
+[INFO] Apache Ratis Client ................................ SUCCESS [  1.336 s]
+[INFO] Apache Ratis Server API ............................ SUCCESS [  1.199 s]
+[INFO] Apache Ratis Metrics API ........................... SUCCESS [  0.723 s]
+[INFO] Apache Ratis Metrics Default Implementation ........ SUCCESS [  0.817 s]
+[INFO] Apache Ratis Server ................................ SUCCESS [  3.750 s]
+[INFO] Apache Ratis gRPC Support .......................... SUCCESS [  1.974 s]
+[INFO] Apache Ratis Netty Support ......................... SUCCESS [  1.744 s]
+[INFO] Apache Ratis Tracing - OpenTelemetry ............... SUCCESS [  0.864 s]
+[INFO] Apache Ratis Shell ................................. SUCCESS [  1.074 s]
+[INFO] Apache Ratis Test .................................. SUCCESS [  6.570 s]
+[INFO] ------------------------------------------------------------------------
+[INFO] BUILD SUCCESS
+[INFO] ------------------------------------------------------------------------
+[INFO] Total time:  28.432 s
+[INFO] Finished at: 2026-08-04T11:56:32Z
+[INFO] ------------------------------------------------------------------------
+[INFO] 154 goals, 154 executed

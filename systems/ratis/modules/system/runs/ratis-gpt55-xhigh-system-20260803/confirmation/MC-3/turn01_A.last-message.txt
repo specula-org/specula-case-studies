@@ -1,0 +1,52 @@
+- **Source**: MC
+- **Novelty**: NEW
+- **Location**: ratis-server/src/main/java/org/apache/ratis/server/impl/RaftServerImpl.java:642
+
+## Description
+Confirmed. `changeToFollowerAndPersistMetadata` can advance the in-memory term before `persistMetadata()` succeeds. A later same-term `AppendEntries` can be accepted without retrying term persistence, leaving `currentTerm=1` while durable `raft-meta` still records term `0`. After restart, the server reloads term `0` and can grant a same-term vote to another candidate.
+
+I searched upstream Apache Ratis issues/PRs and recent git history for this mechanism (`raft-meta`, `persistMetadata`, `changeToFollowerAndPersistMetadata`, same-term leader recognition) and found no prior report or recently landed fix.
+
+## Trigger scenario
+1. Follower `s2` starts with volatile and persisted term `0`.
+2. `s1` sends higher-term `AppendEntries(term=1)`.
+3. Metadata persistence fails after the volatile term is raised, matching counterexample State 2: `MCRaftServerImpl_changeToFollowerAndPersistMetadata_PersistFailure(s2,s1,1)`.
+4. Storage becomes writable again; `s1` sends same-term `AppendEntries(term=1)`.
+5. Ratis accepts the same-term leader and returns `SUCCESS`, but persisted term remains `0`.
+6. After restart, `s2` reloads term `0` and grants `RequestVote(term=1)` to `s3`.
+
+## Developer intent
+`raft-meta` is the durable source for `currentTerm` and `votedFor` across restart. `changeToFollowerAndPersistMetadata` is the intended persistence point when a higher term is observed. Same-term leader recognition should not allow successful Raft traffic after a failed term durability update without forcing a retry or preventing acceptance.
+
+## Reproduction result
+Reproduction test written and executed:
+
+`/home/ubuntu/specula-ratis-issue123-20260803/specula/runs/ratis-gpt55-xhigh-system-20260803/ratis-system/.specula-output/repro/test_bugMC-3_metadata_persist_failure.sh`
+
+Checklist before `REPRODUCED`:
+
+1. Did Level 0 or Level 1 alone trigger it? **no**. Level 0 control did not trigger it; the reproducer injects a real filesystem metadata-write failure.
+2. No source patch or unreachable state was used. The injected precondition is the admissible counterexample step `MCRaftServerImpl_changeToFollowerAndPersistMetadata_PersistFailure(s2,s1,1)`, implemented by making the real storage `current/` directory non-writable during the higher-term append.
+3. Real consumers observe the wrong outcome: `RaftServerImpl.appendEntries` returns `SUCCESS`; production gRPC leader code consumes that in `ratis-grpc/src/main/java/org/apache/ratis/grpc/server/GrpcLogAppender.java:493` and forwards the reply at `GrpcLogAppender.java:547`. After restart, `RaftServerImpl.requestVote` returns `voteGranted=true` to the election caller at `ratis-server/src/main/java/org/apache/ratis/server/impl/LeaderElection.java:155`.
+4. The bad state is not masked before crash. Same-term append skips the failed persistence retry; restart reloads the older durable term and allows a same-term vote to another candidate. No downstream sync/loopback/resend guard resolved it in the reproduced path.
+
+Actual output:
+
+```text
+MC3_REPRO_COMMAND timeout 12m ./mvnw -pl ratis-server -am -Dtest=TestBugMC3MetadataPersistFailure#metadataPersistFailureAllowsSameTermAppendToRemainNonDurable test
+[INFO] Running org.apache.ratis.server.impl.TestBugMC3MetadataPersistFailure
+[INFO] Tests run: 1, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 2.906 s -- in org.apache.ratis.server.impl.TestBugMC3MetadataPersistFailure
+[INFO] BUILD SUCCESS
+MC3_MAVEN_EXIT 0
+MC3_SUREFIRE_MARKERS
+ratis-server/target/surefire-reports/org.apache.ratis.server.impl.TestBugMC3MetadataPersistFailure-output.txt:4:MC3_LEVEL0_CONTROL result=SUCCESS volatileTerm=0 persistedTerm=0
+ratis-server/target/surefire-reports/org.apache.ratis.server.impl.TestBugMC3MetadataPersistFailure-output.txt:5:MC3_FAULT_STEP firstHigherTermAppendFailed=AccessDeniedException volatileTerm=1 persistedTerm=0
+ratis-server/target/surefire-reports/org.apache.ratis.server.impl.TestBugMC3MetadataPersistFailure-output.txt:6:MC3_BUG_ACCEPTED_SAME_TERM_APPEND result=SUCCESS replySuccess=true leaderId=s1 volatileTerm=1 persistedTerm=0
+ratis-server/target/surefire-reports/org.apache.ratis.server.impl.TestBugMC3MetadataPersistFailure-output.txt:7:MC3_AFTER_RESTART volatileTerm=0 persistedTerm=0
+ratis-server/target/surefire-reports/org.apache.ratis.server.impl.TestBugMC3MetadataPersistFailure-output.txt:8:MC3_BUG_SAME_TERM_VOTE_AFTER_ACCEPTED_LEADER voteGranted=true candidate=s3 volatileTerm=1 votedFor=s3
+```
+
+## Recommendation
+Do not leave a raised volatile term as accepted state when metadata persistence fails. Either persist the new term before exposing same-term leader acceptance, roll back/mark the term as dirty on persistence failure, or force a metadata retry before returning success for same-term `AppendEntries`.
+
+VERDICT: REPRODUCED
