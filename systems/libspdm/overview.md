@@ -8,7 +8,7 @@ Specula analyzed and tested libspdm's SPDM requester-responder protocol across o
 
 Specula found 31 new bugs:
 
-- On an unprotected transport, cleartext MEL responses have no integrity protection, allowing an intermediary to substitute equal-length log data undetectably.
+- **Specification Issue:** On an unprotected transport, cleartext MEL responses have no integrity protection, allowing an intermediary to substitute equal-length log data undetectably.
 - Encapsulated-request error paths restore the normal response state without clearing the current request opcode, leaving partially reset authentication context.
 - **Approved:** Encapsulated `SEND_EVENT` handling omits the version and `EVENT_CAP` checks used by the non-encapsulated path, allowing event processing on unsupported connections.
 - **Approved:** Event acknowledgments do not verify the session's subscription state, allowing delivery through stale or cross-session subscriptions.
@@ -24,10 +24,10 @@ Specula found 31 new bugs:
 - **Approved:** Algorithm negotiation writes selections into connection state before validation and does not roll them back on error, contaminating a retry with failed-attempt values.
 - Algorithm negotiation sets a nonzero base asymmetric algorithm even when no enabled capability requires one, producing an incoherent negotiated state.
 - Challenge handling marks the connection authenticated before encapsulated authentication finishes and does not roll the state back if that flow fails.
-- MEL exchanges are absent from the signed transcript and carry no signature, nonce, or requester context, leaving a consumed log unbound to the responder or session.
+- **Specification Issue:** MEL exchanges are absent from the signed transcript and carry no signature, nonce, or requester context, leaving a consumed log unbound to the responder or session.
 - `mel_spec` validation is skipped for measurement-only profiles without key-exchange or PSK capability, allowing an unrecognized wire value into negotiated state.
 - An out-of-sequence `CHUNK_SEND_ACK` records an error but still copies the chunk into the reassembly buffer before returning it.
-- The with-context PSK exchange enters `HANDSHAKING` without arming the watchdog used by the without-context path, leaving incomplete sessions dangling.
+- **Implementation Enhancement:** The with-context PSK exchange enters `HANDSHAKING` without arming the watchdog used by the without-context path, leaving incomplete sessions dangling. Note that the [SPDM white paper](https://www.dmtf.org/sites/default/files/standards/documents/DSP2058_1.3.0.pdf) states non-normatively that an implementer may impose timeout requirements during the handshake phase.
 - The requester sends `GET_MEASUREMENT_EXTENSION_LOG` without checking for a negotiated nonzero `mel_spec`, provoking an avoidable protocol error.
 - **Approved:** Cross-chunk MEL validation detects only a shrinking total, not same-length content changes or an increased total, so inconsistent multi-chunk logs can pass silently.
 - The requester reads `mel_entries_len` before confirming that the first accumulated MEL chunk contains the complete 16-byte header.
@@ -42,4 +42,4 @@ Specula found 31 new bugs:
 
 Specula also found 1 previously known bug:
 
-- **Open:** The requester does not validate the chunk handle in `CHUNK_RESPONSE`, allowing a malicious responder to supply wrong-handle data for reassembly (Issue #3598).
+- **Fixed:** The requester does not validate the chunk handle in `CHUNK_RESPONSE`, allowing a malicious responder to supply wrong-handle data for reassembly (https://github.com/DMTF/libspdm/issues/3598).
