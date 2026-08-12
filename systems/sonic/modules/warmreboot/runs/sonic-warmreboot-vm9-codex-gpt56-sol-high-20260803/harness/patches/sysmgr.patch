@@ -1,0 +1,229 @@
+diff --git a/src/sonic-sysmgr/rebootbackend/Makefile.am b/src/sonic-sysmgr/rebootbackend/Makefile.am
+index a7c7dc3..d59b5cb 100644
+--- a/src/sonic-sysmgr/rebootbackend/Makefile.am
++++ b/src/sonic-sysmgr/rebootbackend/Makefile.am
+@@ -10,7 +10,7 @@ DBGFLAGS = -g
+ endif
+
+ rebootbackend_SOURCES = rebootbackend.cpp rebootbe.cpp interfaces.cpp \
+-                        reboot_thread.cpp
++                        reboot_thread.cpp tla_trace.cpp
+
+ rebootbackend_CFLAGS = $(DBGFLAGS) $(AM_CFLAGS) $(CFLAGS_COMMON) $(CFLAGS_ASAN)
+ rebootbackend_CPPFLAGS = $(DBGFLAGS) $(AM_CFLAGS) $(CFLAGS_COMMON) $(CFLAGS_ASAN)
+diff --git a/src/sonic-sysmgr/rebootbackend/reboot_thread.cpp b/src/sonic-sysmgr/rebootbackend/reboot_thread.cpp
+index 18aa654..75dd004 100644
+--- a/src/sonic-sysmgr/rebootbackend/reboot_thread.cpp
++++ b/src/sonic-sysmgr/rebootbackend/reboot_thread.cpp
+@@ -3,6 +3,9 @@
+ #include <google/protobuf/util/json_util.h>
+
+ #include <chrono>
++#include <functional>
++#include <sstream>
++#include <string>
+
+ #include "dbconnector.h"
+ #include "logger.h"
+@@ -15,6 +18,7 @@
+ #include "subscriberstatetable.h"
+ #include "system/system.pb.h"
+ #include "timestamp.h"
++#include "tla_trace.h"
+
+ namespace rebootbackend {
+
+@@ -26,6 +30,16 @@ namespace gpu = ::google::protobuf::util;
+
+ bool sigterm_requested = false;
+
++namespace {
++std::string RequestDigest(const RebootRequest& request) {
++  std::string json;
++  if (!gpu::MessageToJsonString(request, &json).ok()) {
++    json = request.DebugString();
++  }
++  return std::to_string(std::hash<std::string>{}(json));
++}
++}  // namespace
++
+ RebootThread::RebootThread(DbusInterface &dbus_interface,
+                            swss::SelectableEvent &m_finished)
+     : m_db("STATE_DB", 0),
+@@ -60,5 +74,7 @@ RebootStatusResponse RebootThread::GetResponse(void) {
+
+ bool RebootThread::HasRun() { return m_status.get_reboot_count() > 0; }
+
++bool RebootThread::IsJoinable() const { return m_thread.joinable(); }
++
+ Progress RebootThread::platform_reboot_select(swss::Select &s,
+                                               swss::SelectableTimer &l_timer) {
+@@ -96,5 +112,10 @@ Progress RebootThread::wait_for_platform_reboot(swss::Select &s) {
+
+   l_timer.start();
+
++  tla_trace::Emit(
++      "WaitForPlatformRebootStart",
++      "{\"request_digest\":" + tla_trace::Quote(RequestDigest(m_request)) +
++          ",\"timer_started\":true,\"dbus_outcome\":\"success\"}");
++
+   Progress progress = platform_reboot_select(s, l_timer);
+
+@@ -147,7 +169,17 @@ RebootThread::Progress RebootThread::send_dbus_reboot_request() {
+
+   if (dbus_response.status == DbusInterface::DbusStatus::DBUS_FAIL) {
+     log_error_and_set_non_retry_failure(dbus_response.json_string);
++    tla_trace::Emit(
++        "HostServiceTransportFailure",
++        "{\"request_digest\":" + tla_trace::Quote(RequestDigest(m_request)) +
++            ",\"exception_class\":\"DBUS_FAIL\",\"active\":true,"
++            "\"status\":\"failure\"}");
+     return Progress::EXIT_EARLY;
+   }
++  tla_trace::Emit(
++      "HostServiceIssueRebootAccept",
++      "{\"request_digest\":" + tla_trace::Quote(RequestDigest(m_request)) +
++          ",\"host_pending\":true,\"host_status\":\"accepted\","
++          "\"dbus_return_status\":\"success\"}");
+   return Progress::PROCEED;
+ }
+@@ -166,4 +200,9 @@ void RebootThread::do_cold_reboot(swss::Select &s) {
+   // We shouldn't be here. Platform reboot should've killed us.
+   log_error_and_set_non_retry_failure("platform failed to reboot");
+
++  tla_trace::Emit(
++      "PlatformRebootDeadline",
++      "{\"request_digest\":" + tla_trace::Quote(RequestDigest(m_request)) +
++          ",\"timer_stopped\":true,\"status\":\"failure\","
++          "\"failure_text\":\"platform failed to reboot\"}");
+   // Set critical state
+@@ -188,4 +227,9 @@ void RebootThread::do_halt_reboot(swss::Select &s) {
+   // We shouldn't be here. Platform reboot halt should've killed us.
+   log_error_and_set_non_retry_failure("platform failed to halt the system");
+
++  tla_trace::Emit(
++      "PlatformRebootDeadline",
++      "{\"request_digest\":" + tla_trace::Quote(RequestDigest(m_request)) +
++          ",\"timer_stopped\":true,\"status\":\"failure\","
++          "\"failure_text\":\"platform failed to halt the system\"}");
+   return;
+@@ -205,4 +249,9 @@ void RebootThread::do_warm_reboot(swss::Select &s) {
+   // We shouldn't be here. Platform reboot should've killed us.
+   log_error_and_set_non_retry_failure("failed to warm reboot");
+
++  tla_trace::Emit(
++      "PlatformRebootDeadline",
++      "{\"request_digest\":" + tla_trace::Quote(RequestDigest(m_request)) +
++          ",\"timer_stopped\":true,\"status\":\"failure\","
++          "\"failure_text\":\"failed to warm reboot\"}");
+   return;
+@@ -287,4 +336,9 @@ NotificationResponse RebootThread::Start(const RebootRequest &request) {
+     error_string += e.what();
+     log_error_and_set_failure_as_retriable(error_string);
+
++    tla_trace::Emit(
++        "StartThreadLaunchFailure",
++        "{\"request_digest\":" + tla_trace::Quote(RequestDigest(m_request)) +
++            ",\"active\":true,\"last_status\":\"retriable\","
++            "\"thread_joinable\":false}");
+     // Notify calling thread that thread has finished.
+diff --git a/src/sonic-sysmgr/rebootbackend/reboot_thread.h b/src/sonic-sysmgr/rebootbackend/reboot_thread.h
+index 907581e..04bd489 100644
+--- a/src/sonic-sysmgr/rebootbackend/reboot_thread.h
++++ b/src/sonic-sysmgr/rebootbackend/reboot_thread.h
+@@ -156,4 +156,7 @@ class RebootThread {
+   // and false otherwise.
+   bool HasRun();
+
++  // Trace-only observation of the real std::thread ownership state.
++  bool IsJoinable() const;
++
+  private:
+diff --git a/src/sonic-sysmgr/rebootbackend/rebootbe.cpp b/src/sonic-sysmgr/rebootbackend/rebootbe.cpp
+index 3025c93..ed80022 100644
+--- a/src/sonic-sysmgr/rebootbackend/rebootbe.cpp
++++ b/src/sonic-sysmgr/rebootbackend/rebootbe.cpp
+@@ -4,5 +4,7 @@
+ #include <unistd.h>
+
++#include <functional>
+ #include <memory>
+ #include <mutex>
++#include <sstream>
+ #include <string>
+@@ -16,2 +18,3 @@
+ #include "status_code_util.h"
+ #include "warm_restart.h"
++#include "tla_trace.h"
+@@ -196,11 +199,25 @@ NotificationResponse RebootBE::HandleRebootRequest(
+                   request.DebugString().c_str());
+   response = m_RebootThread.Start(request);
+   if (response.status == swss::StatusCode::SWSS_RC_SUCCESS) {
++    const char* manager_status = "unknown";
+     if (request.method() == gnoi::system::RebootMethod::COLD) {
+       SetCurrentStatus(RebManagerStatus::COLD_REBOOT_IN_PROGRESS);
++      manager_status = "cold";
+     } else if (request.method() == gnoi::system::RebootMethod::HALT) {
+       SetCurrentStatus(RebManagerStatus::HALT_REBOOT_IN_PROGRESS);
++      manager_status = "halt";
+     } else if (request.method() == gnoi::system::RebootMethod::WARM) {
+       SetCurrentStatus(RebManagerStatus::WARM_REBOOT_IN_PROGRESS);
++      manager_status = "warm";
+     }
++    if (m_RebootThread.IsJoinable()) {
++      const std::string digest =
++          std::to_string(std::hash<std::string>{}(jsonRebootRequest));
++      tla_trace::Emit(
++          "HandleRebootRequestAccept",
++          "{\"method\":" + tla_trace::Quote(manager_status) +
++              ",\"request_digest\":" + tla_trace::Quote(digest) +
++              ",\"manager_status\":\"in_progress\",\"active\":true,"
++              "\"thread_joinable\":true}");
++    }
+   }
+@@ -304,6 +321,15 @@ void RebootBE::HandleRebootFinish() {
+   SWSS_LOG_WARN(
+       "Receieved notification that reboot has finished. This probably means "
+       "something is wrong");
+-  m_RebootThread.Join();
++  const bool joined = m_RebootThread.Join();
+   SetCurrentStatus(RebManagerStatus::IDLE);
++  const auto response = m_RebootThread.GetResponse();
++  tla_trace::Emit(
++      joined ? "HandleRebootFinishJoinable"
++             : "HandleRebootFinishNonJoinable",
++      std::string("{\"active\":") + (response.active() ? "true" : "false") +
++          ",\"manager\":\"idle\",\"joinable\":" +
++          (m_RebootThread.IsJoinable() ? "true" : "false") +
++          ",\"status\":" +
++          tla_trace::Quote(response.status().message()) + "}");
+ }
+diff --git a/src/sonic-sysmgr/tests/Makefile.am b/src/sonic-sysmgr/tests/Makefile.am
+index 867b1e3..038ca19 100644
+--- a/src/sonic-sysmgr/tests/Makefile.am
++++ b/src/sonic-sysmgr/tests/Makefile.am
+@@ -27,4 +27,5 @@ tests_SOURCES = rebootbe_test.cpp \
+                 $(top_srcdir)/rebootbackend/rebootbe.cpp \
+                 reboot_thread_test.cpp \
+                 $(top_srcdir)/rebootbackend/reboot_thread.cpp \
++                $(top_srcdir)/rebootbackend/tla_trace.cpp \
+                 test_main.cpp
+diff --git a/src/sonic-sysmgr/tests/test_main.cpp b/src/sonic-sysmgr/tests/test_main.cpp
+index a1a9f85..a417f1d 100644
+--- a/src/sonic-sysmgr/tests/test_main.cpp
++++ b/src/sonic-sysmgr/tests/test_main.cpp
+@@ -1,7 +1,14 @@
+
++#include <cstdlib>
++
++#include "dbconnector.h"
+ #include "gtest/gtest.h"
+
+ int main(int argc, char* argv[]) {
++  const char* database_config = std::getenv("SPECULA_DATABASE_CONFIG");
++  if (database_config != nullptr && database_config[0] != '\0') {
++    swss::SonicDBConfig::initialize(database_config);
++  }
+   testing::InitGoogleTest(&argc, argv);
+   return RUN_ALL_TESTS();
+ }

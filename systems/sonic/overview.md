@@ -4,11 +4,17 @@
 
 Specula analyzed and tested SONiC's DPU active-standby HA manager, FDB and bridge-port orchestration, ICCP and MCLAG synchronization, Dual-ToR mux control, and warm-reboot orchestration, including failover, MAC and FDB learning and aging, peer-state synchronization, mux transitions, and multi-component state restoration.
 
-The August 2026 additions are backed by the reviewed [DASH HA run](modules/dash-ha/runs/sonic-dash-ha-vm-codex-gpt56-sol-max-20260801/review/independent-review.md) and [ICCPD run](modules/iccpd/runs/sonic-iccpd-vm-codex-gpt56-sol-max-20260801/review/independent-review.md).
+The August 2026 additions are backed by the reviewed [DASH HA run](modules/dash-ha/runs/sonic-dash-ha-vm-codex-gpt56-sol-max-20260801/review/independent-review.md), [ICCPD run](modules/iccpd/runs/sonic-iccpd-vm-codex-gpt56-sol-max-20260801/review/independent-review.md), [warm reboot run](modules/warmreboot/runs/sonic-warmreboot-vm9-codex-gpt56-sol-high-20260803/review/independent-review.md), and the curated [`effort_EXP` ledger](modules/effort-exp/runs/sonic-effort-exp-codex-gpt56-sol-20260811/review/independent-review.md).
+
+## Reviewed `effort_EXP` ledger
+
+The reviewed `effort_EXP` batch contributes 52 recordable SONiC bugs across DASH HA, FDB, ICCPD, LinkMgrD, and warm reboot: 43 `New` bugs and 9 `Known` bugs, with 28 `Critical`, 21 `High`, and 3 `Medium` severity classifications.
+
+This ledger includes warm reboot `high/MC-2`: `sonic-package-manager install --enable` is treated as a supported management surface, and no current ordering or exclusion guard prevents it from interleaving with warm-restart finalization. Warm reboot `high/MC-5` remains deferred pending direct validation; findings classified as `MASKED`, `ENV_LIMITED`, `FALSE POSITIVE`, or `DROPPED` are excluded.
 
 ## Bugs
 
-Specula found 32 new bugs:
+The existing consolidated system summary currently lists 35 new bugs:
 
 - `DefaultRoute::Wait` satisfies the active-switch gate before the default route is confirmed healthy, allowing a premature transition to Active.
 - Active-Active mux control lacks a transition for `(LPWait, MuxError, LinkUp)`, leaving the state machine idle until another heartbeat arrives.
@@ -26,9 +32,12 @@ Specula found 32 new bugs:
 - Parent cleanup does not cascade deletion notifications from DPU and HA-set actors to their children, leaving stale actors that continue making HA decisions.
 - Syncd applies warm-reboot changes to the ASIC and Redis in separate non-atomic stages, while orchagent cannot observe failure and may declare reconciliation complete.
 - Warm-restart components reconcile independently without a global dependency barrier, allowing FDB restoration before VXLAN tunnels and causing a traffic blackhole.
+- Restarting `rebootbackend` during an accepted host reboot loses accepted-reboot ownership, exposing stale inactive gNOI status and allowing a false second success.
+- The warmboot finalizer snapshots extension reconcile files only once; a later warm-aware `install --enable` component can be omitted from the barrier while global warm finalization clears.
 - `warmRestartCheck()` can send `READY` before draining newly arrived ring-buffer events, and the shared ring indices and idle flag are non-atomic, allowing events to be lost across reboot.
 - Neighsyncd starts its five-second reconciliation timer before requesting the netlink dump, so a slow dump can delete valid but not-yet-replayed neighbors as stale.
 - A failure after syncd's destructive warm-reboot stage has no automatic cold-restart fallback, leaving orchagent in a restart loop until manual recovery.
+- An interrupted `docker cp` backup can publish a non-empty partial Redis `dump.rdb` that restore gates accept, causing Redis/database startup failure until cleanup or cold recovery.
 - A crash after a durable NPU delete but before the queued DPU delete loses the downstream deletion, leaving the DPU HA scope active after restart.
 - `DesiredHaState::Unspecified` is enforced as standby on the DPU but persisted as unspecified in `STATE_DB`, exposing inconsistent controller state.
 - ICCPD increments its descriptor count for every new socket but never decrements it on disconnect, causing unbounded per-loop stack allocation across reconnects.
@@ -43,7 +52,7 @@ Specula found 32 new bugs:
 - A crash after peer socket teardown but before disconnect cleanup can permanently skip failover cleanup, leaving State DB and the CLI reporting the dead peer as up.
 - Partial ICCP frames and unsupported APP traffic can block protocol progress in the single scheduler, while mclagsyncd EOF can leave a stale descriptor that suppresses reconnect.
 
-Specula also found 9 previously known bugs:
+The existing consolidated system summary also lists 9 previously known bugs:
 
 - **Open:** Peer mux state is not reset across a link Down-to-Up transition, so initialization can treat stale pre-restart state as healthy (Issue #285).
 - **Open:** Local health recovery does not re-evaluate stale peer mux state, allowing asymmetric failure handling to leave both ToRs in Standby (Issues #143 and #285).

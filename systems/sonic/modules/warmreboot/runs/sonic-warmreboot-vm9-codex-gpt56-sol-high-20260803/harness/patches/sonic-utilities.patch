@@ -1,0 +1,61 @@
+diff --git a/scripts/fast-reboot b/scripts/fast-reboot
+index d949003..085a0d7 100755
+--- a/scripts/fast-reboot
++++ b/scripts/fast-reboot
+@@ -36,3 +36,5 @@ UIMAGE_HDR_SIZE=64
+ REQUIRE_TEAMD_RETRY_COUNT=no
+ 
++[[ -n "${SPECULA_TRACE_SH:-}" ]] && . "${SPECULA_TRACE_SH}"
++
+ EXIT_SUCCESS=0
+@@ -893,6 +895,26 @@ function check_warm_restart_in_progress() {
+     done
+ }
+ 
++function specula_fast_reboot_begin() {
++    local namespaces="["
++    local separator=""
++    local dev
++    for dev in "${ASIC_LIST[@]}"; do
++        namespaces="${namespaces}${separator}\"asic${dev}\""
++        separator=","
++    done
++    namespaces="${namespaces}]"
++    specula_trace_event "FastRebootBegin" "fast-reboot" "" "" \
++        "request_digest=${SPECULA_REQUEST_DIGEST:-warm-reboot-request}" \
++        "reboot_type=${REBOOT_TYPE}" "namespace_list=${namespaces}"
++}
++
+ function enable_warm_restart() {
+     config warm_restart enable -n "$NETNS" system
++    local rc=$?
++    local asic=${NETNS:-asic0}
++    specula_trace_event "EnableWarmRestart" "fast-reboot" "$asic" "" \
++        "namespace=${asic}" "command=config warm_restart enable" \
++        "exit_code=${rc}" "resulting_enable=true"
++    return "$rc"
+ }
+@@ -919,4 +945,8 @@ function check_conflict_boot_in_fw_update() {
+     fi
+ }
+ 
++if [[ "${SPECULA_LIBRARY_ONLY:-0}" == "1" ]]; then
++    return 0 2>/dev/null || exit 0
++fi
++
+ # main starts here
+@@ -971,3 +1002,4 @@ BOOT_TYPE_ARG="cold"
+ case "$REBOOT_TYPE" in
+     "fast-reboot")
++        specula_fast_reboot_begin
+         check_warm_restart_in_progress
+@@ -978,3 +1010,4 @@ case "$REBOOT_TYPE" in
+         ;;
+     "warm-reboot")
++        specula_fast_reboot_begin
+         execute_in_namespaces all check_warm_restart_in_progress
+@@ -992,3 +1025,4 @@ case "$REBOOT_TYPE" in
+         ;;
+     "express-reboot")
++        specula_fast_reboot_begin
+         check_warm_restart_in_progress

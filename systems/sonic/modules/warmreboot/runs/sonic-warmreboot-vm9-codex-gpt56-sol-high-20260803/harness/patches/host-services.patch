@@ -1,0 +1,64 @@
+diff --git a/host_modules/reboot.py b/host_modules/reboot.py
+index 39f58d2..f05d8c1 100644
+--- a/host_modules/reboot.py
++++ b/host_modules/reboot.py
+@@ -12,2 +12,3 @@ from utils.run_cmd import _run_command
+ from enum import Enum
+ from sonic_py_common import device_info
++from specula_trace import emit as specula_trace_emit
+@@ -156,4 +157,9 @@ class Reboot(host_service.HostModule):
+ 
+         rc, stdout, stderr = _run_command(command)
+         if rc:
++            specula_trace_emit("HostComplete", "host-service", {
++                "request_digest": str(hash(str(reboot_method))),
++                "host_status": "complete", "command_exit": rc,
++                "command_result": str(stderr),
++            })
+             self.populate_reboot_status_flag(False, int (time.time()), "Failed to execute reboot command", reboot_method, RebootStatus.STATUS_FAILURE)
+@@ -193,4 +202,9 @@ class Reboot(host_service.HostModule):
+         else:
+             time.sleep(REBOOT_TIMEOUT)
+             # Conclude that the reboot has failed if we reach this point
++            specula_trace_emit("HostComplete", "host-service", {
++                "request_digest": str(hash(str(reboot_method))),
++                "host_status": "complete", "command_exit": 0,
++                "command_result": "reboot process survived timeout",
++            })
+             self.populate_reboot_status_flag(False, int(time.time()), "Reboot command failed to execute", reboot_method, RebootStatus.STATUS_FAILURE)
+@@ -211,4 +225,9 @@ class Reboot(host_service.HostModule):
+         self.lock.release()
+         # Return without issuing the reboot if the previous reboot is ongoing
+         if is_reboot_ongoing:
++            specula_trace_emit("HostServiceIssueRebootReject", "host-service", {
++                "request_digest": str(hash(options[0])), "host_pending": True,
++                "host_status": "accepted", "application_status": 1,
++                "retString": "Previous reboot is ongoing",
++            })
+             return 1, "Previous reboot is ongoing"
+@@ -229,3 +249,8 @@ class Reboot(host_service.HostModule):
+         err, errstr = self.validate_reboot_request(reboot_request)
+         if err:
++            specula_trace_emit("HostServiceIssueRebootReject", "host-service", {
++                "request_digest": str(hash(options[0])), "host_pending": False,
++                "host_status": "rejected", "application_status": err,
++                "retString": errstr,
++            })
+             return err, errstr
+@@ -238,6 +264,15 @@ class Reboot(host_service.HostModule):
+         try:
+             t = threading.Thread(target=self.execute_reboot, args=(reboot_request["method"],))
+             t.start()
+         except RuntimeError as error:
++            specula_trace_emit("HostServiceIssueRebootReject", "host-service", {
++                "request_digest": str(hash(options[0])), "host_pending": False,
++                "host_status": "rejected", "application_status": 1,
++                "retString": str(error),
++            })
+             return 1, "Failed to start thread to execute reboot with error: " + str(error)
++        specula_trace_emit("HostServiceIssueRebootAccept", "host-service", {
++            "request_digest": str(hash(options[0])), "host_pending": True,
++            "host_status": "accepted", "dbus_return_status": 0,
++        })
+         return 0, "Successfully issued reboot"
+

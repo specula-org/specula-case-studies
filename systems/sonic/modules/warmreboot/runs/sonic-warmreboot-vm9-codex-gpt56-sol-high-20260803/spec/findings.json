@@ -1,0 +1,90 @@
+{
+  "schema_version": "2",
+  "system": "SONiC Warm Reboot",
+  "generated_by": "validation-workflow",
+  "findings": [
+    {
+      "id": "MC-1",
+      "title": "Backend Restart Loses Accepted-Reboot Ownership",
+      "source": "model-checking",
+      "scenario": "1 — backend restart during an accepted reboot",
+      "severity": "High",
+      "invariant": "OwnershipRecovery",
+      "config": "MC_hunt_scenario1.cfg",
+      "counterexample": "spec/output/MC_hunt_scenario1_bfs.out",
+      "affected_code": [
+        "src/sonic-sysmgr/rebootbackend/rebootbe.h:48",
+        "src/sonic-sysmgr/rebootbackend/rebootbe.cpp:26",
+        "src/sonic-sysmgr/rebootbackend/rebootbe.cpp:44",
+        "src/sonic-host-services/host_modules/reboot.py:74"
+      ],
+      "summary": "The backend acknowledges a reboot that remains pending in the host workflow, then loses its process-local ownership when the backend restarts. RebootManager initializes to IDLE and startup does not reconcile the host's separately maintained status. The restarted control plane can therefore appear idle and admit conflicting work while the accepted reboot is still outstanding. Persisted operation identity and startup reconciliation are required."
+    },
+    {
+      "id": "MC-2",
+      "title": "Late Warm Component Is Omitted from Finalization Barrier",
+      "source": "model-checking",
+      "scenario": "2 — component registration after the finalizer's startup snapshot",
+      "severity": "High",
+      "invariant": "NoPrematureFinalization",
+      "config": "MC_hunt_scenario2.cfg",
+      "counterexample": "spec/output/MC_hunt_scenario2_bfs.out",
+      "affected_code": [
+        "files/image_config/warmboot-finalizer/finalize-warmboot.sh:25",
+        "files/image_config/warmboot-finalizer/finalize-warmboot.sh:93",
+        "files/image_config/warmboot-finalizer/finalize-warmboot.sh:313",
+        "files/image_config/warmboot-finalizer/finalize-warmboot.sh:334"
+      ],
+      "summary": "The finalizer snapshots reconciliation files only once at startup and all namespace workers wait on that static component set. A warm-sensitive component that registers after discovery is invisible to the barrier. After the workers exit, global finalization proceeds even though the late component has not restored the current epoch. Registration must be frozen or versioned and global completion must cover the stable generation."
+    },
+    {
+      "id": "MC-3",
+      "title": "Configuration Update Can Cross the Consumer Freeze Boundary",
+      "source": "model-checking",
+      "scenario": "3 — producer update races with orchagent freeze",
+      "severity": "High",
+      "invariant": "CausalFreeze",
+      "config": "MC_hunt_scenario3.cfg",
+      "counterexample": "spec/output/MC_hunt_scenario3_bfs.out",
+      "affected_code": [
+        "src/sonic-utilities/scripts/fast-reboot:1159",
+        "src/sonic-utilities/scripts/fast-reboot:1183",
+        "src/sonic-utilities/scripts/fast-reboot:1235"
+      ],
+      "summary": "The shutdown sequence pauses orchagent before stopping configuration producers and has no generation-based drain barrier. A producer can emit an update after the consumer has crossed its freeze point, leaving a causally prior change outside the preserved state. The force path can also bypass the restart check. Producers should be fenced and propagation drained before the consumer freeze is acknowledged."
+    },
+    {
+      "id": "MC-4",
+      "title": "Failed Snapshot Copy Leaves a Restorable Artifact",
+      "source": "model-checking",
+      "scenario": "4 — snapshot copy fails after destructive pruning",
+      "severity": "High",
+      "invariant": "SnapshotSafety",
+      "config": "MC_hunt_scenario4.cfg",
+      "counterexample": "spec/output/MC_hunt_scenario4_bfs.out",
+      "affected_code": [
+        "src/sonic-utilities/scripts/fast-reboot:470",
+        "src/sonic-utilities/scripts/fast-reboot:503",
+        "files/build_templates/docker_image_ctl.j2:107"
+      ],
+      "summary": "The backup path destructively prunes Redis and copies dump.rdb directly into the warm-restore location without atomic publication or integrity validation. The restore path considers file existence sufficient, so an interrupted copy can leave an old or partial artifact that is treated as valid. Snapshot creation should use a temporary path, verified epoch-bound manifest, and atomic rename. Restoration should require that validation metadata rather than mere existence."
+    },
+    {
+      "id": "MC-5",
+      "title": "Transient D-Bus Failure Is Classified as Definitive",
+      "source": "model-checking",
+      "scenario": "5 — transport loss while dispatching the host reboot request",
+      "severity": "Medium",
+      "invariant": "FailureClassification",
+      "config": "MC_hunt_scenario5.cfg",
+      "counterexample": "spec/output/MC_hunt_scenario5_bfs.out",
+      "affected_code": [
+        "src/sonic-sysmgr/rebootbackend/interfaces.cpp:35",
+        "src/sonic-sysmgr/rebootbackend/interfaces.cpp:43",
+        "src/sonic-sysmgr/rebootbackend/reboot_thread.cpp:169",
+        "src/sonic-sysmgr/rebootbackend/reboot_thread.cpp:357"
+      ],
+      "summary": "The D-Bus wrapper collapses a transport exception and an authoritative nonzero host response into DBUS_FAIL. The reboot thread classifies every such value as non-retry despite having a retriable-failure protocol path. Callers therefore cannot safely distinguish transient uncertainty from definitive rejection. Separate result types and idempotent status reconciliation are needed."
+    }
+  ]
+}

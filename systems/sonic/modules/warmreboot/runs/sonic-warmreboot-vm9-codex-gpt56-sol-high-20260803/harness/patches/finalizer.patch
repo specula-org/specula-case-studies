@@ -1,0 +1,80 @@
+diff --git a/files/image_config/warmboot-finalizer/finalize-warmboot.sh b/files/image_config/warmboot-finalizer/finalize-warmboot.sh
+index a3844b7..40a481a 100755
+--- a/files/image_config/warmboot-finalizer/finalize-warmboot.sh
++++ b/files/image_config/warmboot-finalizer/finalize-warmboot.sh
+@@ -2,4 +2,6 @@
+ 
+ VERBOSE=${VERBOSE:-no}
+ 
++[[ -n "${SPECULA_TRACE_SH:-}" ]] && . "${SPECULA_TRACE_SH}"
++
+ # read SONiC immutable variables
+@@ -97,4 +99,14 @@ function get_component_list()
+         status=$(sonic-db-cli CONFIG_DB HGET "FEATURE|${service}" state)
+         if [[ x"${status}" == x"enabled" || x"${status}" == x"always_enabled" ]]; then
+             COMPONENT_LIST="${COMPONENT_LIST} ${components}"
++            if [[ "${DEV:-0}" == "0" ]]; then
++                local component
++                for component in ${components}; do
++                    if specula_trace_component_selected "$component"; then
++                        specula_trace_event "RegisterWarmComponent" "warmboot-finalizer" "" "$component" \
++                            "component=${component}" "service=${service}" \
++                            "scope=$([[ -n "${NETNS:-}" ]] && echo namespace || echo global)"
++                    fi
++                done
++            fi
+         fi
+@@ -146,6 +159,12 @@ function check_list()
+     RET_LIST=''
+     for comp in $@; do
+         state=`get_component_state ${comp}`
+-        if [[ x"${state}" != x"${EXP_STATE}" ]]; then
++        if [[ x"${state}" == x"${EXP_STATE}" ]]; then
++            if [[ "${DEV:-0}" == "0" ]] && specula_trace_component_selected "$comp"; then
++                specula_trace_event "WarmComponentReconciled" "warmboot-finalizer" "" "$comp" \
++                    "component=${comp}" "namespace=${NETNS:-global}" \
++                    "raw_value=${state}" "read_result=success"
++            fi
++        else
+             RET_LIST="${RET_LIST} ${comp}"
+         fi
+@@ -253,5 +277,16 @@ function wait_for_components_to_reconcile() {
+         sleep 5
+     done
+ 
+-    if [[ -n "${list}" ]]; then
++    if [[ -n "${list}" ]]; then
++        if [[ "${DEV:-0}" == "0" ]]; then
++            if [[ -n "${SPECULA_TIMEOUT_AS_READY_COMPONENT:-}" ]]; then
++                specula_trace_event "FinalizerTimeoutAsReady" "warmboot-finalizer" "" \
++                    "${SPECULA_TIMEOUT_AS_READY_COMPONENT}" \
++                    "component=${SPECULA_TIMEOUT_AS_READY_COMPONENT}" \
++                    "namespace=${NETNS:-global}" "marker=timeout" "raw_value=${list}"
++            fi
++            specula_trace_event "FinalizerDeadline" "warmboot-finalizer" "" "" \
++                "incomplete_components=${list}" "namespace=${NETNS:-global}" \
++                "iteration_count=60"
++        fi
+         debug "Some components didn't finish reconcile: ${list} ..."
+@@ -285,3 +323,6 @@ for dev in `seq 0 $((NUM_ASIC - 1))`; do
+         if [[ -n $NETNS ]]; then
+             finalize_boot
++            specula_trace_event "FinalizeNamespace" "warmboot-finalizer" "$NETNS" "" \
++                "namespace=${NETNS}" "prior_warm_flag=true" \
++                "new_warm_flag=false" "command_exit=0"
+         fi
+@@ -299,3 +342,5 @@ done
+ wait
+ 
+ finalize_global
++specula_trace_event "FinalizeGlobal" "warmboot-finalizer" "" "" \
++    "child_results=success" "prior_global_flag=true" "new_global_flag=false"
+@@ -307,3 +356,8 @@ fi
+ # Save DB after stopped control plane assistant to avoid extra entries
+ debug "Save in-memory database after warm/fast reboot ..."
+ config save -y
++save_rc=$?
++specula_trace_event "SaveDatabase" "warmboot-finalizer" "" "" \
++    "exit_code=${save_rc}" "saved_boot_id=${SPECULA_BOOT_ID:-test-boot}" \
++    "config_checksum=${SPECULA_CONFIG_CHECKSUM:-test-config}"
++exit "$save_rc"
