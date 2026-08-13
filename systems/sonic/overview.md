@@ -4,7 +4,7 @@
 
 Specula analyzed and tested SONiC's DPU active-standby HA manager, FDB and bridge-port orchestration, ICCP and MCLAG synchronization, Dual-ToR mux control, and warm-reboot orchestration, including failover, MAC and FDB learning and aging, peer-state synchronization, mux transitions, and multi-component state restoration.
 
-The August 2026 additions are backed by the reviewed [DASH HA run](modules/dash-ha/runs/sonic-dash-ha-vm-codex-gpt56-sol-max-20260801/review/independent-review.md), [ICCPD run](modules/iccpd/runs/sonic-iccpd-vm-codex-gpt56-sol-max-20260801/review/independent-review.md), [warm reboot run](modules/warmreboot/runs/sonic-warmreboot-vm9-codex-gpt56-sol-high-20260803/review/independent-review.md), and the curated [`effort_EXP` ledger](modules/effort-exp/runs/sonic-effort-exp-codex-gpt56-sol-20260811/review/independent-review.md).
+The August 2026 additions are backed by the reviewed [DASH HA run](modules/dash-ha/runs/sonic-dash-ha-vm-codex-gpt56-sol-max-20260801/review/independent-review.md), [ICCPD run](modules/iccpd/runs/sonic-iccpd-vm-codex-gpt56-sol-max-20260801/review/independent-review.md), [warm reboot run](modules/warmreboot/runs/sonic-warmreboot-vm9-codex-gpt56-sol-high-20260803/review/independent-review.md), the curated [`effort_EXP` ledger](modules/effort-exp/runs/sonic-effort-exp-codex-gpt56-sol-20260811/review/independent-review.md), and the focused [LinkMgrD e2e guidance review](modules/linkmgrd/runs/sonic-linkmgrd-e2e-guidance-codex-gpt56-sol-xhigh-20260811/review/independent-review.md).
 
 ## Reviewed `effort_EXP` ledger
 
@@ -12,9 +12,15 @@ The reviewed `effort_EXP` batch contributes 52 recordable SONiC bugs across DASH
 
 This ledger includes warm reboot `high/MC-2`: `sonic-package-manager install --enable` is treated as a supported management surface, and no current ordering or exclusion guard prevents it from interleaving with warm-restart finalization. Warm reboot `high/MC-5` remains deferred pending direct validation; findings classified as `MASKED`, `ENV_LIMITED`, `FALSE POSITIVE`, or `DROPPED` are excluded.
 
+## Focused LinkMgrD e2e guidance review
+
+Four focused LinkMgrD e2e guidance replicas ran against `sonic-net/sonic-linkmgrd` snapshot `298adcd23a95eae918ab53c9697527e5c53a8cf8`. The raw Phase 4 reports contain 35 disposition entries; after deduplication against the existing SONiC records, 8 additional reproduced `New` LinkMgrD bugs are promoted: 3 `Critical`, 4 `High`, and 1 `Medium`.
+
+The raw outputs remain in `/home/ubuntu/specula-linkmgrd-e2e-runner-20260810/runs`; the curated case-study record is [modules/linkmgrd/runs/sonic-linkmgrd-e2e-guidance-codex-gpt56-sol-xhigh-20260811](modules/linkmgrd/runs/sonic-linkmgrd-e2e-guidance-codex-gpt56-sol-xhigh-20260811/README.md).
+
 ## Bugs
 
-The existing consolidated system summary currently lists 35 new bugs:
+The consolidated system summary below lists 43 new-bug summaries: the existing 35 plus 8 focused LinkMgrD e2e additions.
 
 - `DefaultRoute::Wait` satisfies the active-switch gate before the default route is confirmed healthy, allowing a premature transition to Active.
 - Active-Active mux control lacks a transition for `(LPWait, MuxError, LinkUp)`, leaving the state machine idle until another heartbeat arrives.
@@ -45,6 +51,14 @@ The existing consolidated system summary currently lists 35 new bugs:
 - Active-Active initialization can publish Healthy before receiving current hardware-session Up evidence and can consequently authorize a peer Standby command.
 - An untagged delayed mux-probe response can overwrite a newer completed intent and temporarily publish an Unhealthy state.
 - Canceling a hardware positive-probing timer still runs its callback because the error code is discarded, allowing it to publish Active after the link goes Down.
+- A queued pre-init active-active mux-mode callback can replay an obsolete forced mode after a newer Auto configuration is accepted, emitting a stale APP_DB mux command.
+- An old mux-wait acknowledgement or canceled wait callback can clear the current wait epoch and permit peer-probe or forwarding-state work while a newer transition is still outstanding.
+- Cached default-route state is not replayed to late-created active-active ports, so mux and heartbeat behavior can remain stale until a fresh route notification arrives.
+- Active-standby default-route loss can leave a route-ineligible local ToR forwarding Active with no local Standby command.
+- Active-standby handoff can demote the sender on send completion before peer takeover is established, so loss of the takeover packet can leave both ToRs Standby.
+- A delayed legitimate `COMMAND_SWITCH_ACTIVE` TLV can be accepted after the sender returns Active, creating persistent dual-active forwarding.
+- Valid software-cookie peer packets in the hardware prober path can publish `PeerActive` while the peer type remains `UNKNOWN`.
+- Active-standby `Active/Error/Up` reached through a mux-error event can skip recovery because the handler requires a link-prober state change, leaving the port Unhealthy until another event.
 - Logical HA scope state can redirect traffic before the matching ASIC acknowledgement, installing a vDPU route while the hardware role is still dead.
 - A delayed old peer-state request can regress an already accepted HA term and persist the older term to DPU_APPL_DB.
 - A delayed former-peer message can contaminate a newly paired HA scope and trigger a vote using foreign state.
