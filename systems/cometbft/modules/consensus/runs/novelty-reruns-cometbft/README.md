@@ -18,3 +18,7 @@ Generated provenance and file dispositions are stored under `.record/`.
 
 - `multiple_observed_model_versions`
 - `run_id_is_provisional`
+
+## Public reproducer
+
+- `repro/hrs-watermark-rollback/`: CometBFT FilePV HRS-watermark durability gap and deterministic rollback-consequence reproducer. It drives the real `FilePV.SignVote` path, confirms the atomic rename has no parent-directory sync, and shows that rolling the state file back lets the same validator key sign conflicting votes at the same height/round/step.
