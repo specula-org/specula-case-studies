@@ -23,7 +23,8 @@ Specula found 31 new bugs:
 - Measurement-summary hash sizing ignores `MEL_CAP` when `MEAS_CAP` is absent, preventing a MEL-only responder from binding its log into signed authentication responses.
 - **Approved:** Algorithm negotiation writes selections into connection state before validation and does not roll them back on error, contaminating a retry with failed-attempt values.
 - Algorithm negotiation sets a nonzero base asymmetric algorithm even when no enabled capability requires one, producing an incoherent negotiated state.
-- Challenge handling marks the connection authenticated before encapsulated authentication finishes and does not roll the state back if that flow fails.
+- **Not-a-bug:** Challenge handling marks the connection authenticated before encapsulated authentication finishes and does not roll the state back if that flow fails. See
+  https://github.com/DMTF/libspdm/issues/3059 for discussion on why this is not a bug.
 - **Specification Issue:** MEL exchanges are absent from the signed transcript and carry no signature, nonce, or requester context, leaving a consumed log unbound to the responder or session.
 - `mel_spec` validation is skipped for measurement-only profiles without key-exchange or PSK capability, allowing an unrecognized wire value into negotiated state.
 - An out-of-sequence `CHUNK_SEND_ACK` records an error but still copies the chunk into the reassembly buffer before returning it.
