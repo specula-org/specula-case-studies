@@ -1,0 +1,41 @@
+{
+  "schema_version": "2",
+  "system": "solr-operator-broad-interaction",
+  "generated_by": "scoped gpt-5.5 retry from solr-broad-prompt-v2-20260824b",
+  "findings": [
+    {
+      "id": "MC-1",
+      "title": "Managed update can remove the only leader-eligible replica while PULL remains active",
+      "source": "model-checking",
+      "scenario": "S1 managed update and typed replicas",
+      "severity": "High",
+      "invariant": "WriteAvailabilityBudget",
+      "config": "MC_hunt_s1_managed_update.cfg",
+      "counterexample": "spec/output/MC_hunt_s1_managed_update_bfs.out",
+      "affected_code": [
+        "controllers/util/solr_update_util.go:214",
+        "controllers/util/solr_update_util.go:407",
+        "controllers/solr_pod_lifecycle_util.go:51"
+      ],
+      "summary": "Managed-update selection aggregates replica availability by count and drops the parsed NRT/TLOG/PULL type. A normal pod-template update can therefore select and mark unready the pod holding the only NRT leader while an active PULL replica remains. PULL cannot lead writes, so the shard loses write availability despite the configured unavailable-replica budget.",
+      "dedup_note": "also covers code-review Scenario 1 (same replica-count versus leader-eligibility mechanism)"
+    },
+    {
+      "id": "MC-5",
+      "title": "Failed second Secret create can produce Ready Solr without requested BasicAuth",
+      "source": "model-checking",
+      "scenario": "S4 BasicAuth bootstrap pipeline",
+      "severity": "High",
+      "invariant": "ReadyBasicAuthIsInstalled",
+      "config": "MC_hunt_s4_basic_auth.cfg",
+      "counterexample": "spec/output/MC_hunt_s4_basic_auth_bfs.out",
+      "affected_code": [
+        "controllers/util/solr_security_util.go:99",
+        "controllers/util/solr_util.go:1305",
+        "controllers/solrcloud_controller.go:842"
+      ],
+      "summary": "Generated BasicAuth uses two separate Secret creates. If credentials creation succeeds and bootstrap-Secret creation fails, retry sees the credentials Secret and tolerates the missing bootstrap Secret, generating a pod template without setup-zk security installation. Kubernetes readiness can then make SolrCloud status Ready while ZooKeeper has no matching security.json, silently violating the requested application identity.",
+      "dedup_note": "also covers code-review Scenario 4 (same non-atomic BasicAuth bootstrap mechanism)"
+    }
+  ]
+}

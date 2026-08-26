@@ -1,0 +1,269 @@
+diff --git a/controllers/solr_pod_lifecycle_util.go b/controllers/solr_pod_lifecycle_util.go
+index 9815dbd..63bfeac 100644
+--- a/controllers/solr_pod_lifecycle_util.go
++++ b/controllers/solr_pod_lifecycle_util.go
+@@ -21,6 +21,7 @@ import (
+ 	"context"
+ 	solrv1beta1 "github.com/apache/solr-operator/api/v1beta1"
+ 	"github.com/apache/solr-operator/controllers/util"
++	"github.com/apache/solr-operator/internal/speculatrace"
+ 	"github.com/go-logr/logr"
+ 	corev1 "k8s.io/api/core/v1"
+ 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+@@ -122,6 +123,9 @@ func DeletePodForUpdate(ctx context.Context, r *SolrCloudReconciler, instance *s
+ 			r.Recorder.Eventf(instance, corev1.EventTypeNormal, "PodUpdate",
+ 				"Deleting pod %s so that it can be recreated with the updated SolrCloud specification", pod.Name)
+ 		}
++		if err == nil || apierrors.IsNotFound(err) {
++			_ = speculatrace.Record("DeletePodForUpdate", speculatrace.Args{Pod: speculatrace.UpdatePod})
++		}
+ 	}
+ 
+ 	return
+@@ -152,6 +156,9 @@ func EnsurePodReadinessConditions(ctx context.Context, r *SolrCloudReconciler, i
+ 			r.Recorder.Eventf(instance, corev1.EventTypeWarning, "PodReadinessConditionUpdateFailed",
+ 				"Could not patch readiness condition(s) on pod %s to stop traffic: %v", pod.Name, err)
+ 		}
++		if err == nil {
++			_ = speculatrace.Record("EnsurePodReadinessConditions", speculatrace.Args{Pod: speculatrace.UpdatePod})
++		}
+ 	} else {
+ 		updatedPod = pod
+ 	}
+diff --git a/controllers/solrbackup_controller.go b/controllers/solrbackup_controller.go
+index 7d9c244..5e74938 100644
+--- a/controllers/solrbackup_controller.go
++++ b/controllers/solrbackup_controller.go
+@@ -28,6 +28,7 @@ import (
+ 	"time"
+ 
+ 	"github.com/apache/solr-operator/controllers/util"
++	"github.com/apache/solr-operator/internal/speculatrace"
+ 	"github.com/go-logr/logr"
+ 	corev1 "k8s.io/api/core/v1"
+ 	"k8s.io/apimachinery/pkg/api/errors"
+@@ -297,6 +298,9 @@ func reconcileSolrCollectionBackup(ctx context.Context, backup *solrv1beta1.Solr
+ 			collectionBackupStatus.StartTime = &now
+ 		}
+ 		collectionBackupStatus.BackupName = util.FullCollectionBackupName(collection, backup.Name)
++		if started {
++			_ = speculatrace.Record("ReconcileSolrCollectionBackupSubmit", speculatrace.Args{Collection: collection})
++		}
+ 	} else if collectionBackupStatus.InProgress {
+ 		var successful bool
+ 		var asyncStatus string
+@@ -315,6 +319,7 @@ func reconcileSolrCollectionBackup(ctx context.Context, backup *solrv1beta1.Solr
+ 			if collectionBackupStatus.FinishTime == nil {
+ 				collectionBackupStatus.FinishTime = &now
+ 			}
++			_ = speculatrace.Record("CheckAsyncRequestCompleted", speculatrace.Args{Collection: collection})
+ 
+ 			err = util.DeleteAsyncInfoForBackup(ctx, solrCloud, collection, backup.Name, logger)
+ 		} else {
+diff --git a/controllers/util/backup_util.go b/controllers/util/backup_util.go
+index ca4056e..3c77945 100644
+--- a/controllers/util/backup_util.go
++++ b/controllers/util/backup_util.go
+@@ -23,6 +23,7 @@ import (
+ 	"fmt"
+ 	solr "github.com/apache/solr-operator/api/v1beta1"
+ 	"github.com/apache/solr-operator/controllers/util/solr_api"
++	"github.com/apache/solr-operator/internal/speculatrace"
+ 	"github.com/go-logr/logr"
+ 	"github.com/robfig/cron/v3"
+ 	corev1 "k8s.io/api/core/v1"
+@@ -72,6 +73,7 @@ func UpdateStatusOfCollectionBackups(backupStatus *solr.IndividualSolrBackupStat
+ 	if allFinished && backupStatus.Successful == nil {
+ 		backupStatus.Successful = &allSuccessful
+ 	}
++	_ = speculatrace.Record("UpdateStatusOfCollectionBackups", speculatrace.Args{})
+ 	return
+ }
+ 
+@@ -124,6 +126,9 @@ func CheckBackupForCollection(ctx context.Context, cloud *solr.SolrCloud, collec
+ 			finished = true
+ 			success = false
+ 		}
++		if asyncStatus == "notfound" {
++			_ = speculatrace.Record("CheckAsyncRequestNotFound", speculatrace.Args{Collection: collection})
++		}
+ 	} else {
+ 		logger.Error(err, "Error checking on collection backup", "solrCloud", cloud.Name, "collection", collection, "message", message)
+ 	}
+@@ -138,6 +143,9 @@ func DeleteAsyncInfoForBackup(ctx context.Context, cloud *solr.SolrCloud, collec
+ 	if err != nil {
+ 		logger.Error(err, "Error deleting async data for collection backup", "solrCloud", cloud.Name, "collection", collection)
+ 	}
++	if err == nil {
++		_ = speculatrace.Record("DeleteAsyncRequestForBackup", speculatrace.Args{Collection: collection})
++	}
+ 
+ 	return err
+ }
+@@ -207,6 +215,9 @@ func ScheduleNextBackup(restartSchedule string, lastBackupTime time.Time) (nextB
+ 	} else {
+ 		nextBackup = parsedSchedule.Next(lastBackupTime)
+ 	}
++	if err == nil {
++		_ = speculatrace.Record("ScheduleNextBackup", speculatrace.Args{})
++	}
+ 	return
+ }
+ 
+@@ -219,5 +230,8 @@ func ListAllSolrCollections(ctx context.Context, cloud *solr.SolrCloud, logger l
+ 	if _, apiErr := solr_api.CheckForCollectionsApiError("LIST", resp.ResponseHeader, resp.Error); apiErr != nil {
+ 		err = apiErr
+ 	}
++	if err == nil {
++		_ = speculatrace.Record("ListAllSolrCollections", speculatrace.Args{})
++	}
+ 	return resp.Collections, err
+ }
+diff --git a/controllers/util/solr_scale_util.go b/controllers/util/solr_scale_util.go
+index e10c6da..3aa1e6b 100644
+--- a/controllers/util/solr_scale_util.go
++++ b/controllers/util/solr_scale_util.go
+@@ -21,6 +21,7 @@ import (
+ 	"context"
+ 	solr "github.com/apache/solr-operator/api/v1beta1"
+ 	"github.com/apache/solr-operator/controllers/util/solr_api"
++	"github.com/apache/solr-operator/internal/speculatrace"
+ 	"github.com/go-logr/logr"
+ 	appsv1 "k8s.io/api/apps/v1"
+ 	"time"
+@@ -43,8 +44,10 @@ func BalanceReplicasForCluster(ctx context.Context, solrCloud *solr.SolrCloud, s
+ 		// First check to see if the Async Balance request has started
+ 		if asyncState, message, asyncErr := solr_api.CheckAsyncRequest(ctx, solrCloud, requestId); asyncErr != nil {
+ 			err = asyncErr
++			_ = speculatrace.Record("BalanceReplicasForClusterCheckFailure", speculatrace.Args{})
+ 			logger.Error(err, "Error occurred while checking the status of the balance replicas task. Will try again.", "requestId", requestId)
+ 		} else if asyncState == "notfound" {
++			_ = speculatrace.Record("BalanceReplicasForClusterNotFound", speculatrace.Args{})
+ 			// Only start the balance command if all pods are ready
+ 			if *statefulSet.Spec.Replicas != statefulSet.Status.ReadyReplicas {
+ 				logger.Info("Cannot start balancing replicas until all pods are ready.", "pods", *statefulSet.Spec.Replicas, "readyPods", statefulSet.Status.ReadyReplicas)
+@@ -70,7 +73,9 @@ func BalanceReplicasForCluster(ctx context.Context, solrCloud *solr.SolrCloud, s
+ 				if !balanceComplete && err == nil {
+ 					logger.Info("Started balancing replicas across cluster.", "requestId", requestId)
+ 					requestInProgress = true
++					_ = speculatrace.Record("BalanceReplicasForClusterSubmitSuccess", speculatrace.Args{})
+ 				} else if err != nil {
++					_ = speculatrace.Record("BalanceReplicasForClusterSubmitFailure", speculatrace.Args{})
+ 					logger.Error(err, "Could not balance replicas across the cluster. Will try again.")
+ 				}
+ 			}
+@@ -94,6 +99,9 @@ func BalanceReplicasForCluster(ctx context.Context, solrCloud *solr.SolrCloud, s
+ 					balanceComplete = false
+ 					requestInProgress = true
+ 				}
++				if balanceComplete && err == nil {
++					_ = speculatrace.Record("BalanceReplicasForClusterCompleted", speculatrace.Args{})
++				}
+ 			}
+ 		}
+ 	}
+diff --git a/controllers/util/solr_security_util.go b/controllers/util/solr_security_util.go
+index 816d852..9f14afd 100644
+--- a/controllers/util/solr_security_util.go
++++ b/controllers/util/solr_security_util.go
+@@ -25,6 +25,7 @@ import (
+ 	"fmt"
+ 	solr "github.com/apache/solr-operator/api/v1beta1"
+ 	"github.com/apache/solr-operator/controllers/util/solr_api"
++	"github.com/apache/solr-operator/internal/speculatrace"
+ 	appsv1 "k8s.io/api/apps/v1"
+ 	corev1 "k8s.io/api/core/v1"
+ 	"k8s.io/apimachinery/pkg/api/errors"
+@@ -97,6 +98,7 @@ func reconcileForBasicAuthWithBootstrappedSecurityJson(ctx context.Context, clie
+ 	basicAuthSecret := &corev1.Secret{}
+ 	err := reader.Get(ctx, types.NamespacedName{Name: instance.BasicAuthSecretName(), Namespace: instance.Namespace}, basicAuthSecret)
+ 	if err != nil && errors.IsNotFound(err) {
++		_ = speculatrace.Record("ReconcileForBasicAuthLookupMissingSecret", speculatrace.Args{})
+ 		authSecret, bootstrapSecret := generateBasicAuthSecretWithBootstrap(instance)
+ 
+ 		// take ownership of these secrets since we created them
+@@ -110,10 +112,13 @@ func reconcileForBasicAuthWithBootstrappedSecurityJson(ctx context.Context, clie
+ 		if err != nil {
+ 			return nil, err
+ 		}
++		_ = speculatrace.Record("CreateBasicAuthSecret", speculatrace.Args{})
+ 		err = reader.Create(ctx, bootstrapSecret)
+ 		if err != nil {
++			_ = speculatrace.Record("FailBootstrapSecretCreate", speculatrace.Args{})
+ 			return nil, err
+ 		}
++		_ = speculatrace.Record("CreateBootstrapSecret", speculatrace.Args{})
+ 
+ 		// supply the bootstrap security.json to the initContainer via a simple BASE64 encoding env var
+ 		security.SecurityJson = string(bootstrapSecret.Data[SecurityJsonFile])
+@@ -143,6 +148,7 @@ func reconcileForBasicAuthWithBootstrappedSecurityJson(ctx context.Context, clie
+ 				SecretKeyRef: &corev1.SecretKeySelector{
+ 					LocalObjectReference: corev1.LocalObjectReference{Name: bootstrapSecret.Name}, Key: SecurityJsonFile}}
+ 		}
++		_ = speculatrace.Record("ReconcileForBasicAuthLookupExistingSecret", speculatrace.Args{})
+ 	}
+ 
+ 	return security, nil
+diff --git a/controllers/util/solr_update_util.go b/controllers/util/solr_update_util.go
+index 647ef13..f5613b8 100644
+--- a/controllers/util/solr_update_util.go
++++ b/controllers/util/solr_update_util.go
+@@ -22,6 +22,7 @@ import (
+ 	"fmt"
+ 	solr "github.com/apache/solr-operator/api/v1beta1"
+ 	"github.com/apache/solr-operator/controllers/util/solr_api"
++	"github.com/apache/solr-operator/internal/speculatrace"
+ 	"github.com/go-logr/logr"
+ 	"github.com/robfig/cron/v3"
+ 	appsv1 "k8s.io/api/apps/v1"
+@@ -141,6 +142,7 @@ func GetNodeReplicaState(ctx context.Context, cloud *solr.SolrCloud, statefulSet
+ 		}
+ 		if err == nil {
+ 			state = findSolrNodeContents(clusterResp.ClusterStatus, overseerResp.Leader, GetManagedSolrNodeNames(cloud, int(*statefulSet.Spec.Replicas)))
++			_ = speculatrace.Record("GetNodeReplicaState", speculatrace.Args{})
+ 		} else {
+ 			logger.Error(err, "Could not fetch cluster state information for cloud")
+ 		}
+@@ -189,6 +191,9 @@ func DeterminePodsSafeToUpdate(cloud *solr.SolrCloud, totalPods int, outOfDatePo
+ 		if len(podsToUpdate) == 0 && len(outOfDatePods.Running) > 0 {
+ 			retryLater = true
+ 		}
++		if len(podsToUpdate) > 0 {
++			_ = speculatrace.Record("DeterminePodsSafeToUpdate", speculatrace.Args{Pod: speculatrace.UpdatePod, Selected: true})
++		}
+ 	}
+ 	return podsToUpdate, retryLater
+ }
+diff --git a/controllers/util/solr_util.go b/controllers/util/solr_util.go
+index 33def13..4df3ca3 100644
+--- a/controllers/util/solr_util.go
++++ b/controllers/util/solr_util.go
+@@ -24,6 +24,7 @@ import (
+ 	"strings"
+ 
+ 	solr "github.com/apache/solr-operator/api/v1beta1"
++	"github.com/apache/solr-operator/internal/speculatrace"
+ 	appsv1 "k8s.io/api/apps/v1"
+ 	corev1 "k8s.io/api/core/v1"
+ 	netv1 "k8s.io/api/networking/v1"
+@@ -1317,7 +1318,7 @@ func generateZKInteractionInitContainer(solrCloud *solr.SolrCloud, solrCloudStat
+ 				MountPath: "/tmp",
+ 			},
+ 		}
+-		return true, corev1.Container{
++		container := corev1.Container{
+ 			Name:                     "setup-zk",
+ 			Image:                    solrCloud.Spec.SolrImage.ToImageName(),
+ 			ImagePullPolicy:          solrCloud.Spec.SolrImage.PullPolicy,
+@@ -1334,8 +1335,11 @@ func generateZKInteractionInitContainer(solrCloud *solr.SolrCloud, solrCloudStat
+ 			},
+ 			VolumeMounts: volumeMounts,
+ 		}
++		_ = speculatrace.Record("GenerateZKInteractionInitContainer", speculatrace.Args{})
++		return true, container
+ 	}
+ 
++	_ = speculatrace.Record("GenerateZKInteractionInitContainer", speculatrace.Args{})
+ 	return false, corev1.Container{}
+ }
+ 

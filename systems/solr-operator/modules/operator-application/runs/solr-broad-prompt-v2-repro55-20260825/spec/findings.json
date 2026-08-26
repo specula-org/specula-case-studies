@@ -1,0 +1,87 @@
+{
+  "schema_version": "2",
+  "system": "solr-operator-broad-interaction",
+  "generated_by": "validation-workflow",
+  "findings": [
+    {
+      "id": "MC-1",
+      "title": "Managed update can remove the only leader-eligible replica while PULL remains active",
+      "source": "model-checking",
+      "scenario": "S1 managed update and typed replicas",
+      "severity": "High",
+      "invariant": "WriteAvailabilityBudget",
+      "config": "MC_hunt_s1_managed_update.cfg",
+      "counterexample": "spec/output/MC_hunt_s1_managed_update_bfs.out",
+      "affected_code": [
+        "controllers/util/solr_update_util.go:214",
+        "controllers/util/solr_update_util.go:407",
+        "controllers/solr_pod_lifecycle_util.go:51"
+      ],
+      "summary": "Managed-update selection aggregates replica availability by count and drops the parsed NRT/TLOG/PULL type. A normal pod-template update can therefore select and mark unready the pod holding the only NRT leader while an active PULL replica remains. PULL cannot lead writes, so the shard loses write availability despite the configured unavailable-replica budget."
+    },
+    {
+      "id": "MC-2",
+      "title": "Dispatcher erases rolling-update and balance errors, abandoning the cluster-operation lock",
+      "source": "model-checking",
+      "scenario": "S2 durable cluster-operation obligations",
+      "severity": "Medium",
+      "invariant": "NonterminalOpHasFuture",
+      "config": "MC_hunt_s2_rolling_error.cfg",
+      "counterexample": "spec/output/MC_hunt_s2_rolling_error_bfs.out",
+      "affected_code": [
+        "controllers/solrcloud_controller.go:523",
+        "controllers/solr_cluster_ops_util.go:483",
+        "controllers/util/solr_scale_util.go:43"
+      ],
+      "summary": "Rolling cluster-state failure and BalanceReplicas status/submission failures return an error without a durable future event. The dispatcher clears that error before its timeout and queue policy can consume it, then leaves the nonterminal StatefulSet lock in place. With no task, requeue, queued operation, or watched mutation, the desired cluster operation can be abandoned permanently; open issue #707 covers the related scale-down manifestation but not these siblings."
+    },
+    {
+      "id": "MC-3",
+      "title": "Relisting can drop an already-submitted collection from backup polling",
+      "source": "model-checking",
+      "scenario": "S3 backup cohort and async evidence",
+      "severity": "Medium",
+      "invariant": "SubmittedBackupRemainsInCohort",
+      "config": "MC_hunt_s3_backup_cohort.cfg",
+      "counterexample": "spec/output/MC_hunt_s3_backup_cohort_bfs.out",
+      "affected_code": [
+        "controllers/solrbackup_controller.go:247",
+        "controllers/solrbackup_controller.go:273",
+        "controllers/util/backup_util.go:61"
+      ],
+      "summary": "With spec.collections omitted, the controller rebuilds the target set from LIST on every reconcile. If a collection is deleted after its BACKUP submission, the next LIST drops it from iteration even though its retained submitted status still participates in aggregate completion. The operator no longer polls that task, so the run and recurrence can be stranded."
+    },
+    {
+      "id": "MC-4",
+      "title": "DELETESTATUS destroys terminal evidence before SolrBackup status is durable",
+      "source": "model-checking",
+      "scenario": "S3 backup cohort and async evidence",
+      "severity": "Medium",
+      "invariant": "CleanupAfterDurableTerminal",
+      "config": "MC_hunt_s3_backup_cleanup.cfg",
+      "counterexample": "spec/output/MC_hunt_s3_backup_cleanup_bfs.out",
+      "affected_code": [
+        "controllers/solrbackup_controller.go:308",
+        "controllers/solrbackup_controller.go:179",
+        "controllers/util/backup_util.go:139"
+      ],
+      "summary": "After REQUESTSTATUS reports completion, the controller updates only its in-memory collection status and immediately calls DELETESTATUS. Solr's stored terminal response is erased before the later Kubernetes status patch makes success durable. A status conflict or controller loss can therefore discard the only terminal evidence and leave the next reconcile with notfound."
+    },
+    {
+      "id": "MC-5",
+      "title": "Failed second Secret create can produce Ready Solr without requested BasicAuth",
+      "source": "model-checking",
+      "scenario": "S4 BasicAuth bootstrap pipeline",
+      "severity": "High",
+      "invariant": "ReadyBasicAuthIsInstalled",
+      "config": "MC_hunt_s4_basic_auth.cfg",
+      "counterexample": "spec/output/MC_hunt_s4_basic_auth_bfs.out",
+      "affected_code": [
+        "controllers/util/solr_security_util.go:99",
+        "controllers/util/solr_util.go:1305",
+        "controllers/solrcloud_controller.go:842"
+      ],
+      "summary": "Generated BasicAuth uses two separate Secret creates. If credentials creation succeeds and bootstrap-Secret creation fails, retry sees the credentials Secret and tolerates the missing bootstrap Secret, generating a pod template without setup-zk security installation. Kubernetes readiness can then make SolrCloud status Ready while ZooKeeper has no matching security.json, silently violating the requested application identity."
+    }
+  ]
+}

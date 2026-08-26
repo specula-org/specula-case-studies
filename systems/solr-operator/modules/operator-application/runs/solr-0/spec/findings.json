@@ -1,0 +1,24 @@
+{
+  "schema_version": "2",
+  "system": "solr-operator-interaction",
+  "generated_by": "validation-workflow",
+  "findings": [
+    {
+      "id": "MC-1",
+      "title": "REPLACENODE issued during scale-down when < 2 nodes are live \u2192 opaque 400 \u2192 eviction livelock",
+      "source": "model-checking",
+      "scenario": "S4 (admin call issued before its Solr-side precondition holds; composes with S2 opaque-v1-error)",
+      "severity": "High",
+      "invariant": "PreconditionBeforeCall",
+      "config": "MC_hunt_s4.cfg",
+      "counterexample": "spec/output/MC_hunt_s4.out",
+      "affected_code": [
+        "controllers/util/solr_update_util.go:569",
+        "controllers/util/solr_update_util.go:580",
+        "controllers/util/solr_api/api.go:173",
+        "solr/core/src/java/org/apache/solr/cloud/api/collections/ReplaceNodeCmd.java:62"
+      ],
+      "summary": "During a scale-down of TargetNode, transient ZK session loss can reduce Solr's live_nodes to just the target itself while a still-lagged CLUSTERSTATUS shows the target holding replicas. The operator issues REPLACENODE (sourceNode=target) with only a podHasReplicas guard and no live-target check (solr_update_util.go:569-582). Solr's handler rejects it with HTTP 400 because getLiveNodes().size() <= 1 (ReplaceNodeCmd.java:62-67). The v1 client collapses every StatusCode>=400 into an opaque ServiceUnavailable, discarding the error body (api.go:173-176), so the operator cannot tell a semantic 400 from a transient 503. The non-nil error leaves canDeletePod=false with the ScaleDown lock retained, so level-triggered reconciliation re-submits the identical impossible REPLACENODE forever \u2014 a livelock that never completes and never surfaces a terminal failure until \u22652 nodes are live again. This is a new precondition-livelock beyond the three known-good-grounding bugs."
+    }
+  ]
+}
