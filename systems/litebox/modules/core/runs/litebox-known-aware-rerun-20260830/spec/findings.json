@@ -1,0 +1,155 @@
+{
+  "schema_version": "2",
+  "system": "litebox",
+  "generated_by": "validation-workflow",
+  "findings": [
+    {
+      "id": "MC-1",
+      "title": "Detached-parent create returns success for an unreachable file",
+      "source": "model-checking",
+      "scenario": "1 - path snapshot versus stable namespace identity",
+      "severity": "Medium",
+      "invariant": "ReachableCreate",
+      "config": "MC_hunt_scenario_1_reachable_create.cfg",
+      "counterexample": "spec/output/MC_hunt_scenario_1_reachable_create_bfs.out",
+      "affected_code": [
+        "litebox/src/fs/resolver.rs:214",
+        "litebox/src/fs/in_mem.rs:249",
+        "litebox/src/fs/in_mem.rs:478",
+        "litebox/src/fs/in_mem.rs:556"
+      ],
+      "summary": "InMem path walking returns a retained directory Arc without keeping a namespace guard. A concurrent rmdir can unlink that object before create_file_at inserts into it. The create reports success and returns a live handle, but the file has no reachable pathname. No same-site duplicate or maintainer acknowledgement was found."
+    },
+    {
+      "id": "MC-2",
+      "title": "Pathname recreation silently redirects relative operations from the current directory",
+      "source": "model-checking",
+      "scenario": "1 - path snapshot versus stable namespace identity",
+      "severity": "High",
+      "invariant": "CwdIdentityStable",
+      "config": "MC_hunt_scenario_1_cwd_identity.cfg",
+      "counterexample": "spec/output/MC_hunt_scenario_1_cwd_identity_bfs.out",
+      "affected_code": [
+        "litebox/src/fs/resolver.rs:50",
+        "litebox_shim_linux/src/syscalls/file.rs:205",
+        "litebox_shim_linux/src/syscalls/file.rs:1755"
+      ],
+      "summary": "The CWD is stored as normalized pathname text rather than a stable directory identity. After another task unlinks and recreates that pathname, a relative operation re-resolves to the replacement directory. This can redirect reads or writes from the task's original CWD to attacker-controlled namespace state. Existing CWD issues and PRs do not document this unlink/recreate mechanism."
+    },
+    {
+      "id": "MC-3",
+      "title": "One chunked syscall can consume multiple open-file descriptions after fd reuse",
+      "source": "model-checking",
+      "scenario": "2 - raw fd slots versus open-file-description identity",
+      "severity": "High",
+      "invariant": "OperationBindsOneOFD",
+      "config": "MC_hunt_scenario_2_fd_identity.cfg",
+      "counterexample": "spec/output/MC_hunt_scenario_2_fd_identity_bfs.out",
+      "affected_code": [
+        "litebox_shim_linux/src/lib.rs:516",
+        "litebox_shim_linux/src/lib.rs:588",
+        "litebox_shim_linux/src/syscalls/file.rs:598",
+        "litebox_shim_linux/src/syscalls/mm.rs:270"
+      ],
+      "summary": "Several large or vectored operations retain only the raw fd and resolve it again for every chunk. Close and reuse between chunks changes the consumer from the OFD seen at entry to a new OFD. One syscall can therefore splice data from different files or act on a reused descriptor. Existing fd-table dup reports concern different sites and mechanisms."
+    },
+    {
+      "id": "MC-4",
+      "title": "Duplicated directory descriptors do not share their directory position",
+      "source": "model-checking",
+      "scenario": "2 - shared OFD consumers",
+      "severity": "Medium",
+      "invariant": "AliasOffsetsShared",
+      "config": "MC_hunt_scenario_2_alias_offsets.cfg",
+      "counterexample": "spec/output/MC_hunt_scenario_2_alias_offsets_bfs.out",
+      "affected_code": [
+        "litebox/src/fd/mod.rs:70",
+        "litebox/src/fd/mod.rs:410",
+        "litebox_shim_linux/src/syscalls/file.rs:2571"
+      ],
+      "summary": "Descriptor duplication shares the underlying entry, but getdents64 stores Diroff as per-fd metadata. Advancing one alias updates only that descriptor while another alias of the same OFD remains at the old position. Applications can observe repeated or omitted directory entries. PR #783 handles directory offsets but not dup aliasing."
+    },
+    {
+      "id": "MC-5",
+      "title": "Last-close epoll interests persist and accumulate across raw-fd reuse",
+      "source": "model-checking",
+      "scenario": "2 - epoll interest identity",
+      "severity": "Medium",
+      "invariant": "NoStaleEpollInterests",
+      "config": "MC_hunt_scenario_2_epoll_interest.cfg",
+      "counterexample": "spec/output/MC_hunt_scenario_2_epoll_interest_bfs.out",
+      "affected_code": [
+        "litebox_shim_linux/src/syscalls/epoll.rs:81",
+        "litebox_shim_linux/src/syscalls/epoll.rs:232",
+        "litebox_shim_linux/src/syscalls/epoll.rs:327",
+        "litebox_shim_linux/src/syscalls/epoll.rs:468"
+      ],
+      "summary": "The interests map owns entries keyed by raw fd plus descriptor pointer and has no last-close removal hook. A source comment acknowledges lazy stale entries but assumes a later insert replaces them; fd reuse creates a new pointer key, so it does not. Repeated add, close, and reuse retains dead interests and observers. PR #1230 addresses dup-surviving interest lifetime, not this retention consequence."
+    },
+    {
+      "id": "MC-6",
+      "title": "A stale ELF patch plan can rewrite a newer fixed-address mapping",
+      "source": "model-checking",
+      "scenario": "3 - mapping generation versus stale auxiliary state",
+      "severity": "High",
+      "invariant": "NoStalePatchPlan",
+      "config": "MC_hunt_scenario_3_stale_patch_plan.cfg",
+      "counterexample": "spec/output/MC_hunt_scenario_3_stale_patch_plan_bfs.out",
+      "affected_code": [
+        "litebox_shim_linux/src/syscalls/mm.rs:215",
+        "litebox_shim_linux/src/syscalls/mm.rs:482",
+        "litebox_shim_linux/src/syscalls/mm.rs:522",
+        "litebox_shim_linux/src/syscalls/mm.rs:768"
+      ],
+      "summary": "A fixed-address CoW replacement updates the host mapping before Vmem and patch-cache publication. Concurrent mprotect collection can copy the old fd/address interval and later apply it to the new host generation without revalidation. Runtime patching can therefore rewrite code or data in a replacement mapping using stale identity. PR #669 acknowledges the race window, but not this live consumer or consequence."
+    },
+    {
+      "id": "MC-7",
+      "title": "SNP spawn failure leaks an attached phantom thread and can block process quiescence",
+      "source": "model-checking",
+      "scenario": "4 - clone transaction and ownership transfer",
+      "severity": "High",
+      "invariant": "CloneFailureAtomic, ThreadCountMatchesAttachments",
+      "config": "MC_hunt_scenario_4_clone_failure_atomic.cfg",
+      "counterexample": "spec/output/MC_hunt_scenario_4_clone_failure_atomic_bfs.out",
+      "affected_code": [
+        "litebox_shim_linux/src/syscalls/process.rs:66",
+        "litebox_shim_linux/src/syscalls/process.rs:207",
+        "litebox_shim_linux/src/syscalls/process.rs:700",
+        "litebox_platform_linux_kernel/src/host/snp/snp_impl.rs:250"
+      ],
+      "summary": "Clone attaches the child and increments nr_threads before invoking the fallible platform spawn. The SNP provider converts the init box to a raw pointer before the host call; on failure it neither reconstructs the box nor detaches the child, and the caller returns ENOMEM. The phantom attachment can make wait_for_exit or exec quiescence wait forever, while the raw allocation leaks. No same-site report was found."
+    },
+    {
+      "id": "MC-8",
+      "title": "Failed clone3 stack validation leaves a phantom child TID in parent memory",
+      "source": "model-checking",
+      "scenario": "4 - clone publication before commit",
+      "severity": "Medium",
+      "invariant": "CloneFailureAtomic",
+      "config": "MC_hunt_scenario_4_parent_tid.cfg",
+      "counterexample": "spec/output/MC_hunt_scenario_4_parent_tid_bfs.out",
+      "affected_code": [
+        "litebox_shim_linux/src/syscalls/process.rs:685",
+        "litebox_shim_linux/src/syscalls/process.rs:690"
+      ],
+      "summary": "The clone path writes the allocated child TID through PARENT_SETTID before validating clone3 stack arguments. An invalid stack combination then returns EINVAL without creating a child or rolling back caller memory. The caller can observe a non-existent child TID after failure. PR #366 concerns success-path ordering and does not cover this failure-side publication."
+    },
+    {
+      "id": "MC-9",
+      "title": "An unvalidated futex waiter can consume wake(1) while a validated waiter remains blocked",
+      "source": "model-checking",
+      "scenario": "5 - futex validation and wake quota",
+      "severity": "High",
+      "invariant": "WakeCountsValidatedWaiters",
+      "config": "MC_hunt_scenario_5_futex_quota.cfg",
+      "counterexample": "spec/output/MC_hunt_scenario_5_futex_quota_bfs_run3.out",
+      "affected_code": [
+        "litebox/src/sync/futex.rs:96",
+        "litebox/src/sync/futex.rs:108",
+        "litebox/src/sync/futex.rs:145"
+      ],
+      "summary": "wait inserts into the selectable loan list before it checks the futex word. wake(1) can select and count an unvalidated queue head that later returns mismatch, exhausting the quota while a second, validated waiter remains blocked. A single expected wake can therefore become an indefinite block or timeout. PR #1228 covers a distinct post-validation store-buffering mechanism."
+    }
+  ]
+}
