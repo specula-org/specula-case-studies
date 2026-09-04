@@ -1,0 +1,59 @@
+{
+  "schema_version": "2",
+  "system": "SlateDB Distributed Compaction",
+  "generated_by": "validation-workflow",
+  "findings": [
+    {
+      "id": "MC-1",
+      "title": "External submissions bypass cross-compaction conflict checks",
+      "source": "model-checking",
+      "scenario": "1 — split admission control for externally submitted compactions",
+      "severity": "High",
+      "invariant": "NoConflictingActiveCompactions",
+      "config": "MC_hunt_family1_conflicts.cfg",
+      "counterexample": "spec/output/MC_hunt_family1_conflicts_fullbounds_bfs.out",
+      "affected_code": [
+        "slatedb/src/compactor.rs:478",
+        "slatedb/src/compactor_state.rs:892",
+        "slatedb/src/compactor_state.rs:976",
+        "slatedb/src/compactor.rs:910"
+      ],
+      "summary": "External submissions are inserted directly into the durable compactions object and later merged as Submitted records. The local add_compaction path checks active destination conflicts, but canonical submitted validation explicitly does not repeat those cross-job checks. An external job with the same source and output as an already admitted local job can therefore also reach Scheduled, exposing concurrent conflicting work and possible publication collisions."
+    },
+    {
+      "id": "MC-2",
+      "title": "External jobs can overflow the coordinator concurrency limit",
+      "source": "model-checking",
+      "scenario": "1 — split admission control for externally submitted compactions",
+      "severity": "Medium",
+      "invariant": "BoundedRunningClaims",
+      "config": "MC_hunt_family1.cfg",
+      "counterexample": "spec/output/MC_hunt_family1_repaired_bfs.out",
+      "affected_code": [
+        "slatedb/src/compactor.rs:478",
+        "slatedb/src/compactor.rs:1178",
+        "slatedb/src/compaction_worker.rs:304",
+        "slatedb/src/config.rs:1110"
+      ],
+      "summary": "A local job and a disjoint external job can both be promoted to Scheduled while the coordinator limit is one. Separate workers then claim one job each because worker capacity is local and no durable global claim budget exists. The resulting two Running records violate the coordinator's documented maximum and can cause resource overcommit."
+    },
+    {
+      "id": "MC-3",
+      "title": "Repeated scheduler ticks can overflow the coordinator concurrency limit",
+      "source": "model-checking",
+      "scenario": "5 — fragmented concurrent-compaction accounting",
+      "severity": "Medium",
+      "invariant": "BoundedRunningClaims",
+      "config": "MC_hunt_family5.cfg",
+      "counterexample": "spec/output/MC_hunt_family5_repaired_bfs.out",
+      "affected_code": [
+        "slatedb/src/compactor.rs:1123",
+        "slatedb/src/compactor.rs:1178",
+        "slatedb/src/compactor.rs:1269",
+        "slatedb/src/compactor_state.rs:277",
+        "slatedb/src/compaction_worker.rs:304"
+      ],
+      "summary": "Scheduler capacity counts only Running jobs, so repeated ticks can accumulate multiple Submitted jobs while the configured limit is one. Validation promotes the backlog without reapplying capacity, and independent workers can each claim a job. The implementation already labels Submitted and Scheduled as capacity-consuming, but the scheduling and claim paths do not enforce that definition globally."
+    }
+  ]
+}
