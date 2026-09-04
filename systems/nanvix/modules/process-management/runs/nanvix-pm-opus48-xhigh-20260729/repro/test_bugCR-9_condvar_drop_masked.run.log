@@ -1,0 +1,18 @@
+== CR-9: CondvarInner::drop panic — reachability of a non-empty-queue drop ==
+
+[A normal-wait/notify/resume] NO PANIC
+       mask proven: refcount=2, queue=[20] -> put_cond did NOT reclaim
+[B two-waiters-notify-one (mask fires)] NO PANIC
+       forced kill leaked the waiter's Arc: CondvarInner still alive (strong_count=2, queue=[99]) -> no drop, no panic (resource leak instead)
+[C forced-teardown-leaks-clone] NO PANIC
+[D injected-unreachable-state (control)] PANIC (CondvarInner::drop fired on a non-empty queue)
+
+== SUMMARY ==
+A reachable normal path .......... no panic
+B reachable notify path (mask) ... no panic
+C reachable kill path (leak) ..... no panic
+D injected UNREACHABLE control .... PANIC
+
+VERDICT-SUPPORT: No reachable teardown (A/B/C) drops a condvar with a non-empty
+queue; the panic fires ONLY from the injected, unreachable state (D). The DoS is
+a real code hazard but is currently MASKED by the refcount/leak discipline.

@@ -1,0 +1,126 @@
+diff --git a/src/kernel/src/pm/mod.rs b/src/kernel/src/pm/mod.rs
+index 9ae4ae9f4..1289a39b3 100644
+--- a/src/kernel/src/pm/mod.rs
++++ b/src/kernel/src/pm/mod.rs
+@@ -12,6 +12,9 @@ pub mod sync;
+ #[cfg(feature = "test")]
+ mod test;
+ pub mod thread;
++// Specula trace-harness NDJSON emitter (test builds only).
++#[cfg(feature = "test")]
++pub(crate) mod tla_trace;
+ 
+ //==================================================================================================
+ // Imports
+diff --git a/src/kernel/src/pm/process/state/mod.rs b/src/kernel/src/pm/process/state/mod.rs
+index 5a0255714..e0018c004 100644
+--- a/src/kernel/src/pm/process/state/mod.rs
++++ b/src/kernel/src/pm/process/state/mod.rs
+@@ -24,6 +24,9 @@ mod signal_test;
+ mod sleeping;
+ #[cfg(feature = "test")]
+ mod test_detach;
++// Specula trace-harness lifecycle scenarios (test builds only).
++#[cfg(feature = "test")]
++pub(crate) mod tla_world;
+ mod zombie;
+ 
+ //==================================================================================================
+@@ -590,6 +593,17 @@ impl ProcessState {
+         port.write(port_width, value)
+     }
+ 
++    ///
++    /// # Description
++    ///
++    /// Returns whether a mutex entry for `mutex_addr` is currently present in the process mutex
++    /// map. Used by the Specula trace harness to snapshot `mutexInMap`.
++    ///
++    #[cfg(feature = "test")]
++    pub(crate) fn contains_mutex(&self, mutex_addr: MutexAddress) -> bool {
++        self.mutexes.contains_key(&mutex_addr)
++    }
++
+     ///
+     /// # Description
+     ///
+diff --git a/src/kernel/src/pm/test.rs b/src/kernel/src/pm/test.rs
+index 5463786a0..eab57d45a 100644
+--- a/src/kernel/src/pm/test.rs
++++ b/src/kernel/src/pm/test.rs
+@@ -867,5 +867,7 @@ pub fn test() -> bool {
+     passed &= run_test!(test_link_user_pages_errors_on_preexisting_child_overlap);
+     passed &= run_test!(test_link_user_pages_rolls_back_on_partial_failure);
+     passed &= super::process::test();
++    // Specula trace harness: drive real PM state transitions and emit NDJSON trace events.
++    passed &= crate::pm::process::state::tla_world::run_all();
+     passed
+ }
+diff --git a/src/kernel/src/pm/thread/state.rs b/src/kernel/src/pm/thread/state.rs
+index 4bc02f65e..aa42c63bb 100644
+--- a/src/kernel/src/pm/thread/state.rs
++++ b/src/kernel/src/pm/thread/state.rs
+@@ -254,6 +254,45 @@ impl ThreadState {
+         self.interrupt_reason = Some(reason);
+     }
+ 
++    ///
++    /// # Description
++    ///
++    /// Returns a read-only reference to the interrupt reason recorded for this thread, if any.
++    ///
++    /// Used by the Specula trace harness to observe the interrupt reason carried by a resumed
++    /// thread without consuming it (unlike [`Self::take_interrupt_reason`]).
++    ///
++    #[cfg(feature = "test")]
++    pub(crate) fn interrupt_reason_ref(&self) -> Option<&InterruptReason> {
++        self.interrupt_reason.as_ref()
++    }
++
++    ///
++    /// # Description
++    ///
++    /// Clears the recorded interrupt reason. Used by the Specula trace harness to model the
++    /// dispatcher's return-to-user checkpoint, which consumes the reason of a resumed thread that
++    /// returns to user mode rather than exiting.
++    ///
++    #[cfg(feature = "test")]
++    pub(crate) fn clear_interrupt_reason(&mut self) {
++        self.interrupt_reason = None;
++    }
++
++    ///
++    /// # Description
++    ///
++    /// Re-installs an interrupt reason on this thread. Used by the Specula trace harness to keep the
++    /// per-thread interrupt reason observable after `ReadyThread::run` has extracted it into the
++    /// dispatcher return value: the spec models `threadReason` as persisting on the thread until the
++    /// dispatcher checkpoint consumes it, whereas the implementation carries it out-of-band, so the
++    /// harness re-stores the real reason for snapshotting only.
++    ///
++    #[cfg(feature = "test")]
++    pub(crate) fn set_interrupt_reason_trace(&mut self, reason: InterruptReason) {
++        self.interrupt_reason = Some(reason);
++    }
++
+     ///
+     /// # Description
+     ///
+@@ -453,6 +492,17 @@ impl ThreadState {
+         self.saved_blocked.take()
+     }
+ 
++    ///
++    /// # Description
++    ///
++    /// Returns the sigsuspend saved mask without consuming it. Used by the Specula trace harness to
++    /// snapshot the per-thread `savedBlocked` state.
++    ///
++    #[cfg(feature = "test")]
++    pub(crate) fn saved_blocked_ref(&self) -> Option<u64> {
++        self.saved_blocked
++    }
++
+     ///
+     /// # Description
+     ///

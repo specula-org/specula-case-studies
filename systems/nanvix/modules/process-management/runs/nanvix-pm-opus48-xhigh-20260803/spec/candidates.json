@@ -1,0 +1,214 @@
+{
+  "schema_version": "2",
+  "system": "nanvix-process-management",
+  "generated_by": "consolidate",
+  "findings": [
+    {
+      "id": "MC-1",
+      "title": "Unsafe deferred reap of a buried process's thread leaks a live-count slot",
+      "source": "model-checking",
+      "scenario": "2 (accounting / slot exhaustion)",
+      "severity": "High",
+      "invariant": "LiveCountAccurate",
+      "config": "MC_hunt_scenario2_mc1.cfg",
+      "counterexample": "spec/output/MC_hunt_scenario2_mc1_final.out",
+      "affected_code": [
+        "src/kernel/src/pm/process/manager/unsafe.rs:668",
+        "src/kernel/src/pm/process/manager/unsafe.rs:708",
+        "src/kernel/src/pm/thread/zombie.rs:110"
+      ],
+      "summary": "reap_deferred_zombie_threads -> harvest_zombie_thread drops the ThreadState (releasing mutex guards) at unsafe.rs:657, but when the owning process is already buried it takes the early return at unsafe.rs:668 and skips on_thread_reaped() at unsafe.rs:708, which decrements the live-thread count. The slot object is dropped but the counter is never adjusted, so live_count is permanently over-reported (tlive=1 with zero live threads), leaking a thread slot toward MAX_THREADS exhaustion.",
+      "dedup_note": "Covers code-review Scenario 2 (Zombie Reaping & ID/Slot Accounting) — same divergent missing-process handling (early return at unsafe.rs:668 skips on_thread_reaped vs fall-through at mod.rs:3375-3388). MC wins: carries the LiveCountAccurate/ReapedExactlyOnce counterexample."
+    },
+    {
+      "id": "MC-2",
+      "title": "A waiting joiner can receive ThreadNotFound instead of the exit status",
+      "source": "model-checking",
+      "scenario": "2 (join lifecycle)",
+      "severity": "High",
+      "invariant": "JoinGetsStatus",
+      "config": "MC_hunt_scenario2_mc2.cfg",
+      "counterexample": "spec/output/MC_hunt_scenario2_mc2_repaired.out",
+      "affected_code": [
+        "src/kernel/src/pm/process/state/running.rs:541",
+        "src/kernel/src/pm/process/manager/unsafe.rs:742"
+      ],
+      "summary": "try_join_thread (running.rs:541-621) and join_thread (unsafe.rs:742-768) do not atomically bind the woken joiner to the target zombie's retained status. If a concurrent reap/harvest consumes or relocates the target's zombie record between the joiner blocking and resuming, the resumed joiner re-resolves the target, fails to find it, and returns a ThreadNotFound-class error instead of the exit status that join must deliver."
+    },
+    {
+      "id": "MC-3",
+      "title": "A mutex owned by a never-joined zombie is held forever (blocks all waiters, incl. condvar reacquire)",
+      "source": "model-checking",
+      "scenario": "3 (mutex/condvar liveness; modeling-brief MC3 and MC10)",
+      "severity": "High",
+      "invariant": "MutexProgress",
+      "config": "MC_hunt_scenario3_live.cfg",
+      "counterexample": "spec/output/MC_hunt_scenario3_live_repaired.out",
+      "affected_code": [
+        "src/kernel/src/pm/thread/state.rs:83",
+        "src/kernel/src/pm/process/manager/unsafe.rs:657",
+        "src/kernel/src/pm/sync/wait_cond.rs:127"
+      ],
+      "summary": "A MutexGuard lives in ThreadState.locked_mutexes (thread/state.rs:83) and is released only when the ThreadState is dropped, which happens exclusively in harvest_zombie_thread (unsafe.rs:657). Thread exit/kill do not release owned mutexes; a joinable thread is harvested only on pthread_join. If a thread dies holding a mutex as a joinable zombie of a still-alive process and is never joined, the lock is orphaned and every later Mutex::lock waiter blocks forever. MC10 is the condvar instantiation: wait_cond reacquires via lock(None) (wait_cond.rs:127) and inherits the same permanent block. 6-state MutexProgress lasso."
+    },
+    {
+      "id": "MC-4",
+      "title": "A masked default-action signal is acted upon while masked",
+      "source": "model-checking",
+      "scenario": "4 (signal masking)",
+      "severity": "High",
+      "invariant": "MaskedSignalDeferred",
+      "config": "MC_hunt_scenario4_mc4.cfg",
+      "counterexample": "spec/output/MC_hunt_scenario4_mc4_repaired.out",
+      "affected_code": [
+        "src/kernel/src/pm/process/manager/mod.rs:858"
+      ],
+      "summary": "The signal-dispatch path (mod.rs:858-875) applies the block-mask check only on the caught/handler branch. For a signal whose disposition is the default action, delivery proceeds without checking whether the signal is masked in the target thread(s), so a masked default-action signal is acted upon immediately instead of remaining pending until the mask is cleared. POSIX requires the mask to defer all deliverable signals except the un-blockable ones."
+    },
+    {
+      "id": "MC-5",
+      "title": "A caught signal is undeliverable - a sleeping thread in a runnable process is never interrupted",
+      "source": "model-checking",
+      "scenario": "4 (signal delivery / liveness)",
+      "severity": "High",
+      "invariant": "NoUndeliverableCaught",
+      "config": "MC_hunt_scenario4_mc5.cfg",
+      "counterexample": "spec/output/MC_hunt_scenario4_mc5_repaired.out",
+      "affected_code": [
+        "src/kernel/src/pm/process/manager/mod.rs:1009",
+        "src/kernel/src/pm/process/state/runnable.rs:54"
+      ],
+      "summary": "Signal recipient selection (mod.rs:1009-1018) and the runnable-process delivery path (runnable.rs:54-95) only consider running/ready threads. When a caught (handler) signal is pending on a non-suspended process, every running/ready thread has it masked, and the sole unmasked recipient is sleeping, the dispatcher never interrupts the sleeping thread, so the handler signal is never taken and the process keeps it pending forever (also violates SignalEventuallyDelivered in scenario4_live)."
+    },
+    {
+      "id": "MC-6",
+      "title": "Nested signal delivery during sigsuspend corrupts the saved mask",
+      "source": "model-checking",
+      "scenario": "4 (sigsuspend/sigreturn)",
+      "severity": "High",
+      "invariant": "SigsuspendMaskRestored",
+      "config": "MC_hunt_scenario4_mc6.cfg",
+      "counterexample": "spec/output/MC_hunt_scenario4_mc6_repaired.out",
+      "affected_code": [
+        "src/kernel/src/pm/process/manager/mod.rs:734",
+        "src/kernel/src/pm/sync/signal.rs:607"
+      ],
+      "summary": "sigsuspend saves the pre-suspend mask in a location (mod.rs:734) that the nested signal-delivery path (signal.rs:607-610) also writes. A signal taken while suspended overwrites the saved value, so on frame return sigreturn restores the wrong (temporary/nested) mask and the thread's blocked set no longer matches its pre-sigsuspend mask. The saved mask should be stacked per signal frame."
+    },
+    {
+      "id": "MC-7",
+      "title": "sigaction to SIG_DFL/SIG_IGN strands an already-pending signal",
+      "source": "model-checking",
+      "scenario": "4 (disposition change)",
+      "severity": "Medium",
+      "invariant": "NoStrandedProcPending",
+      "config": "MC_hunt_scenario4_mc7.cfg",
+      "counterexample": "spec/output/MC_hunt_scenario4_mc7_repaired.out",
+      "affected_code": [
+        "src/kernel/src/pm/process/manager/mod.rs:603",
+        "src/kernel/src/pm/sync/signal.rs:248"
+      ],
+      "summary": "When a signal is already process-pending with a handler disposition and sigaction (mod.rs:603-611; signal.rs:248-252) changes its disposition to default or ignore, the existing pending entry is not reconciled. A now-ignored pending signal should be discarded and a now-default one re-evaluated; instead it stays pending with a non-handler disposition, so it can never be dispatched as a handler and is never drained (also violates SignalEventuallyDelivered)."
+    },
+    {
+      "id": "MC-8",
+      "title": "kill posts a caught signal onto a zombie process",
+      "source": "model-checking",
+      "scenario": "4 (kill vs. lifecycle)",
+      "severity": "Medium",
+      "invariant": "NoSignalToZombie",
+      "config": "MC_hunt_scenario4_mc8.cfg",
+      "counterexample": "spec/output/MC_hunt_scenario4_mc8_repaired.out",
+      "affected_code": [
+        "src/kernel/src/pm/process/manager/mod.rs:2833",
+        "src/kernel/src/pm/process/manager/mod.rs:850"
+      ],
+      "summary": "The target lookup used by kill (mod.rs:2833-2852) returns zombie processes, and the post path (mod.rs:850-857) enqueues the signal without rejecting a non-runnable/zombie target. A handler signal is thus queued into a process that can never run a handler, wasting the pending slot and misrepresenting deliverability. Handler-signal posting to a zombie should be rejected/no-op."
+    },
+    {
+      "id": "MC-9",
+      "title": "execv is spuriously refused at MAX_THREADS (non-healing admission)",
+      "source": "model-checking",
+      "scenario": "2 (exec admission)",
+      "severity": "Medium",
+      "invariant": "ExecAdmission",
+      "config": "MC_hunt_scenario2_mc9.cfg",
+      "counterexample": "spec/output/MC_hunt_scenario2_mc9_final.out",
+      "affected_code": [
+        "src/kernel/src/pm/process/manager/mod.rs:2022",
+        "src/kernel/src/pm/process/manager/mod.rs:3410"
+      ],
+      "summary": "execv allocates a new main-thread tid via a non-healing try_next_tid (mod.rs:2022) that fails at MAX_THREADS without first draining reclaimable deferred/zombie threads, unlike the create path which reaps deferred zombies before allocating (mod.rs:3410-3428). Because exec discards all other threads and collapses to one, the ceiling check is spurious and yields a false out-of-resource error on a call that should always be admissible.",
+      "dedup_note": "Covers the exec-admission slice of both code-review Scenario 2 and Scenario 5 (non-healing try_next_tid at mod.rs:2022 vs the reaping variant try_next_tid_reaping at mod.rs:3410-3425). MC wins: carries the ExecAdmission counterexample. Scenario 5's remaining rollback-completeness gaps are captured separately in CR-2."
+    },
+    {
+      "id": "MC-10",
+      "title": "put_mutex removes a still-held mutex -> mutual-exclusion split-brain",
+      "source": "model-checking",
+      "scenario": "3 (resource destroy)",
+      "severity": "Critical",
+      "invariant": "NoDestroyWithWaiter",
+      "config": "MC_hunt_scenario3_destroy.cfg",
+      "counterexample": "spec/output/MC_hunt_scenario3_destroy_final.out",
+      "affected_code": [
+        "src/kernel/src/pm/process/state/mod.rs:641",
+        "src/kernel/src/pm/process/state/mod.rs:621"
+      ],
+      "summary": "put_mutex (state/mod.rs:641-655) removes mutex entries with reference_count() <= 2 via extract_if without checking whether the mutex is locked or has waiters. A held mutex has exactly two Arc refs (the map's plus the owner's MutexGuard in ThreadState.locked_mutexes), so it is removed while held. The guard keeps the underlying Arc alive, but the process map drops it, so the next get_mutex (state/mod.rs:621-625) for the same address mints a new distinct Mutex; two threads locking the same address then use different mutexes, silently breaking mutual exclusion, and any parked waiter is orphaned.",
+      "dedup_note": "Covers code-review Scenario 3 (resource destroy) — the refcount-threshold destroy at state/mod.rs:638-713 (put_mutex). MC wins: carries the NoDestroyWithWaiter counterexample."
+    },
+    {
+      "id": "MC-11",
+      "title": "put_cond destroys a condvar with a parked waiter -> CondvarInner::drop panics",
+      "source": "model-checking",
+      "scenario": "3 (resource destroy)",
+      "severity": "Critical",
+      "invariant": "NoDestroyWithWaiter",
+      "config": "MC_hunt_scenario3_destroy.cfg",
+      "counterexample": "spec/output/MC_hunt_scenario3_destroy_final.out",
+      "affected_code": [
+        "src/kernel/src/pm/process/state/mod.rs:702",
+        "src/kernel/src/pm/sync/condvar.rs:286"
+      ],
+      "summary": "put_cond (state/mod.rs:702-715) removes condvar entries with reference_count() <= 1 via extract_if without checking the wait queue. When the map holds the last reference, extract_if drops the CondvarInner whose Drop (condvar.rs:286-292) executes panic! if its sleeping queue is non-empty. Calling the destroy path while another thread waits on the condvar therefore panics the kernel - a denial-of-service reachable from ordinary condvar usage. The same NoDestroyWithWaiter witness (g.destroyWaiter) is set by the PutCond branch in the spec.",
+      "dedup_note": "Covers code-review Scenario 3 (resource destroy) — the refcount-threshold destroy at state/mod.rs:638-713 (put_cond) and the condvar drop-panic at condvar.rs:286. MC wins: carries the NoDestroyWithWaiter counterexample."
+    },
+    {
+      "id": "CR-1",
+      "title": "Location & state-machine integrity: exactly-one-location, no-run-after-zombie, no-stopped-dispatch",
+      "source": "code-review",
+      "scenario": "1 (Location & State-Machine Integrity)",
+      "severity": "High",
+      "invariant": null,
+      "config": null,
+      "counterexample": null,
+      "affected_code": [
+        "src/kernel/src/pm/process/manager/mod.rs:199",
+        "src/kernel/src/pm/process/manager/mod.rs:951",
+        "src/kernel/src/pm/process/manager/mod.rs:2674",
+        "src/kernel/src/pm/process/manager/mod.rs:1671",
+        "src/kernel/src/pm/process/state/runnable.rs:141"
+      ],
+      "summary": "Scenario 1 is the state-machine backbone: every process/thread must occupy exactly one queue/state, each transition must move the whole Box, a process's PM-level state must equal the precedence function of its threads' sub-states, and nothing may run after becoming a zombie or being stopped (containers at manager/mod.rs:199-255; nested precedence in process/state/{running,runnable,sleeping,interrupted,zombie}.rs; scheduler picks only ready non-stopped at mod.rs:1671-1692 and runnable.rs:141-149). The model checker exercised the ExactlyOneLocation, NestedStateConsistent, NoRunAfterZombie, and NoStoppedDispatch invariants and found no violation, so no MC candidate represents this mechanism. Residual code-review concerns remain that were not proven by any counterexample: self-stop is deferred and can run up to one extra quantum before deschedule (mod.rs:951-964, skipped-when-scheduled 2674-2697), and take_earliest_ready calls .expect (mod.rs:2674) which would panic if every ready process were stopped, relying on an unenforced 'kernel process is never stopped' invariant. Confirmation should decide whether these residual gaps are real defects or acceptable-by-design.",
+      "dedup_note": "Not represented by any MC candidate — Scenario 1's backbone invariants were model-checked clean (no ExactlyOneLocation/NoRunAfterZombie/NoStoppedDispatch/NestedStateConsistent violation). Emitted so confirmation can review the residual deferred-self-stop and take_earliest_ready .expect concerns."
+    },
+    {
+      "id": "CR-2",
+      "title": "Creation/fork/exec/address-space rollback completeness (parent CoW and best-effort mmap gaps)",
+      "source": "code-review",
+      "scenario": "5 (Creation / Fork / Exec / Address-Space Rollback)",
+      "severity": "Medium",
+      "invariant": null,
+      "config": null,
+      "counterexample": null,
+      "affected_code": [
+        "src/kernel/src/mm/virt/manager.rs:390",
+        "src/kernel/src/mm/virt/manager.rs:443",
+        "src/kernel/src/pm/process/manager/mod.rs:3548",
+        "src/kernel/src/pm/process/manager/mod.rs:445"
+      ],
+      "summary": "Scenario 5 asserts that multi-step admission (create_thread, create_process, duplicate_process, execv, mmap) reserves IDs/resources via a two-phase reserve/commit and that any rollback on a fallible step restores every affected resource and accounting slot. The model checker verified the ID reserve/commit accounting clean (reserve-without-mutate then commit at mod.rs:445-466, 1202-1233, 1621-1638, 2064-2076) and the only exec-admission interaction it flagged is covered by MC-9, so no MC counterexample exists for the memory-side rollback. Residual gaps not covered by any MC candidate: a failed fork does not restore the parent's copy-on-write page state (mm/virt/manager.rs:390-399, 443-453), and do_mmap rollback is best-effort so an earlier batch can remain mapped when try_unmap_upage fails during rollback_mmap (mod.rs:3548-3599). These were characterized as test-verifiable (T3/T4); confirmation should decide whether they are real safety defects.",
+      "dedup_note": "Partially overlaps MC-9 (exec-admission slice, deduped onto MC-9). The remaining fork-CoW-restore and best-effort mmap-rollback mechanisms have no MC counterexample and are emitted here for confirmation."
+    }
+  ]
+}

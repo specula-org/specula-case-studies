@@ -1,0 +1,118 @@
+diff --git a/src/kernel/src/ipc/rendezvous.rs b/src/kernel/src/ipc/rendezvous.rs
+index 267e662fb..879e4552e 100644
+--- a/src/kernel/src/ipc/rendezvous.rs
++++ b/src/kernel/src/ipc/rendezvous.rs
+@@ -704,3 +704,39 @@ pub unsafe fn cleanup_process(pid: ProcessIdentifier) -> Vec<ThreadIdentifier> {
+ 
+     threads_to_wake
+ }
++
++///
++/// # Description
++///
++/// Test-only helper for the MC-4 reproduction. Registers a pending rendezvous **push** counterpart
++/// whose destination process is `victim_pid`, reproducing exactly the `PendingPush` state that a
++/// real blocking [`do_push`] leaves behind (see the "Register this push and sleep" branch above)
++/// when a thread `owner_tid` in `owner_pid` sends to `victim_pid` and blocks with no matching pull.
++///
++/// After this call, `cleanup_process(victim_pid)` returns `[owner_tid]` (the orphaned counterpart),
++/// which is precisely the state produced by normal cross-process IPC before the destination process
++/// exits.
++///
++/// # Safety
++///
++/// Accesses global mutable state; safe on the single-core kernel with interrupts disabled (as during
++/// in-kernel tests).
++///
++#[cfg(feature = "test")]
++pub unsafe fn register_push_counterpart_for_test(
++    owner_pid: ProcessIdentifier,
++    owner_tid: ThreadIdentifier,
++    victim_pid: ProcessIdentifier,
++    victim_tid: ThreadIdentifier,
++) {
++    // SAFETY: single-core system with interrupts disabled.
++    let pending_pushes: &mut Vec<PendingPush> = unsafe { PENDING.pushes() };
++    pending_pushes.push(PendingPush {
++        pid: owner_pid,
++        tid: owner_tid,
++        dst_pid: victim_pid,
++        dst_tid: victim_tid,
++        buffer: 0,
++        transfer_len: 0,
++    });
++}
+diff --git a/src/kernel/src/pm/process/manager/test.rs b/src/kernel/src/pm/process/manager/test.rs
+index 03d8f6347..540f38d5f 100644
+--- a/src/kernel/src/pm/process/manager/test.rs
++++ b/src/kernel/src/pm/process/manager/test.rs
+@@ -131,6 +131,61 @@ fn test_signal_kcall_result_split_join_preserves_bits() -> bool {
+ // Test Runner
+ //==================================================================================================
+ 
++///
++/// # Description
++///
++/// MC-4 reproduction: `do_exit` empties the running slot with `take_running()` (mod.rs do_exit:2116)
++/// and then, still inside the same call, invokes `cleanup_rendezvous()` (do_exit:2130), whose
++/// `do_wakeup -> try_wakeup_thread` path unwraps the running slot via `get_running()`
++/// (`self.running.as_ref().expect("the kernel should be running")`, mod.rs:2787). When an orphaned
++/// rendezvous counterpart exists, that unwrap panics because `running` is `None`.
++///
++/// This drives the REAL `ProcessManager` singleton and REAL `ipc::rendezvous` PENDING list. It first
++/// establishes a positive control (the safe `terminate()` ordering, where `running` stays populated)
++/// and then reproduces `do_exit`'s exact take-then-cleanup sub-sequence. The counterpart is the same
++/// `PendingPush{dst_pid = victim}` a real blocking `do_push` registers.
++///
++/// This function diverges: on a buggy kernel it panics inside `cleanup_rendezvous`; only if the bug
++/// were absent would it log `MC4-REPRO-NOBUG` and return.
++///
++fn repro_bug_mc4_do_exit_cleanup_rendezvous_panic() {
++    let victim_pid: ProcessIdentifier = ProcessIdentifier::from(4242);
++    let victim_tid: ::sys::pm::ThreadIdentifier = ::sys::pm::ThreadIdentifier::from(4243);
++    let waiter_pid: ProcessIdentifier = ProcessIdentifier::from(4244);
++    let waiter_tid: ::sys::pm::ThreadIdentifier = ::sys::pm::ThreadIdentifier::from(4245);
++
++    // SAFETY: the process manager is initialized before in-kernel tests run; access is synchronized
++    // (single core, interrupts disabled).
++    let mgr: &mut ProcessManager = unsafe { ProcessManager::get_mut() };
++
++    // --- Positive control: terminate() calls cleanup_rendezvous WITHOUT emptying `running`. ---
++    // SAFETY: single-core, interrupts disabled.
++    unsafe {
++        crate::ipc::rendezvous::register_push_counterpart_for_test(
++            waiter_pid, waiter_tid, victim_pid, victim_tid,
++        );
++    }
++    info!("MC4-CONTROL: running=Some; calling cleanup_rendezvous (terminate ordering)");
++    mgr.cleanup_rendezvous(victim_pid, "mc4-control");
++    info!("MC4-CONTROL-OK: cleanup_rendezvous is safe while the running slot is populated");
++
++    // --- Reproduction: do_exit's ordering empties `running` (take_running, do_exit:2116) BEFORE
++    //     cleanup_rendezvous (do_exit:2130) reaches get_running() through the wakeup path. ---
++    // SAFETY: single-core, interrupts disabled.
++    unsafe {
++        crate::ipc::rendezvous::register_push_counterpart_for_test(
++            waiter_pid, waiter_tid, victim_pid, victim_tid,
++        );
++    }
++    info!("MC4-REPRO: take_running() (do_exit:2116) then cleanup_rendezvous() (do_exit:2130)");
++    let emptied = mgr.take_running();
++    mgr.cleanup_rendezvous(victim_pid, "mc4-repro");
++
++    // Only reached if the bug is absent (cleanup_rendezvous tolerated the emptied running slot).
++    mgr.running = Some(emptied);
++    error!("MC4-REPRO-NOBUG: cleanup_rendezvous returned without panic (bug not present)");
++}
++
+ /// Runs all in-kernel unit tests for the process manager module.
+ pub(super) fn test() -> bool {
+     let mut passed: bool = true;
+@@ -141,5 +196,7 @@ pub(super) fn test() -> bool {
+     {
+         passed &= run_test!(test_signal_kcall_result_split_join_preserves_bits);
+     }
++    // MC-4 reproduction — runs last because it deliberately triggers the kernel panic.
++    repro_bug_mc4_do_exit_cleanup_rendezvous_panic();
+     passed
+ }

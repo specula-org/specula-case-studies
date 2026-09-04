@@ -1,0 +1,22 @@
+=== CR-11 reproduction: live_count reap/commit balance vs on_thread_reaped assert ===
+
+[Level 0] Scenario A — real-API balanced lifecycle flows:
+  Scenario A: 27 threads committed, 27 reaped, live_count back to 1 (kernel only).
+  Scenario A: on_thread_reaped assert NEVER fired across all real-API flows.
+  RESULT: balanced; guard is never reached by any real reap path.
+
+[Level 2] Scenario B — negative control (deliberate double-reap the real routing forbids):
+
+thread 'main' (502325) panicked at test_bugCR-11_live_count_balance.rs:62:9:
+live_count underflow: kernel thread must always remain counted
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+  RESULT: the assert fired on a double-reap, as designed.
+  => The guard is a genuine underflow detector; it only trips on an imbalance
+     that the audited remove_if / mem::take routing cannot produce.
+
+=== CONCLUSION ===
+Every real reap path (harvest_zombies, reap_deferred, reap_deferred_zombie_threads,
+harvest_zombie_thread) is balanced against commit_next_tid: each zombie originates
+from exactly one committed thread and is reaped exactly once. The runtime assert in
+on_thread_reaped is deliberate, documented defensive hardening (commit 4764fa974) and
+is UNREACHABLE through the real API. No live consequence => FALSE POSITIVE.

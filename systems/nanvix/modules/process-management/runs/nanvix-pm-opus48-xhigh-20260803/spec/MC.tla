@@ -1,0 +1,93 @@
+--------------------------------- MODULE MC ---------------------------------
+(*****************************************************************************)
+(* Model-checking layer for the Nanvix PM base specification.                *)
+(*                                                                            *)
+(* base.tla is the faithful (possibly buggy) model.  With the full action set  *)
+(* and full signal universe it is far too large to exhaust at a concurrent     *)
+(* scope (the signal subsystem alone -- masks, frames, dispositions, pending --  *)
+(* yields >10^7 states at a single thread).  Rather than add auxiliary counter   *)
+(* STATE (which multiplies the space), MC parameterises the model with two        *)
+(* CONSTANTS that let every cfg pick the smallest model that still reaches its     *)
+(* target:                                                                         *)
+(*                                                                                 *)
+(*   * Enabled : a set of action labels.  Every MCNext disjunct is guarded by       *)
+(*               its label, so a cfg disables an action simply by omitting the       *)
+(*               label.  Enabled is a CONSTANT, so disabling an action removes its    *)
+(*               transitions with NO extra state.                                     *)
+(*   * Sig / Unblockable / StopSig (declared in base): each cfg restricts the         *)
+(*               signal universe to just the signals a scenario exercises; this is     *)
+(*               the dominant state-space lever.                                        *)
+(*                                                                                     *)
+(* MC.cfg enables the lifecycle + sync + stop core (signals collapsed to the           *)
+(* uncatchable {9,19}) and checks only the STRUCTURAL invariants -- it must converge.    *)
+(* Each MC_hunt_<scenario>.cfg enables just the mechanism and signal(s) the finding       *)
+(* needs and turns on exactly that scenario's extension invariant(s) / liveness property. *)
+(*****************************************************************************)
+EXTENDS base
+
+CONSTANT Enabled            \* set of enabled action labels
+
+On(l) == l \in Enabled
+
+(* MCNext re-lists base's disjuncts, each guarded by its action label.  The base     *)
+(* action operators and the 8 base variables are reused unchanged (this module        *)
+(* EXTENDS base), so every MC behaviour is a base behaviour restricted to Enabled.     *)
+MCNext ==
+    \/ On("sched")    /\ \E t \in Thread : Schedule(t)
+    \/ On("preempt")  /\ \E t \in Thread : Preempt(t)
+    \/ On("create")   /\ \E caller, nt \in Thread, det \in BOOLEAN : CreateThread(caller, nt, det)
+    \/ On("fork")     /\ \E caller, ctid \in Thread, cp \in Proc : Fork(caller, cp, ctid)
+    \/ On("execR")    /\ \E caller \in Thread : ExecRefuse(caller)
+    \/ On("exec")     /\ \E caller, nt \in Thread : ExecReplace(caller, nt)
+    \/ On("exit")     /\ \E t \in Thread : ExitThread(t)
+    \/ On("join")     /\ \E caller, u \in Thread : JoinThread(caller, u)
+    \/ On("joinres")  /\ \E caller \in Thread : JoinResume(caller)
+    \/ On("detach")   /\ \E caller, u \in Thread : DetachThread(caller, u)
+    \/ On("harvest")  /\ \E p \in Proc : HarvestZombies(p)
+    \/ On("reapSafe") /\ \E t \in Thread : ReapDeferredSafe(t)
+    \/ On("reapU")    /\ \E t \in Thread : ReapDeferredUnsafe(t)
+    \/ On("lock")     /\ \E t \in Thread, m \in Mutex : LockAcquire(t, m)
+    \/ On("lockblk")  /\ \E t \in Thread, m \in Mutex : LockBlock(t, m)
+    \/ On("lockres")  /\ \E t \in Thread, m \in Mutex : LockResume(t, m)
+    \/ On("unlock")   /\ \E t \in Thread, m \in Mutex : Unlock(t, m)
+    \/ On("putmutex") /\ \E caller \in Thread, m \in Mutex : PutMutex(caller, m)
+    \/ On("cwait")    /\ \E t \in Thread, c \in Cond, m \in Mutex : WaitCondPark(t, c, m)
+    \/ On("csignal")  /\ \E caller \in Thread, c \in Cond : SignalCond(caller, c)
+    \/ On("creacq")   /\ \E t \in Thread : CondResumeReacquire(t)
+    \/ On("cintr")    /\ \E t \in Thread : CondInterrupt(t)
+    \/ On("putcond")  /\ \E caller \in Thread, c \in Cond : PutCond(caller, c)
+    \/ On("sleep")    /\ \E t \in Thread : Sleep(t)
+    \/ On("wake")     /\ \E t \in Thread : Wake(t)
+    \/ On("kill")     /\ \E caller \in Thread, p \in Proc, s \in Sig : Kill(caller, p, s)
+    \/ On("cont")     /\ \E caller \in Thread, p \in Proc : ContinueProcess(caller, p)
+    \/ On("sigact")   /\ \E caller \in Thread, p \in Proc, s \in Sig, nd \in Disp : Sigaction(caller, p, s, nd)
+    \/ On("pmask")    /\ \E t \in Thread, nm \in SUBSET Maskable : Sigprocmask(t, nm)
+    \/ On("async")    /\ \E t \in Thread : AsyncDeliver(t)
+    \/ On("susp")     /\ \E t \in Thread, tm \in SUBSET Maskable : Sigsuspend(t, tm)
+    \/ On("sigret")   /\ \E t \in Thread : Sigreturn(t)
+
+MCSpec == Init /\ [][MCNext]_vars
+
+-----------------------------------------------------------------------------
+(* Fairness for the three liveness hunts.  Safety hunts and MC.cfg use MCSpec     *)
+(* (no fairness).  Progress requires a running thread to be preempted into kernel  *)
+(* context and the reaping / wakeup / delivery actions to eventually fire.  Each    *)
+(* fairness conjunct is itself guarded by Enabled, so a hunt that disables the       *)
+(* action also drops its (vacuous) fairness requirement.                            *)
+LivenessFairness ==
+    /\ WF_vars(On("preempt")  /\ (\E t \in Thread : Preempt(t)))
+    /\ WF_vars(On("sched")    /\ (\E t \in Thread : Schedule(t)))
+    /\ WF_vars(On("harvest")  /\ (\E p \in Proc  : HarvestZombies(p)))
+    /\ WF_vars(On("reapSafe") /\ (\E t \in Thread : ReapDeferredSafe(t)))
+    /\ WF_vars(On("reapU")    /\ (\E t \in Thread : ReapDeferredUnsafe(t)))
+    /\ WF_vars(On("lockres")  /\ (\E t \in Thread, m \in Mutex : LockResume(t, m)))
+    /\ WF_vars(On("unlock")   /\ (\E t \in Thread, m \in Mutex : Unlock(t, m)))
+    /\ WF_vars(On("putmutex") /\ (\E caller \in Thread, m \in Mutex : PutMutex(caller, m)))
+    /\ WF_vars(On("creacq")   /\ (\E t \in Thread : CondResumeReacquire(t)))
+    /\ WF_vars(On("cintr")    /\ (\E t \in Thread : CondInterrupt(t)))
+    /\ WF_vars(On("csignal")  /\ (\E caller \in Thread, c \in Cond : SignalCond(caller, c)))
+    /\ WF_vars(On("async")    /\ (\E t \in Thread : AsyncDeliver(t)))
+
+MCSpecFair == MCSpec /\ LivenessFairness
+
+=============================================================================
