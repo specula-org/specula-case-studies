@@ -1,0 +1,120 @@
+I’ll run this as a confirmation task using the `bug-confirmation` skill, then keep the work constrained to CR-6 and the provided worktree/repro paths. First I’m doing the required lightweight memory pass and reading the skill instructions in full.
+running sed -n '1,240p' /home/ubuntu/.codex/skills/bug-confirmation/SKILL.md
+running rg -n "vsr-rs|CR-6|bug-confirmation|confirmation" /home/ubuntu/.codex/memories/MEMORY.md
+running sed -n '1,260p' /home/ubuntu/.agents/skills/bug-confirmation/SKILL.md
+The memory pass found only general Specula confirmation guidance, not a prior CR-6/vsr-rs result. I’m using that only for process discipline; the actual verdict will come from the live worktree and a fresh repro.
+running sed -n '1,260p' /home/ubuntu/.codex/skills/bug-confirmation/guide.md
+running sed -n '1,260p' /home/ubuntu/.codex/skills/bug-confirmation/phases/01-investigation.md
+running sed -n '1,320p' /home/ubuntu/.codex/skills/bug-confirmation/phases/02-reproduction.md
+running find /home/ubuntu/.codex/skills/bug-confirmation -maxdepth 3 -type f | sort
+I’ve finished reading the required workflow. Next I’m auditing only the cited simulator/Lean/library sites and the repository metadata, then I’ll record the Phase 1 evidence in `investigation.md` before writing a focused repro script.
+running git rev-parse HEAD && git status --short && git remote -v
+running sed -n '1,220p' Cargo.toml
+running ls -la && rg --files | sed -n '1,160p'
+running rg -n "committed|oracle|observe|deliver|reply|tick|reboot|heal|liveness|singleton|assumption|Invariant|Safety|Liveness|AS-" simulator lean lib.rs README.md C...
+The checkout is at the requested commit but already has local modifications (`Cargo.toml`, `lib.rs`, `tla_trace/`). I’m inspecting the diff so the repro does not accidentally depend on unrelated instrumentation.
+running git diff -- Cargo.toml lib.rs
+running nl -ba simulator/properties.rs | sed -n '1,430p'
+running nl -ba simulator/lib.rs | sed -n '520,1010p'
+running nl -ba lib.rs | sed -n '1,220p;250,380p;400,780p;1320,1405p'
+The cited simulator property code really is incremental: several properties keep “already verified” cursors and assume committed prefixes are append-only. I’m now checking whether that is merely an intentional optimization with no observable consequence, or whether the shipped simulator can actually return success while its own observable state violates one of those properties.
+running nl -ba simulator/lib.rs | sed -n '1,520p'
+running nl -ba lib.rs | sed -n '780,1325p'
+running nl -ba simulator/simulator_tests.rs | sed -n '1,180p'
+running nl -ba simulator/Cargo.toml | sed -n '1,180p'
+A first important boundary: the simulator state exposed to properties lacks full transport history by construction, but `snapshot()` also lacks per-entry log contents. That means a direct black-box test cannot ask whether “a prior committed entry changed”; I’m going to make the repro capture that limitation explicitly rather than fabricate a protocol violation.
+running nl -ba README.md | sed -n '160,250p'
+running nl -ba simulator/network.rs | sed -n '1,230p'
+running git log --oneline --decorate -- simulator/properties.rs simulator/lib.rs lib.rs simulator/Cargo.toml README.md | sed -n '1,120p'
+running git blame -L 51,105 -- simulator/properties.rs && git blame -L 291,363 -- simulator/properties.rs && git blame -L 904,969 -- simulator/lib.rs
+Developer comments and README frame these observers as simulator checks, not a library contract surface. I’m doing the required duplicate search now across local history and upstream GitHub issues/PRs, including closed/merged entries, before deciding novelty.
+running git config --get remote.origin.url || true && git branch -avv && git log --all --oneline --grep='simulator\\|property\\|properties\\|observer\\|reply\\|reboo...
+running timeout 2m gh search issues --repo penberg/vsr-rs "simulator properties observer replies committed prefix transport history liveness reboot" --state all --li...
+running timeout 2m gh issue list --repo penberg/vsr-rs --state all --limit 100 --json number,title,state,url,closedAt,createdAt,updatedAt 2>&1 || true
+running timeout 2m gh pr list --repo penberg/vsr-rs --state all --limit 100 --json number,title,state,url,mergedAt,closedAt,createdAt,updatedAt 2>&1 || true
+The issue/PR index is small. I’m opening the relevant public issue/PR bodies now to check whether any already reports the exact simulator-observer mechanism; issue #9 and PR #10 are kvstore-specific, so they should not be treated as automatic duplicates.
+running timeout 2m gh issue view 9 --repo penberg/vsr-rs --comments 2>&1 || true
+running timeout 2m gh issue view 1 --repo penberg/vsr-rs --comments 2>&1 || true
+running timeout 2m gh pr view 10 --repo penberg/vsr-rs --comments 2>&1 || true
+running timeout 2m gh search issues --repo penberg/vsr-rs "simulator properties observer replies committed prefix transport history liveness reboot" --state open --i...
+No public issue/PR search hit for this exact observer-history mechanism so far. I’m also checking commit messages on the simulator/Lean branches because a very recent merged or closed fix would still make the finding known.
+running git log --all --stat --oneline --decorate -- simulator/properties.rs simulator/lib.rs lean lib.rs README.md | sed -n '1,260p'
+running timeout 2m gh issue view 9 --repo penberg/vsr-rs --json number,title,body,state,url,comments 2>&1 || true
+running timeout 2m gh issue view 5 --repo penberg/vsr-rs --json number,title,body,state,url,comments 2>&1 || true
+running timeout 2m gh pr view 6 --repo penberg/vsr-rs --json number,title,body,state,url,mergedAt,closedAt,comments 2>&1 || true
+The cited Lean files are not present on `HEAD`, but they do exist on the repository’s `origin/lean` branch. I’m reading them via `git show` only, so the worktree stays on the pinned source revision.
+running git show origin/lean:lean/Vsr/Invariant.lean | nl -ba | sed -n '140,205p'
+running git show origin/lean:lean/Vsr/Safety.lean | nl -ba | sed -n '180,225p'
+running git show origin/lean:lean/Vsr/Liveness.lean | nl -ba | sed -n '45,85p'
+running git show origin/lean:lean/README.md | nl -ba | sed -n '1,220p'
+running git show origin/lean:lean/Vsr/Liveness.lean | nl -ba | sed -n '80,130p'
+running git show origin/lean:lean/Vsr/Check.lean | rg -n "liveness|sent|Inv|TwoReplicas|sorry|violation" -C 2
+running git show origin/lean:lean/Vsr/System.lean | nl -ba | sed -n '1,140p'
+running git show origin/lean:lean/Vsr/Safety.lean | rg -n "sorry|Reachable|NoPanic|PrefixAgreement|Durability|theorem safety|sentWF|commitBounded" -C 3
+Before editing files, I’m checking the simulator CLI shape so the repro can run the actual shipped entry point with bounded timeouts. Then I’ll write both `investigation.md` and the executable repro script.
+running nl -ba simulator/main.rs | sed -n '1,180p'
+running rg -n \"fn log\\(|log\\(\" simulator/main.rs simulator/lib.rs simulator/tui.rs README.md
+running timeout 2m cargo run -p vsr-simulator -- --help 2>&1 | sed -n '1,220p'
+I’m about to write the Phase 1 evidence file and a repro script. The script will run normal simulator/library paths first, then perform static observer-surface checks; it will not patch library logic or synthesize unreachable protocol state.
+running ls -la /home/ubuntu/specula-vsr-runner-20260905/runs/vsr-rs-gpt6astra-ultra-round2-live-20260905/vsr-rs/.specula-output/confirmation/CR-6 && ls -la /home/ubu...
+running git status --short
+I’m checking one deterministic high-fault simulator command before putting it in the repro, so the final script is stable and doesn’t fail just because I picked a bad seed or too-tight tick budget.
+running timeout 5m cargo run -p vsr-simulator -- --lite --requests-max 50 --ticks-max-requests 100000 --ticks-max-convergence 100000 --packet-loss-probability 0.05 -...
+I’m writing the investigation record now with the exact code anchors, call chain, duplicate-search evidence, and the key reachability boundary: the claim needs a hypothetical observer false negative, not a reachable bad state in the library.
+The investigation file and repro script are written. I’m making the script executable and running it with an outer timeout now; the final verdict will be based on that output plus the investigation record.
+running wc -l /home/ubuntu/specula-vsr-runner-20260905/runs/vsr-rs-gpt6astra-ultra-round2-live-20260905/vsr-rs/.specula-output/confirmation/CR-6/investigation.md /ho...
+running chmod +x /home/ubuntu/specula-vsr-runner-20260905/runs/vsr-rs-gpt6astra-ultra-round2-live-20260905/vsr-rs/.specula-output/repro/test_bugCR-6_observer_coverag...
+The repro failed because my Lean `sorry` regex was too strict, not because the repository contradicted the audit. I’m tightening that static check to look at the theorem window directly, then rerunning the same executable.
+The repro script is patched. I’m executing it again with the same outer timeout and will use this second run’s output as the recorded reproduction result.
+running timeout 10m /home/ubuntu/specula-vsr-runner-20260905/runs/vsr-rs-gpt6astra-ultra-round2-live-20260905/vsr-rs/.specula-output/repro/test_bugCR-6_observer_cove...
+- **Source**: Code Review
+- **Novelty**: NEW
+- **Location**: simulator/properties.rs:89
+
+## Description
+CR-6 is a real assurance boundary in the simulator/proof evidence, but I did not confirm it as a current bug. The simulator properties intentionally use incremental cursors and receive only post-tick state; replies are also delivered outside the simulated network. However, reproducing a live wrong outcome would require mutating private state or patching the library to introduce a hypothetical regression.
+
+## Trigger scenario
+Normal simulator execution reaches the cited observer paths through `Simulator::run` / `run_script` -> `step_run` -> `tick` -> `tick_network` -> `check_properties`. No public API sequence in the pinned source produced a state where these observer omissions caused a wrong result.
+
+## Developer intent
+The comments document the optimization: committed prefixes are assumed append-only and checked once per replica. README/Lean docs also describe these as simulator/proof/coverage boundaries, not complete proofs. Upstream issue/PR search found no exact prior report for this observer-history mechanism; issue #9 and PR #10 are kvstore-specific and not duplicates.
+
+## Reproduction result
+Executed: `/home/ubuntu/specula-vsr-runner-20260905/runs/vsr-rs-gpt6astra-ultra-round2-live-20260905/vsr-rs/.specula-output/repro/test_bugCR-6_observer_coverage.sh`
+
+```text
+repo_head=3ac0104a567092139534c9022205d02281a2da41
+Level 0: run the public library/simulator test suite with no failpoints or source changes
+test result: ok. 16 passed; 0 failed
+test result: ok. 5 passed; 0 failed
+Level 0 result: public tests completed without an observable safety/liveness failure.
+
+Level 1: run a deterministic simulator command with normal fault/timing knobs
+messages: sent=293 delivered=311 lost=9 replayed=27 delayed=0
+requests: sent=50 replied=50
+replicas: crashes=0 restarts=0 reboots=0 core=[0, 1, 2] up=[0, 1, 2]
+PASSED (281 ticks)
+Level 1 result: fault/timing-assisted simulator run completed without an observable failure.
+
+Observer-surface audit: static checks for the cited omissions
+PASS: SimContext exposes tick, replicas, replies, and core, but no transport history
+PASS: Property has check/finalize/on_reboot callbacks only
+PASS: Committed-prefix properties skip already verified committed indices
+PASS: Simulator checks properties after request/crash/heartbeat/network phases
+PASS: tick_network batches delivery and has no property check inside the delivery loop
+PASS: Replica replies are delivered directly to clients and appended to replies, not passed through Network::send
+PASS: Snapshot exposes in-flight messages and aggregate counters, not full past transport history
+PASS: MessageSummary is aggregate counters only
+PASS: Retained Lean invariant branch explicitly assumes at least two replicas
+PASS: Retained Lean safety theorem is still a sorry
+PASS: Retained Lean liveness theorem is still a sorry
+Level 2 result: no legal state injection used; exposing the suspected false-negative requires private state mutation or a hypothetical regression.
+Level 3 result: no source patch used; patching library logic would create the symptom rather than reproduce a current bug.
+Overall: the observer omissions are real coverage boundaries, but this test did not reproduce a current reachable wrong outcome through the public simulator/library paths.
+```
+
+## Recommendation
+Do not report this as a vsr-rs protocol bug. If the maintainer wants stronger assurance, split this into concrete test-improvement tasks: add history-aware simulator observers or mutation tests for committed-prefix rewrites, model replies through the same transport layer if that is in scope, and document simulator-vs-Lean coverage boundaries.
+
+VERDICT: FALSE POSITIVE

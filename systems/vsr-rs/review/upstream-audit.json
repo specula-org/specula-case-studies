@@ -1,0 +1,110 @@
+{
+  "checked_at": "2026-09-06T10:23:12.864Z",
+  "repository": "penberg/vsr-rs",
+  "issues": [
+    {
+      "number": 10,
+      "title": "Fix connection-lifecycles bugs in kvstore example",
+      "state": "closed",
+      "created_at": "2026-09-04T15:52:34Z",
+      "updated_at": "2026-09-06T10:04:06Z",
+      "html_url": "https://github.com/penberg/vsr-rs/pull/10",
+      "body": "Fixes #9 and more specifically (1) and (2). Left the client ID issue alone since it seemed out of scope"
+    },
+    {
+      "number": 9,
+      "title": "A couple issues in the kvstore example",
+      "state": "closed",
+      "created_at": "2026-09-04T15:50:22Z",
+      "updated_at": "2026-09-06T10:04:07Z",
+      "html_url": "https://github.com/penberg/vsr-rs/issues/9",
+      "body": "Hey @penberg,\n\nFellow [VSR enjoyer](https://github.com/cozis/ToastyFS/blob/d38f3c24e8cbf884fc06138a6698d33a696b25f5/src/server.c#L1231) here! I was running some DST tooling I'm working on on this project and found some potential issues in the kvstore (protocol itself looks good)\n\n1) When a connection reset happens between primary and backup, a view change is always issued regardless of nodes being healthy. The connect backoff of `500ms` is equal to 5 heartbeat intervals `TICK * PRIMARY_TIMEOUT = 500ms`, so a failed connections causes exactly 5 heartbeats to be lost and therefore a view change. You could reduce the backoff to 300ms or something which would fix it cleanly.\n\n```rust\n/// How often the replica and the clients run their idle logic.\nconst TICK: Duration = Duration::from_millis(100);\n/// Ticks between two re-sends of a request that got no reply.\nconst CLIENT_RESEND_TICKS: u64 = 5;\n/// Idle periods without hearing from the primary before a view change.\nconst PRIMARY_TIMEOUT: usize = 5;\n\n// ...\n\nfn run_sender(\n    self_id: ReplicaID,\n    addresses: Vec<SocketAddr>,\n    frames: Receiver<(ReplicaID, Frame)>,\n    events: Sender<Event>,\n) {\n    let mut streams: HashMap<ReplicaID, TcpStream> = HashMap::new();\n    let mut last_failure: HashMap<ReplicaID, Instant> = HashMap::new();\n    for (dst, frame) in frames {\n        // ...\n        let stream = match streams.entry(dst) {\n            std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),\n            std::collections::hash_map::Entry::Vacant(entry) => {\n                if last_failure\n                    .get(&dst)\n                    .is_some_and(|at| at.elapsed() < Duration::from_millis(500)) // <----- HERE\n                {\n                    continue;\n                }\n                // ...\n            }\n        };\n        // ...\n    }\n}\n```\n\n2) The early return in `run_client_connection` cause the disconnect event to never be generated leaking the connection cleanup in `main()`\n\n```rust\nfn run_client_connection(\n    stream: TcpStream,\n    connection: u64,\n    events: Sender<Event>,\n) -> std::io::Result<()> {\n    let (respond_tx, respond_rx) = channel::<String>();\n    let mut writer = stream.try_clone()?; // <--------- (1)\n    let reader = BufReader::new(stream);\n    for line in reader.lines() {\n        let line = line?; // <--------- (2)\n        let command = match parse_command(&line) {\n            Ok(None) => continue,\n            Ok(Some(command)) => command,\n            Err(response) => {\n                writer.write_all(format!(\"{response}\\r\\n\").as_bytes())?; // <------ (3)\n                continue;\n            }\n        };\n        let _ = events.send(Event::Command {\n            connection,\n            command,\n            respond: respond_tx.clone(),\n        });\n        let Ok(response) = respond_rx.recv() else {\n            break;\n        };\n        writer.write_all(response.as_bytes())?; // <--------- (4)\n    }\n    let _ = events.send(Event::Disconnect(connection));\n    Ok(())\n}\n```\n\n3) This is most likely out of scope for an example but simulation testing easily triggers it. A node may issue the same ID if it starts two times in under a second:\n\n```rust\nlet started = std::time::SystemTime::now()\n    .duration_since(std::time::UNIX_EPOCH)\n    .map(|since| since.as_secs())\n    .unwrap_or(0)\n    & 0xFF_FFFF;\nfor (next, stream) in listener.incoming().flatten().enumerate() {\n    let connection = ((node_id as u64) << 56) | (started << 32) | next as u64;\n    // ...\n}\n```\n\nThe two clients will have the same `started` and same `next` since the connection count restarts on recovery. If this happends they will use the same entry of the client table which would break VSR."
+    },
+    {
+      "number": 8,
+      "title": "Notify client if primary changed",
+      "state": "closed",
+      "created_at": "2023-05-06T09:17:03Z",
+      "updated_at": "2026-09-03T08:40:52Z",
+      "html_url": "https://github.com/penberg/vsr-rs/issues/8",
+      "body": "We need to notify the client when a primary has changed so that they won't keep sending messages to the old one."
+    },
+    {
+      "number": 7,
+      "title": "Remove `on_idle()` from Replica",
+      "state": "closed",
+      "created_at": "2023-05-06T09:16:20Z",
+      "updated_at": "2026-09-03T08:40:49Z",
+      "html_url": "https://github.com/penberg/vsr-rs/issues/7",
+      "body": "We need to make `Replica` keep track of (logical) time so that it can detect timeouts based on the `tick()` event. This simplifies simulation as well because we can, for example, just stop generating messages from primary and the backups will detect it's down on their own and initiate a view change."
+    },
+    {
+      "number": 6,
+      "title": "View change protocol",
+      "state": "closed",
+      "created_at": "2023-05-06T07:29:55Z",
+      "updated_at": "2026-09-03T08:36:38Z",
+      "html_url": "https://github.com/penberg/vsr-rs/pull/6",
+      "body": null
+    },
+    {
+      "number": 5,
+      "title": "Replace custom simulator with MadSim?",
+      "state": "closed",
+      "created_at": "2023-04-17T07:47:09Z",
+      "updated_at": "2026-09-03T08:40:47Z",
+      "html_url": "https://github.com/penberg/vsr-rs/issues/5",
+      "body": null
+    },
+    {
+      "number": 4,
+      "title": "Resend messages after timeout",
+      "state": "closed",
+      "created_at": "2023-04-15T11:16:22Z",
+      "updated_at": "2026-09-03T08:40:46Z",
+      "html_url": "https://github.com/penberg/vsr-rs/issues/4",
+      "body": "For example, let's assume a replica is attempting to catch up by sending `GetState` message. It will now wait to receive a `NewState` message, but there are many reasons why that may not happen. Maybe the replica we sent the `GetState` message to died or the message got lost. Therefore, resend (some) messages after some timeout period to make progress in the presence of failures."
+    },
+    {
+      "number": 3,
+      "title": "CI configuration",
+      "state": "closed",
+      "created_at": "2023-04-15T09:30:42Z",
+      "updated_at": "2023-04-15T09:30:55Z",
+      "html_url": "https://github.com/penberg/vsr-rs/pull/3",
+      "body": "Let's steal the CI configuration from \"mvcc-rs\" project..."
+    },
+    {
+      "number": 2,
+      "title": "Handle duplicate messages",
+      "state": "closed",
+      "created_at": "2023-04-15T09:22:32Z",
+      "updated_at": "2023-04-15T09:52:26Z",
+      "html_url": "https://github.com/penberg/vsr-rs/pull/2",
+      "body": null
+    },
+    {
+      "number": 1,
+      "title": "Deterministic simulation testing",
+      "state": "closed",
+      "created_at": "2022-10-31T13:24:09Z",
+      "updated_at": "2022-11-05T12:20:57Z",
+      "html_url": "https://github.com/penberg/vsr-rs/issues/1",
+      "body": "Look into adopting https://crates.io/crates/turmoil for a deterministic simulation testing framework in our test suite."
+    }
+  ],
+  "pull_10": {
+    "state": "closed",
+    "merged": true,
+    "merged_at": "2026-09-06T10:04:05Z",
+    "merge_commit_sha": "0b64760fb163861d19fd42b4c13e3494f610879c",
+    "body": "Fixes #9 and more specifically (1) and (2). Left the client ID issue alone since it seemed out of scope",
+    "html_url": "https://github.com/penberg/vsr-rs/pull/10"
+  },
+  "pull_10_files": [
+    {
+      "filename": "examples/kvstore/main.rs",
+      "patch": "@@ -385,9 +385,11 @@ fn run_sender(\n             .write_all(line.as_bytes())\n             .and_then(|_| stream.write_all(b\"\\n\"))\n         {\n+            // Drop the stream but do not start the backoff: the peer was\n+            // reachable a moment ago, so the next frame retries the connect\n+            // right away. If that connect fails, the backoff starts then.\n             warn!(\"lost connection to node {dst}: {err}\");\n             streams.remove(&dst);\n-            last_failure.insert(dst, Instant::now());\n         }\n     }\n }\n@@ -442,7 +444,8 @@ fn parse_command(line: &str) -> Result<Option<Command>, String> {\n }\n \n /// Serves one client connection: one command at a time, each answered once\n-/// the replicated store has executed it.\n+/// the replicated store has executed it. However the connection ends, the\n+/// event loop is told it is gone.\n fn run_client_connection(\n     stream: TcpStream,\n     connection: u64,\n@@ -451,28 +454,62 @@ fn run_client_connection(\n     let (respond_tx, respond_rx) = channel::<String>();\n     let mut writer = stream.try_clone()?;\n     let reader = BufReader::new(stream);\n+    // A read or write error breaks out of the loop rather than returning, or\n+    // it would carry us past the Event::Disconnect below and the event loop\n+    // would keep this connection's client for the life of the process.\n+    let mut outcome = Ok(());\n     for line in reader.lines() {\n-        let line = line?;\n-        let command = match parse_command(&line) {\n-            Ok(None) => continue,\n-            Ok(Some(command)) => command,\n-            Err(response) => {\n-                writer.write_all(format!(\"{response}\\r\\n\").as_bytes())?;\n-                continue;\n-            }\n-        };\n-        let _ = events.send(Event::Command {\n-            connection,\n-            command,\n-            respond: respond_tx.clone(),\n+        let step = line.and_then(|line| {\n+            run_client_command(\n+                &line,\n+                &mut writer,\n+                connection,\n+                &events,\n+                &respond_tx,\n+                &respond_rx,\n+            )\n         });\n-        let Ok(response) = respond_rx.recv() else {\n-            break;\n-        };\n-        writer.write_all(response.as_bytes())?;\n+        match step {\n+            Ok(true) => continue,\n+            Ok(false) => break,\n+            Err(err) => {\n+                outcome = Err(err);\n+                break;\n+            }\n+        }\n     }\n     let _ = events.send(Event::Disconnect(connection));\n-    Ok(())\n+    outcome\n+}\n+\n+/// Runs one command from a client connection. Returns false once the\n+/// connection should be closed.\n+fn run_client_command(\n+    line: &str,\n+    writer: &mut TcpStream,\n+    connection: u64,\n+    events: &Sender<Event>,\n+    respond_tx: &Sender<String>,\n+    respond_rx: &Receiver<String>,\n+) -> std::io::Result<bool> {\n+    let command = match parse_command(line) {\n+        Ok(None) => return Ok(true),\n+        Ok(Some(command)) => command,\n+        Err(response) => {\n+            writer.write_all(format!(\"{response}\\r\\n\").as_bytes())?;\n+            return Ok(true);\n+        }\n+    };\n+    let _ = events.send(Event::Command {\n+        connection,\n+        command,\n+        respond: respond_tx.clone(),\n+    });\n+    let Ok(response) = respond_rx.recv() else {\n+        return Ok(false);\n+    };\n+    writer.write_all(response.as_bytes())?;\n+    Ok(true)\n }\n \n fn run_client_acceptor(listener: TcpListener, node_id: ReplicaID, events: Sender<Event>) {"
+    }
+  ]
+}

@@ -1,0 +1,128 @@
+I’ll use the `bug-confirmation` skill and keep this confined to CR-2. I’ll first read the skill instructions and relevant memory, then inspect only the target repo and issue/git history needed for duplicate filtering.
+running // @exec: {"max_output_tokens": 100000} rg -n "bug-confirmation|vsr-rs|CR-2|singleton|self-quorum|one-replica|quorum" /home/ubuntu/.codex/memories/MEMORY.md
+running // @exec: {\"max_output_tokens\": 100000} sed -n '1,260p' /home/ubuntu/.codex/skills/bug-confirmation/SKILL.md
+The skill entry points to its guide and phase files, so I’m reading those now before touching the worktree. The memory registry did not surface a prior vsr-rs CR-2 entry, so I’m proceeding from the live artifacts.
+running sed -n '1,260p' /home/ubuntu/.codex/skills/bug-confirmation/guide.md
+running sed -n '1,320p' /home/ubuntu/.codex/skills/bug-confirmation/phases/01-investigation.md
+running sed -n '1,360p' /home/ubuntu/.codex/skills/bug-confirmation/phases/02-reproduction.md
+I’ve got the required workflow: write `investigation.md`, do the duplicate search first, then create and run a real reproduction under `repro/`. Next I’m auditing the cited code and repo metadata at the pinned worktree.
+running nl -ba lib.rs | sed -n '1,130p;650,780p'
+running pwd && git rev-parse HEAD && git status --short && git remote -v
+running nl -ba simulator/lib.rs | sed -n '210,270p'
+running rg -n "PrepareOk|on_request|commit|quorum|add_replica|config|Request|Client|Reply|primary|replica" lib.rs simulator/lib.rs tests examples Cargo.toml README*
+The worktree is at the pinned commit but already dirty (`Cargo.toml`, `lib.rs`, and `tla_trace/`). I’m treating those as pre-existing state, reading the diff for provenance, and I’ll keep any new repro file outside the source tree path requested by the dispatcher.
+running git diff -- Cargo.toml lib.rs
+running git remote -v
+running nl -ba lib.rs | sed -n '128,260p;580,660p;780,880p;880,1040p'
+running nl -ba tests/cluster.rs | sed -n '1,150p;405,460p'
+running find /home/ubuntu/specula-vsr-runner-20260905/runs/vsr-rs-gpt6astra-ultra-round2-live-20260905/vsr-rs/.specula-output -maxdepth 3 -type f \\( -name '*log' -o...
+using web_search
+The local audit shows the library accepts a singleton `Config`, records the primary’s own ack on request append, and only evaluates quorum when handling a `PrepareOk`. I’m now checking upstream issues/PRs and local history for the exact singleton/self-ack mechanism before deciding novelty.
+running git log --oneline --decorate --all -- lib.rs simulator/lib.rs tests/cluster.rs Cargo.toml | sed -n '1,120p'
+running git blame -L 94,102 -- lib.rs && git blame -L 660,710 -- lib.rs && git blame -L 749,783 -- lib.rs && git blame -L 258,260 -- simulator/lib.rs
+running rg -n \"one replica|single replica|single-node|singleton|quorum|replica_count|at least 1|prepare ok|PrepareOk|commit|majority|f \\+ 1|replica_count must\" RE...
+running command -v gh || true
+running timeout 2m gh issue list -R penberg/vsr-rs --state all --limit 100 --search "singleton OR single replica OR quorum OR PrepareOk OR commit"
+running timeout 2m gh pr list -R penberg/vsr-rs --state all --limit 100 --search "singleton OR single replica OR quorum OR PrepareOk OR commit"
+running timeout 2m gh issue list -R penberg/vsr-rs --state all --limit 100
+running timeout 2m gh pr list -R penberg/vsr-rs --state all --limit 100
+Upstream has only a small tracker surface: six issues and four PRs. The search terms did not return an exact singleton/self-ack report; I’m reading the plausible nearby issue/PR bodies to make the novelty call evidence-backed.
+running timeout 2m gh issue view 4 -R penberg/vsr-rs --json number,title,state,url,body,createdAt,updatedAt,closedAt
+running timeout 2m gh issue view 5 -R penberg/vsr-rs --json number,title,state,url,body,createdAt,updatedAt,closedAt
+running timeout 2m gh issue view 9 -R penberg/vsr-rs --json number,title,state,url,body,createdAt,updatedAt,closedAt
+running timeout 2m gh pr view 2 -R penberg/vsr-rs --json number,title,state,url,body,createdAt,updatedAt,closedAt,mergedAt,commits,files
+running timeout 2m gh pr view 6 -R penberg/vsr-rs --json number,title,state,url,body,createdAt,updatedAt,closedAt,mergedAt,commits,files
+running timeout 2m gh pr view 10 -R penberg/vsr-rs --json number,title,state,url,body,createdAt,updatedAt,closedAt,mergedAt,commits,files
+The nearby upstream reports are kvstore/simulator/resend/view-change issues, not this library singleton path. I’m doing one narrower search for “single replica”, “replica_count 1”, and `PrepareOk` across issues and PRs, then I’ll write the investigation record.
+running timeout 2m gh search issues --repo penberg/vsr-rs "single replica" --state all --limit 50
+running timeout 2m gh search issues --repo penberg/vsr-rs "replica_count 1" --state all --limit 50
+running git log --all --grep='single\\|singleton\\|quorum\\|PrepareOk\\|commit\\|replica_count' --regexp-ignore-case --oneline --decorate
+running timeout 2m gh search issues --repo penberg/vsr-rs "PrepareOk" --state all --limit 50
+running timeout 2m gh search prs --repo penberg/vsr-rs "single replica" --state all --limit 50
+running timeout 2m gh search prs --repo penberg/vsr-rs "replica_count 1" --state all --limit 50
+running timeout 2m gh search prs --repo penberg/vsr-rs "PrepareOk" --state all --limit 50
+running git log --all -S'pub fn quorum' --oneline --decorate -- lib.rs simulator/lib.rs tests/cluster.rs && git log --all -S'replica_count >= 1' --oneline --decorate...
+running timeout 2m gh search issues --repo penberg/vsr-rs "single replica" --state open --limit 50 --json number,title,state,url,updatedAt
+running timeout 2m gh search issues --repo penberg/vsr-rs "single replica" --state closed --limit 50 --json number,title,state,url,updatedAt
+running timeout 2m gh search issues --repo penberg/vsr-rs "replica_count 1" --state open --limit 50 --json number,title,state,url,updatedAt
+running timeout 2m gh search issues --repo penberg/vsr-rs "replica_count 1" --state closed --limit 50 --json number,title,state,url,updatedAt
+running timeout 2m gh search issues --repo penberg/vsr-rs "PrepareOk" --state open --limit 50 --json number,title,state,url,updatedAt
+running timeout 2m gh search issues --repo penberg/vsr-rs "PrepareOk" --state closed --limit 50 --json number,title,state,url,updatedAt
+running timeout 2m gh search prs --repo penberg/vsr-rs "single replica" --state open --limit 50 --json number,title,state,url,updatedAt,mergedAt
+running timeout 2m gh search prs --repo penberg/vsr-rs "replica_count 1" --state open --limit 50 --json number,title,state,url,updatedAt,mergedAt
+running timeout 2m gh search prs --repo penberg/vsr-rs "single replica" --state closed --limit 50 --json number,title,state,url,updatedAt,mergedAt
+running timeout 2m gh search prs --repo penberg/vsr-rs "replica_count 1" --state closed --limit 50 --json number,title,state,url,updatedAt,mergedAt
+running timeout 2m gh search prs --repo penberg/vsr-rs "PrepareOk" --state closed --limit 50 --json number,title,state,url,updatedAt,mergedAt
+running timeout 2m gh search prs --repo penberg/vsr-rs "PrepareOk" --state open --limit 50 --json number,title,state,url,updatedAt,mergedAt
+One `gh search prs` option combination failed because this installed `gh` build does not expose `mergedAt` in search JSON. I’m rerunning the same PR searches with the supported fields; this is just the duplicate-filter step.
+running timeout 2m gh search prs --repo penberg/vsr-rs "single replica" --state open --limit 50 --json number,title,state,url,updatedAt,closedAt
+running timeout 2m gh search prs --repo penberg/vsr-rs "single replica" --state closed --limit 50 --json number,title,state,url,updatedAt,closedAt
+running timeout 2m gh search prs --repo penberg/vsr-rs "replica_count 1" --state open --limit 50 --json number,title,state,url,updatedAt,closedAt
+running timeout 2m gh search prs --repo penberg/vsr-rs "PrepareOk" --state open --limit 50 --json number,title,state,url,updatedAt,closedAt
+running timeout 2m gh search prs --repo penberg/vsr-rs "replica_count 1" --state closed --limit 50 --json number,title,state,url,updatedAt,closedAt
+running timeout 2m gh search prs --repo penberg/vsr-rs "PrepareOk" --state closed --limit 50 --json number,title,state,url,updatedAt,closedAt
+running nl -ba lib.rs | sed -n '260,380p;390,540p;1220,1420p;1440,1490p'
+running rg -n \"fn send\\(|fn send_to_others|fn drain|pub fn drain|drain_messages|drain_replies|primary_id|is_primary|append_to_log|Client<\" lib.rs
+running nl -ba README.md | sed -n '48,78p;91,138p;176,185p'
+The public README describes the intended owner loop and says the state machine is called for every committed operation. For a one-member config, the owner loop has no peer messages to deliver after the initial request, which is exactly the suspected progress gap.
+running nl -ba lib.rs | sed -n '380,389p;1418,1438p;1490,1498p'
+running cargo test --no-run
+I’m writing the Phase 1 evidence record now. It records the reachable public call chain, the absence of an exact upstream duplicate, and the nearby but non-duplicate issue/PR evidence.
+Phase 1 is recorded. I’m going to add a self-contained shell repro under the requested `repro/` directory; it will build a temporary Rust client against the worktree and exercise only public `Client`/`Replica` APIs, with a three-replica control and a singleton trigger.
+running sed -n '1,80p' Cargo.toml
+running ls -ld /home/ubuntu/specula-vsr-runner-20260905/runs/vsr-rs-gpt6astra-ultra-round2-live-20260905/vsr-rs/.specula-output/repro
+I’m adding the repro script now. It will not patch the library or fabricate messages; the only delivered message in the singleton case is the public client `Request`, followed by normal idle/retry rounds.
+The repro script is in place. I’m marking it executable and running it with an outer timeout, as required by the confirmation workflow.
+running chmod +x /home/ubuntu/specula-vsr-runner-20260905/runs/vsr-rs-gpt6astra-ultra-round2-live-20260905/vsr-rs/.specula-output/repro/test_bugCR-2_singleton_self_q...
+running timeout 5m /home/ubuntu/specula-vsr-runner-20260905/runs/vsr-rs-gpt6astra-ultra-round2-live-20260905/vsr-rs/.specula-output/repro/test_bugCR-2_singleton_self...
+The Level 0 run reproduced the behavior without timing help, state injection, or source changes. I’m recording the exact command and output in the CR-2 work directory so the final verdict is backed by the executed artifact.
+- **Source**: Code Review
+- **Novelty**: NEW
+- **Location**: lib.rs:698
+
+## Description
+`Config::add_replica` accepts a one-replica configuration and `Config::quorum()` returns 1, but the singleton primary does not commit its own request after recording its self-ack. The primary records `{self}` in `on_request`, then only evaluates quorum inside `on_prepare_ok`; with no peers, no `PrepareOk` can arrive and no reply is produced.
+
+## Trigger scenario
+Create a one-member config through the public API, create `Client` and `Replica`, submit one client request, deliver the client's public `Request` to replica 0, then run normal idle/retry/drain rounds. The replica reaches `op_number == 1`, but stays at `commit_number == 0`, leaves the state machine unapplied, and produces no reply.
+
+## Developer intent
+The public README owner loop says callers deliver messages, call `on_idle`, then drain messages/replies; it does not reject or document singleton clusters as unsupported. The simulator also validates `replica_count >= 1` at `simulator/lib.rs:258-260`, while randomized runs choose 3..7.
+
+Prior-report search covered upstream issues and recently open/closed PRs via `gh issue list`, `gh pr list`, and searches for `single replica`, `replica_count 1`, and `PrepareOk`. Nearby reports are not this mechanism: issue #4 is resend timeout, issue #9 and PR #10 are kvstore issues, and PR #2 is duplicate-message handling.
+
+## Reproduction result
+Test written and executed: `/home/ubuntu/specula-vsr-runner-20260905/runs/vsr-rs-gpt6astra-ultra-round2-live-20260905/vsr-rs/.specula-output/repro/test_bugCR-2_singleton_self_quorum.sh`
+
+Command:
+```sh
+timeout 5m /home/ubuntu/specula-vsr-runner-20260905/runs/vsr-rs-gpt6astra-ultra-round2-live-20260905/vsr-rs/.specula-output/repro/test_bugCR-2_singleton_self_quorum.sh
+```
+
+Output:
+```text
+control_three_replicas: op=1 commit=1 value=7 replies=1
+singleton_config: replicas=[0] quorum=1
+singleton_request: request_number=0
+singleton_round_0: delivered_before_idle=1 delivered_after_idle=1 op=1 commit=0 value=0 replies=0
+singleton_round_1: delivered_before_idle=0 delivered_after_idle=1 op=1 commit=0 value=0 replies=0
+singleton_round_2: delivered_before_idle=0 delivered_after_idle=1 op=1 commit=0 value=0 replies=0
+singleton_round_3: delivered_before_idle=0 delivered_after_idle=1 op=1 commit=0 value=0 replies=0
+singleton_round_4: delivered_before_idle=0 delivered_after_idle=1 op=1 commit=0 value=0 replies=0
+singleton_round_5: delivered_before_idle=0 delivered_after_idle=1 op=1 commit=0 value=0 replies=0
+singleton_round_6: delivered_before_idle=0 delivered_after_idle=1 op=1 commit=0 value=0 replies=0
+singleton_round_7: delivered_before_idle=0 delivered_after_idle=1 op=1 commit=0 value=0 replies=0
+singleton_final: op=1 commit=0 value=0 replies=0 no_replica_messages_left=true no_replies_left=true
+BUG REPRODUCED: singleton accepts quorum=1 and records the request, but no public owner-loop step commits it or returns a reply
+```
+
+Checklist:
+1. Did Level 0 or Level 1 alone trigger it? yes, Level 0.
+2. Level 2/3 precondition: N/A.
+3. Real consumer/caller observing wrong outcome: the public owner loop that drains `Replica::drain_replies` (`README.md:119-126`, `lib.rs:1492-1494`) receives no reply; the state machine is not applied despite the accepted request.
+4. Permanent or masked: permanent under the public owner-loop path. `send_to_others` skips self (`lib.rs:1424-1429`), primary idle only sends to others, and client retries remain unanswered; the repro shows repeated rounds with no messages/replies left.
+
+## Recommendation
+Either reject/document singleton configurations consistently, or commit immediately after inserting the primary self-ack when `acks.len() == config.quorum()` in `on_request`.
+
+VERDICT: REPRODUCED

@@ -1,0 +1,96 @@
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -13,4 +13,8 @@
+ log = "0.4.17"
+ 
+ [dev-dependencies]
++serde_json = "1"
+ env_logger = "0.9.1"
++
++[features]
++trace-harness = []
+--- a/lib.rs
++++ b/lib.rs
+@@ -19,6 +19,10 @@
+ //! replica can forget that it asked for a view change and let two views run
+ //! at once, as shown by Michael et al. in "Recovering Shared Objects Without
+ //! Stable Storage".
++
++#[cfg(all(test, feature = "trace-harness"))]
++#[path = "tla_trace/tla_trace.rs"]
++mod tla_trace;
+ 
+ use log::trace;
+ use std::{
+@@ -310,6 +314,8 @@
+ 
+     /// Sends `op` to the primary and returns the request number it was given.
+     pub fn on_request(&mut self, op: Op) -> RequestNumber {
++        #[cfg(all(test, feature = "trace-harness"))]
++        tla_trace::observe_call("ClientOnRequest", self.client_id);
+         trace!("Client {} <- {:?}", self.client_id, op);
+         let request_number = self.next_request_number;
+         self.next_request_number += 1;
+@@ -332,6 +338,8 @@
+     /// answers the pending request; a duplicate or a reply for an earlier
+     /// request does not.
+     pub fn on_reply(&mut self, request_number: RequestNumber, view_number: ViewNumber) -> bool {
++        #[cfg(all(test, feature = "trace-harness"))]
++        tla_trace::observe_call("ClientOnReply", self.client_id);
+         if view_number > self.view_number {
+             self.view_number = view_number;
+         }
+@@ -351,6 +359,8 @@
+     /// request, if any, to every replica: the primary may have changed
+     /// without this client knowing, and backups ignore client requests.
+     pub fn on_idle(&mut self) {
++        #[cfg(all(test, feature = "trace-harness"))]
++        tla_trace::observe_call("ClientOnIdle", self.client_id);
+         let Some((request_number, op)) = &self.pending else {
+             return;
+         };
+@@ -472,6 +482,8 @@
+     recovery_responses: BTreeMap<ReplicaID, RecoveryResponse<SM::Input>>,
+     outbox: Vec<(ReplicaID, Message<SM::Input>)>,
+     replies: Vec<Reply<SM::Output>>,
++    #[cfg(all(test, feature = "trace-harness"))]
++    trace_applied: Vec<LogEntry<SM::Input>>,
+ }
+ 
+ impl<SM: StateMachine> Replica<SM> {
+@@ -499,6 +511,8 @@
+             recovery_responses: BTreeMap::new(),
+             outbox: Vec::new(),
+             replies: Vec::new(),
++            #[cfg(all(test, feature = "trace-harness"))]
++            trace_applied: Vec::new(),
+         }
+     }
+ 
+@@ -526,6 +540,8 @@
+ 
+     /// The main entry point to replica logic.
+     pub fn on_message(&mut self, message: Message<SM::Input>) {
++        #[cfg(all(test, feature = "trace-harness"))]
++        tla_trace::observe_call(&format!("On{}", tla_trace::message_kind(&message)), self.self_id);
+         trace!("Replica {} <- {:?}", self.self_id, message);
+         // A recovering replica knows nothing it could safely act on: not
+         // which view is current, not what it acknowledged before the crash.
+@@ -1231,6 +1247,8 @@
+     /// change, and a view change that takes as long to complete is
+     /// followed by another, waiting twice as long each time.
+     pub fn on_idle(&mut self) {
++        #[cfg(all(test, feature = "trace-harness"))]
++        tla_trace::observe_call("OnIdle", self.self_id);
+         match self.status {
+             Status::Normal if self.is_primary() => {
+                 self.note_stable();
+@@ -1361,6 +1379,8 @@
+     /// without running it again.
+     fn commit_op(&mut self, op_idx: usize) -> Reply<SM::Output> {
+         let entry = self.log[op_idx].clone();
++        #[cfg(all(test, feature = "trace-harness"))]
++        self.trace_applied.push(entry.clone());
+         let result = self.state_machine.apply(entry.op);
+         self.commit_number += 1;
+         if let Some(client) = self.client_table.get_mut(&entry.client_id) {

@@ -1,0 +1,115 @@
+I’ll use the `bug-confirmation` skill and first load its instructions, plus a quick memory lookup for any prior vsr-rs confirmation context. Then I’ll inspect only the requested source/work dirs and keep the reproduction evidence self-contained.
+running // @exec: {\"max_output_tokens\": 100000} sed -n '1,260p' /home/ubuntu/.codex/skills/bug-confirmation/SKILL.md
+running // @exec: {"max_output_tokens": 100000} find /home/ubuntu/.codex/skills/bug-confirmation -maxdepth 3 -type f | sort
+running // @exec: {"max_output_tokens": 100000} rg -n "CR-3|vsr-rs|kvstore|shared sender|blocked peer|one blocked|sender-isolation|failure detector" /home/ubuntu/.co...
+The skill entrypoint points to the detailed guide and phase files. I’m loading those now; after that I’ll inspect the kvstore sender path and build a real executable reproduction rather than relying on the scenario summary.
+running rg -n "CR-3|vsr-rs|kvstore|shared sender|blocked peer|one blocked|sender-isolation|failure detector" /home/ubuntu/.codex/memories/MEMORY.md
+running sed -n '1,260p' /home/ubuntu/.codex/skills/bug-confirmation/guide.md
+running sed -n '1,260p' /home/ubuntu/.codex/skills/bug-confirmation/phases/01-investigation.md
+running sed -n '1,300p' /home/ubuntu/.codex/skills/bug-confirmation/phases/02-reproduction.md
+running wc -l /home/ubuntu/.codex/skills/bug-confirmation/SKILL.md /home/ubuntu/.codex/skills/bug-confirmation/guide.md /home/ubuntu/.codex/skills/bug-confirmation/p...
+running ls -la /home/ubuntu/specula-vsr-runner-20260905/runs/vsr-rs-gpt6astra-ultra-round2-live-20260905/vsr-rs/.specula-output/confirmation/CR-3 /home/ubuntu/specul...
+running git -C /home/ubuntu/specula-vsr-runner-20260905/runs/vsr-rs-gpt6astra-ultra-round2-live-20260905/vsr-rs/.specula-output/confirmation/CR-3/worktree status --s...
+The worktree is already dirty (`Cargo.toml`, `lib.rs`, and `tla_trace/`), so I’ll avoid treating that as mine or reverting it. I’ll anchor the investigation on the checked-out commit and the kvstore code path the finding cites.
+running nl -ba examples/kvstore/main.rs | sed -n '1,90p;300,420p;520,675p'
+running rg -n "write_all|connect_timeout|failure|tick|Sender|mpsc|send|TcpStream|set_write_timeout|thread::spawn|heartbeat|timeout|recv|client|replica" examples/kvst...
+running git diff --stat && git diff -- Cargo.toml lib.rs | sed -n '1,240p'
+running find .. -maxdepth 3 -type f | sort
+running nl -ba examples/kvstore/main.rs | sed -n '420,520p;675,765p'
+running sed -n '1,220p' README.md
+running git log --oneline --decorate -- examples/kvstore/main.rs | sed -n '1,80p' && git blame -L 337,392 -- examples/kvstore/main.rs
+running rg -n "TODO|FIXME|write timeout|write_all|blocked|blocking|sender|run_sender|unreachable|re-send|resend|protocol re-sends|set_write_timeout|nodelay|kvstore|e...
+The code path is reachable from normal kvstore operation: the main event loop drains replica/client messages into a single `frames` channel, and one sender thread serializes every remote write. I’m now checking developer history and tracker status for the exact “blocking kvstore sender delays other peers” mechanism before writing the repro.
+running sed -n '1,140p' examples/kvstore/README.md
+running git log --all --decorate --oneline --grep='kvstore\\|sender\\|write_all\\|timeout\\|blocked\\|stall\\|peer' --regexp-ignore-case | sed -n '1,120p'
+running git log --all --decorate --oneline -S'run_sender' -- examples/kvstore/main.rs && git log --all --decorate --oneline -S'set_write_timeout' -- . && git log --a...
+running gh --version || true if gh repo view penberg/vsr-rs >/tmp/cr3_gh_repo.txt 2>/tmp/cr3_gh_repo.err; then cat /tmp/cr3_gh_repo.txt else cat /tmp/cr3_gh_repo.err fi
+The local history shows the kvstore sender was introduced in one commit and has no later local change adding write timeouts. I’m doing the required upstream issue/PR search now, including closed PRs, to decide novelty before reproduction.
+running gh search issues --repo penberg/vsr-rs "kvstore write_all sender" --state all --limit 50
+running gh search issues --repo penberg/vsr-rs "blocked peer" --state all --limit 50
+running gh search prs --repo penberg/vsr-rs "kvstore write timeout" --state all --limit 50
+running gh search prs --repo penberg/vsr-rs "sender OR blocked OR stall OR write_all" --state all --limit 50
+The first `gh search` form rejected `--state all`, so I’m rerunning open and closed searches explicitly and also listing recent closed PRs. This is just the novelty check; no external mutation.
+running for state in open closed; do echo "### issues state=$state: kvstore write_all sender timeout blocked stall peer" gh search issues --repo penberg/vsr-rs "kvst...
+running for state in open closed; do echo "### prs state=$state: kvstore write_all sender timeout blocked stall peer" gh search prs --repo penberg/vsr-rs "kvstore wr...
+running gh issue list --repo penberg/vsr-rs --state all --limit 100 --json number,title,state,url,updatedAt,closedAt | jq -r '.[] | \"#\\(.number) [\\(.state)] \\(.t...
+running gh pr list --repo penberg/vsr-rs --state all --limit 100 --json number,title,state,url,mergedAt,closedAt,updatedAt | jq -r '.[] | \"#\\(.number) [\\(.state)]...
+The tracker has a live kvstore issue (#9) and an open kvstore PR (#10), so I need to inspect those to avoid mislabeling a duplicate as new. I’m checking whether they cover this exact sender-write blocking mechanism at `run_sender`, not just other kvstore lifecycle issues.
+running gh pr diff 10 --repo penberg/vsr-rs -- examples/kvstore/main.rs | sed -n '1,260p'
+running gh issue view 9 --repo penberg/vsr-rs --json number,title,state,url,body,comments | jq -r '. as "'$i | "#'"\\("'$i.number) ['"\\("'$i.state)] '"\\("'$i.title...
+running gh pr view 10 --repo penberg/vsr-rs --json number,title,state,url,body,comments,files,commits,reviews | jq -r '. as "'$p | "#'"\\("'$p.number) ['"\\("'$p.sta...
+running gh issue view 4 --repo penberg/vsr-rs --json number,title,state,url,body,comments | jq -r '. as "'$i | "#'"\\("'$i.number) ['"\\("'$i.state)] '"\\("'$i.title...
+Issue #9/PR #10 cover connect-backoff after a dropped live connection and client disconnect cleanup, plus nonce freshness; they do not report the exact “a connected but non-reading peer blocks writes to other destinations” mechanism. I’m pulling the PR diff just to confirm it did not add a write timeout or per-destination sender isolation.
+running git log --all --decorate --oneline --since='2026-09-01' -- examples/kvstore/main.rs lib.rs tests simulator | sed -n '1,160p'
+running gh pr diff 10 --repo penberg/vsr-rs | sed -n '1,260p'
+running gh pr view 10 --repo penberg/vsr-rs --json files --jq '.files[] | select(.path==\"examples/kvstore/main.rs\") | .path + \" additions=\" + (.additions|tostrin...
+I’m going to reproduce through the shipped kvstore binary rather than a copied sender loop: start a real three-node cluster, pause one backup so its TCP receive window stops draining, issue a large client `SET`, and measure whether the other healthy backup/client are delayed until the paused peer resumes.
+running timeout 5m cargo build --example kvstore
+running python3 - <<'PY' import os, signal, socket, subprocess, tempfile, time, select, sys from pathlib import Path root=Path.cwd() bin=root/'target/debug/examples/...
+running python3 - <<'PY' import os, signal, socket, subprocess, tempfile, time, select from pathlib import Path root=Path.cwd(); bin=root/'target/debug/examples/kvst...
+The first calibration showed 8 MiB is the largest payload that still commits in a healthy local cluster within about 0.6s; larger values destabilize even without a paused peer. I’m narrowing the repro around that size so the fault case is attributable to the stalled peer rather than payload size alone.
+running python3 - <<'PY' import os, signal, socket, subprocess, tempfile, time, select from pathlib import Path root=Path.cwd(); bin=root/'target/debug/examples/kvst...
+With an 8 MiB normal client value, the healthy cluster responds, but pausing one backup makes the same public operation exceed the 800 ms window and only complete several seconds after the peer resumes. I’m checking a smaller payload too, to find the least invasive deterministic trigger.
+running python3 - <<'PY' import os, signal, socket, subprocess, tempfile, time, select from pathlib import Path root=Path.cwd(); bin=root/'target/debug/examples/kvst...
+I’ve got the reproduction shape: Level 0 proves a 4 MiB client write completes with all peers running; Level 1 pauses one real backup process, then the same public client write receives no reply inside the 800 ms window and only resolves after the peer is resumed. I’m writing that as the required self-contained repro script and recording the Phase 1 evidence.
+running mkdir -p /home/ubuntu/specula-vsr-runner-20260905/runs/vsr-rs-gpt6astra-ultra-round2-live-20260905/vsr-rs/.specula-output/repro
+The repro script and investigation record are now in place. I’m running the repro with an outer timeout, as required by the skill, and I’ll use the actual output for the verdict.
+running chmod +x /home/ubuntu/specula-vsr-runner-20260905/runs/vsr-rs-gpt6astra-ultra-round2-live-20260905/vsr-rs/.specula-output/repro/test_bugCR-3_sender_stall.py...
+- **Source**: Code Review
+- **Novelty**: NEW
+- **Location**: examples/kvstore/main.rs:342
+
+## Description
+`examples/kvstore/main.rs` uses one shared sender thread and one FIFO `frames` channel for all peer destinations. `run_sender` bounds `connect_timeout`, but once a `TcpStream` exists it performs blocking `write_all` calls without a write timeout at `examples/kvstore/main.rs:383-387`. A connected peer that stops draining its TCP receive buffer can therefore hold the sender thread and delay queued frames to healthy peers.
+
+## Trigger scenario
+Start the shipped three-node kvstore. Let the primary establish TCP streams to both backups. Stall one real backup process with `SIGSTOP`, then send a normal public client `SET` containing a 4 MiB single-word value to node 0. The primary blocks writing the `Prepare` frame to the stalled backup, so the `Prepare` to the healthy backup waits behind it and the client sees no reply past the 500 ms failure-detector budget.
+
+## Developer intent
+No existing upstream issue or PR reports this exact connected-write blocking mechanism. I searched open and closed issues/PRs for `kvstore`, `write_all`, `sender`, `timeout`, `blocked peer`, `stalled peer`, and `run_sender`.
+
+Issue #9 reports reconnect backoff, client disconnect cleanup, and client-id reuse. PR #10 fixes the first two of those and leaves the connected `write_all` path without a write timeout or per-destination isolation.
+
+## Reproduction result
+Test written and executed: `/home/ubuntu/specula-vsr-runner-20260905/runs/vsr-rs-gpt6astra-ultra-round2-live-20260905/vsr-rs/.specula-output/repro/test_bugCR-3_sender_stall.py`
+
+Command:
+```text
+timeout 2m /home/ubuntu/specula-vsr-runner-20260905/runs/vsr-rs-gpt6astra-ultra-round2-live-20260905/vsr-rs/.specula-output/repro/test_bugCR-3_sender_stall.py
+```
+
+Output:
+```text
+repo=/home/ubuntu/specula-vsr-runner-20260905/runs/vsr-rs-gpt6astra-ultra-round2-live-20260905/vsr-rs/.specula-output/confirmation/CR-3/worktree
+build: cargo build --example kvstore
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.05s
+peer_ports=[47183, 59013, 51567]
+client_ports=[35797, 35607, 50543]
+Level 0: all replicas running; 4MiB SET via node 0
+level0 send_seconds=0.001 response_wait_seconds=0.324 response=b'+OK\r\n'
+Level 1: SIGSTOP replica 1 so its established TCP receive side stops draining; issue the same public SET via node 0
+level1 before_resume send_seconds=0.001 wait_seconds=0.800 response=b''
+resume replica 1 after the 800ms no-reply observation
+level1 after_resume additional_wait_seconds=6.928 total_wait_after_send_seconds=7.728 response=b'+OK\r\n'
+BUG_TRIGGERED: one stalled peer delayed the client-visible commit past the 500ms failure-detector budget; the reply arrived only after the peer resumed.
+node0_returncode=-15
+node0_stdout_tail='node 0 of 3: replicas on 127.0.0.1:47183, clients on 127.0.0.1:35797, primary is node 0\nview 1: primary is node 1\nview 2: primary is node 2\nview 3: primary is node 0 (this node)\nview 4: primary is node 1\nview 5: primary is node 2\n'
+node0_stderr_tail=''
+node1_returncode=-15
+node1_stdout_tail='node 1 of 3: replicas on 127.0.0.1:59013, clients on 127.0.0.1:35607, primary is node 0\nview 1: primary is node 1 (this node)\nview 2: primary is node 2\nview 3: primary is node 0\nview 4: primary is node 1 (this node)\nview 5: primary is node 2\n'
+node1_stderr_tail=''
+node2_returncode=-15
+node2_stdout_tail='node 2 of 3: replicas on 127.0.0.1:51567, clients on 127.0.0.1:50543, primary is node 0\nview 1: primary is node 1\nview 2: primary is node 2 (this node)\nview 3: primary is node 0\nview 4: primary is node 1\nview 5: primary is node 2 (this node)\n'
+node2_stderr_tail=''
+```
+
+Checklist:
+1. Did Level 0 or Level 1 alone trigger it? **yes**. Level 0 was the healthy baseline; Level 1 triggered it with only timing/fault assistance against real kvstore processes and a public client request.
+2. Level 2/3 state injection or source patch? **not used**.
+3. Real consumer/caller observing wrong outcome: the kvstore client path in `examples/kvstore/main.rs:469` waits for the replicated response and `examples/kvstore/main.rs:472` writes it to the client. The test client observed no response for 800 ms, then `+OK` only after the stalled peer resumed.
+4. Permanent or masked? The bad state was not masked during the observation window. The operation missed the 500 ms failure-detector budget, caused view changes, and was resolved only after the stalled peer resumed 7.728 s after send.
+
+## Recommendation
+Give each peer destination independent backpressure isolation, or set a bounded write timeout/nonblocking write path and drop/reconnect only the affected peer when its socket stops draining. A single destination’s connected write should not block delivery to other replicas.
+
+VERDICT: REPRODUCED

@@ -1,0 +1,17 @@
+# Trace validation and capture audit
+
+Run `bash harness/validate.sh` from `.specula-output/` to audit and replay every implementation trace in `traces/*.ndjson`. Optional arguments select individual files. `TLA_TOOLS_JAR` and `COMMUNITY_MODULES_JAR` override the locally available jars; `TRACE_VALIDATION_TIMEOUT` overrides the 180-second per-file limit (maximum 1800). The runner retains separate TLC working directories, logs, `validation/results.tsv`, and `validation/audit.json` under this harness. It uses the complete supplied `Trace.cfg`, including `TraceMatched` and all seven safety invariants.
+
+`python3 harness/audit_traces.py --require-all-events` verifies strict JSON, mandatory snapshots, map/set uniqueness, real-clock timestamp plausibility, event vocabulary, aggregate event coverage, and the full L2 replay wiring. It does not implement or substitute for protocol replay. Completion sidecars are required and checked against both the event count and the cumulative native callback count. Capture completeness also depends on the instrumented owner boundaries and independent call counters; replay alone cannot detect omitted no-op calls or a truncated terminal suffix.
+
+## Minimal input reconciliation
+
+The installed harness-generation methodology mandates `"tag":"trace"`, but the generated input filter and its mapping used `"tag":"vsr"`. This phase changes only the filter string in `spec/Trace.tla` and the two corresponding tag references in `spec/instrumentation-spec.md`. No action, guard, state comparison, invariant, fairness condition, or configuration was relaxed. The event payload retains the input model's flat, full-snapshot schema; the timestamp is additional diagnostic metadata and does not determine replay order.
+
+The earlier synthetic fixtures in `spec/validation/` remain historical generation-time evidence and still use their original tag. They are not copied into `traces/`, regenerated as implementation evidence, or included in the harness validation command. Their old replay instructions require tag reconciliation before they can be reused with the current filter. The earlier `spec/artifact-manifest.json` is likewise historical and is not rewritten to disguise this phase's small input change.
+
+## L2 coverage audit
+
+`ValidatePostState` is a complete equality check, not a stub. `SnapshotShape` requires exactly the `NewReplica` state domain: all 20 captured fields (`status`, `view`, `lastNormal`, `commit`, `log`, `acks`, `table`, `heard`, `waiting`, `attempts`, `stable`, `svc`, `dvcSent`, `dvc`, `catching`, `nonce`, `responses`, `app`, `applied`, `out`). Arrays encoding maps/sets are decoded before comparison and duplicate keys/elements are rejected. Every one of the 19 post-Init event wrappers invokes this full check, including no-op handler branches and explicit network loss/duplication.
+
+The check also covers every client's `view`, `next`, and `pending`; owner `live`, `durableView`, `incarnation`, and `usedNonces`; the full network multiset with multiplicity; and the exact newly drained output sequence. `ValidateInitialState` checks the same snapshot against fresh constructors. Application execution and reply histories used by safety invariants are independently rebuilt by the base actions rather than imported from traces. There are no weak capture levels, silent replay actions, or captured protocol fields without a corresponding state check.

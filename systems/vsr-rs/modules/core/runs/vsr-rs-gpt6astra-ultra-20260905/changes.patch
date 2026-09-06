@@ -1,0 +1,1296 @@
+diff --git a/Cargo.toml b/Cargo.toml
+index d7462fc8654877d20d6aab3f4754cb9753519b43..ea78dbdf8c4c874beace38efcb39add89921ce1d 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -9,8 +9,13 @@ path = "lib.rs"
+ [workspace]
+ members = ["simulator"]
+ 
++[features]
++tla-trace = ["dep:serde", "dep:serde_json"]
++
+ [dependencies]
+ log = "0.4.17"
++serde = { version = "1", optional = true }
++serde_json = { version = "1", optional = true }
+ 
+ [dev-dependencies]
+ env_logger = "0.9.1"
+diff --git a/lib.rs b/lib.rs
+index c1669644ae5a481ad6d7b65a31c69d653aa789a2..d5b236f21607c347c6a707496772254677bcadd7 100644
+--- a/lib.rs
++++ b/lib.rs
+@@ -21,6 +21,9 @@
+ //! Stable Storage".
+ 
+ use log::trace;
++#[cfg(feature = "tla-trace")]
++pub mod tla_trace;
++
+ use std::{
+     collections::{BTreeMap, BTreeSet},
+     fmt::Debug,
+@@ -58,6 +61,12 @@ pub trait StateMachine {
+     type Output: Clone + Debug;
+ 
+     fn apply(&mut self, input: Self::Input) -> Self::Output;
++
++    /// Read-only application observation for the optional trace harness.
++    #[cfg(feature = "tla-trace")]
++    fn trace_state(&self) -> serde_json::Value {
++        serde_json::Value::Null
++    }
+ }
+ 
+ /// Configuration.
+@@ -472,6 +481,13 @@ pub struct Replica<SM: StateMachine> {
+     recovery_responses: BTreeMap<ReplicaID, RecoveryResponse<SM::Input>>,
+     outbox: Vec<(ReplicaID, Message<SM::Input>)>,
+     replies: Vec<Reply<SM::Output>>,
++    /// Observer-only state, never consulted by protocol decisions.
++    #[cfg(feature = "tla-trace")]
++    trace_prepare_ok_proofs: BTreeMap<usize, Vec<LogEntry<SM::Input>>>,
++    #[cfg(feature = "tla-trace")]
++    trace_apply_history: Vec<tla_trace::ApplyObservation<SM::Input, SM::Output>>,
++    #[cfg(feature = "tla-trace")]
++    trace_apply_cursor: usize,
+ }
+ 
+ impl<SM: StateMachine> Replica<SM> {
+@@ -499,6 +515,12 @@ impl<SM: StateMachine> Replica<SM> {
+             recovery_responses: BTreeMap::new(),
+             outbox: Vec::new(),
+             replies: Vec::new(),
++            #[cfg(feature = "tla-trace")]
++            trace_prepare_ok_proofs: BTreeMap::new(),
++            #[cfg(feature = "tla-trace")]
++            trace_apply_history: Vec::new(),
++            #[cfg(feature = "tla-trace")]
++            trace_apply_cursor: 0,
+         }
+     }
+ 
+@@ -1361,7 +1383,19 @@ impl<SM: StateMachine> Replica<SM> {
+     /// without running it again.
+     fn commit_op(&mut self, op_idx: usize) -> Reply<SM::Output> {
+         let entry = self.log[op_idx].clone();
++        #[cfg(feature = "tla-trace")]
++        let observed_entry = entry.clone();
++        #[cfg(feature = "tla-trace")]
++        let state_before = self.state_machine.trace_state();
+         let result = self.state_machine.apply(entry.op);
++        #[cfg(feature = "tla-trace")]
++        self.trace_apply_history.push(tla_trace::ApplyObservation {
++            slot: op_idx + 1,
++            entry: observed_entry,
++            state_before,
++            result: result.clone(),
++            state_after: self.state_machine.trace_state(),
++        });
+         self.commit_number += 1;
+         if let Some(client) = self.client_table.get_mut(&entry.client_id) {
+             if client.request_number == entry.request_number {
+@@ -1379,6 +1413,11 @@ impl<SM: StateMachine> Replica<SM> {
+     /// Acknowledges to the primary that we have every op up to our op
+     /// number.
+     fn send_prepare_ok(&mut self) {
++        // Capture at creation: a later handler may replace the log before
++        // the owner releases this acknowledgement into the transport.
++        #[cfg(feature = "tla-trace")]
++        self.trace_prepare_ok_proofs
++            .insert(self.outbox.len(), self.log.clone());
+         let message = Message::PrepareOk {
+             view_number: self.view_number,
+             op_number: self.op_number(),
+@@ -1466,6 +1505,8 @@ impl<SM: StateMachine> Replica<SM> {
+ 
+     /// Messages to send to other replicas.
+     pub fn drain_messages(&mut self) -> std::vec::Drain<'_, (ReplicaID, Message<SM::Input>)> {
++        #[cfg(feature = "tla-trace")]
++        self.trace_prepare_ok_proofs.clear();
+         self.outbox.drain(..)
+     }
+ 
+diff --git a/tests/specula_harness/controller.rs b/tests/specula_harness/controller.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..11ade3a1feb831ebb3fba95e54968fd351baf563
+--- /dev/null
++++ b/tests/specula_harness/controller.rs
+@@ -0,0 +1,413 @@
++//! Controlled caller for the real library, adapted from tests/cluster.rs.
++//! This module schedules public methods; it contains no replica algorithm.
++use serde_json::{json, Value};
++use std::collections::{BTreeMap, BTreeSet, VecDeque};
++use std::fs::{self, File, OpenOptions};
++use std::io::{BufWriter, Write};
++use std::path::PathBuf;
++use std::sync::{Mutex, MutexGuard};
++use std::time::{SystemTime, UNIX_EPOCH};
++use vsr_rs::tla_trace::{entry, reply_wire, wire, Input, Register};
++use vsr_rs::{Client, Config, LogEntry, Message, Replica, Reply};
++
++const REVISION: &str = "3ac0104a567092139534c9022205d02281a2da41";
++static SCENARIO: Mutex<()> = Mutex::new(());
++static WRITER: Mutex<Option<BufWriter<File>>> = Mutex::new(None);
++
++fn timestamp() -> u128 {
++    SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
++}
++
++#[derive(Clone)]
++enum Payload {
++    Message(Message<Input>),
++    Reply(Reply<usize>),
++}
++
++#[derive(Clone)]
++struct Packet {
++    envelope: Value,
++    payload: Payload,
++}
++
++fn envelopes(packets: &VecDeque<Packet>) -> Vec<Value> {
++    packets.iter().map(|p| p.envelope.clone()).collect()
++}
++
++fn bag(packets: &[Packet]) -> Vec<Value> {
++    let mut rows: Vec<Value> = Vec::new();
++    for packet in packets {
++        if let Some(row) = rows.iter_mut().find(|r| r["message"] == packet.envelope) {
++            row["count"] = json!(row["count"].as_u64().unwrap() + 1);
++        } else {
++            rows.push(json!({"message":packet.envelope,"count":1}));
++        }
++    }
++    rows
++}
++
++pub struct Cluster {
++    config: Config,
++    replicas: Vec<Option<Replica<Register>>>,
++    empty: Vec<Value>,
++    clients: BTreeMap<usize, Option<Client<Input>>>,
++    retired_snapshots: BTreeMap<usize, Value>,
++    outputs: Vec<VecDeque<Packet>>,
++    replies: Vec<VecDeque<Packet>>,
++    client_outputs: BTreeMap<usize, VecDeque<Packet>>,
++    network: Vec<Packet>,
++    reply_channel: Vec<Packet>,
++    released: Vec<Packet>,
++    durable: Vec<usize>,
++    lives: Vec<&'static str>,
++    phases: Vec<&'static str>,
++    incarnations: Vec<usize>,
++    nonce_epochs: Vec<BTreeMap<u64, usize>>,
++    retired: BTreeSet<usize>,
++    invocations: Vec<Value>,
++    accepted: Vec<Value>,
++    applications: BTreeMap<(usize, usize), Vec<Value>>,
++    storage: PathBuf,
++    _scenario: MutexGuard<'static, ()>,
++}
++
++impl Cluster {
++    pub fn new(name: &str, client_ids: &[usize]) -> Self {
++        let scenario = SCENARIO.lock().unwrap();
++        assert!(!name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'));
++        assert!(!client_ids.is_empty() && client_ids.iter().all(|c| *c >= 3));
++        assert_eq!(client_ids.len(), client_ids.iter().collect::<BTreeSet<_>>().len());
++        let trace_dir = PathBuf::from(std::env::var("VSR_TRACE_DIR").expect("VSR_TRACE_DIR required"));
++        let runtime = PathBuf::from(std::env::var("VSR_TRACE_RUNTIME").expect("VSR_TRACE_RUNTIME required"));
++        fs::create_dir_all(&trace_dir).unwrap();
++        let storage = runtime.join(format!("{name}-{}", timestamp()));
++        fs::create_dir_all(&storage).unwrap();
++        let mut config = Config::new();
++        for _ in 0..3 { config.add_replica(); }
++        config.set_primary_timeout(3);
++        let replicas: Vec<_> = (0..3).map(|i| Some(Replica::new(i, config.clone(), Register::default()))).collect();
++        let empty = replicas.iter().map(|r| r.as_ref().unwrap().trace_snapshot(&[], &[], 0)).collect();
++        let clients = client_ids.iter().map(|c| (*c, Some(Client::new(*c, config.clone())))).collect();
++        let cluster = Self {
++            config, replicas, empty, clients, storage, _scenario: scenario,
++            retired_snapshots: BTreeMap::new(),
++            outputs: vec![VecDeque::new(); 3], replies: vec![VecDeque::new(); 3],
++            client_outputs: client_ids.iter().map(|c| (*c, VecDeque::new())).collect(),
++            network: vec![], reply_channel: vec![], released: vec![],
++            durable: vec![0; 3], lives: vec!["Running"; 3], phases: vec!["Release"; 3],
++            incarnations: vec![0; 3], nonce_epochs: vec![BTreeMap::new(); 3],
++            retired: BTreeSet::new(), invocations: vec![], accepted: vec![],
++            applications: (0..3).map(|i| ((i, 0), vec![])).collect(),
++        };
++        for i in 0..3 { cluster.write_view(i, 0); }
++        File::open(&cluster.storage).unwrap().sync_all().unwrap();
++        *WRITER.lock().unwrap() = Some(BufWriter::new(File::create(trace_dir.join(format!("{name}.ndjson"))).unwrap()));
++        cluster.write(json!({"event":"Init","revision":REVISION,"workload":"register-put-old-v1",
++            "replicas":[0,1,2],"clients":client_ids,"values":[0,1,2],"primaryTimeout":3,"state":cluster.snapshot()}));
++        cluster
++    }
++
++    fn write(&self, mut event: Value) {
++        event["tag"] = json!("trace");
++        event["ts"] = json!(timestamp().to_string());
++        let mut lock = WRITER.lock().unwrap();
++        let writer = lock.as_mut().unwrap();
++        serde_json::to_writer(&mut *writer, &event).unwrap();
++        writer.write_all(b"\n").unwrap();
++        writer.flush().unwrap();
++    }
++
++    fn emit(&self, mut event: Value, applies: Vec<Value>) {
++        event["state"] = self.snapshot();
++        event["applies"] = json!(applies);
++        self.write(event);
++    }
++
++    pub fn snapshot(&self) -> Value {
++        let replicas: Vec<_> = (0..3).map(|i| match &self.replicas[i] {
++            Some(replica) => replica.trace_snapshot(&envelopes(&self.outputs[i]), &envelopes(&self.replies[i]),
++                self.normalize_nonce(i, replica.trace_raw_nonce())),
++            None => self.empty[i].clone(),
++        }).collect();
++        let clients: Vec<_> = self.clients.iter().map(|(c, client)| json!({"id":c,"state": match client {
++            Some(client) => client.trace_snapshot(&envelopes(&self.client_outputs[c])),
++            None => self.retired_snapshots[c].clone(),
++        }})).collect();
++        let applications: Vec<_> = self.applications.iter().map(|((i, epoch), entries)|
++            json!({"replica":i,"incarnation":epoch,"entries":entries})).collect();
++        json!({"replicas":replicas,"durableViews":self.durable,"lives":self.lives,
++            "phases":self.phases,"incarnations":self.incarnations,"clients":clients,
++            "retiredClients":self.retired,"invocations":self.invocations,"acceptedReplies":self.accepted,
++            "network":bag(&self.network),"replyChannel":bag(&self.reply_channel),
++            "released":self.released.iter().map(|p| p.envelope.clone()).collect::<Vec<_>>(),
++            "applications":applications})
++    }
++
++    fn normalize_nonce(&self, node: usize, raw: u64) -> usize {
++        if raw == 0 { 0 } else { *self.nonce_epochs[node].get(&raw).expect("unknown raw recovery nonce") }
++    }
++
++    fn packet(&self, src: usize, dst: usize, message: Message<Input>, proof: Vec<LogEntry<Input>>) -> Packet {
++        let nonce = match &message {
++            Message::Recovery { nonce, replica_id, .. } => {
++                assert_eq!(*replica_id, src); self.normalize_nonce(src, *nonce)
++            }
++            Message::RecoveryResponse { nonce, replica_id, .. } => {
++                assert_eq!(*replica_id, src); self.normalize_nonce(dst, *nonce)
++            }
++            Message::PrepareOk { replica_id, .. } | Message::GetState { replica_id, .. } |
++            Message::StartViewChange { replica_id, .. } | Message::DoViewChange { replica_id, .. } => {
++                assert_eq!(*replica_id, src); 0
++            }
++            Message::Request { client_id, .. } => { assert_eq!(*client_id, src); 0 }
++            _ => 0,
++        };
++        let incarnation = if src < 3 { self.incarnations[src] } else { 0 };
++        Packet { envelope: json!({"src":src,"dst":dst,"wire":wire(&message,nonce),
++            "incarnation":incarnation,"proof":proof.iter().map(entry).collect::<Vec<_>>()}), payload: Payload::Message(message) }
++    }
++
++    // Vec::drain is representation-only: everything stays in an unpublished FIFO.
++    fn stage_replica(&mut self, i: usize) -> Vec<Value> {
++        let replica = self.replicas[i].as_mut().unwrap();
++        let messages = replica.trace_drain_messages();
++        let replies: Vec<_> = replica.drain_replies().collect();
++        let applies = replica.trace_take_applies();
++        for (dst, message, proof) in messages {
++            let packet = self.packet(i, dst, message, proof);
++            self.outputs[i].push_back(packet);
++        }
++        for reply in replies {
++            let packet = Packet { envelope: json!({"src":i,"dst":reply.client_id,"wire":reply_wire(&reply),
++                "incarnation":self.incarnations[i],"proof":[]}), payload: Payload::Reply(reply) };
++            self.replies[i].push_back(packet);
++        }
++        let history = self.applications.get_mut(&(i, self.incarnations[i])).unwrap();
++        for apply in &applies { history.push(apply["entry"].clone()); }
++        applies
++    }
++
++    fn stage_client(&mut self, c: usize) {
++        let messages: Vec<_> = self.clients.get_mut(&c).unwrap().as_mut().unwrap().drain().collect();
++        for (dst, message) in messages {
++            let packet = self.packet(c, dst, message, vec![]);
++            self.client_outputs.get_mut(&c).unwrap().push_back(packet);
++        }
++    }
++
++    fn ready(&self, i: usize) -> bool { self.lives[i] == "Running" && self.phases[i] == "Release" }
++
++    fn write_view(&self, i: usize, view: usize) {
++        let mut file = OpenOptions::new().create(true).truncate(true).write(true)
++            .open(self.storage.join(format!("replica-{i}.view"))).unwrap();
++        writeln!(file, "{view}").unwrap();
++        file.sync_all().unwrap();
++    }
++
++    pub fn persist(&mut self, i: usize) {
++        assert_eq!(self.lives[i], "Running");
++        assert_eq!(self.phases[i], "Persist");
++        let view = self.replicas[i].as_ref().unwrap().view_number();
++        self.write_view(i, view);
++        self.durable[i] = view;
++        self.phases[i] = "Release";
++        self.emit(json!({"event":"PersistView","node":i}), vec![]);
++    }
++
++    fn publish(&mut self, packet: Packet, reply: bool) {
++        if !self.released.iter().any(|p| p.envelope == packet.envelope) { self.released.push(packet.clone()); }
++        if reply { self.reply_channel.push(packet); } else { self.network.push(packet); }
++    }
++
++    pub fn release_message(&mut self, i: usize) -> bool {
++        assert!(self.ready(i));
++        if let Some(packet) = self.outputs[i].pop_front() {
++            let envelope = packet.envelope.clone();
++            self.publish(packet, false);
++            self.emit(json!({"event":"ReleaseMessage","node":i,"message":envelope}), vec![]);
++            true
++        } else { false }
++    }
++
++    pub fn release_reply(&mut self, i: usize) -> bool {
++        assert!(self.ready(i));
++        if let Some(packet) = self.replies[i].pop_front() {
++            let envelope = packet.envelope.clone();
++            self.publish(packet, true);
++            self.emit(json!({"event":"ReleaseReply","node":i,"message":envelope}), vec![]);
++            true
++        } else { false }
++    }
++
++    pub fn release_all(&mut self, i: usize) {
++        while self.release_message(i) {}
++        while self.release_reply(i) {}
++    }
++
++    pub fn request(&mut self, c: usize, input: Input) -> usize {
++        assert!(!self.retired.contains(&c));
++        assert!(self.clients[&c].as_ref().unwrap().trace_snapshot(&[])["pending"].as_array().unwrap().is_empty());
++        let request = self.clients.get_mut(&c).unwrap().as_mut().unwrap().on_request(input.clone());
++        self.invocations.push(json!({"client":c,"request":request,"input":input}));
++        self.stage_client(c);
++        self.emit(json!({"event":"ClientOnRequest","client":c,"input":input,"request":request}), vec![]);
++        request
++    }
++
++    pub fn client_idle(&mut self, c: usize) {
++        assert!(!self.retired.contains(&c));
++        assert!(!self.clients[&c].as_ref().unwrap().trace_snapshot(&[])["pending"].as_array().unwrap().is_empty());
++        self.clients.get_mut(&c).unwrap().as_mut().unwrap().on_idle();
++        self.stage_client(c);
++        self.emit(json!({"event":"ClientOnIdle","client":c}), vec![]);
++    }
++
++    pub fn client_drain(&mut self, c: usize) {
++        assert!(!self.retired.contains(&c));
++        while let Some(packet) = self.client_outputs.get_mut(&c).unwrap().pop_front() {
++            let envelope = packet.envelope.clone();
++            self.publish(packet, false);
++            self.emit(json!({"event":"ClientDrain","client":c,"message":envelope}), vec![]);
++        }
++    }
++
++    pub fn idle(&mut self, i: usize) {
++        assert!(self.ready(i));
++        let replica = self.replicas[i].as_mut().unwrap();
++        let branch = replica.trace_idle_branch();
++        replica.on_idle();
++        let applies = self.stage_replica(i);
++        self.phases[i] = "Persist";
++        self.emit(json!({"event":"ReplicaOnIdle","node":i,"branch":branch}), applies);
++    }
++
++    /// One real receive call, stopping before the persist/publication boundary.
++    pub fn receive_where(&mut self, predicate: impl Fn(&Value) -> bool) -> Option<usize> {
++        let pos = self.network.iter().position(|p| {
++            let dst = p.envelope["dst"].as_u64().unwrap() as usize;
++            self.ready(dst) && predicate(&p.envelope)
++        })?;
++        let packet = self.network.remove(pos);
++        let i = packet.envelope["dst"].as_u64().unwrap() as usize;
++        let Payload::Message(message) = packet.payload else { unreachable!() };
++        let replica = self.replicas[i].as_mut().unwrap();
++        let branch = replica.trace_message_branch(&message);
++        replica.on_message(message);
++        let applies = self.stage_replica(i);
++        self.phases[i] = "Persist";
++        self.emit(json!({"event":"ReplicaOnMessage","node":i,"message":packet.envelope,"branch":branch}), applies);
++        Some(i)
++    }
++
++    pub fn deliver_where(&mut self, predicate: impl Fn(&Value) -> bool) -> bool {
++        if let Some(i) = self.receive_where(predicate) {
++            self.persist(i); self.release_all(i); true
++        } else { false }
++    }
++
++    pub fn deliver_reply_where(&mut self, predicate: impl Fn(&Value) -> bool) -> bool {
++        let Some(pos) = self.reply_channel.iter().position(|p| {
++            let dst = p.envelope["dst"].as_u64().unwrap() as usize;
++            !self.retired.contains(&dst) && predicate(&p.envelope)
++        }) else { return false; };
++        let packet = self.reply_channel.remove(pos);
++        let Payload::Reply(reply) = packet.payload else { unreachable!() };
++        let c = reply.client_id;
++        assert_eq!(packet.envelope["dst"], json!(c));
++        let accepted = self.clients.get_mut(&c).unwrap().as_mut().unwrap().on_reply(reply.request_number, reply.view_number);
++        if accepted && !self.accepted.contains(&packet.envelope) { self.accepted.push(packet.envelope.clone()); }
++        self.emit(json!({"event":"ClientOnReply","client":c,"message":packet.envelope,"accepted":accepted}), vec![]);
++        true
++    }
++
++    pub fn settle(&mut self) {
++        for c in self.clients.keys().copied().collect::<Vec<_>>() {
++            if !self.retired.contains(&c) { self.client_drain(c); }
++        }
++        for i in 0..3 { if self.ready(i) { self.release_all(i); } }
++        for _ in 0..1000 {
++            if self.deliver_where(|_| true) { continue; }
++            if self.deliver_reply_where(|_| true) { continue; }
++            return;
++        }
++        panic!("controlled delivery did not quiesce after 1000 events");
++    }
++
++    pub fn pause(&mut self, i: usize) {
++        assert_eq!(self.lives[i], "Running"); self.lives[i] = "Paused";
++        self.emit(json!({"event":"Pause","node":i}), vec![]);
++    }
++
++    pub fn resume(&mut self, i: usize) {
++        assert_eq!(self.lives[i], "Paused"); self.lives[i] = "Running";
++        self.emit(json!({"event":"Resume","node":i}), vec![]);
++    }
++
++    pub fn crash(&mut self, i: usize) {
++        assert_ne!(self.lives[i], "Down");
++        self.replicas[i] = None;
++        self.outputs[i].clear(); self.replies[i].clear();
++        self.lives[i] = "Down"; self.phases[i] = "Release";
++        self.emit(json!({"event":"Crash","node":i}), vec![]);
++    }
++
++    pub fn recover(&mut self, i: usize) {
++        assert_eq!(self.lives[i], "Down");
++        let view: usize = fs::read_to_string(self.storage.join(format!("replica-{i}.view"))).unwrap().trim().parse().unwrap();
++        assert_eq!(view, self.durable[i]);
++        let raw = u64::try_from(timestamp()).unwrap();
++        assert_ne!(raw, 0);
++        assert!(!self.nonce_epochs[i].contains_key(&raw), "raw recovery nonce reused");
++        self.incarnations[i] += 1;
++        self.nonce_epochs[i].insert(raw, self.incarnations[i]);
++        self.applications.insert((i, self.incarnations[i]), vec![]);
++        self.replicas[i] = Some(Replica::recover(i, self.config.clone(), Register::default(), view, raw));
++        self.lives[i] = "Running"; self.phases[i] = "Persist";
++        let applies = self.stage_replica(i);
++        assert!(applies.is_empty());
++        self.emit(json!({"event":"Recover","node":i}), applies);
++    }
++
++    pub fn retire(&mut self, c: usize) {
++        assert!(self.retired.insert(c));
++        let client = self.clients.get_mut(&c).unwrap().take().unwrap();
++        let mut snapshot = client.trace_snapshot(&[]);
++        snapshot["pending"] = json!([]); snapshot["out"] = json!([]);
++        self.retired_snapshots.insert(c, snapshot);
++        self.client_outputs.get_mut(&c).unwrap().clear();
++        self.emit(json!({"event":"ClientRetire","client":c}), vec![]);
++    }
++
++    pub fn lose_where(&mut self, predicate: impl Fn(&Value) -> bool) -> bool {
++        if let Some(pos) = self.network.iter().position(|p| predicate(&p.envelope)) {
++            let packet = self.network.remove(pos);
++            self.emit(json!({"event":"LoseMessage","message":packet.envelope}), vec![]); true
++        } else { false }
++    }
++
++    pub fn lose_reply_where(&mut self, predicate: impl Fn(&Value) -> bool) -> bool {
++        if let Some(pos) = self.reply_channel.iter().position(|p| predicate(&p.envelope)) {
++            let packet = self.reply_channel.remove(pos);
++            self.emit(json!({"event":"LoseReply","message":packet.envelope}), vec![]); true
++        } else { false }
++    }
++
++    pub fn replay_message(&mut self, envelope: &Value) { self.replay(envelope, false); }
++    pub fn replay_reply(&mut self, envelope: &Value) { self.replay(envelope, true); }
++
++    fn replay(&mut self, envelope: &Value, reply: bool) {
++        let packet = self.released.iter().find(|p| p.envelope == *envelope).expect("replay must be authentic").clone();
++        assert_eq!(matches!(packet.payload, Payload::Reply(_)), reply);
++        if reply { self.reply_channel.push(packet); } else { self.network.push(packet); }
++        self.emit(json!({"event":if reply {"ReplayReply"} else {"ReplayMessage"},"message":envelope}), vec![]);
++    }
++}
++
++impl Drop for Cluster {
++    fn drop(&mut self) {
++        if let Some(mut writer) = WRITER.lock().unwrap().take() {
++            writer.flush().unwrap();
++            writer.get_ref().sync_all().unwrap();
++        }
++    }
++}
+diff --git a/tests/specula_harness/scenarios.rs b/tests/specula_harness/scenarios.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..b1b352ee2f6367b48f1722ec80c6e98f9c1c92ec
+--- /dev/null
++++ b/tests/specula_harness/scenarios.rs
+@@ -0,0 +1,267 @@
++//! Controlled schedules adapted from the real `tests/cluster.rs` regressions.
++//! Each scenario calls the library through the owner/transport controller;
++//! selected/replayed packets are immutable outputs of actual library calls.
++
++use crate::controller::Cluster;
++use serde_json::Value;
++use vsr_rs::tla_trace::Input;
++
++fn packet(message: &Value, kind: &str, dst: usize) -> bool {
++    message["wire"]["kind"] == kind && message["dst"].as_u64() == Some(dst as u64)
++}
++
++fn from(message: &Value, src: usize) -> bool {
++    message["src"].as_u64() == Some(src as u64)
++}
++
++fn op(message: &Value, slot: usize) -> bool {
++    message["wire"]["opn"].as_u64() == Some(slot as u64)
++}
++
++fn released(cluster: &Cluster, predicate: impl Fn(&Value) -> bool) -> Value {
++    cluster.snapshot()["released"]
++        .as_array()
++        .unwrap()
++        .iter()
++        .rev()
++        .find(|message| predicate(message))
++        .expect("the schedule must select a packet actually released by the library")
++        .clone()
++}
++
++fn messages(cluster: &mut Cluster, predicate: impl Fn(&Value) -> bool) {
++    let mut delivered = 0;
++    while cluster.deliver_where(|message| predicate(message)) {
++        delivered += 1;
++        assert!(delivered < 1000, "unexpected unbounded message cascade");
++    }
++}
++
++fn replies(cluster: &mut Cluster) {
++    while cluster.deliver_reply_where(|_| true) {}
++}
++
++fn idle(cluster: &mut Cluster, node: usize) {
++    cluster.idle(node);
++    cluster.persist(node);
++    cluster.release_all(node);
++}
++
++fn heartbeat(cluster: &mut Cluster, primary: usize) {
++    idle(cluster, primary);
++    cluster.settle();
++}
++
++fn reply(cluster: &Cluster, client: usize, request: usize, result: usize) {
++    assert!(cluster.snapshot()["acceptedReplies"]
++        .as_array()
++        .unwrap()
++        .iter()
++        .any(|message| packet(message, "Reply", client)
++            && message["wire"]["request"].as_u64() == Some(request as u64)
++            && message["wire"]["result"].as_u64() == Some(result as u64)));
++}
++
++fn all_applied(cluster: &Cluster, value: usize, results: &[usize]) {
++    for replica in cluster.snapshot()["replicas"].as_array().unwrap() {
++        assert_eq!(replica["status"], "Normal");
++        assert_eq!(replica["app"].as_u64(), Some(value as u64));
++        assert_eq!(replica["commit"].as_u64(), Some(results.len() as u64));
++        assert_eq!(replica["applied"].as_array().unwrap().len(), results.len());
++        assert_eq!(replica["results"], serde_json::json!(results));
++    }
++}
++
++/// Extends lost-request and duplicate-request regressions with the independent
++/// reply channel, order-sensitive Get/Put results, and client lifetime changes.
++#[test]
++fn trace_requests_replies_and_lifetimes() {
++    let mut cluster = Cluster::new("requests_replies_and_lifetimes", &[3, 4, 5]);
++    cluster.request(3, Input::Put(1));
++    cluster.client_drain(3);
++    let request = released(&cluster, |message| packet(message, "Request", 0));
++    assert!(cluster.lose_where(|message| message == &request));
++
++    cluster.client_idle(3);
++    cluster.client_drain(3);
++    assert!(cluster.deliver_where(|message| packet(message, "Request", 0)));
++    cluster.replay_message(&request);
++    assert!(cluster.deliver_where(|message| message == &request));
++    messages(&mut cluster, |_| true);
++    let old_reply = released(&cluster, |message| packet(message, "Reply", 3));
++    assert!(cluster.lose_reply_where(|message| message == &old_reply));
++
++    // The retry after commit must resend the cached old register value.
++    cluster.client_idle(3);
++    cluster.settle();
++    reply(&cluster, 3, 0, 0);
++    cluster.replay_reply(&old_reply);
++    assert!(cluster.deliver_reply_where(|message| message == &old_reply));
++
++    cluster.request(3, Input::Get);
++    cluster.replay_reply(&old_reply);
++    assert!(cluster.deliver_reply_where(|message| message == &old_reply));
++    let state = cluster.snapshot();
++    assert_eq!(state["clients"].as_array().unwrap().iter()
++        .find(|row| row["id"] == 3).unwrap()["state"]["pending"]
++        .as_array().unwrap().len(), 1);
++    cluster.settle();
++    reply(&cluster, 3, 1, 1);
++
++    cluster.request(4, Input::Put(2));
++    cluster.settle();
++    reply(&cluster, 4, 0, 1);
++    cluster.retire(3);
++    cluster.request(5, Input::Get);
++    cluster.settle();
++    reply(&cluster, 5, 0, 2);
++    heartbeat(&mut cluster, 0);
++    all_applied(&cluster, 2, &[0, 1, 1, 2]);
++}
++
++/// Adapts reordered-Prepare and stale-NewState regressions. Concurrent requests
++/// belong to distinct clients, preserving the one-outstanding-request contract.
++#[test]
++fn trace_reordered_state_transfer() {
++    let mut cluster = Cluster::new("reordered_state_transfer", &[3, 4, 5]);
++    for (client, input) in [(3, Input::Put(1)), (4, Input::Put(2)), (5, Input::Get)] {
++        cluster.request(client, input);
++        cluster.client_drain(client);
++        assert!(cluster.deliver_where(|message| packet(message, "Request", 0) && from(message, client)));
++    }
++
++    assert!(cluster.deliver_where(|message| packet(message, "Prepare", 1) && op(message, 3)));
++    let old_get_state = released(&cluster, |message| packet(message, "GetState", 0) && from(message, 1));
++    // The earlier Prepare arrives while transfer is active. It must not append.
++    assert!(cluster.deliver_where(|message| packet(message, "Prepare", 1) && op(message, 1)));
++    assert!(cluster.lose_where(|message| packet(message, "Prepare", 1) && op(message, 2)));
++    messages(&mut cluster, |message| !packet(message, "NewState", 1));
++    assert_eq!(cluster.snapshot()["replicas"][1]["log"].as_array().unwrap().len(), 0);
++    assert!(cluster.deliver_where(|message| packet(message, "NewState", 1)));
++    cluster.settle();
++    heartbeat(&mut cluster, 0);
++    all_applied(&cluster, 2, &[0, 1, 2]);
++
++    for (client, input) in [(3, Input::Put(0)), (4, Input::Put(1))] {
++        cluster.request(client, input);
++        cluster.client_drain(client);
++        assert!(cluster.deliver_where(|message| packet(message, "Request", 0) && from(message, client)));
++    }
++    assert!(cluster.lose_where(|message| packet(message, "Prepare", 1) && op(message, 4)));
++    assert!(cluster.deliver_where(|message| packet(message, "Prepare", 1) && op(message, 5)));
++    assert!(cluster.lose_where(|message| packet(message, "GetState", 0) && from(message, 1)));
++    messages(&mut cluster, |_| true);
++    replies(&mut cluster);
++    assert_eq!(cluster.snapshot()["replicas"][1]["log"].as_array().unwrap().len(), 3);
++
++    // This authentic old request asks from offset 0, while the recipient now
++    // needs offset 3. The real primary constructs the overlapping suffix reply.
++    cluster.replay_message(&old_get_state);
++    assert!(cluster.deliver_where(|message| message == &old_get_state));
++    assert!(cluster.deliver_where(|message| packet(message, "NewState", 1)));
++    cluster.settle();
++    heartbeat(&mut cluster, 0);
++    all_applied(&cluster, 1, &[0, 1, 2, 2, 0]);
++    reply(&cluster, 3, 1, 2);
++    reply(&cluster, 4, 1, 0);
++}
++
++/// Adapts the primary-loss regression using a retained pause. The old primary
++/// resumes through the public handlers and catches up before its StartView.
++#[test]
++fn trace_view_change_and_retained_resume() {
++    let mut cluster = Cluster::new("view_change_and_retained_resume", &[3, 4]);
++    cluster.request(3, Input::Put(1));
++    cluster.settle();
++    heartbeat(&mut cluster, 0);
++
++    cluster.request(4, Input::Put(2));
++    cluster.client_drain(4);
++    assert!(cluster.deliver_where(|message| packet(message, "Request", 0)));
++    messages(&mut cluster, |message| message["wire"]["kind"] != "PrepareOk");
++    assert_eq!(cluster.snapshot()["replicas"][0]["commit"], 1);
++    cluster.pause(0);
++    for _ in 0..4 {
++        idle(&mut cluster, 1);
++        idle(&mut cluster, 2);
++        // Hold the view-change packets until both backup timers have expired.
++    }
++    assert_eq!(cluster.snapshot()["replicas"][1]["status"], "ViewChange");
++    idle(&mut cluster, 1); // Exercise the real view-change retransmission arm.
++    cluster.settle();
++    assert_eq!(cluster.snapshot()["replicas"][1]["view"], 1);
++    assert_eq!(cluster.snapshot()["replicas"][1]["app"], 2);
++    reply(&cluster, 4, 0, 1);
++
++    cluster.request(4, Input::Get);
++    cluster.settle();
++    reply(&cluster, 4, 1, 2);
++    cluster.resume(0);
++    idle(&mut cluster, 1);
++    // Deliver the latest heartbeat ahead of delayed StartView and old acks.
++    assert!(cluster.deliver_where(|message| packet(message, "Commit", 0) && message["wire"]["view"] == 1));
++    assert!(cluster.deliver_where(|message| packet(message, "GetState", 1) && from(message, 0)));
++    assert!(cluster.deliver_where(|message| packet(message, "NewState", 0)));
++    cluster.settle();
++    heartbeat(&mut cluster, 1);
++    all_applied(&cluster, 2, &[0, 1, 2]);
++}
++
++/// Extends reboot recovery with a crash before persistence/publication, retry,
++/// old-incarnation acknowledgements, and a stale authentic recovery response.
++#[test]
++fn trace_recovery_epochs_and_reconstruction() {
++    let mut cluster = Cluster::new("recovery_epochs_and_reconstruction", &[3, 4]);
++    cluster.request(3, Input::Put(1));
++    cluster.settle();
++    cluster.request(3, Input::Put(2));
++    cluster.settle();
++    heartbeat(&mut cluster, 0);
++    let old_ack = released(&cluster, |message| packet(message, "PrepareOk", 0) && from(message, 1));
++
++    cluster.crash(1);
++    cluster.recover(1);
++    // The first constructor's Recovery broadcasts remain volatile and never
++    // reach transport; a second constructor must select a new raw nonce.
++    cluster.crash(1);
++    cluster.recover(1);
++    cluster.persist(1);
++    cluster.release_all(1);
++    while cluster.lose_where(|message| message["wire"]["kind"] == "Recovery" && from(message, 1)) {}
++
++    cluster.request(4, Input::Get);
++    cluster.client_drain(4);
++    messages(&mut cluster, |_| true);
++    replies(&mut cluster);
++    assert_eq!(cluster.snapshot()["replicas"][1]["status"], "Recovering");
++    assert_eq!(cluster.snapshot()["replicas"][1]["app"], 0);
++    reply(&cluster, 4, 0, 2);
++
++    idle(&mut cluster, 1);
++    cluster.settle();
++    heartbeat(&mut cluster, 0);
++    all_applied(&cluster, 2, &[0, 1, 2]);
++    assert_eq!(cluster.snapshot()["incarnations"][1], 2);
++    cluster.replay_message(&old_ack);
++    assert!(cluster.deliver_where(|message| message == &old_ack));
++    let old_response = released(&cluster, |message| packet(message, "RecoveryResponse", 1));
++
++    cluster.crash(1);
++    cluster.recover(1);
++    cluster.persist(1);
++    cluster.release_all(1);
++    cluster.replay_message(&old_response);
++    assert!(cluster.deliver_where(|message| message == &old_response));
++    assert_eq!(cluster.snapshot()["replicas"][1]["responses"].as_array().unwrap().len(), 0);
++    assert_eq!(cluster.snapshot()["replicas"][1]["status"], "Recovering");
++    cluster.settle();
++    heartbeat(&mut cluster, 0);
++    all_applied(&cluster, 2, &[0, 1, 2]);
++    assert_eq!(cluster.snapshot()["incarnations"][1], 3);
++    let snapshot = cluster.snapshot();
++    let histories = snapshot["applications"].as_array().unwrap();
++    for (incarnation, count) in [(0, 2), (1, 0), (2, 3), (3, 3)] {
++        let history = histories.iter().find(|row| row["replica"] == 1 && row["incarnation"] == incarnation).unwrap();
++        assert_eq!(history["entries"].as_array().unwrap().len(), count);
++    }
++}
+diff --git a/tests/specula_trace.rs b/tests/specula_trace.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..d701c87aaca0243c046ab1cdaa931c70de47dfc8
+--- /dev/null
++++ b/tests/specula_trace.rs
+@@ -0,0 +1,5 @@
++#![cfg(feature = "tla-trace")]
++#[path = "specula_harness/controller.rs"]
++mod controller;
++#[path = "specula_harness/scenarios.rs"]
++mod scenarios;
+diff --git a/tla_trace.rs b/tla_trace.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..6e5b1dcf6d501f10b67a887200e82cbe7cdf4403
+--- /dev/null
++++ b/tla_trace.rs
+@@ -0,0 +1,474 @@
++//! Feature-gated observations of the real VSR implementation.
++//!
++//! This module reads private implementation fields. It does not execute any
++//! protocol transition. The caller owns publication, transport and persistence
++//! snapshots; `commit_op` and `send_prepare_ok` capture transient observations.
++
++use crate::{Client, LogEntry, Message, Replica, Reply, StateMachine, Status};
++use serde::{Serialize, Serializer};
++use serde_json::{json, Value};
++
++#[derive(Clone, Debug, PartialEq, Eq)]
++pub enum Input {
++    Put(usize),
++    Get,
++}
++
++impl Serialize for Input {
++    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
++        input(self).serialize(serializer)
++    }
++}
++
++/// An order-sensitive application: Put and Get both return the old value.
++#[derive(Debug, Default)]
++pub struct Register {
++    pub value: usize,
++}
++
++impl StateMachine for Register {
++    type Input = Input;
++    type Output = usize;
++
++    fn apply(&mut self, operation: Input) -> usize {
++        let old = self.value;
++        if let Input::Put(value) = operation {
++            self.value = value;
++        }
++        old
++    }
++
++    fn trace_state(&self) -> Value {
++        json!(self.value)
++    }
++}
++
++#[derive(Debug)]
++pub(crate) struct ApplyObservation<Op, Output> {
++    pub(crate) slot: usize,
++    pub(crate) entry: LogEntry<Op>,
++    pub(crate) state_before: Value,
++    pub(crate) result: Output,
++    pub(crate) state_after: Value,
++}
++
++pub fn input(operation: &Input) -> Value {
++    match operation {
++        Input::Put(value) => json!({"kind": "Put", "value": value}),
++        Input::Get => json!({"kind": "Get", "value": 0}),
++    }
++}
++
++pub fn entry(item: &LogEntry<Input>) -> Value {
++    json!({"client": item.client_id, "request": item.request_number,
++        "input": input(&item.op)})
++}
++
++pub fn entries(log: &[LogEntry<Input>]) -> Vec<Value> {
++    log.iter().map(entry).collect()
++}
++
++pub fn kind(message: &Message<Input>) -> &'static str {
++    match message {
++        Message::Request { .. } => "Request",
++        Message::Prepare { .. } => "Prepare",
++        Message::PrepareOk { .. } => "PrepareOk",
++        Message::Commit { .. } => "Commit",
++        Message::GetState { .. } => "GetState",
++        Message::NewState { .. } => "NewState",
++        Message::StartViewChange { .. } => "StartViewChange",
++        Message::DoViewChange { .. } => "DoViewChange",
++        Message::StartView { .. } => "StartView",
++        Message::Recovery { .. } => "Recovery",
++        Message::RecoveryResponse { .. } => "RecoveryResponse",
++    }
++}
++
++fn default_wire(kind: &str) -> Value {
++    json!({"kind":kind, "view":0, "opn":0, "commit":0,
++        "entry":[], "log":[], "start":0, "last":0, "nonce":0,
++        "hasState":false, "client":[], "request":0, "result":0})
++}
++
++/// The owner resolves nonces against the recovering destination's nonce map.
++/// `normalized_nonce` is ignored for variants without a nonce on the wire.
++pub fn wire(message: &Message<Input>, normalized_nonce: usize) -> Value {
++    let mut w = default_wire(kind(message));
++    match message {
++        Message::Request {
++            client_id,
++            request_number,
++            op,
++        } => {
++            w["entry"] = json!([entry(&LogEntry {
++                client_id: *client_id,
++                request_number: *request_number,
++                op: op.clone()
++            })]);
++        }
++        Message::Prepare {
++            view_number,
++            op_number,
++            client_id,
++            request_number,
++            op,
++            commit_number,
++        } => {
++            w["view"] = json!(view_number);
++            w["opn"] = json!(op_number);
++            w["commit"] = json!(commit_number);
++            w["entry"] = json!([entry(&LogEntry {
++                client_id: *client_id,
++                request_number: *request_number,
++                op: op.clone()
++            })]);
++        }
++        Message::PrepareOk {
++            view_number,
++            op_number,
++            ..
++        }
++        | Message::GetState {
++            view_number,
++            op_number,
++            ..
++        } => {
++            w["view"] = json!(view_number);
++            w["opn"] = json!(op_number);
++        }
++        Message::Commit {
++            view_number,
++            commit_number,
++        } => {
++            w["view"] = json!(view_number);
++            w["commit"] = json!(commit_number);
++        }
++        Message::NewState {
++            view_number,
++            log,
++            op_number_start,
++            op_number_end,
++            commit_number,
++        } => {
++            w["view"] = json!(view_number);
++            w["log"] = json!(entries(log));
++            w["start"] = json!(op_number_start);
++            w["opn"] = json!(op_number_end);
++            w["commit"] = json!(commit_number);
++        }
++        Message::StartViewChange { view_number, .. } => {
++            w["view"] = json!(view_number);
++        }
++        Message::DoViewChange {
++            view_number,
++            last_normal_view,
++            log,
++            op_number,
++            commit_number,
++            ..
++        } => {
++            w["view"] = json!(view_number);
++            w["last"] = json!(last_normal_view);
++            w["log"] = json!(entries(log));
++            w["opn"] = json!(op_number);
++            w["commit"] = json!(commit_number);
++        }
++        Message::StartView {
++            view_number,
++            log,
++            op_number,
++            commit_number,
++        } => {
++            w["view"] = json!(view_number);
++            w["log"] = json!(entries(log));
++            w["opn"] = json!(op_number);
++            w["commit"] = json!(commit_number);
++        }
++        Message::Recovery { view_number, .. } => {
++            w["view"] = json!(view_number);
++            w["nonce"] = json!(normalized_nonce);
++        }
++        Message::RecoveryResponse {
++            view_number, state, ..
++        } => {
++            w["view"] = json!(view_number);
++            w["nonce"] = json!(normalized_nonce);
++            w["hasState"] = json!(state.is_some());
++            if let Some(state) = state {
++                w["log"] = json!(entries(&state.log));
++                w["commit"] = json!(state.commit_number);
++            }
++        }
++    }
++    w
++}
++
++pub fn reply_wire(reply: &Reply<usize>) -> Value {
++    let mut w = default_wire("Reply");
++    w["view"] = json!(reply.view_number);
++    w["client"] = json!([reply.client_id]);
++    w["request"] = json!(reply.request_number);
++    w["result"] = json!(reply.result);
++    w
++}
++
++impl Replica<Register> {
++    /// Drain to volatile owner staging, preserving emission-time ack evidence.
++    /// No publication transition occurs until the owner releases one packet.
++    pub fn trace_drain_messages(&mut self) -> Vec<(usize, Message<Input>, Vec<LogEntry<Input>>)> {
++        let mut proofs = std::mem::take(&mut self.trace_prepare_ok_proofs);
++        self.outbox
++            .drain(..)
++            .enumerate()
++            .map(|(index, (destination, message))| {
++                let proof = proofs.remove(&index).unwrap_or_default();
++                if let Message::PrepareOk { op_number, .. } = &message {
++                    assert_eq!(proof.len(), *op_number, "missing creation-time ack prefix");
++                } else {
++                    assert!(proof.is_empty());
++                }
++                (destination, message, proof)
++            })
++            .collect()
++    }
++
++    /// Ordered observations since the previous completed handler.
++    pub fn trace_take_applies(&mut self) -> Vec<Value> {
++        let result = self.trace_apply_history[self.trace_apply_cursor..]
++            .iter()
++            .map(|a| {
++                json!({"slot":a.slot,"entry":entry(&a.entry),
++                "stateBefore":a.state_before,"result":a.result,
++                "stateAfter":a.state_after})
++            })
++            .collect();
++        self.trace_apply_cursor = self.trace_apply_history.len();
++        result
++    }
++
++    pub fn trace_raw_nonce(&self) -> u64 {
++        self.recovery_nonce
++    }
++
++    /// Full private-state projection; `out`/`replies` include owner staging.
++    pub fn trace_snapshot(
++        &self,
++        out: &[Value],
++        replies: &[Value],
++        normalized_nonce: usize,
++    ) -> Value {
++        assert!(
++            self.outbox.is_empty(),
++            "stage library outputs before snapshot"
++        );
++        assert!(
++            self.replies.is_empty(),
++            "stage library replies before snapshot"
++        );
++        let acks: Vec<_> = self
++            .acks
++            .iter()
++            .map(|(slot, replicas)| json!({"slot":slot,"replicas":replicas}))
++            .collect();
++        let table: Vec<_> = self
++            .client_table
++            .iter()
++            .map(|(client, item)| {
++                json!({"client":client,"request":item.request_number,
++                "hasReply":item.reply.is_some(),"reply":item.reply.unwrap_or(0)})
++            })
++            .collect();
++        let dvc: Vec<_> = self
++            .do_view_change_from
++            .iter()
++            .map(|(replica, item)| {
++                json!({"replica":replica,"last":item.last_normal_view,
++                "log":entries(&item.log),"commit":item.commit_number})
++            })
++            .collect();
++        let responses: Vec<_> = self
++            .recovery_responses
++            .iter()
++            .map(|(replica, item)| {
++                let (log, commit) = match &item.state {
++                    Some(state) => (entries(&state.log), state.commit_number),
++                    None => (Vec::new(), 0),
++                };
++                json!({"replica":replica,"view":item.view_number,
++                "hasState":item.state.is_some(),"log":log,"commit":commit})
++            })
++            .collect();
++        let applied: Vec<_> = self
++            .trace_apply_history
++            .iter()
++            .map(|a| entry(&a.entry))
++            .collect();
++        let results: Vec<_> = self.trace_apply_history.iter().map(|a| a.result).collect();
++        json!({"id":self.self_id,"status":format!("{:?}",self.status),
++            "view":self.view_number,"lastNormal":self.last_normal_view,
++            "commit":self.commit_number,"log":entries(&self.log),"acks":acks,
++            "table":table,"heard":self.heard_from_primary,
++            "waiting":self.idle_periods_waiting,"attempts":self.view_change_attempts,
++            "stable":self.idle_periods_stable,"svc":self.start_view_change_from,
++            "dvcSent":self.do_view_change_sent,"dvc":dvc,"catching":self.catching_up,
++            "nonce":normalized_nonce,"responses":responses,"out":out,"replies":replies,
++            "app":self.state_machine.value,"applied":applied,"results":results})
++    }
++
++    /// Classification only: inspect PRE-state, then invoke real `on_message`.
++    pub fn trace_message_branch(&self, message: &Message<Input>) -> &'static str {
++        if self.status == Status::Recovering && !matches!(message, Message::RecoveryResponse { .. })
++        {
++            return "ignore-recovering";
++        }
++        match message {
++            Message::Request {
++                client_id,
++                request_number,
++                ..
++            } => {
++                if !self.is_primary() || self.status != Status::Normal {
++                    "ignore-role-status"
++                } else if let Some(item) = self.client_table.get(client_id) {
++                    if *request_number < item.request_number {
++                        "old-request"
++                    } else if *request_number == item.request_number {
++                        "duplicate-request"
++                    } else {
++                        "append-request"
++                    }
++                } else {
++                    "append-request"
++                }
++            }
++            Message::Prepare {
++                view_number,
++                op_number,
++                ..
++            } => self.trace_primary_message_branch(
++                *view_number,
++                *op_number > self.log.len() + 1,
++                *op_number == self.log.len() + 1,
++            ),
++            Message::Commit {
++                view_number,
++                commit_number,
++            } => self.trace_primary_message_branch(
++                *view_number,
++                *commit_number > self.log.len(),
++                false,
++            ),
++            Message::NewState { view_number, .. } => {
++                if *view_number != self.view_number {
++                    "different-view"
++                } else if self.status == Status::StateTransfer {
++                    "same-view-transfer"
++                } else if self.status == Status::ViewChange && self.catching_up {
++                    "view-catch-up"
++                } else {
++                    "ignore-status"
++                }
++            }
++            _ => kind(message),
++        }
++    }
++
++    fn trace_primary_message_branch(&self, view: usize, gap: bool, append: bool) -> &'static str {
++        if view < self.view_number {
++            "old-view"
++        } else if view > self.view_number {
++            "catch-up-new-view"
++        } else if self.status == Status::ViewChange {
++            "catch-up-same-view"
++        } else if self.status != Status::Normal || self.is_primary() {
++            "ignore-role-status"
++        } else if gap {
++            "state-transfer"
++        } else if append {
++            "append-prepare"
++        } else {
++            "normal"
++        }
++    }
++
++    pub fn trace_idle_branch(&self) -> &'static str {
++        match self.status {
++            Status::Normal if self.is_primary() => "primary",
++            Status::Recovering => "recovering",
++            Status::ViewChange => "view-change",
++            _ => "backup-or-transfer",
++        }
++    }
++}
++
++impl Client<Input> {
++    pub fn trace_snapshot(&self, out: &[Value]) -> Value {
++        assert!(
++            self.outbox.is_empty(),
++            "stage library outputs before snapshot"
++        );
++        let pending: Vec<_> = self
++            .pending
++            .iter()
++            .map(|(request, op)| {
++                entry(&LogEntry {
++                    client_id: self.client_id,
++                    request_number: *request,
++                    op: op.clone(),
++                })
++            })
++            .collect();
++        json!({"view":self.view_number,"next":self.next_request_number,
++            "pending":pending,"out":out})
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use crate::Config;
++
++    #[test]
++    fn creation_time_ack_prefixes_and_actual_ordered_apply_results() {
++        let mut config = Config::new();
++        for _ in 0..3 {
++            config.add_replica();
++        }
++        let mut primary = Replica::new(0, config.clone(), Register::default());
++        let mut backup = Replica::new(1, config, Register::default());
++        for (client_id, value) in [(3, 1), (4, 2)] {
++            primary.on_message(Message::Request {
++                client_id,
++                request_number: 0,
++                op: Input::Put(value),
++            });
++        }
++        for (destination, message, _) in primary.trace_drain_messages() {
++            if destination == 1 {
++                backup.on_message(message);
++            }
++        }
++        // Both acks remain unpublished while the backup's log grows. The
++        // first proof must preserve its shorter creation-time prefix.
++        let acknowledgements = backup.trace_drain_messages();
++        assert_eq!(acknowledgements[0].2.len(), 1);
++        assert_eq!(acknowledgements[1].2.len(), 2);
++        // Cumulative ack 2 applies both entries in one real handler.
++        primary.on_message(acknowledgements[1].1.clone());
++        let applies = primary.trace_take_applies();
++        assert_eq!(applies.len(), 2);
++        assert_eq!(applies[0]["slot"], 1);
++        assert_eq!(applies[0]["stateBefore"], 0);
++        assert_eq!(applies[0]["result"], 0);
++        assert_eq!(applies[0]["stateAfter"], 1);
++        assert_eq!(applies[1]["slot"], 2);
++        assert_eq!(applies[1]["stateBefore"], 1);
++        assert_eq!(applies[1]["result"], 1);
++        assert_eq!(applies[1]["stateAfter"], 2);
++        assert!(primary.trace_take_applies().is_empty());
++        assert_eq!(primary.drain_replies().count(), 2);
++        let snapshot = primary.trace_snapshot(&[], &[], 0);
++        assert_eq!(snapshot["applied"].as_array().unwrap().len(), 2);
++        assert_eq!(snapshot["results"], json!([0, 1]));
++    }
++}

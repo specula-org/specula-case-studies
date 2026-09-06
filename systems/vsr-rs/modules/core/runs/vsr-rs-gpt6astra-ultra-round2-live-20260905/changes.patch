@@ -1,0 +1,1001 @@
+diff --git a/Cargo.toml b/Cargo.toml
+index d7462fc8654877d20d6aab3f4754cb9753519b43..e1519fde19527bf850441634e22adf91e32b2c89 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -13,4 +13,8 @@ members = ["simulator"]
+ log = "0.4.17"
+ 
+ [dev-dependencies]
++serde_json = "1"
+ env_logger = "0.9.1"
++
++[features]
++trace-harness = []
+diff --git a/lib.rs b/lib.rs
+index c1669644ae5a481ad6d7b65a31c69d653aa789a2..29719dd12e81c5241ca416b49b8769dfdc3d8667 100644
+--- a/lib.rs
++++ b/lib.rs
+@@ -20,6 +20,10 @@
+ //! at once, as shown by Michael et al. in "Recovering Shared Objects Without
+ //! Stable Storage".
+ 
++#[cfg(all(test, feature = "trace-harness"))]
++#[path = "tla_trace/tla_trace.rs"]
++mod tla_trace;
++
+ use log::trace;
+ use std::{
+     collections::{BTreeMap, BTreeSet},
+@@ -310,6 +314,8 @@ impl<Op: Clone + Debug> Client<Op> {
+ 
+     /// Sends `op` to the primary and returns the request number it was given.
+     pub fn on_request(&mut self, op: Op) -> RequestNumber {
++        #[cfg(all(test, feature = "trace-harness"))]
++        tla_trace::observe_call("ClientOnRequest", self.client_id);
+         trace!("Client {} <- {:?}", self.client_id, op);
+         let request_number = self.next_request_number;
+         self.next_request_number += 1;
+@@ -332,6 +338,8 @@ impl<Op: Clone + Debug> Client<Op> {
+     /// answers the pending request; a duplicate or a reply for an earlier
+     /// request does not.
+     pub fn on_reply(&mut self, request_number: RequestNumber, view_number: ViewNumber) -> bool {
++        #[cfg(all(test, feature = "trace-harness"))]
++        tla_trace::observe_call("ClientOnReply", self.client_id);
+         if view_number > self.view_number {
+             self.view_number = view_number;
+         }
+@@ -351,6 +359,8 @@ impl<Op: Clone + Debug> Client<Op> {
+     /// request, if any, to every replica: the primary may have changed
+     /// without this client knowing, and backups ignore client requests.
+     pub fn on_idle(&mut self) {
++        #[cfg(all(test, feature = "trace-harness"))]
++        tla_trace::observe_call("ClientOnIdle", self.client_id);
+         let Some((request_number, op)) = &self.pending else {
+             return;
+         };
+@@ -472,6 +482,8 @@ pub struct Replica<SM: StateMachine> {
+     recovery_responses: BTreeMap<ReplicaID, RecoveryResponse<SM::Input>>,
+     outbox: Vec<(ReplicaID, Message<SM::Input>)>,
+     replies: Vec<Reply<SM::Output>>,
++    #[cfg(all(test, feature = "trace-harness"))]
++    trace_applied: Vec<LogEntry<SM::Input>>,
+ }
+ 
+ impl<SM: StateMachine> Replica<SM> {
+@@ -499,6 +511,8 @@ impl<SM: StateMachine> Replica<SM> {
+             recovery_responses: BTreeMap::new(),
+             outbox: Vec::new(),
+             replies: Vec::new(),
++            #[cfg(all(test, feature = "trace-harness"))]
++            trace_applied: Vec::new(),
+         }
+     }
+ 
+@@ -526,6 +540,8 @@ impl<SM: StateMachine> Replica<SM> {
+ 
+     /// The main entry point to replica logic.
+     pub fn on_message(&mut self, message: Message<SM::Input>) {
++        #[cfg(all(test, feature = "trace-harness"))]
++        tla_trace::observe_call(&format!("On{}", tla_trace::message_kind(&message)), self.self_id);
+         trace!("Replica {} <- {:?}", self.self_id, message);
+         // A recovering replica knows nothing it could safely act on: not
+         // which view is current, not what it acknowledged before the crash.
+@@ -1231,6 +1247,8 @@ impl<SM: StateMachine> Replica<SM> {
+     /// change, and a view change that takes as long to complete is
+     /// followed by another, waiting twice as long each time.
+     pub fn on_idle(&mut self) {
++        #[cfg(all(test, feature = "trace-harness"))]
++        tla_trace::observe_call("OnIdle", self.self_id);
+         match self.status {
+             Status::Normal if self.is_primary() => {
+                 self.note_stable();
+@@ -1361,6 +1379,8 @@ impl<SM: StateMachine> Replica<SM> {
+     /// without running it again.
+     fn commit_op(&mut self, op_idx: usize) -> Reply<SM::Output> {
+         let entry = self.log[op_idx].clone();
++        #[cfg(all(test, feature = "trace-harness"))]
++        self.trace_applied.push(entry.clone());
+         let result = self.state_machine.apply(entry.op);
+         self.commit_number += 1;
+         if let Some(client) = self.client_table.get_mut(&entry.client_id) {
+diff --git a/tla_trace/owner.rs b/tla_trace/owner.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..bdb08b9f6d819bd97de3fb670af6af1382225caa
+--- /dev/null
++++ b/tla_trace/owner.rs
+@@ -0,0 +1,288 @@
++//! Single-threaded owner of real library objects and authentic in-flight messages.
++//! This schedules calls and publishes their observations; no VSR transitions live here.
++use super::*;
++
++#[derive(Clone, Debug)]
++enum Payload {
++    Message(Message<i64>),
++    Reply(Reply<i64>),
++}
++#[derive(Clone, Debug)]
++struct Packet {
++    payload: Payload,
++    canonical: Value,
++}
++
++pub(super) struct Owner {
++    config: Config,
++    replicas: Vec<Option<Replica<Accumulator>>>,
++    clients: Vec<Client<i64>>,
++    durable: Vec<usize>,
++    incarnations: Vec<usize>,
++    used: Vec<BTreeSet<u64>>,
++    nonces: Nonces,
++    network: Vec<Packet>,
++    issued: BTreeMap<(usize, usize), i64>,
++    steps: usize,
++    _guard: MutexGuard<'static, ()>,
++}
++
++impl Owner {
++    pub fn new(name: &str, n: usize, client_count: usize) -> Self {
++        assert!(n >= 2 && client_count > 0);
++        let guard = initialize(name);
++        let mut config = Config::new();
++        config.set_primary_timeout(2);
++        for _ in 0..n {
++            config.add_replica();
++        }
++        let owner = Self {
++            replicas: (0..n)
++                .map(|i| Some(Replica::new(i, config.clone(), Accumulator::default())))
++                .collect(),
++            clients: (0..client_count)
++                .map(|i| Client::new(i, config.clone()))
++                .collect(),
++            config,
++            durable: vec![0; n],
++            incarnations: vec![0; n],
++            used: vec![BTreeSet::new(); n],
++            nonces: vec![BTreeMap::from([(0, 0)]); n],
++            network: Vec::new(),
++            issued: BTreeMap::new(),
++            steps: 0,
++            _guard: guard,
++        };
++        owner.snapshot(json!({"event":"Init","schema":1,"system":"vsr-rs","revision":REVISION,
++            "category":"A","application":"integer-sum","servers":(0..n).collect::<Vec<_>>(),
++            "clientIds":(0..client_count).map(client_name).collect::<Vec<_>>(),"operations":[1,2],"primaryTimeout":2}),vec![]);
++        owner
++    }
++    pub fn state(&self, node: usize) -> Value {
++        self.replicas[node]
++            .as_ref()
++            .map(|r| replica_snapshot(r, &self.nonces))
++            .unwrap_or_else(empty_state)
++    }
++    pub fn client_state(&self, client: usize) -> Value {
++        client_snapshot(&self.clients[client])
++    }
++    pub fn messages(&self) -> Vec<Value> {
++        self.network.iter().map(|p| p.canonical.clone()).collect()
++    }
++
++    fn snapshot(&self, mut event: Value, outputs: Vec<Value>) {
++        let replicas:Vec<_> = (0..self.replicas.len()).map(|i|json!({"id":i,"live":self.replicas[i].is_some(),
++            "durableView":self.durable[i],"incarnation":self.incarnations[i],
++            "usedNonces":self.used[i].iter().map(|n|nonce_json(&self.nonces,i,*n)).collect::<BTreeSet<_>>(),
++            "state":self.state(i)})).collect();
++        let clients: Vec<_> = (0..self.clients.len())
++            .map(|i| json!({"id":client_name(i),"state":self.client_state(i)}))
++            .collect();
++        event["replicas"] = json!(replicas);
++        event["clients"] = json!(clients);
++        event["network"] = json!(self.messages());
++        event["outputs"] = json!(outputs);
++        emit(event);
++    }
++    fn record(&mut self, event: Value, outputs: Vec<Value>) {
++        self.steps += 1;
++        self.snapshot(event, outputs);
++    }
++    fn enqueue(&mut self, packet: Packet, outputs: &mut Vec<Value>) {
++        outputs.push(packet.canonical.clone());
++        self.network.push(packet);
++    }
++    fn publish_replica(&mut self, node: usize) -> Vec<Value> {
++        let replica = self.replicas[node].as_mut().unwrap();
++        // Conforming owner storage survives destruction of the replica. This models
++        // successful publication; it does not claim to test filesystem durability.
++        self.durable[node] = replica.view_number();
++        let messages: Vec<_> = replica.drain_messages().collect();
++        let replies: Vec<_> = replica.drain_replies().collect();
++        let mut outputs = Vec::new();
++        for (dst, message) in messages {
++            let value = canonical(&message, json!(node), dst, &self.nonces);
++            self.enqueue(
++                Packet {
++                    payload: Payload::Message(message),
++                    canonical: value,
++                },
++                &mut outputs,
++            );
++        }
++        for reply in replies {
++            let op = self.issued[&(reply.client_id, reply.request_number)];
++            let mut value = envelope("Reply", json!(node), json!(client_name(reply.client_id)));
++            value["view"] = json!(reply.view_number);
++            value["result"] = json!(reply.result);
++            value["request"] = request_json(reply.client_id, reply.request_number, op);
++            self.enqueue(
++                Packet {
++                    payload: Payload::Reply(reply),
++                    canonical: value,
++                },
++                &mut outputs,
++            );
++        }
++        outputs
++    }
++    fn publish_client(&mut self, client: usize) -> Vec<Value> {
++        let messages: Vec<_> = self.clients[client].drain().collect();
++        let mut outputs = Vec::new();
++        for (dst, message) in messages {
++            let value = canonical(&message, json!(client_name(client)), dst, &self.nonces);
++            self.enqueue(
++                Packet {
++                    payload: Payload::Message(message),
++                    canonical: value,
++                },
++                &mut outputs,
++            );
++        }
++        outputs
++    }
++
++    pub fn request(&mut self, client: usize, op: i64) {
++        assert!([1, 2].contains(&op));
++        assert!(
++            self.clients[client].pending.is_none(),
++            "one outstanding request per client"
++        );
++        let number = self.clients[client].on_request(op);
++        check_call("ClientOnRequest", client);
++        assert!(self.issued.insert((client, number), op).is_none());
++        let outputs = self.publish_client(client);
++        self.record(
++            json!({"event":"ClientOnRequest","client":client_name(client),"op":op}),
++            outputs,
++        );
++    }
++    pub fn client_idle(&mut self, client: usize) {
++        self.clients[client].on_idle();
++        check_call("ClientOnIdle", client);
++        let outputs = self.publish_client(client);
++        self.record(
++            json!({"event":"ClientOnIdle","client":client_name(client)}),
++            outputs,
++        );
++    }
++    pub fn idle(&mut self, node: usize) {
++        self.replicas[node]
++            .as_mut()
++            .expect("cannot tick down node")
++            .on_idle();
++        check_call("OnIdle", node);
++        let outputs = self.publish_replica(node);
++        self.record(json!({"event":"OnIdle","node":node}), outputs);
++    }
++    fn deliverable(&self, packet: &Packet) -> bool {
++        match &packet.payload {
++            Payload::Message(_) => {
++                self.replicas[packet.canonical["dst"].as_u64().unwrap() as usize].is_some()
++            }
++            Payload::Reply(_) => true,
++        }
++    }
++    fn deliver_index(&mut self, index: usize) {
++        assert!(self.deliverable(&self.network[index]));
++        let packet = self.network.remove(index);
++        match packet.payload {
++            Payload::Message(message) => {
++                let node = packet.canonical["dst"].as_u64().unwrap() as usize;
++                let name = format!("On{}", message_kind(&message));
++                self.replicas[node].as_mut().unwrap().on_message(message);
++                check_call(&name, node);
++                let outputs = self.publish_replica(node);
++                self.record(
++                    json!({"event":name,"node":node,"message":packet.canonical}),
++                    outputs,
++                );
++            }
++            Payload::Reply(reply) => {
++                let client = reply.client_id;
++                self.clients[client].on_reply(reply.request_number, reply.view_number);
++                check_call("ClientOnReply", client);
++                let outputs = self.publish_client(client);
++                assert!(outputs.is_empty());
++                self.record(json!({"event":"ClientOnReply","client":client_name(client),"message":packet.canonical}),outputs);
++            }
++        }
++    }
++    pub fn deliver(&mut self, kind: &str, src: Value, dst: Value) {
++        self.deliver_where(|m| m["kind"] == kind && m["src"] == src && m["dst"] == dst);
++    }
++    pub fn deliver_where(&mut self, predicate: impl Fn(&Value) -> bool) {
++        let index = self
++            .network
++            .iter()
++            .position(|p| predicate(&p.canonical))
++            .expect("missing selected packet");
++        self.deliver_index(index);
++    }
++    pub fn pump(&mut self, limit: usize) {
++        for _ in 0..limit {
++            let Some(index) = self.network.iter().position(|p| self.deliverable(p)) else {
++                return;
++            };
++            self.deliver_index(index);
++        }
++        assert!(
++            !self.network.iter().any(|p| self.deliverable(p)),
++            "delivery budget exhausted"
++        );
++    }
++    pub fn lose_where(&mut self, predicate: impl Fn(&Value) -> bool) {
++        let index = self
++            .network
++            .iter()
++            .position(|p| predicate(&p.canonical))
++            .expect("missing loss target");
++        let packet = self.network.remove(index);
++        self.record(json!({"event":"Lose","message":packet.canonical}), vec![]);
++    }
++    pub fn duplicate_where(&mut self, predicate: impl Fn(&Value) -> bool) {
++        let packet = self
++            .network
++            .iter()
++            .find(|p| predicate(&p.canonical))
++            .expect("missing duplication target")
++            .clone();
++        self.network.push(packet.clone());
++        self.record(
++            json!({"event":"Duplicate","message":packet.canonical}),
++            vec![],
++        );
++    }
++    pub fn crash(&mut self, node: usize) {
++        let replica = self.replicas[node].take().expect("already down");
++        assert_eq!(self.durable[node], replica.view_number());
++        drop(replica); // actually destroy protocol state and application
++        self.record(json!({"event":"Crash","node":node}), vec![]);
++    }
++    pub fn recover(&mut self, node: usize, nonce: u64) {
++        assert!(
++            self.replicas[node].is_none(),
++            "recover only destroyed objects"
++        );
++        let next = self.nonces[node].len();
++        self.nonces[node].entry(nonce).or_insert(next); // preserves equality across restarts
++        self.replicas[node] = Some(Replica::recover(
++            node,
++            self.config.clone(),
++            Accumulator::default(),
++            self.durable[node],
++            nonce,
++        ));
++        self.incarnations[node] += 1;
++        self.used[node].insert(nonce); // do not sanitize/reject repeated raw nonces
++        let outputs = self.publish_replica(node);
++        self.record(
++            json!({"event":"Recover","node":node,"nonce":nonce_json(&self.nonces,node,nonce)}),
++            outputs,
++        );
++    }
++    pub fn finish(self) {
++        shutdown(self.steps);
++    }
++}
+diff --git a/tla_trace/scenarios.rs b/tla_trace/scenarios.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..5a095978d6ba79d3b26cb462839ffcd2b332ccb5
+--- /dev/null
++++ b/tla_trace/scenarios.rs
+@@ -0,0 +1,263 @@
++//! Controlled deliveries adapted from the existing `tests/cluster.rs` tests.
++//! The Owner invokes the real Client and Replica APIs once per recorded event.
++
++use super::*;
++use serde_json::{json, Value};
++
++/// Drain selected authentic queued messages, recording each delivery separately.
++/// Callers explicitly exclude down destinations; held packets remain in network.
++fn pump_matching(owner: &mut Owner, predicate: impl Fn(&Value) -> bool) {
++    for _ in 0..256 {
++        if !owner.messages().iter().any(&predicate) {
++            return;
++        }
++        owner.deliver_where(|message| predicate(message));
++    }
++    panic!("scenario exceeded its bounded selective delivery budget");
++}
++
++fn assert_applied(owner: &Owner, nodes: &[usize], count: usize, sum: i64) {
++    for &node in nodes {
++        let state = owner.state(node);
++        assert_eq!(state["status"], "Normal", "replica {node}");
++        assert_eq!(state["commit"], json!(count), "replica {node}");
++        assert_eq!(state["app"], json!(sum), "replica {node}");
++        assert_eq!(state["applied"].as_array().unwrap().len(), count);
++        assert_eq!(state["log"].as_array().unwrap().len(), count);
++    }
++}
++
++/// Reuses test_duplicate_prepare_ok_is_not_a_quorum,
++/// test_duplicate_request_executes_once, test_lost_request_resent_on_idle,
++/// and test_prepare_resent_on_idle_when_prepare_lost.
++#[test]
++fn trace_normal_retry_duplicates() {
++    let mut owner = Owner::new("normal_retry_duplicates", 4, 2);
++    owner.client_idle(0); // Also capture the no-pending callback.
++    owner.request(0, 1);
++    owner.lose_where(|m| m["kind"] == "Request");
++    assert_eq!(owner.state(0)["log"], json!([]));
++    owner.client_idle(0);
++    owner.duplicate_where(|m| m["kind"] == "Request" && m["dst"] == 0);
++    owner.deliver("Request", json!("c0"), json!(0));
++    owner.deliver("Request", json!("c0"), json!(0));
++    assert_eq!(owner.state(0)["log"].as_array().unwrap().len(), 1);
++    for node in 1..4 {
++        owner.deliver("Request", json!("c0"), json!(node));
++    }
++
++    // With four members, self plus one backup is insufficient even when replayed.
++    owner.deliver("Prepare", json!(0), json!(3));
++    owner.duplicate_where(|m| m["kind"] == "PrepareOk" && m["src"] == 3);
++    owner.deliver("PrepareOk", json!(3), json!(0));
++    owner.deliver("PrepareOk", json!(3), json!(0));
++    assert_eq!(owner.state(0)["commit"], 0);
++    assert_eq!(owner.state(0)["app"], 0);
++    owner.lose_where(|m| m["kind"] == "Prepare" && m["dst"] == 1);
++    owner.lose_where(|m| m["kind"] == "Prepare" && m["dst"] == 2);
++    owner.idle(0); // Real timer retries the uncommitted prepare.
++    owner.pump(256);
++    assert_eq!(owner.client_state(0)["pending"], json!([]));
++    owner.idle(0);
++    owner.pump(256);
++    assert_applied(&owner, &[0, 1, 2, 3], 1, 1);
++
++    // Replies share the fault network: lose one, retry, and replay its replacement.
++    owner.request(1, 2);
++    owner.deliver("Request", json!("c1"), json!(0));
++    owner.deliver("Prepare", json!(0), json!(1));
++    owner.deliver("Prepare", json!(0), json!(2));
++    owner.deliver("PrepareOk", json!(1), json!(0));
++    assert_eq!(owner.state(0)["commit"], 1);
++    owner.deliver("PrepareOk", json!(2), json!(0));
++    owner.lose_where(|m| m["kind"] == "Reply" && m["dst"] == "c1");
++    assert_eq!(
++        owner.client_state(1)["pending"].as_array().unwrap().len(),
++        1
++    );
++    owner.client_idle(1);
++    owner.deliver("Request", json!("c1"), json!(0));
++    owner.duplicate_where(|m| m["kind"] == "Reply" && m["dst"] == "c1");
++    owner.deliver("Reply", json!(0), json!("c1"));
++    owner.deliver("Reply", json!(0), json!("c1"));
++    owner.pump(256);
++    owner.client_idle(0);
++    owner.idle(0);
++    owner.pump(256);
++    assert_applied(&owner, &[0, 1, 2, 3], 2, 3);
++    assert_eq!(owner.client_state(0)["pending"], json!([]));
++    assert_eq!(owner.client_state(1)["pending"], json!([]));
++    owner.finish();
++}
++
++/// Reuses test_prepare_reordered_during_state_transfer,
++/// test_stale_new_state_during_state_transfer, and test_get_state_retried_on_idle.
++/// One outstanding request per client is maintained throughout this adaptation.
++#[test]
++fn trace_state_transfer_reordering() {
++    let mut owner = Owner::new("state_transfer_reordering", 3, 1);
++    owner.request(0, 1);
++    owner.pump(256);
++
++    owner.request(0, 2);
++    owner.deliver("Request", json!("c0"), json!(0));
++    pump_matching(&mut owner, |m| {
++        !(m["kind"] == "Prepare" && m["dst"] == 1 && m["opnum"] == 2)
++    });
++    assert_eq!(owner.state(1)["log"].as_array().unwrap().len(), 1);
++
++    owner.request(0, 1);
++    owner.deliver("Request", json!("c0"), json!(0));
++    owner.deliver_where(|m| m["kind"] == "Prepare" && m["dst"] == 1 && m["opnum"] == 3);
++    assert_eq!(owner.state(1)["status"], "StateTransfer");
++    owner.deliver_where(|m| m["kind"] == "Prepare" && m["dst"] == 1 && m["opnum"] == 2);
++    assert_eq!(owner.state(1)["log"].as_array().unwrap().len(), 1);
++    owner.duplicate_where(|m| m["kind"] == "GetState" && m["src"] == 1);
++    owner.deliver("GetState", json!(1), json!(0));
++    owner.deliver("NewState", json!(0), json!(1));
++    pump_matching(&mut owner, |m| m["kind"] != "GetState");
++    owner.idle(0);
++    pump_matching(&mut owner, |m| m["kind"] != "GetState");
++    assert_applied(&owner, &[0, 1, 2], 3, 4);
++
++    owner.request(0, 2);
++    owner.deliver("Request", json!("c0"), json!(0));
++    owner.lose_where(|m| m["kind"] == "Prepare" && m["dst"] == 1);
++    pump_matching(&mut owner, |m| m["kind"] != "GetState");
++
++    owner.request(0, 1);
++    owner.deliver("Request", json!("c0"), json!(0));
++    owner.deliver("Prepare", json!(0), json!(1));
++    owner.lose_where(|m| m["kind"] == "GetState" && m["opnum"] == 3);
++    assert_eq!(owner.state(1)["status"], "StateTransfer");
++    owner.idle(1); // Retry is observable even though the old authentic request wins.
++    assert!(owner
++        .messages()
++        .iter()
++        .any(|m| m["kind"] == "GetState" && m["opnum"] == 3));
++    owner.deliver_where(|m| m["kind"] == "GetState" && m["opnum"] == 1);
++    assert!(owner
++        .messages()
++        .iter()
++        .any(|m| { m["kind"] == "NewState" && m["start"] == 1 && m["opnum"] == 5 }));
++    owner.deliver("NewState", json!(0), json!(1));
++    assert_eq!(owner.state(1)["log"].as_array().unwrap().len(), 5);
++    owner.pump(256);
++    owner.idle(0);
++    owner.pump(256);
++    assert_applied(&owner, &[0, 1, 2], 5, 7);
++    assert_eq!(owner.client_state(0)["pending"], json!([]));
++    owner.finish();
++}
++
++/// Reuses test_view_change_after_primary_crash, with an actual owner destruction
++/// and explicit retained packets; also delivers an old equal-view StartView.
++#[test]
++fn trace_view_change_after_crash() {
++    let mut owner = Owner::new("view_change_after_crash", 3, 1);
++    owner.request(0, 1);
++    owner.pump(256);
++    owner.idle(0);
++    owner.pump(256);
++    assert_applied(&owner, &[0, 1, 2], 1, 1);
++
++    owner.request(0, 2);
++    owner.deliver("Request", json!("c0"), json!(0));
++    owner.deliver("Prepare", json!(0), json!(1));
++    owner.deliver("Prepare", json!(0), json!(2));
++    assert_eq!(owner.state(0)["commit"], 1);
++    owner.crash(0); // The PrepareOk messages stay in the tracked network.
++    for _ in 0..3 {
++        owner.idle(1);
++    }
++    assert_eq!(owner.state(1)["status"], "ViewChange");
++    owner.deliver("StartViewChange", json!(1), json!(2));
++    owner.deliver("StartViewChange", json!(2), json!(1));
++    owner.deliver("DoViewChange", json!(2), json!(1));
++    owner.duplicate_where(|m| m["kind"] == "StartView" && m["dst"] == 2);
++    owner.deliver("StartView", json!(1), json!(2));
++    pump_matching(&mut owner, |m| {
++        m["dst"] != 0 && !(m["kind"] == "StartView" && m["dst"] == 2)
++    });
++    assert_eq!(owner.state(1)["view"], 1);
++    assert_eq!(owner.state(1)["commit"], 2);
++    assert_eq!(owner.state(1)["app"], 3);
++    assert_eq!(owner.client_state(0)["view"], 1);
++    assert_eq!(owner.client_state(0)["pending"], json!([]));
++    owner.idle(1);
++    pump_matching(&mut owner, |m| {
++        m["dst"] != 0 && !(m["kind"] == "StartView" && m["dst"] == 2)
++    });
++    assert_applied(&owner, &[1, 2], 2, 3);
++
++    owner.request(0, 1); // The real client targets the primary learned from its reply.
++    pump_matching(&mut owner, |m| {
++        m["dst"] != 0 && !(m["kind"] == "StartView" && m["dst"] == 2)
++    });
++    assert_eq!(owner.state(2)["log"].as_array().unwrap().len(), 3);
++    owner.deliver("StartView", json!(1), json!(2));
++    assert_eq!(owner.state(2)["log"].as_array().unwrap().len(), 3);
++    owner.idle(1);
++    owner.pump(256);
++    assert_applied(&owner, &[1, 2], 3, 4);
++    assert_eq!(owner.client_state(0)["pending"], json!([]));
++    assert!(owner.messages().iter().all(|m| m["dst"] == 0));
++    owner.finish();
++}
++
++/// Reuses test_recovery_after_reboot. A retained authentic response from the
++/// first recovery is delivered during the next recovery, with a fresh nonce.
++#[test]
++fn trace_recovery_stale_responses() {
++    let mut owner = Owner::new("recovery_stale_responses", 3, 1);
++    owner.request(0, 1);
++    owner.pump(256);
++    owner.idle(0);
++    owner.pump(256);
++    assert_applied(&owner, &[0, 1, 2], 1, 1);
++
++    owner.crash(1);
++    owner.recover(1, 101); // Canonical nonce 1 in replica 1's whole-trace mapping.
++    owner.request(0, 2);
++    pump_matching(&mut owner, |m| m["kind"] != "Recovery");
++    assert_eq!(owner.state(1)["status"], "Recovering");
++    assert_eq!(owner.state(1)["log"], json!([]));
++    assert_eq!(owner.state(0)["app"], 3);
++
++    owner.deliver("Recovery", json!(1), json!(0));
++    owner.duplicate_where(|m| m["kind"] == "RecoveryResponse" && m["src"] == 0);
++    owner.deliver("RecoveryResponse", json!(0), json!(1));
++    assert_eq!(owner.state(1)["status"], "Recovering");
++    owner.deliver("Recovery", json!(1), json!(2));
++    owner.deliver("RecoveryResponse", json!(2), json!(1));
++    assert_applied(&owner, &[1], 2, 3);
++
++    owner.crash(1);
++    owner.recover(1, 202); // Canonical nonce 2; never relabel the retained response.
++    owner.deliver_where(|m| m["kind"] == "RecoveryResponse" && m["nonce"] == 1);
++    assert_eq!(owner.state(1)["status"], "Recovering");
++    assert_eq!(owner.state(1)["responses"], json!([]));
++    assert_eq!(owner.state(1)["app"], 0);
++    owner.idle(1); // Recovering timer retries the real constructor's request.
++    owner.lose_where(|m| m["kind"] == "Recovery" && m["dst"] == 0 && m["nonce"] == 2);
++    owner.deliver("Recovery", json!(1), json!(2));
++    owner.deliver("Recovery", json!(1), json!(2));
++    owner.deliver("RecoveryResponse", json!(2), json!(1));
++    owner.duplicate_where(|m| m["kind"] == "RecoveryResponse" && m["src"] == 2);
++    owner.deliver("RecoveryResponse", json!(2), json!(1));
++    owner.deliver("RecoveryResponse", json!(2), json!(1));
++    assert_eq!(owner.state(1)["status"], "Recovering");
++    assert_eq!(owner.state(1)["responses"].as_array().unwrap().len(), 1);
++    owner.deliver("Recovery", json!(1), json!(0));
++    owner.deliver("RecoveryResponse", json!(0), json!(1));
++    assert_applied(&owner, &[1], 2, 3);
++    owner.pump(256);
++
++    owner.request(0, 1);
++    owner.pump(256);
++    owner.idle(0);
++    owner.pump(256);
++    assert_applied(&owner, &[0, 1, 2], 3, 4);
++    assert_eq!(owner.client_state(0)["pending"], json!([]));
++    owner.finish();
++}
+diff --git a/tla_trace/tla_trace.rs b/tla_trace/tla_trace.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..e29ffd1297bc2b261a3791cb15c70d412b4b3d32
+--- /dev/null
++++ b/tla_trace/tla_trace.rs
+@@ -0,0 +1,332 @@
++//! Observation only: snapshots of real fields, native-message encoding, and NDJSON I/O.
++use super::*;
++use serde_json::{json, Value};
++use std::cell::RefCell;
++use std::fs::{self, File};
++use std::io::{BufWriter, Write};
++use std::path::PathBuf;
++use std::sync::{Mutex, MutexGuard};
++use std::time::{Instant, SystemTime, UNIX_EPOCH};
++
++#[path = "owner.rs"]
++mod owner;
++use owner::Owner;
++#[path = "scenarios.rs"]
++mod scenarios;
++
++pub const REVISION: &str = "3ac0104a567092139534c9022205d02281a2da41";
++static SCENARIO: Mutex<()> = Mutex::new(());
++static WRITER: Mutex<Option<TraceWriter>> = Mutex::new(None);
++thread_local! { static CALLS: RefCell<Vec<(String, usize)>> = const { RefCell::new(Vec::new()) }; }
++thread_local! { static NATIVE_CALL_COUNT: RefCell<usize> = const { RefCell::new(0) }; }
++
++// These markers run at real library entry points, including early-return branches.
++pub fn observe_call(event: &str, id: usize) {
++    CALLS.with(|calls| calls.borrow_mut().push((event.to_owned(), id)));
++    NATIVE_CALL_COUNT.with(|count| *count.borrow_mut() += 1);
++}
++fn check_call(event: &str, id: usize) {
++    CALLS.with(|calls| {
++        assert_eq!(
++            std::mem::take(&mut *calls.borrow_mut()),
++            vec![(event.to_owned(), id)]
++        )
++    });
++}
++pub fn message_kind<Op>(message: &Message<Op>) -> &'static str {
++    match message {
++        Message::Request { .. } => "Request",
++        Message::Prepare { .. } => "Prepare",
++        Message::PrepareOk { .. } => "PrepareOk",
++        Message::Commit { .. } => "Commit",
++        Message::GetState { .. } => "GetState",
++        Message::NewState { .. } => "NewState",
++        Message::StartViewChange { .. } => "StartViewChange",
++        Message::DoViewChange { .. } => "DoViewChange",
++        Message::StartView { .. } => "StartView",
++        Message::Recovery { .. } => "Recovery",
++        Message::RecoveryResponse { .. } => "RecoveryResponse",
++    }
++}
++
++struct TraceWriter {
++    file: BufWriter<File>,
++    path: PathBuf,
++    name: String,
++    count: usize,
++    native_events: usize,
++    started: Instant,
++}
++fn initialize(name: &str) -> MutexGuard<'static, ()> {
++    let guard = SCENARIO.lock().expect("previous scenario panicked");
++    CALLS.with(|calls| calls.borrow_mut().clear());
++    NATIVE_CALL_COUNT.with(|count| *count.borrow_mut() = 0);
++    let dir = PathBuf::from(std::env::var("TRACE_DIR").expect("set TRACE_DIR via harness/run.sh"));
++    fs::create_dir_all(&dir).unwrap();
++    let path = dir.join(format!("{name}.ndjson"));
++    let completion = path.with_extension("complete.json");
++    if completion.exists() {
++        fs::remove_file(completion).unwrap();
++    }
++    *WRITER.lock().unwrap() = Some(TraceWriter {
++        file: BufWriter::new(File::create(&path).unwrap()),
++        path,
++        name: name.to_owned(),
++        count: 0,
++        native_events: 0,
++        started: Instant::now(),
++    });
++    guard
++}
++fn emit(mut event: Value) {
++    let mut writer = WRITER.lock().unwrap();
++    let writer = writer.as_mut().expect("initialize first");
++    let name = event["event"].as_str().unwrap();
++    if name.starts_with("On") || name.starts_with("ClientOn") {
++        writer.native_events += 1;
++    }
++    event["tag"] = json!("trace");
++    // Strings avoid the JSON module's bounded-integer decoder for wall time.
++    event["ts"] = json!(SystemTime::now()
++        .duration_since(UNIX_EPOCH)
++        .unwrap()
++        .as_nanos()
++        .to_string());
++    event["monotonic_ns"] = json!(writer.started.elapsed().as_nanos().to_string());
++    serde_json::to_writer(&mut writer.file, &event).unwrap();
++    writer.file.write_all(b"\n").unwrap();
++    writer.file.flush().unwrap();
++    writer.count += 1;
++}
++fn shutdown(callback_count: usize) {
++    CALLS.with(|calls| assert!(calls.borrow().is_empty(), "unobserved library callback"));
++    let mut writer = WRITER.lock().unwrap().take().unwrap();
++    writer.file.flush().unwrap();
++    writer.file.get_ref().sync_all().unwrap();
++    let native_callback_count = NATIVE_CALL_COUNT.with(|count| *count.borrow());
++    assert_eq!(
++        native_callback_count, writer.native_events,
++        "one event per native callback"
++    );
++    assert_eq!(
++        writer.count,
++        callback_count + 1,
++        "Init plus one event per owner step"
++    );
++    let record = json!({"scenario":writer.name,"event_count":writer.count,
++        "owner_step_count":callback_count,"native_callback_count":native_callback_count,
++        "completed":true,"revision":REVISION});
++    fs::write(
++        writer.path.with_extension("complete.json"),
++        serde_json::to_vec_pretty(&record).unwrap(),
++    )
++    .unwrap();
++}
++
++#[derive(Debug, Default)]
++struct Accumulator {
++    value: i64,
++}
++impl StateMachine for Accumulator {
++    type Input = i64;
++    type Output = i64;
++    fn apply(&mut self, input: i64) -> i64 {
++        self.value += input;
++        self.value
++    }
++}
++fn client_name(id: usize) -> String {
++    format!("c{id}")
++}
++fn request_json(client: usize, number: usize, op: i64) -> Value {
++    json!({"client":client_name(client),"number":number,"op":op})
++}
++fn log_json(entries: &[LogEntry<i64>]) -> Vec<Value> {
++    entries
++        .iter()
++        .map(|e| request_json(e.client_id, e.request_number, e.op))
++        .collect()
++}
++type Nonces = Vec<BTreeMap<u64, usize>>;
++fn nonce_json(nonces: &Nonces, node: usize, raw: u64) -> usize {
++    *nonces[node]
++        .get(&raw)
++        .expect("nonce must originate from an observed recovery")
++}
++fn empty_state() -> Value {
++    // Explicit absence encoding for a destroyed replica, not reconstructed live state.
++    json!({"status":"Normal","view":0,"lastNormal":0,"commit":0,"log":[],
++        "acks":[],"table":[],"heard":true,"waiting":0,"attempts":0,"stable":0,
++        "svc":[],"dvcSent":false,"dvc":[],"catching":false,"nonce":0,
++        "responses":[],"app":0,"applied":[],"out":[]})
++}
++fn replica_snapshot(r: &Replica<Accumulator>, nonces: &Nonces) -> Value {
++    assert!(
++        r.outbox.is_empty() && r.replies.is_empty(),
++        "capture after draining both outputs"
++    );
++    let acks: Vec<_> = r
++        .acks
++        .iter()
++        .map(|(k, v)| json!({"key":k,"value":v}))
++        .collect();
++    let table: Vec<_> = r.client_table.iter().map(|(k,v)| json!({"key":client_name(*k),
++        "value":{"number":v.request_number,"hasReply":v.reply.is_some(),"result":v.reply.unwrap_or(0)}})).collect();
++    let dvc: Vec<_> = r
++        .do_view_change_from
++        .iter()
++        .map(|(k, v)| {
++            json!({"key":k,
++        "value":{"lastNormal":v.last_normal_view,"log":log_json(&v.log),"commit":v.commit_number}})
++        })
++        .collect();
++    let responses: Vec<_> = r
++        .recovery_responses
++        .iter()
++        .map(|(k, v)| {
++            json!({"key":k,
++        "value":{"view":v.view_number,"hasState":v.state.is_some(),
++            "log":v.state.as_ref().map(|s| log_json(&s.log)).unwrap_or_default(),
++            "commit":v.state.as_ref().map(|s|s.commit_number).unwrap_or(0)}})
++        })
++        .collect();
++    json!({"status":format!("{:?}",r.status),"view":r.view_number,"lastNormal":r.last_normal_view,
++        "commit":r.commit_number,"log":log_json(&r.log),"acks":acks,"table":table,
++        "heard":r.heard_from_primary,"waiting":r.idle_periods_waiting,"attempts":r.view_change_attempts,
++        "stable":r.idle_periods_stable,"svc":r.start_view_change_from,"dvcSent":r.do_view_change_sent,
++        "dvc":dvc,"catching":r.catching_up,"nonce":nonce_json(nonces,r.self_id,r.recovery_nonce),
++        "responses":responses,"app":r.state_machine().value,"applied":log_json(&r.trace_applied),"out":[]})
++}
++fn client_snapshot(c: &Client<i64>) -> Value {
++    assert!(c.outbox.is_empty());
++    let pending: Vec<_> = c
++        .pending
++        .iter()
++        .map(|(number, op)| request_json(c.client_id, *number, *op))
++        .collect();
++    json!({"view":c.view_number,"next":c.next_request_number,"pending":pending})
++}
++
++fn envelope(kind: &str, src: Value, dst: Value) -> Value {
++    json!({"kind":kind,"src":src,"dst":dst,"view":0,"opnum":0,"commit":0,"start":0,
++        "lastNormal":0,"nonce":0,"hasState":false,"log":[],
++        "request":{"client":"","number":0,"op":0},"result":0})
++}
++fn canonical(message: &Message<i64>, src: Value, dst: usize, nonces: &Nonces) -> Value {
++    let mut m = envelope(message_kind(message), src.clone(), json!(dst));
++    match message {
++        Message::Request {
++            client_id,
++            request_number,
++            op,
++        } => {
++            assert_eq!(src, json!(client_name(*client_id)));
++            m["request"] = request_json(*client_id, *request_number, *op);
++        }
++        Message::Prepare {
++            view_number,
++            op_number,
++            client_id,
++            request_number,
++            op,
++            commit_number,
++        } => {
++            m["view"] = json!(view_number);
++            m["opnum"] = json!(op_number);
++            m["commit"] = json!(commit_number);
++            m["request"] = request_json(*client_id, *request_number, *op);
++        }
++        Message::PrepareOk {
++            view_number,
++            op_number,
++            replica_id,
++        }
++        | Message::GetState {
++            view_number,
++            op_number,
++            replica_id,
++        } => {
++            assert_eq!(src, json!(replica_id));
++            m["view"] = json!(view_number);
++            m["opnum"] = json!(op_number);
++        }
++        Message::Commit {
++            view_number,
++            commit_number,
++        } => {
++            m["view"] = json!(view_number);
++            m["commit"] = json!(commit_number);
++        }
++        Message::NewState {
++            view_number,
++            log,
++            op_number_start,
++            op_number_end,
++            commit_number,
++        } => {
++            m["view"] = json!(view_number);
++            m["log"] = json!(log_json(log));
++            m["start"] = json!(op_number_start);
++            m["opnum"] = json!(op_number_end);
++            m["commit"] = json!(commit_number);
++        }
++        Message::StartViewChange {
++            view_number,
++            replica_id,
++        } => {
++            assert_eq!(src, json!(replica_id));
++            m["view"] = json!(view_number);
++        }
++        Message::DoViewChange {
++            view_number,
++            replica_id,
++            last_normal_view,
++            log,
++            op_number,
++            commit_number,
++        } => {
++            assert_eq!(src, json!(replica_id));
++            m["view"] = json!(view_number);
++            m["lastNormal"] = json!(last_normal_view);
++            m["log"] = json!(log_json(log));
++            m["opnum"] = json!(op_number);
++            m["commit"] = json!(commit_number);
++        }
++        Message::StartView {
++            view_number,
++            log,
++            op_number,
++            commit_number,
++        } => {
++            m["view"] = json!(view_number);
++            m["log"] = json!(log_json(log));
++            m["opnum"] = json!(op_number);
++            m["commit"] = json!(commit_number);
++        }
++        Message::Recovery {
++            replica_id,
++            nonce,
++            view_number,
++        } => {
++            assert_eq!(src, json!(replica_id));
++            m["view"] = json!(view_number);
++            m["nonce"] = json!(nonce_json(nonces, *replica_id, *nonce));
++        }
++        Message::RecoveryResponse {
++            view_number,
++            nonce,
++            replica_id,
++            state,
++        } => {
++            assert_eq!(src, json!(replica_id));
++            m["view"] = json!(view_number);
++            m["nonce"] = json!(nonce_json(nonces, dst, *nonce));
++            m["hasState"] = json!(state.is_some());
++            if let Some(s) = state {
++                m["log"] = json!(log_json(&s.log));
++                m["commit"] = json!(s.commit_number);
++            }
++        }
++    }
++    m
++}

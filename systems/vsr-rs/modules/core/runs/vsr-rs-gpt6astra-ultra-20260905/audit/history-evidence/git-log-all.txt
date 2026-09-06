@@ -1,0 +1,466 @@
+commit 6043ed871dd66f85233e9e30795c16002cc7b573
+Author:     Pekka Enberg <penberg@iki.fi>
+AuthorDate: Sat Sep 5 09:54:38 2026 +0300
+Commit:     Pekka Enberg <penberg@iki.fi>
+CommitDate: Sat Sep 5 09:54:38 2026 +0300
+
+    wip
+
+commit 860e5bc84f78f470cb31241419ce2e05b4cfc6b2
+Author:     Pekka Enberg <penberg@iki.fi>
+AuthorDate: Sat Sep 5 09:46:40 2026 +0300
+Commit:     Pekka Enberg <penberg@iki.fi>
+CommitDate: Sat Sep 5 09:46:40 2026 +0300
+
+    Lean: rename 'vote' to DoViewChange to match the paper and the code
+    
+    The Lean twin used 'vote' (Vote, doViewChangeVotes, bestVote, voters, ...),
+    which is Raft's leader-election term. Viewstamped Replication has no vote:
+    the Rust code names the struct DoViewChange and the field do_view_change_from,
+    and the simulator calls the non-recovering replicas participants. This was
+    my terminology, not the paper's or the code's.
+    
+    Renamed throughout the model, the invariant, and the proofs: the struct
+    Vote is now DoViewChange, doViewChangeVotes is doViewChangeFrom, the ghost
+    chosenVotes is chosenDoViewChanges, bestVote is bestDoViewChange, the
+    Durability participants match the simulator, and the StartedVotesCover /
+    votesCover clauses become StartedDoViewChangesCover / doViewChangesCover.
+    No proof changed; the build and the conformance test still pass.
+
+commit fda71b80bcb8ec9b79015bf5176a3af8681e26ab
+Author:     Pekka Enberg <penberg@iki.fi>
+AuthorDate: Sat Sep 5 09:42:42 2026 +0300
+Commit:     Pekka Enberg <penberg@iki.fi>
+CommitDate: Sat Sep 5 09:42:42 2026 +0300
+
+    wip
+
+commit 8d22e269cf8eacb78a1800ecc8b8c75a390d7045
+Author:     Pekka Enberg <penberg@iki.fi>
+AuthorDate: Sat Sep 5 09:34:47 2026 +0300
+Commit:     Pekka Enberg <penberg@iki.fi>
+CommitDate: Sat Sep 5 09:39:18 2026 +0300
+
+    wip
+
+commit 3d843993060b1e931b57ed5eafaf3d5363221039
+Author:     Pekka Enberg <penberg@iki.fi>
+AuthorDate: Sat Sep 5 08:20:04 2026 +0300
+Commit:     Pekka Enberg <penberg@iki.fi>
+CommitDate: Sat Sep 5 09:39:18 2026 +0300
+
+    Lean: the quorum-intersection lemma
+    
+    Vsr/Quorum.lean proves that in a cluster of n replicas, where a quorum is
+    n/2+1, any two quorums of distinct replica ids share a member: a Finset
+    pigeonhole from Mathlib. Stated both directly and over Config.
+    
+    This is the keystone of the safety endgame. onPrepareOk (a new
+    acknowledgement completing a quorum), the view-change handlers (the chosen
+    log carries every committed entry), and durability all rest on it.
+    
+    The library now depends on Mathlib for it, adding the Classical.choice
+    axiom. Main.lean, the vsr-replay executable, imports only Vsr.Check rather
+    than the umbrella so it stays free of Mathlib.
+
+commit 92257753cc5ccc5577eeb221f276f54774fb0695
+Author:     Pekka Enberg <penberg@iki.fi>
+AuthorDate: Fri Sep 4 14:55:58 2026 +0300
+Commit:     Pekka Enberg <penberg@iki.fi>
+CommitDate: Sat Sep 5 09:39:18 2026 +0300
+
+    Lean: catch-up preservation (Inv.catchUp), a step block for onCommit
+    
+    System.drain_replaceSend states draining a changed replica that sends one
+    message as a replica replacement plus one sent message. Inv.catchUpChange
+    composes replaceVC (a replica moving to a non-normal status) with
+    addGetState (the GetState it sends), and Inv.catchUp is the handler for
+    r.catchUpWithView: the early return is drain_clean, the change branch is
+    catchUpChange. Both rest on propext and Quot.sound.
+    
+    catchUpChange takes any non-normal, non-recovering target status, so the
+    state-transfer case of onCommit reuses it too.
+
+commit 3d446bc12f54ef7820ab13b1570e8e6c263b9b4c
+Author:     Pekka Enberg <penberg@iki.fi>
+AuthorDate: Fri Sep 4 13:59:57 2026 +0300
+Commit:     Pekka Enberg <penberg@iki.fi>
+CommitDate: Sat Sep 5 09:39:18 2026 +0300
+
+    Lean: Inv.replaceVC for status and view changes
+    
+    The third onCommit building block. Like Inv.replace, but the replica moves
+    to a non-normal, non-recovering status (state transfer, or a view-change
+    catch-up): log, last normal view, and commit number are fixed, the view may
+    only grow, and the one new obligation is that a catching-up replica is not
+    its view's primary. The non-normal status makes the acknowledgement and
+    primary-longest clauses vacuous. Rests on propext.
+    
+    With Inv.commitStep and Inv.addGetState this is every core onCommit needs;
+    what remains is assembling the handler's cases and a catch-up helper.
+
+commit fa07b0b2ba2392dc9370d14a2eaa0cbaf930b11d
+Author:     Pekka Enberg <penberg@iki.fi>
+AuthorDate: Fri Sep 4 13:28:16 2026 +0300
+Commit:     Pekka Enberg <penberg@iki.fi>
+CommitDate: Sat Sep 5 09:39:18 2026 +0300
+
+    Lean: Inv.addGetState, adding a GetState message keeps Inv
+    
+    The second building block for onCommit. A GetState carries no log and is
+    not a fragment, an acknowledgement, or any constructor a clause tracks, so
+    it is inert everywhere except MessagesBelowView, which the sender's view
+    being at least the message's discharges. Rests on propext.
+    
+    With Inv.commitStep this leaves one block for onCommit: a replica change
+    that also alters status or view, for the state-transfer and catch-up cases,
+    composed with this lemma to add the GetState each of them sends.
+
+commit 469d18980e43df36f704eec1703de282ceeaa4ce
+Author:     Pekka Enberg <penberg@iki.fi>
+AuthorDate: Fri Sep 4 11:16:50 2026 +0300
+Commit:     Pekka Enberg <penberg@iki.fi>
+CommitDate: Sat Sep 5 09:39:18 2026 +0300
+
+    Lean: land Inv.commitStep via a reusable replica-replacement lemma
+    
+    commitUpTo_false_panicked proves committing does not panic when the target
+    commit is within the log, a go-induction that rules out the missing-entry
+    branch since the commit index stays below the log length.
+    
+    Inv.replace is the reusable core for a step that changes one replica and
+    sends nothing: sent and started are unchanged, so every message fact
+    transfers by monotonicity, and only the replaced replica is re-checked
+    against the field equalities it is handed. Inv.commitStep applies it to a
+    normal backup raising its commit number to a backed bound within its log,
+    the new commit backed because the old one and the bound both are. This is
+    the receiving side of onCommit, onPrepare, and onNewState.
+    
+    Both rest on propext and Quot.sound; no sorry. Frame lemmas for the acks,
+    recovery nonce, chosen votes, and reply fields support them.
+
+commit c3b05146eb3a05a18b94b4539623ff4b2c9a4149
+Author:     Pekka Enberg <penberg@iki.fi>
+AuthorDate: Fri Sep 4 11:02:31 2026 +0300
+Commit:     Pekka Enberg <penberg@iki.fi>
+CommitDate: Sat Sep 5 09:39:18 2026 +0300
+
+    Lean: commit-arithmetic and Backed helpers for preservation
+    
+    Groundwork for the next preservation handlers. commitUpTo_go_add_le and
+    commitUpTo_le_max bound a commit step by max of the old commit and the
+    target; Backed.downward and Backed.max give that a bound backed at two
+    points is backed at their max, which is what a receiving replica needs to
+    show its new commit number is backed. System.drain_replace states a step
+    that sends nothing as a plain replica replacement, and frame lemmas cover
+    the acks, recovery nonce, and chosen-votes fields.
+    
+    These assemble into Inv.commitStep, a normal backup raising its commit to
+    a backed bound, which is the receiving-side core of onCommit, onPrepare,
+    and onNewState. Landing it needs one more lemma, that commitUpTo does not
+    panic when the target is within the log, which the next commit adds.
+
+commit 474df3a809731d795ec5ac112564f8fe0dddbcf1
+Author:     Pekka Enberg <penberg@iki.fi>
+AuthorDate: Fri Sep 4 09:49:43 2026 +0300
+Commit:     Pekka Enberg <penberg@iki.fi>
+CommitDate: Sat Sep 5 09:39:18 2026 +0300
+
+    Lean: preservation skeleton and the first handler, onGetState
+    
+    Vsr/Preserve.lean starts the proof that every step preserves Inv. Two
+    lemmas give the shape: a replica that changed nothing and sent nothing
+    leaves the cluster as it was, and one that changed nothing and sent one
+    message leaves the cluster with one more message. On those,
+    Inv.addNewState proves that a NewState cut from a normal replica's log
+    keeps every clause, and Inv.onGetState is the handler. Both rest on
+    propext alone.
+    
+    Enumerating the first handler's obligations clause by clause found five
+    more facts the invariant has to carry: every entry a replica holds is
+    covered by some message of its view, two replicas last normal in the
+    same view agree where their logs overlap, every view above zero that
+    anything refers to was started, replicas are clean between steps, and
+    the cluster has at least two replicas, since one replica never sends and
+    nothing about it can be said through sent. Each went in as a check first
+    and holds on every conformance trace. Inv.init now takes the two-replica
+    hypothesis.
+    
+    The message clause of CommitsBacked is a named definition, MsgBacked, so
+    that its monotonicity is a lemma rather than a dependent match.
+
+commit 9adecdd6ac460e41315b5259c29dff367ebe0f55
+Author:     Pekka Enberg <penberg@iki.fi>
+AuthorDate: Fri Sep 4 09:33:06 2026 +0300
+Commit:     Pekka Enberg <penberg@iki.fi>
+CommitDate: Sat Sep 5 09:39:18 2026 +0300
+
+    Lean: state layers three to five of the safety invariant, prove init and prefix agreement
+    
+    Vsr/Invariant.lean states the rest of the safety invariant as one
+    structure, Inv: one log per view, commits backed by a quorum of
+    acknowledgements, and committed entries surviving later views, on top of
+    the proved layers one and two. They are one induction, since a replica
+    catching up keeps its committed prefix and takes the rest from the new
+    view, and the two agree only because committed entries survive.
+    
+    Working the hardest preservation case through by hand, a PrepareOk that
+    completes a quorum, showed the three layers are not inductive on their
+    own. The argument needs that an acknowledgement was sent before its
+    sender's vote for a later view, that a primary's log covers everything
+    it has sent in its view, and which votes a view's log was chosen from.
+    None of that is in the state, so Inv carries ten helper clauses, each
+    with a Bool twin in Vsr/Check.lean that holds on every conformance
+    trace.
+    
+    The last of those needed a history variable. The primary's own vote is
+    never a message, so when its own log is the one a view starts from,
+    nothing persistent records the choice. The model now has a ghost field,
+    System.started, the votes each started view was chosen from, moved
+    there by the system step from a ghost field on the replica. It is not in
+    the Rust and not observable; the conformance test is unaffected.
+    
+    Proved: Inv holds initially, everything stated through sent and started
+    is monotone, and Inv implies prefix agreement. The last is the check
+    that the statement is strong enough, and it forced two additions:
+    Survives covers Prepare fragments and the started votes, and layer two
+    now says op numbers are positive.
+    
+    Open: that every step preserves Inv.
+
+commit 0fe2a47ff5b476c26f5ec0a0bbaef061d5dc86a5
+Author:     Pekka Enberg <penberg@iki.fi>
+AuthorDate: Thu Sep 3 15:28:00 2026 +0300
+Commit:     Pekka Enberg <penberg@iki.fi>
+CommitDate: Sat Sep 5 09:39:06 2026 +0300
+
+    Keep the view-change backoff until the new view has proved stable
+    
+    A view change could start the next one, forever. With a primary timeout of
+    two idle periods, a heartbeat every tick, and no delay, a view change
+    takes exactly as long as a replica is willing to wait for it, and the
+    simulator runs idle periods before deliveries within a tick, so a replica
+    that joined the change with the shortest wait timed out one tick before
+    StartView reached it and started another view. The backoff exists for
+    this, doubling the wait for every view change entered from another, but
+    enter_normal reset it to zero. The replica that had just completed a view
+    was therefore always the one with the shortest wait in the next view
+    change, and always the one to cut it short, round the ring. On a perfect
+    network the view number rose by one every two ticks for the whole
+    million-tick convergence budget.
+    
+    The backoff now survives enter_normal and is forgotten only after
+    Config::primary_timeout consecutive idle periods of stable normal
+    operation, counted in a new field, idle_periods_stable. A replica pulled
+    into a view change right after completing one keeps its longer wait, so
+    each replica needs at most one cut-short view change to wait long enough,
+    and the storm ends. Once the cluster is calm for a full timeout the
+    counter returns to zero as before.
+    
+    Found by scripts/simulate at commit 19d71e51f41758622b7b00285e6f6634f33e2f8b:
+    
+        vsr-simulator --lite 7098080745341283894
+        vsr-simulator --lite 6658838664322981494
+    
+    Both failed with "no state convergence: pending message" at ticks 1003341
+    and 1021549; both pass now. The regression test is
+    test_view_change_does_not_start_the_next in tests/cluster.rs, on a new
+    step method of the hand-driven cluster that delivers with a one-tick
+    latency in the simulator's order; it climbed to view 251 in 500 steps
+    before the fix.
+    
+    The Lean model caught it too, once it could say anything about progress.
+    Vsr/Liveness.lean adds a synchronous scheduler and the liveness property
+    settles, from any reachable state with a quorum not recovering. On the
+    model before the fix, theorems proved by running the model in the kernel
+    refuted it for the regression scenario: no settled round among 500, view
+    251 after 500 rounds, and a run periodic in everything but the view
+    number. The same theorems now prove the scenario settles within eight
+    rounds in view 3. Check.liveness runs the bounded property after every
+    step of a conformance trace; it fired on 27 of the 40 traces before the
+    fix and on none now. The twin mirrors the fix, and the conformance test
+    passes.
+
+commit 054d21878e3ba4c19d90a6a6961e31b278f99a80
+Author:     Pekka Enberg <penberg@iki.fi>
+AuthorDate: Thu Sep 3 14:45:10 2026 +0300
+Commit:     Pekka Enberg <penberg@iki.fi>
+CommitDate: Sat Sep 5 09:38:27 2026 +0300
+
+    Lean: prove the first two layers of the safety invariant
+    
+    The safety theorem needs an inductive invariant over the whole cluster.
+    This proves its first two layers and leaves the rest as sorry.
+    
+    Layer one is the per-replica invariant in Vsr/Local.lean: the commit
+    number is within the log, the last normal view is not ahead of the view
+    and equals it in normal status and state transfer, a replica catching up
+    is in view-change status, and a recovering replica holds nothing. Every
+    handler, idle period, and recovery preserves it with no assumption about
+    the messages received. Lifted to the system it proves
+    commitBounded_of_reachable, the first of the four properties.
+    
+    Layer two is well-formedness of every message ever sent, in
+    Vsr/WellFormed.lean: log lengths match the op numbers carried, commit
+    numbers do not exceed them, a vote's last normal view is not ahead of its
+    view, and a recovery state's commit number is within its log. Every
+    handler only sends well-formed messages because its sender satisfies
+    layer one. Lifted to the system it proves sentWF_of_reachable.
+    
+    Vsr/Frame.lean holds the frame lemmas both run on: what each helper of
+    the replica leaves alone, as simp lemmas. Two handlers, onRequest and
+    onStartViewChange, lost the Option tricks in their definitions so the
+    proofs split cleanly; the conformance test confirmed the rewrites change
+    nothing.
+    
+    Vsr/Check.lean has a Bool version of every invariant, proved or
+    candidate, and vsr-replay evaluates them after every step of a trace,
+    reporting violations on stderr; the conformance test fails on any. The
+    candidates for the remaining layers, one log per view, committed means
+    quorum-acknowledged, and committed entries survive later views, held on
+    240 seeds. Those three form one combined invariant, since a replica
+    catching up keeps its committed prefix and takes the rest from the new
+    view, which only agrees because committed entries survive. Mathlib is in
+    the lakefile for the quorum intersection lemma that needs; nothing
+    imports it yet.
+    
+    Durability was restated to match the simulator: it counts holders among
+    replicas that are not recovering, since a replica back from a crash holds
+    nothing until it has recovered. The version that counted every replica
+    was false.
+    
+    lean/README.md lists the file layout, what is proved and what is not, the
+    plan for the rest, how the model is checked against the code, and the
+    proof conventions that got the handler lemmas through.
+
+commit 6ea68910d871a5ebfd5f15ec5090a9cb31fa9301
+Author:     Pekka Enberg <penberg@iki.fi>
+AuthorDate: Thu Sep 3 13:40:57 2026 +0300
+Commit:     Pekka Enberg <penberg@iki.fi>
+CommitDate: Sat Sep 5 09:38:22 2026 +0300
+
+    Replace the Kani harnesses with a Lean model and a conformance check
+    
+    The Kani harnesses never finished. The replica keeps five B-trees, and
+    CBMC unrolls the standard library's node code for every map operation
+    and even for Drop, so the fully concrete two-step harness ran twenty
+    minutes and six gigabytes without producing a formula. The symbolic
+    harnesses branch on top of that, and their unwind bounds sit below the
+    B-tree node capacity, so they would have failed on unwinding assertions
+    regardless. Bounded model checking of a whole cluster is the wrong shape
+    of problem for Kani; the simulator already explores interleavings faster
+    than CBMC can encode one.
+    
+    lean/ holds a model of the replica in Lean 4: one definition per Rust
+    function with the same control flow, B-trees as sorted association lists
+    so the tie-breaking in the view-change vote matches, and every assert!
+    as a panicked flag so the handlers are total. The cluster model keeps
+    every message ever sent, so delivery covers loss, delay, replay, and
+    reordering with one rule. Safety is stated over reachable states: no
+    panic, commit bounded by log length, committed-prefix agreement, and
+    durability in a quorum. The main theorem is a sorry; what is proved is
+    that commit numbers never move backwards.
+    
+    verify/ ties the model to the code. It generates seeded traces of cluster
+    steps, runs the real replicas and the model through each, and diffs what
+    they print after every step. Forty seeds of two hundred steps pass, on
+    three and five replicas, reaching view 5, state transfer, and recovery.
+    Making the model skip commits on Commit messages is caught at step 29 of
+    seed 0. The test passes with a note when no Lean toolchain is installed.
+
+commit 3ac0104a567092139534c9022205d02281a2da41
+Author:     Pekka Enberg <penberg@iki.fi>
+AuthorDate: Sat Sep 5 09:12:39 2026 +0300
+Commit:     Pekka Enberg <penberg@iki.fi>
+CommitDate: Sat Sep 5 09:12:39 2026 +0300
+
+    Drop Raft's "vote" vocabulary from the view change
+    
+    The VSR papers never speak of votes: a replica sends DoViewChange, and
+    the new primary picks the log from a quorum of them. Name things after
+    the message, the way TigerBeetle does with do_view_change_from_all_replicas:
+    
+    - ViewChangeVote is now DoViewChange, like the RecoveryResponse struct
+      that is also named after its message, and locals are dvc
+    - do_view_change_votes is now do_view_change_from, mirroring
+      start_view_change_from
+    - the durability property counts participants, not voters
+
+commit a67f1f8b5182fc2871390f75c271394d0538dac2
+Author:     Pekka Enberg <penberg@iki.fi>
+AuthorDate: Fri Sep 4 11:01:57 2026 +0300
+Commit:     Pekka Enberg <penberg@iki.fi>
+CommitDate: Fri Sep 4 11:01:57 2026 +0300
+
+    Coverage report from the simulator
+    
+    The simulator is the thing that exercises the implementation, so the
+    question worth answering is which lines it reaches, not which lines the
+    unit tests reach.
+    
+    scripts/coverage builds the simulator with LLVM source-based
+    instrumentation, runs a batch of random seeds on every core the way
+    scripts/simulate does, and merges the profiles into one report: a per-file
+    summary on the terminal, annotated sources in target/coverage/report.txt,
+    and HTML in target/coverage/html.
+    
+    A hundred seeds cover 97% of the lines of lib.rs. What they miss is
+    unused accessors and a handful of defensive early returns.
+    
+    The instrumented build keeps its own target directory so it does not
+    invalidate the normal build cache, and a failing seed does not stop the
+    batch: the report is still written and the command to reproduce the
+    failure is printed.
+
+commit a1de0555fc3c22205c51335ca47b787801747ff9
+Author:     Pekka Enberg <penberg@iki.fi>
+AuthorDate: Fri Sep 4 10:02:02 2026 +0300
+Commit:     Pekka Enberg <penberg@iki.fi>
+CommitDate: Fri Sep 4 10:53:51 2026 +0300
+
+    README.md
+
+commit b97ffdd3c7f5e7efc6ef66c1ff0f918caf0723c8
+Author:     Pekka Enberg <penberg@iki.fi>
+AuthorDate: Fri Sep 4 10:02:02 2026 +0300
+Commit:     Pekka Enberg <penberg@iki.fi>
+CommitDate: Fri Sep 4 10:46:54 2026 +0300
+
+    Add key-value store example
+    
+    examples/kvstore replicates a key-value map over a three-replica cluster,
+    showing how an application drives Replica and Client and applies a
+    StateMachine.
+
+commit 26869860b6d488f1c09ad3f145e8af3088d876e9
+Author:     Pekka Enberg <penberg@iki.fi>
+AuthorDate: Fri Sep 4 10:02:02 2026 +0300
+Commit:     Pekka Enberg <penberg@iki.fi>
+CommitDate: Fri Sep 4 10:46:54 2026 +0300
+
+    Deterministic simulator
+    
+    A simulator that drives a cluster of replicas and clients over a
+    simulated network, seeded so every run is reproducible from its seed. It
+    injects faults, loss, replay, reordering delay, crashes, restarts,
+    reboots through recovery, and partitions, and checks the safety
+    properties after every tick. scripts/simulate runs it on every core with
+    random seeds for a time budget and reports per commit. A terminal viewer
+    draws the cluster as it runs. Every bug in this repository was found by
+    it.
+
+commit 716c5bfa4d0bff39b8bfe4d49a84a63c94a1edaa
+Author:     Pekka Enberg <penberg@iki.fi>
+AuthorDate: Fri Sep 4 10:01:51 2026 +0300
+Commit:     Pekka Enberg <penberg@iki.fi>
+CommitDate: Fri Sep 4 10:46:54 2026 +0300
+
+    Initial commit
+    
+    A work-in-progress implementation of Viewstamped Replication, following
+    "Viewstamped Replication Revisited" by Liskov and Cowling. The library
+    does no I/O, keeps no clocks, and starts no threads: a Replica and a
+    Client are state machines their owner steps with on_message, on_idle, and
+    on_reply, and drains what they want sent. Normal operation, state
+    transfer, view changes, and recovery are all here. tests/cluster.rs
+    drives a small cluster by hand.

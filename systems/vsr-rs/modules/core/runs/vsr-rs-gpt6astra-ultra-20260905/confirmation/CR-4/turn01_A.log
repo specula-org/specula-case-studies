@@ -1,0 +1,99 @@
+I’ll use the `bug-confirmation` skill and keep this scoped to CR-4 only. I’m first loading the required skill instructions and doing a lightweight memory check for any prior confirmation conventions that could affect the verdict format.
+running // @exec: {"max_output_tokens": 100000} rg -n "vsr-rs|CR-4|bug-confirmation|repair-request|confirmation" /home/ubuntu/.codex/memories/MEMORY.md
+running // @exec: {\"max_output_tokens\": 100000} sed -n '1,260p' /home/ubuntu/.codex/skills/bug-confirmation/SKILL.md
+The memory lookup did not surface a vsr-rs/CR-4 prior run to reuse, so I’m treating the supplied finding and live worktree as authoritative. Next I’m reading the skill’s workflow files completely, then I’ll inspect only the cited implementation paths and upstream history for this mechanism.
+running sed -n '1,260p' /home/ubuntu/.codex/skills/bug-confirmation/guide.md
+running sed -n '1,260p' /home/ubuntu/.codex/skills/bug-confirmation/phases/01-investigation.md
+running sed -n '1,260p' /home/ubuntu/.codex/skills/bug-confirmation/phases/02-reproduction.md
+I’ve finished the required skill files: the key bar is reachability through real interfaces plus a real observed consequence; otherwise the verdict must distinguish masked, environment-limited, false-positive, or known-drop. I’m now auditing the example boundary code and the library obligations it is supposed to satisfy.
+running wc -l /home/ubuntu/.codex/skills/bug-confirmation/guide.md /home/ubuntu/.codex/skills/bug-confirmation/phases/01-investigation.md /home/ubuntu/.codex/skills/...
+running git -C /home/ubuntu/specula-vsr-runner-20260905/runs/vsr-rs-gpt6astra-ultra-20260905/vsr-rs/.specula-output/confirmation/CR-4/worktree status --short && git...
+running find /home/ubuntu/specula-vsr-runner-20260905/runs/vsr-rs-gpt6astra-ultra-20260905/vsr-rs/.specula-output -maxdepth 3 -type f \\( -name '*.log' -o -name '*.t...
+The source checkout is at the requested revision but already has local harness changes, so I’m leaving them untouched and keeping my repro outside the repo in `.specula-output/repro`. I’m reading the example code around every cited site plus the library comments that define the caller obligations.
+running nl -ba examples/kvstore/main.rs | sed -n '300,380p'
+running nl -ba examples/kvstore/main.rs | sed -n '430,475p'
+running nl -ba examples/kvstore/main.rs | sed -n '540,725p'
+running nl -ba examples/kvstore/main.rs | sed -n '725,770p'
+running nl -ba lib.rs | sed -n '1,45p'
+running nl -ba lib.rs | sed -n '490,515p'
+running nl -ba lib.rs | sed -n '250,290p'
+running rg -n "pub trait StateMachine|pub trait PersistentState|struct RecoveryRequest|enum Timeout|fn on_message|fn execute|execute_all_committed|Client|nonce|persi...
+The example does implement several obligations explicitly: view persistence before `flush`, a tick thread, per-connection client IDs, and reconnecting sender behavior. The suspicious boundary point I need to test harder is whether normal example operation can reuse a client ID across disconnect/reconnect and whether that yields an observable client result.
+running nl -ba examples/kvstore/main.rs | sed -n '380,540p'
+running nl -ba lib.rs | sed -n '300,380p'
+running nl -ba lib.rs | sed -n '520,675p'
+running nl -ba lib.rs | sed -n '1320,1385p'
+running nl -ba README.md | sed -n '45,90p'
+running rg -n "connection|fetch_add|Atomic|Client::new|Disconnect|client ids|must never repeat|run_client_acceptor|run_client_connection|run_peer|acceptor" examples/...
+The code audit shows the example uses `started = SystemTime::now().as_secs() & 0xFF_FFFF` plus an accept counter for client identity. That prevents reuse across normal reconnects in one process, but permits reuse when the node restarts within the same second and accepts the first connection again; I’m checking whether that exact mechanism is already reported upstream before deciding whether to drop or reproduce.
+running nl -ba examples/kvstore/main.rs | sed -n '1,120p'
+running nl -ba examples/kvstore/main.rs | sed -n '220,320p'
+running nl -ba examples/kvstore/main.rs | sed -n '120,220p'
+running git log --oneline --decorate --all -- examples/kvstore/main.rs lib.rs README.md | sed -n '1,120p'
+running nl -ba examples/kvstore/main.rs | sed -n '320,385p'
+running git blame -L 478,492 -- examples/kvstore/main.rs && git blame -L 683,701 -- examples/kvstore/main.rs && git blame -L 749,750 -- examples/kvstore/main.rs
+The upstream history points to the example being added in one commit, with comments explicitly warning that client IDs must never repeat. I’m using the issue/PR tracker now to determine whether the same example-boundary identity mechanism has already been filed, including closed or merged PRs.
+running git remote -v
+running git log --all --grep='client\\|identity\\|connection\\|backoff\\|disconnect\\|persist\\|nonce\\|timer\\|tick\\|view' --regexp-ignore-case --oneline --decorat...
+running gh issue list -R penberg/vsr-rs --state all --limit 100 --json number,title,state,updatedAt,closedAt,url,body
+running gh pr list -R penberg/vsr-rs --state all --limit 100 --json number,title,state,updatedAt,closedAt,mergedAt,url,body
+The tracker search found an open upstream issue that reports the same client-identity reuse mechanism in the kvstore example, and an open PR that fixes other kvstore lifecycle issues while explicitly leaving that identity issue out. I’m checking the issue/PR comments and the local PR history now to confirm fix status and whether there is any newer merged change covering it.
+running git log --all --oneline --decorate --grep='same ID\\|client ID\\|client identity\\|start time\\|run_client_acceptor\\|same entry\\|client table' --regexp-ign...
+running git branch -a --contains HEAD && git show --stat --oneline b97ffdd3 -- examples/kvstore/main.rs README.md
+running gh issue view 9 -R penberg/vsr-rs --comments --json number,title,state,url,body,comments
+running gh pr view 10 -R penberg/vsr-rs --comments --json number,title,state,url,body,comments,commits,mergedAt,closedAt,headRefOid,baseRefOid
+The known-status evidence is strong: issue #9 filed the exact “same `started`, same accept counter, same client table entry” client-ID defect; PR #10 is still open and leaves that part unfixed. I’m still checking the actual library behavior around duplicate request handling so the final body can name the concrete consequence accurately rather than treating the umbrella finding as vague.
+running nl -ba lib.rs | sed -n '668,735p'
+running nl -ba lib.rs | sed -n '735,835p'
+running nl -ba lib.rs | sed -n '1380,1415p'
+running rg -n \"fn drain|drain_replies|replies|outbox|on_reply|on_request|commit_op|client_table|request_number\" lib.rs | sed -n '1,180p'
+running find . -maxdepth 3 -type f \\( -name '*kvstore*' -o -name '*.rs' -o -name '*.toml' \\) | sort | sed -n '1,200p'
+There may be two possible paths here: a strict known-drop on the filed client-ID defect, or a broader confirmation attempt for unfiled boundary obligations like crash durability and recovery nonce freshness. I’m checking recovery mechanics before deciding, because the reproduction must use a real public sequence and not an artificial state.
+running nl -ba lib.rs | sed -n '1138,1245p'
+running nl -ba lib.rs | sed -n '1245,1320p'
+running nl -ba lib.rs | sed -n '1413,1465p'
+running nl -ba lib.rs | sed -n '1490,1520p'
+running cat Cargo.toml
+Because the finding is code-review sourced and the same defect is already filed upstream, the skill’s prefilter points to `DROPPED`. I’m going to write the required investigation record now, including the local code path, tracker evidence, and fix status; I’ll avoid mutating the source checkout.
+To satisfy the requested `repro/test_bugCR-4_*` artifact while preserving the known-drop verdict, I’m adding a small self-contained reproduction script outside the source repo. It will not patch the implementation; it uses the public library API plus the kvstore ID formula to demonstrate the already-filed duplicate-client-id consequence.
+The repro script is in place. I’m executing it under a timeout now; the output will tell us whether the duplicate client identity produces the expected cached-reply symptom under normal public library calls.
+running timeout 5m bash /home/ubuntu/specula-vsr-runner-20260905/runs/vsr-rs-gpt6astra-ultra-20260905/vsr-rs/.specula-output/repro/test_bugCR-4_client_id_reuse.sh
+The script reproduced the duplicate-client-id consequence cleanly: a new `GET` on the restarted identity receives the cached `SET` reply result (`None`) instead of `Some("old")`. I’m marking the script executable and then I’ll produce the parsed verdict; because the same mechanism is already in upstream issue #9, the final status remains `DROPPED`, not a new reproduced bug.
+running chmod +x /home/ubuntu/specula-vsr-runner-20260905/runs/vsr-rs-gpt6astra-ultra-20260905/vsr-rs/.specula-output/repro/test_bugCR-4_client_id_reuse.sh && ls -l...
+- **Source**: Code Review
+- **Novelty**: KNOWN (cite: https://github.com/penberg/vsr-rs/issues/9; fix-status: unfixed)
+- **Location**: examples/kvstore/main.rs:491
+
+## Description
+CR-4 resolves to the kvstore example’s client-identity boundary obligation. The example derives client IDs from `node_id`, a 24-bit wall-clock seconds value, and a per-process accept counter; if a node restarts within the same second, the first accepted client can reuse the previous `ClientID` and request number 0. Upstream issue #9 already reports this exact mechanism at this site, and PR #10 is still open while explicitly leaving the client-ID issue unfixed.
+
+## Trigger scenario
+Start the kvstore example, connect the first client to a node, and commit `SET k old`. Restart that node within the same wall-clock second, then connect the first client again and issue `GET k`. The restarted connection can reuse the same client ID and request number, so the primary’s client table treats the new `GET` as a resend of the old `SET`.
+
+## Developer intent
+The library documents that every client must have its own identity and that restarted clients must not reuse one (`lib.rs:32`). The example’s own comment says repeated client IDs make the primary answer a new connection’s first request from the cache (`examples/kvstore/main.rs:479`). Issue #9 reports the same defect, and PR #10 says it fixes #9 items 1 and 2 while leaving the client-ID issue alone.
+
+## Reproduction result
+Repro artifact written and executed:
+`/home/ubuntu/specula-vsr-runner-20260905/runs/vsr-rs-gpt6astra-ultra-20260905/vsr-rs/.specula-output/repro/test_bugCR-4_client_id_reuse.sh`
+
+Command:
+```bash
+timeout 5m bash /home/ubuntu/specula-vsr-runner-20260905/runs/vsr-rs-gpt6astra-ultra-20260905/vsr-rs/.specula-output/repro/test_bugCR-4_client_id_reuse.sh
+```
+
+Output:
+```text
+kvstore restart-within-one-second id: first=48358647398400000 restarted_first=48358647398400000
+first command SET k old: reply client=48358647398400000 request=0 result=None
+restarted first command GET k: reply client=48358647398400000 request=0 result=None
+expected GET k result after committed SET: Some("old")
+BUG OBSERVED: duplicate client id/request number was answered from the old SET cache; the kvstore connection code would format this GET reply as $-1 instead of returning old
+```
+
+Because this is code-review sourced and already reported upstream as the same mechanism at the same site, the skill’s known-duplicate rule applies.
+
+## Recommendation
+Do not count CR-4 as a new finding. Track it against upstream issue #9; the durable fix is to generate restart-unique client IDs, e.g. with a persisted incarnation/epoch or sufficiently strong random/monotonic identity source rather than seconds plus a per-process counter.
+
+VERDICT: DROPPED

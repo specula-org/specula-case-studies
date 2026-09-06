@@ -1,0 +1,85 @@
+source_revision=3ac0104a567092139534c9022205d02281a2da41
+source_tree=a154948e355d4059720575cbe1146c0253e06406
+CR-1 reproduction: existing identity silently restarts as new
+worktree: /home/ubuntu/tmp/vsr-case-study.KokvC6/source
+build target: /home/ubuntu/tmp/vsr-case-study.KokvC6/build
+
+== Level 0A: actual kvstore startup with existing invalid view file ==
+    Updating crates.io index
+     Locking 102 packages to latest compatible versions
+      Adding env_logger v0.9.3 (available: v0.11.11)
+      Adding rand v0.8.8 (available: v0.10.2)
+      Adding rand_chacha v0.3.1 (available: v0.10.0)
+      Adding ratatui v0.29.0 (available: v0.30.2)
+      Adding unicode-width v0.2.0 (available: v0.2.2)
+   Compiling libc v0.2.189
+   Compiling memchr v2.8.3
+   Compiling regex-syntax v0.8.11
+   Compiling aho-corasick v1.1.5
+   Compiling regex-automata v0.4.18
+   Compiling log v0.4.34
+   Compiling atty v0.2.14
+   Compiling termcolor v1.4.1
+   Compiling regex v1.13.1
+   Compiling humantime v2.4.0
+   Compiling env_logger v0.9.3
+   Compiling vsr-rs v0.1.0 (/home/ubuntu/tmp/vsr-case-study.KokvC6/source)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 7.51s
+view file before startup: ff 0a
+kvstore process status: 124 (124 means timeout stopped the long-running server)
+kvstore stdout:
+node 1 of 3: replicas on 127.0.0.1:0, clients on 127.0.0.1:0, primary is node 0
+view 1: primary is node 1 (this node)
+view 2: primary is node 2
+kvstore stderr:
+view file after startup: 32 0a
+observed: the example accepted an existing invalid view file, skipped recovery, and rewrote it with a normal numeric view
+
+== Level 0B: public Replica API consequence after that constructor choice ==
+view 0 primary has uncommitted slot 1 op X
+replicas 1 and 2 formed view 1 with primary 1
+new-view client reply: view=1 client=200 request=0 result=Y
+replica 2 has committed slot 1 op Y in view 1
+malformed-view restart selected Replica::new: previous persisted view should be 1, restarted status Normal, view 0
+old-view client reply: view=0 client=100 request=0 result=X
+BUG TRIGGERED: committed slot 1 differs: replica0=X, replica2=Y
+view 0 primary has uncommitted slot 1 op X
+replicas 1 and 2 formed view 1 with primary 1
+new-view client reply: view=1 client=200 request=0 result=Y
+replica 2 has committed slot 1 op Y in view 1
+control with Replica::recover(view=1): old view produced 0 replies; replica0 status ViewChange, view 1
+CR-1 reproduction completed
+control_three_replicas: op=1 commit=1 value=7 replies=1
+singleton_config: replicas=[0] quorum=1
+singleton_request: request_number=0
+singleton_round_0: delivered_before_idle=1 delivered_after_idle=1 op=1 commit=0 value=0 replies=0
+singleton_round_1: delivered_before_idle=0 delivered_after_idle=1 op=1 commit=0 value=0 replies=0
+singleton_round_2: delivered_before_idle=0 delivered_after_idle=1 op=1 commit=0 value=0 replies=0
+singleton_round_3: delivered_before_idle=0 delivered_after_idle=1 op=1 commit=0 value=0 replies=0
+singleton_round_4: delivered_before_idle=0 delivered_after_idle=1 op=1 commit=0 value=0 replies=0
+singleton_round_5: delivered_before_idle=0 delivered_after_idle=1 op=1 commit=0 value=0 replies=0
+singleton_round_6: delivered_before_idle=0 delivered_after_idle=1 op=1 commit=0 value=0 replies=0
+singleton_round_7: delivered_before_idle=0 delivered_after_idle=1 op=1 commit=0 value=0 replies=0
+singleton_final: op=1 commit=0 value=0 replies=0 no_replica_messages_left=true no_replies_left=true
+BUG REPRODUCED: singleton accepts quorum=1 and records the request, but no public owner-loop step commits it or returns a reply
+repo=/home/ubuntu/tmp/vsr-case-study.KokvC6/source
+build: cargo build --example kvstore
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.03s
+peer_ports=[35913, 44957, 53511]
+client_ports=[35001, 47007, 45175]
+Level 0: all replicas running; 4MiB SET via node 0
+level0 send_seconds=0.001 response_wait_seconds=0.409 response=b'+OK\r\n'
+Level 1: SIGSTOP replica 1 so its established TCP receive side stops draining; issue the same public SET via node 0
+level1 before_resume send_seconds=0.001 wait_seconds=0.800 response=b''
+resume replica 1 after the 800ms no-reply observation
+level1 after_resume additional_wait_seconds=8.000 total_wait_after_send_seconds=8.800 response=b''
+BUG_TRIGGERED: one stalled peer delayed the client-visible commit past the 500ms failure-detector budget; no reply arrived even after the peer resumed within the test window.
+node0_returncode=-15
+node0_stdout_tail='node 0 of 3: replicas on 127.0.0.1:35913, clients on 127.0.0.1:35001, primary is node 0\nview 1: primary is node 1\nview 2: primary is node 2\nview 3: primary is node 0 (this node)\nview 4: primary is node 1\nview 5: primary is node 2\n'
+node0_stderr_tail=''
+node1_returncode=-15
+node1_stdout_tail='node 1 of 3: replicas on 127.0.0.1:44957, clients on 127.0.0.1:47007, primary is node 0\nview 1: primary is node 1 (this node)\nview 2: primary is node 2\nview 3: primary is node 0\nview 4: primary is node 1 (this node)\nview 5: primary is node 2\n'
+node1_stderr_tail=''
+node2_returncode=-15
+node2_stdout_tail='node 2 of 3: replicas on 127.0.0.1:53511, clients on 127.0.0.1:45175, primary is node 0\nview 1: primary is node 1\nview 2: primary is node 2 (this node)\nview 3: primary is node 0\nview 4: primary is node 1\nview 5: primary is node 2 (this node)\n'
+node2_stderr_tail=''

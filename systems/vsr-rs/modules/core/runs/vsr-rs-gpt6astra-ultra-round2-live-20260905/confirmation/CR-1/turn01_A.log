@@ -1,0 +1,124 @@
+I’ll run the required bug-confirmation workflow first: load the skill instructions in full, then inspect only the allowed source/worktree context for this single CR-1 mechanism.
+running rg -n "CR-1|vsr-rs|startup fallback|view file|Replica::recover|Replica::new|Existing identity" /home/ubuntu/.codex/memories/MEMORY.md
+running sed -n '1,260p' /home/ubuntu/.codex/skills/bug-confirmation/SKILL.md
+The memory lookup didn’t surface relevant prior context for this target; I’m proceeding from the live worktree and the skill files. Next I’m reading the required guide and phase documents completely before touching code.
+running sed -n '1,260p' /home/ubuntu/.codex/skills/bug-confirmation/guide.md
+running sed -n '1,260p' /home/ubuntu/.codex/skills/bug-confirmation/phases/01-investigation.md
+running sed -n '1,260p' /home/ubuntu/.codex/skills/bug-confirmation/phases/02-reproduction.md
+I have the decision table and reproduction ladder loaded. I’m checking whether the guide files had more content beyond the first pass, then I’ll audit the cited source and upstream history.
+running wc -l /home/ubuntu/.codex/skills/bug-confirmation/guide.md /home/ubuntu/.codex/skills/bug-confirmation/phases/01-investigation.md /home/ubuntu/.codex/skills/...
+running sed -n '261,520p' /home/ubuntu/.codex/skills/bug-confirmation/guide.md
+running sed -n '261,520p' /home/ubuntu/.codex/skills/bug-confirmation/phases/01-investigation.md
+running sed -n '261,560p' /home/ubuntu/.codex/skills/bug-confirmation/phases/02-reproduction.md
+The skill files are fully read. I’m now anchoring the finding against the exact checkout and reading the startup/recovery path plus the public library contract it calls into.
+running sed -n '1,120p' lib.rs
+running git rev-parse HEAD && git status --short && git remote -v
+running sed -n '440,780p' lib.rs
+running sed -n '640,730p' examples/kvstore/main.rs
+running sed -n '560,705p' examples/kvstore/main.rs
+The checkout is at the pinned revision, but it is dirty (`Cargo.toml`, `lib.rs`, plus `tla_trace/`). I’m not reverting those; I’ll inspect enough to distinguish target behavior from local instrumentation before writing the reproduction outside the worktree.
+running git diff -- lib.rs Cargo.toml | sed -n '1,260p'
+running nl -ba examples/kvstore/main.rs | sed -n '560,725p'
+running nl -ba lib.rs | sed -n '1,35p;465,500p;630,755p;755,830p'
+running git log --oneline --decorate --all -- examples/kvstore/main.rs lib.rs | sed -n '1,120p'
+running rg -n "recover|persist|view file|view number|stable storage|crash|kvstore-node|TODO|FIXME|issue|Recovery" README* examples lib.rs Cargo.toml tests simulator...
+The relevant startup code treats both “file absent” and “file present but unreadable/unparseable” as the same `None` case. I’m checking public docs/tests/history now, because the final novelty field must reflect actual tracker and PR evidence, not default to NEW.
+running sed -n '1,110p' examples/kvstore/README.md && sed -n '60,90p' README.md && sed -n '150,185p' README.md
+running nl -ba lib.rs | sed -n '1135,1280p;1445,1475p'
+running nl -ba tests/cluster.rs | sed -n '560,620p'
+running git blame -L 683,701 -- examples/kvstore/main.rs && git blame -L 14,21 -- lib.rs && git blame -L 519,537 -- lib.rs
+running git show --stat --oneline b97ffdd && git show --stat --oneline 3ac0104
+The docs and tests reinforce the intended contract: persisted view must survive and `recover` gates participation until recovery completes. I’m now designing the smallest reproduction that uses that same public state-machine API and the kvstore startup decision rather than private fields.
+running nl -ba lib.rs | sed -n '120,310p;300,380p;1380,1455p;1460,1515p'
+running rg -n "''^pub | pub fn|pub enum|pub struct|fn drain|fn deliver|fn request|struct Cluster|impl Cluster|enum Message|enum Status|struct Client" lib.rs tests/cl...
+running nl -ba tests/cluster.rs | sed -n '1,180p;180,280p;430,555p'
+running command -v gh || true; gh --version 2>/dev/null | head -5 || true
+The repository has only three commits locally, so the local history does not show a later fix. I’m querying the upstream tracker for closed/open issues and PRs around kvstore view-file parsing/recovery now.
+running gh issue list --repo penberg/vsr-rs --state all --limit 100 --search "view recover OR recovery OR persisted OR kvstore-node" --json number,title,state,url,cr...
+running gh pr list --repo penberg/vsr-rs --state all --limit 100 --search "view recover OR recovery OR persisted OR kvstore-node" --json number,title,state,url,creat...
+running gh issue list --repo penberg/vsr-rs --state all --limit 100 --search "malformed OR parse OR unreadable OR UTF-8 OR invalid" --json number,title,state,url,cre...
+running gh pr list --repo penberg/vsr-rs --state all --limit 100 --search "malformed OR parse OR unreadable OR UTF-8 OR invalid" --json number,title,state,url,create...
+running gh issue list --repo penberg/vsr-rs --state all --limit 100 --search "Replica::new OR Replica::recover OR stable storage OR view file" --json number,title,st...
+running gh pr list --repo penberg/vsr-rs --state all --limit 100 --search "Replica::new OR Replica::recover OR stable storage OR view file" --json number,title,state...
+The tracker search found issue #9 as the only plausible overlap, plus older unrelated timeout/client issues and no matching PR search results. I’m opening #9 and the relevant PR metadata/body to check exact-duplicate status before treating this as novel.
+running gh issue view 9 --repo penberg/vsr-rs --json number,title,state,url,createdAt,closedAt,body,comments
+running gh pr view 10 --repo penberg/vsr-rs --json number,title,state,url,createdAt,closedAt,mergedAt,body,comments,files 2>&1 || true
+running gh pr list --repo penberg/vsr-rs --state all --limit 100 --json number,title,state,url,createdAt,closedAt,mergedAt | jq -r '.[] | [.number,.state,.mergedAt,....
+running gh issue list --repo penberg/vsr-rs --state all --limit 100 --json number,title,state,url,createdAt,closedAt | jq -r '.[] | [.number,.state,.title,.url] | @tsv'
+Issue #9 covers connection backoff, cleanup, and client IDs, not the persisted-view parse fallback. PR #10 is open and addresses #9 items (1) and (2), leaving client IDs; it does not cover this mechanism.
+running git ls-remote --heads --tags origin | sed -n '1,120p'
+running gh pr view 6 --repo penberg/vsr-rs --json number,title,state,url,createdAt,closedAt,mergedAt,body,files,comments
+running gh issue view 4 --repo penberg/vsr-rs --json number,title,state,url,body,comments,createdAt,closedAt
+The closed view-change PR predates the kvstore example and touches old `src/*` paths, so it is not this bug. The local clone has no usable `origin` remote configured, but `gh` gave the tracker/PR evidence needed for novelty.
+running find . -maxdepth 2 -type f | sort | sed -n '1,160p'
+running sed -n '1,220p' Cargo.toml
+running find /home/ubuntu/specula-vsr-runner-20260905/runs/vsr-rs-gpt6astra-ultra-round2-live-20260905/vsr-rs/.specula-output -maxdepth 3 \\( -name '*build*' -o -nam...
+The first black-box check is straightforward: a malformed `kvstore-node-N.view` causes the example startup branch to choose `Replica::new`. The harder part is the confirmation bar, so I’m tracing whether that branch leads to a real observable protocol consequence or is only a bad startup diagnostic.
+running nl -ba lib.rs | sed -n '830,1140p;1280,1385p'
+running sed -n '1,240p' simulator/lib.rs | sed -n '430,720p'
+I’ve got a reachable public-API schedule: old view 0 primary keeps an uncommitted operation, replicas 1 and 2 form view 1 and commit a different slot-1 operation, then replica 1 restarts through the malformed-view-file branch as `Replica::new` and acknowledges the old view. I’m writing the investigation record and a self-contained repro script now.
+running ls -ld /home/ubuntu/specula-vsr-runner-20260905/runs/vsr-rs-gpt6astra-ultra-round2-live-20260905/vsr-rs/.specula-output/repro /home/ubuntu/specula-vsr-runner...
+running find /home/ubuntu/specula-vsr-runner-20260905/runs/vsr-rs-gpt6astra-ultra-round2-live-20260905/vsr-rs/.specula-output/repro -maxdepth 1 -type f -name 'test_b...
+I’m making two scoped writes: `confirmation/CR-1/investigation.md` for the Phase 1 evidence record, and the required `repro/test_bugCR-1_existing_identity_restarts_as_new.sh` reproduction script. The repro combines an actual kvstore startup check with a public `Replica` API schedule for the conflicting committed replies.
+The reproduction file is in place. I’m marking it executable and running it under an outer timeout now; if the public-API schedule doesn’t behave as expected, I’ll adjust the repro rather than downgrade from incomplete evidence.
+running chmod +x /home/ubuntu/specula-vsr-runner-20260905/runs/vsr-rs-gpt6astra-ultra-round2-live-20260905/vsr-rs/.specula-output/repro/test_bugCR-1_existing_identit...
+The first run confirmed the startup branch but the assertion was too narrow: the server stayed alive long enough to advance from fresh view 0 to view 2, so the corrupted file ended as `2\n` instead of `0\n`. I’m tightening the check to require “invalid bytes were accepted and replaced by a normal numeric view, with no recovery log,” then rerunning.
+The repro script is updated. I’m running the same outer-timeout command again and will use its terminal output verbatim in the verdict if it passes.
+running timeout 10m /home/ubuntu/specula-vsr-runner-20260905/runs/vsr-rs-gpt6astra-ultra-round2-live-20260905/vsr-rs/.specula-output/repro/test_bugCR-1_existing_iden...
+- **Source**: Code Review
+- **Novelty**: NEW
+- **Location**: examples/kvstore/main.rs:687
+
+## Description
+CR-1 is confirmed. `examples/kvstore/main.rs:687-699` collapses an existing invalid/unreadable view file into the same `None` case as a missing file, starts the old replica identity with `Replica::new`, and then rewrites the view file through `persist_view`.
+
+This bypasses the library’s intended recovery guard: `Replica::recover` starts in `Recovering` and ignores normal messages, while the fresh `Replica::new` instance is a normal view-0 participant.
+
+## Trigger scenario
+A view-0 primary keeps an uncommitted slot-1 operation X. Replicas 1 and 2 form view 1 and replica 1 commits slot-1 operation Y. Replica 1 then restarts with an existing invalid `kvstore-node-1.view`; kvstore skips recovery, restarts it as a fresh view-0 replica, and it acknowledges the old primary’s view-0 prepare for X. The old primary then commits X, so two real client replies exist for different slot-1 operations.
+
+Prior-report search checked upstream issues and PRs, including issue #9 and PR #10; those cover kvstore connection lifecycle/client-id items, not this persisted-view parse fallback:
+https://github.com/penberg/vsr-rs/issues/9
+https://github.com/penberg/vsr-rs/pull/10
+
+## Developer intent
+The docs and library comments say the view number must survive crashes and be passed to `Replica::recover`; without it, a replica can forget a view change and let two views run at once (`lib.rs:14-21`, `README.md:69-70`, `examples/kvstore/README.md:38-39`). Existing tests cover correct recovery only when callers actually use `Replica::recover`.
+
+## Reproduction result
+Executed:
+```bash
+timeout 10m /home/ubuntu/specula-vsr-runner-20260905/runs/vsr-rs-gpt6astra-ultra-round2-live-20260905/vsr-rs/.specula-output/repro/test_bugCR-1_existing_identity_restarts_as_new.sh
+```
+
+Key output:
+```text
+view file before startup: ff 0a
+kvstore process status: 124 (124 means timeout stopped the long-running server)
+kvstore stdout:
+node 1 of 3: replicas on 127.0.0.1:0, clients on 127.0.0.1:0, primary is node 0
+view 1: primary is node 1 (this node)
+view 2: primary is node 2
+view file after startup: 32 0a
+observed: the example accepted an existing invalid view file, skipped recovery, and rewrote it with a normal numeric view
+
+view 0 primary has uncommitted slot 1 op X
+replicas 1 and 2 formed view 1 with primary 1
+new-view client reply: view=1 client=200 request=0 result=Y
+replica 2 has committed slot 1 op Y in view 1
+malformed-view restart selected Replica::new: previous persisted view should be 1, restarted status Normal, view 0
+old-view client reply: view=0 client=100 request=0 result=X
+BUG TRIGGERED: committed slot 1 differs: replica0=X, replica2=Y
+control with Replica::recover(view=1): old view produced 0 replies; replica0 status ViewChange, view 1
+CR-1 reproduction completed
+```
+
+Checklist:
+1. Level 0 alone triggered it: **yes**.
+2. Level 2/3 injection: **N/A**; no state injection or source patch was used.
+3. Real consumer/caller: `Replica::drain_replies` at `lib.rs:1492-1495` releases conflicting client replies; kvstore would send them via `deliver_reply` at `examples/kvstore/main.rs:528`.
+4. Permanence/masking: the committed conflict is permanent in the reproduced state; the `Replica::recover(view=1)` control prevents it, but the malformed-file startup path bypasses that guard.
+
+## Recommendation
+Treat an existing but unreadable or unparsable view file as a fatal startup error, not as first initialization. Only choose `Replica::new` when the file is definitely absent; otherwise require valid persisted view data before the old identity can release outputs.
+
+VERDICT: REPRODUCED

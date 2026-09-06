@@ -1,0 +1,113 @@
+diff --git a/Cargo.toml b/Cargo.toml
+index d7462fc..ea78dbd 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -9,8 +9,13 @@ path = "lib.rs"
+ [workspace]
+ members = ["simulator"]
+ 
++[features]
++tla-trace = ["dep:serde", "dep:serde_json"]
++
+ [dependencies]
+ log = "0.4.17"
++serde = { version = "1", optional = true }
++serde_json = { version = "1", optional = true }
+ 
+ [dev-dependencies]
+ env_logger = "0.9.1"
+diff --git a/lib.rs b/lib.rs
+index c166964..d5b236f 100644
+--- a/lib.rs
++++ b/lib.rs
+@@ -21,6 +21,9 @@
+ //! Stable Storage".
+ 
+ use log::trace;
++#[cfg(feature = "tla-trace")]
++pub mod tla_trace;
++
+ use std::{
+     collections::{BTreeMap, BTreeSet},
+     fmt::Debug,
+@@ -58,6 +61,12 @@ pub trait StateMachine {
+     type Output: Clone + Debug;
+ 
+     fn apply(&mut self, input: Self::Input) -> Self::Output;
++
++    /// Read-only application observation for the optional trace harness.
++    #[cfg(feature = "tla-trace")]
++    fn trace_state(&self) -> serde_json::Value {
++        serde_json::Value::Null
++    }
+ }
+ 
+ /// Configuration.
+@@ -472,6 +481,13 @@ pub struct Replica<SM: StateMachine> {
+     recovery_responses: BTreeMap<ReplicaID, RecoveryResponse<SM::Input>>,
+     outbox: Vec<(ReplicaID, Message<SM::Input>)>,
+     replies: Vec<Reply<SM::Output>>,
++    /// Observer-only state, never consulted by protocol decisions.
++    #[cfg(feature = "tla-trace")]
++    trace_prepare_ok_proofs: BTreeMap<usize, Vec<LogEntry<SM::Input>>>,
++    #[cfg(feature = "tla-trace")]
++    trace_apply_history: Vec<tla_trace::ApplyObservation<SM::Input, SM::Output>>,
++    #[cfg(feature = "tla-trace")]
++    trace_apply_cursor: usize,
+ }
+ 
+ impl<SM: StateMachine> Replica<SM> {
+@@ -499,6 +515,12 @@ impl<SM: StateMachine> Replica<SM> {
+             recovery_responses: BTreeMap::new(),
+             outbox: Vec::new(),
+             replies: Vec::new(),
++            #[cfg(feature = "tla-trace")]
++            trace_prepare_ok_proofs: BTreeMap::new(),
++            #[cfg(feature = "tla-trace")]
++            trace_apply_history: Vec::new(),
++            #[cfg(feature = "tla-trace")]
++            trace_apply_cursor: 0,
+         }
+     }
+ 
+@@ -1361,7 +1383,19 @@ impl<SM: StateMachine> Replica<SM> {
+     /// without running it again.
+     fn commit_op(&mut self, op_idx: usize) -> Reply<SM::Output> {
+         let entry = self.log[op_idx].clone();
++        #[cfg(feature = "tla-trace")]
++        let observed_entry = entry.clone();
++        #[cfg(feature = "tla-trace")]
++        let state_before = self.state_machine.trace_state();
+         let result = self.state_machine.apply(entry.op);
++        #[cfg(feature = "tla-trace")]
++        self.trace_apply_history.push(tla_trace::ApplyObservation {
++            slot: op_idx + 1,
++            entry: observed_entry,
++            state_before,
++            result: result.clone(),
++            state_after: self.state_machine.trace_state(),
++        });
+         self.commit_number += 1;
+         if let Some(client) = self.client_table.get_mut(&entry.client_id) {
+             if client.request_number == entry.request_number {
+@@ -1379,6 +1413,11 @@ impl<SM: StateMachine> Replica<SM> {
+     /// Acknowledges to the primary that we have every op up to our op
+     /// number.
+     fn send_prepare_ok(&mut self) {
++        // Capture at creation: a later handler may replace the log before
++        // the owner releases this acknowledgement into the transport.
++        #[cfg(feature = "tla-trace")]
++        self.trace_prepare_ok_proofs
++            .insert(self.outbox.len(), self.log.clone());
+         let message = Message::PrepareOk {
+             view_number: self.view_number,
+             op_number: self.op_number(),
+@@ -1466,6 +1505,8 @@ impl<SM: StateMachine> Replica<SM> {
+ 
+     /// Messages to send to other replicas.
+     pub fn drain_messages(&mut self) -> std::vec::Drain<'_, (ReplicaID, Message<SM::Input>)> {
++        #[cfg(feature = "tla-trace")]
++        self.trace_prepare_ok_proofs.clear();
+         self.outbox.drain(..)
+     }
+ 

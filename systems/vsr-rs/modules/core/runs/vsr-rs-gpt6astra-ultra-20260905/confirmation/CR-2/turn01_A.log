@@ -1,0 +1,91 @@
+I’ll use the `bug-confirmation` skill first, then inspect the target worktree and only touch the required repro/notes paths. I’ll also do a lightweight memory check because this is a Specula confirmation workflow with repository-specific constraints.
+running // @exec: {"max_output_tokens": 100000} rg -n "CR-2|vsr-rs|bug-confirmation|confirmation|reproduction|VSR|logical request|client-table" /home/ubuntu/.codex/m...
+running // @exec: {\"max_output_tokens\": 100000} sed -n '1,240p' /home/ubuntu/.codex/skills/bug-confirmation/SKILL.md
+The memory pass only surfaced a relevant reminder: treat `NEW` as an upstream-evidence claim, not as a pipeline default. I’ve now moved to the installed skill files and will follow the investigation/reproduction phases directly.
+running sed -n '1,260p' /home/ubuntu/.codex/skills/bug-confirmation/guide.md
+running sed -n '1,260p' /home/ubuntu/.codex/skills/bug-confirmation/phases/01-investigation.md
+running sed -n '1,320p' /home/ubuntu/.codex/skills/bug-confirmation/phases/02-reproduction.md
+running find /home/ubuntu/.codex/skills/bug-confirmation -maxdepth 3 -type f | sort
+The skill says this code-review finding can only be dropped before reproduction if the exact mechanism was already reported upstream; otherwise I must write and run a repro test and decide after that. Next I’m auditing the cited `lib.rs` and simulator lines in the target worktree, then I’ll run the upstream history/issue search for novelty.
+running wc -l /home/ubuntu/.codex/skills/bug-confirmation/guide.md /home/ubuntu/.codex/skills/bug-confirmation/phases/01-investigation.md /home/ubuntu/.codex/skills/...
+running git -C /home/ubuntu/specula-vsr-runner-20260905/runs/vsr-rs-gpt6astra-ultra-20260905/vsr-rs/.specula-output/confirmation/CR-2/worktree status --short && git...
+running rg -n "pub struct Replica|impl<.*Replica|pub fn request|fn request|on_message|recover|commit|apply|client_table|client|reply|op_number|operation_number|State...
+running sed -n '1,220p' lib.rs && sed -n '500,720p' lib.rs && sed -n '1040,1088p' lib.rs && sed -n '1180,1368p' lib.rs
+The worktree is already dirty from existing harness files, so I’ll leave those alone and keep my writes outside the source checkout as requested. I’m reading the exact implementation paths now with line numbers so the investigation record can be cited precisely.
+running nl -ba lib.rs | sed -n '1,90p;390,555p;660,755p;760,815p;835,925p;960,1115p;1140,1235p;1324,1415p;1478,1530p'
+running nl -ba README.md | sed -n '45,85p;170,185p;250,268p' && nl -ba examples/kvstore/main.rs | sed -n '444,565p;680,705p;711,746p'
+running nl -ba simulator/state_machine.rs | sed -n '1,80p' && nl -ba simulator/properties.rs | sed -n '1,90p;150,205p;207,285p;291,362p'
+running git -C /home/ubuntu/specula-vsr-runner-20260905/runs/vsr-rs-gpt6astra-ultra-20260905/vsr-rs/.specula-output/confirmation/CR-2/worktree log --oneline --decora...
+The main candidate risk so far is not a simple log-safety failure; the implementation rebuilds client-table state from the selected log and recomputes replies during commit/recovery. The remaining question is whether a real client, under the documented one-outstanding-request discipline, can observe a stale/missing/wrong reply after view change or recovery.
+running rg -n "recover|view change|client_table|resend|reply|duplicate|StateMachine|commit_up_to|install_log|NoDuplicate|RepliesMatch|one request|outstanding|restart...
+running find . -maxdepth 3 -type f \\( -name '*.rs' -o -name '*.md' -o -name 'Cargo.toml' \\) | sort
+running git blame -L 666,715 -- lib.rs && git blame -L 1062,1096 -- lib.rs && git blame -L 1174,1228 -- lib.rs && git blame -L 1330,1410 -- lib.rs
+running git log --format='%H%n%s%n%b%n---END---' --all --grep='client\\|reply\\|recover\\|view\\|duplicate\\|request\\|table\\|commit' --regexp-ignore-case
+running nl -ba lib.rs | sed -n '280,378p;1413,1478p'
+running nl -ba tests/cluster.rs | sed -n '1,140p;140,230p;400,530p;570,620p'
+running nl -ba simulator/lib.rs | sed -n '170,210p;690,705p;830,865p;930,965p'
+running git diff -- lib.rs Cargo.toml tests/specula_trace.rs tests/specula_harness/controller.rs tests/specula_harness/scenarios.rs tla_trace.rs | sed -n '1,260p'
+using web_search
+The general web search was noisy, so I’m switching to GitHub-specific evidence: local git history plus GitHub issue/PR search pages or API results for the exact terms.
+running command -v gh || true; command -v jq || true; git -C /home/ubuntu/specula-vsr-runner-20260905/runs/vsr-rs-gpt6astra-ultra-20260905/vsr-rs/.specula-output/con...
+running git ls-remote https://github.com/penberg/vsr-rs.git 'refs/heads/*' 'refs/pull/*/head' | sed -n '1,120p'
+running curl -sS 'https://api.github.com/search/issues?q=repo:penberg/vsr-rs%20(client%20table%20OR%20reply%20OR%20recovery%20OR%20request%20OR%20duplicate%20OR%20vi...
+using web_search
+Upstream search found issue #9 and PR #10, but those describe kvstore connection cleanup/backoff and example client-id reuse, not the library’s recovery/client-table reconstruction mechanism. I’m still checking local history and the few existing tests so the novelty statement is based on both tracker and commit evidence.
+running git -C /home/ubuntu/specula-vsr-runner-20260905/runs/vsr-rs-gpt6astra-ultra-20260905/vsr-rs/.specula-output/confirmation/CR-2/worktree log --all --date=iso-s...
+running gh issue list --repo penberg/vsr-rs --state all --limit 100 --json number,state,title,createdAt,closedAt,url,body --jq '.[] | [.number,.state,.title,.url,((....
+running gh pr list --repo penberg/vsr-rs --state all --limit 100 --json number,state,title,createdAt,closedAt,mergedAt,url,body --jq '.[] | [.number,.state,(.mergedA...
+running gh search issues --repo penberg/vsr-rs 'client table' --state all --json number,state,title,url,body --jq '.[] | [.number,.state,.title,.url,((.body // \"\")...
+The full upstream tracker is small: current issues #1, #4, #5, #7, #8, #9 and PRs #2, #3, #6, #10. None is a report of recovery replay corrupting application state or reconstructing a wrong cached reply; #9’s client-id item is an example identity-reuse concern at a different site.
+running 'for state in open closed; do echo STATE:$state; gh search issues --repo penberg/vsr-rs --include-prs --state "$state" '"'client table' --json number,state,t...
+running 'for state in open closed; do echo STATE:$state; gh search issues --repo penberg/vsr-rs --include-prs --state "$state" '"'recovery reply' --json number,state...
+running 'for state in open closed; do echo STATE:$state; gh search issues --repo penberg/vsr-rs --include-prs --state "$state" '"'duplicate request' --json number,st...
+running 'for state in open closed; do echo STATE:$state; gh search issues --repo penberg/vsr-rs --include-prs --state "$state" '"'request identity' --json number,sta...
+I’m going to run a bounded build/test preflight before writing the repro. The source checkout has local instrumentation changes, so I’ll use it as the dependency path but keep the repro independent and record any environment/build constraints explicitly.
+running find /home/ubuntu/specula-vsr-runner-20260905/runs/vsr-rs-gpt6astra-ultra-20260905/vsr-rs/.specula-output/confirmation/CR-2 -maxdepth 3 -type f | sort
+running find /home/ubuntu/specula-vsr-runner-20260905/runs/vsr-rs-gpt6astra-ultra-20260905/vsr-rs/.specula-output -maxdepth 3 -type f \\( -name '*log' -o -name '*.lo...
+running timeout 5m cargo test --lib --tests
+running nl -ba lib.rs | sed -n '378,388p'
+I have enough to write the Phase 1 evidence record and a self-contained repro script. The repro will drive only `Replica`/`Client` public APIs, explicitly lose/reorder messages as the library allows, and check normal duplicate reply, view-change reply emission, and recovery-side cached reply reconstruction.
+The investigation record and repro script are written. I’ll execute it with an outer timeout now; if it fails, I’ll adjust the test logic rather than weakening the assertions.
+running ls -l /home/ubuntu/specula-vsr-runner-20260905/runs/vsr-rs-gpt6astra-ultra-20260905/vsr-rs/.specula-output/repro/test_bugCR-2_request_recovery_reconstruction...
+running chmod +x /home/ubuntu/specula-vsr-runner-20260905/runs/vsr-rs-gpt6astra-ultra-20260905/vsr-rs/.specula-output/repro/test_bugCR-2_request_recovery_reconstruct...
+The repro did not trigger a live defect: duplicate request replay returned the cached result without reapplying, recovery rebuilt the latest cached reply without emitting recovery replies, and the recovered replica later served the pending client correctly after becoming primary. I’m doing one final evidence pass for line references and then I’ll return the single verdict.
+running nl -ba /home/ubuntu/.codex/memories/MEMORY.md | sed -n '560,564p'
+running git -C /home/ubuntu/specula-vsr-runner-20260905/runs/vsr-rs-gpt6astra-ultra-20260905/vsr-rs/.specula-output/confirmation/CR-2/worktree status --short && git...
+running sed -n '1,260p' /home/ubuntu/specula-vsr-runner-20260905/runs/vsr-rs-gpt6astra-ultra-20260905/vsr-rs/.specula-output/confirmation/CR-2/investigation.md
+running timeout 5m /home/ubuntu/specula-vsr-runner-20260905/runs/vsr-rs-gpt6astra-ultra-20260905/vsr-rs/.specula-output/repro/test_bugCR-2_request_recovery_reconstru...
+- **Source**: Code Review
+- **Novelty**: NEW
+- **Location**: lib.rs:1349
+
+## Description
+CR-2 is not confirmed as a defect under the documented public contract. `install_log`, `commit_up_to`, and `commit_op` rebuild state and cached replies consistently for the latest request per client; the stale-cache scenarios require violating the client contract: unique client identities and at most one outstanding request per client.
+
+## Trigger scenario
+I tested a real public-API sequence: lost client reply, duplicate resend, replica reboot through `Replica::recover`, view change to the recovered replica, and resend of the still-pending request. The recovered new primary returned the reconstructed cached reply without reapplying the operation.
+
+## Developer intent
+The docs require one request at a time and fresh client identity after restart. Upstream search covered issues and PRs, including https://github.com/penberg/vsr-rs/issues/9 and https://github.com/penberg/vsr-rs/pull/10; those cover kvstore example connection/client-id concerns, not this library recovery/reply-reconstruction mechanism.
+
+## Reproduction result
+Repro written and executed: `repro/test_bugCR-2_request_recovery_reconstruction.sh`
+
+Command:
+```text
+timeout 5m /home/ubuntu/specula-vsr-runner-20260905/runs/vsr-rs-gpt6astra-ultra-20260905/vsr-rs/.specula-output/repro/test_bugCR-2_request_recovery_reconstruction.sh
+```
+
+Output:
+```text
+Level 0 public API duplicate request: cached retry reply result=10, primary_applied=1
+Level 1 timed recovery/view-change: recovered primary reply result=7, view=1, applied_before=1, applied_after=1
+Level 2 state injection: not used; the remaining suspicious stale-client-table preconditions require violating the documented one-outstanding-request/client-identity contract.
+Level 3 source patch: not used; no public-API timing window produced a wrong reply, duplicate application, or permanent bad state.
+CR-2 RESULT: no wrong client-visible reply and no duplicate application under the documented public contract
+```
+
+## Recommendation
+No CR-2 protocol fix is indicated. Optional hardening would be to make `Client::on_request` reject a second outstanding request and make `Replica::recover` docs explicitly say the supplied state machine must be fresh recovery state.
+
+VERDICT: FALSE POSITIVE
