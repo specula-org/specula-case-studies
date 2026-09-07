@@ -1,0 +1,107 @@
+#!/usr/bin/env python3
+"""Record an inconclusive MC deadline without claiming convergence/hunting."""
+from pathlib import Path
+import datetime, hashlib, json, os, re, subprocess
+s=Path(__file__).resolve().parent.parent; out=s/'output'; source=s.parent.parent/'source'
+raw=(out/'MC_round1b.out').read_bytes(); log=raw.replace(b'\0',b'').decode(errors='replace')
+assert 'Timed out' in log, 'Only run after observed managed deadline'
+assert 'Model checking completed. No error has been found.' not in log
+assert not re.search(r'^Error:',log,re.M), 'Classify any error before finalizing'
+pid=int((out/'MC_round1b.out.pid').read_text())
+try: os.kill(pid,0)
+except ProcessLookupError: pass
+else: raise AssertionError('Managed MC wrapper is still alive')
+initial=json.loads((out/'initial-manifest.json').read_text())
+for n,h in initial['spec_inputs'].items():
+ assert hashlib.sha256((s/n).read_bytes()).hexdigest()==h, 'Spec/config changed: '+n
+for n,h in initial['traces'].items():
+ assert hashlib.sha256((s.parent/'traces'/n).read_bytes()).hexdigest()==h, 'Trace changed: '+n
+assert subprocess.check_output(['git','-C',str(source),'status','--short'],text=True)==initial['source_status'], 'Source status changed'
+assert subprocess.check_output(['git','-C',str(source),'rev-parse','HEAD'],text=True).strip()==initial['revision']
+h=s.parent/'harness'
+assert subprocess.check_output(['git','-C',str(source),'diff'])==(h/'patches/instrumentation.patch').read_bytes()
+pairs={'observe.rs':'specula_observe.rs','harness.rs':'examples/kvstore/specula_harness.rs','scenarios.rs':'examples/kvstore/specula_scenarios.rs','frame_probe.rs':'examples/kvstore/specula_frame_probe.rs'}
+for a,b in pairs.items(): assert (h/'src'/a).read_bytes()==(source/b).read_bytes(), b
+progress=[]
+pattern=r'Progress\((\d+)\) at ([\d -]+[\d:]+): ([\d,]+) states generated .*?, ([\d,]+) distinct states found .*?, ([\d,]+) states left on queue\.'
+for m in re.finditer(pattern,log):
+ row={'depth':int(m[1]),'utc':m[2], 'states_generated':int(m[3].replace(',','')),'distinct_states':int(m[4].replace(',','')),'queue':int(m[5].replace(',',''))}
+ if row not in progress: progress.append(row)
+assert progress, 'No parsed coverage'
+progress.sort(key=lambda x:x['states_generated']); last=progress[-1]
+tr=json.loads((out/'trace-round1.json').read_text()); assert tr['status']=='success' and tr['passed']==7
+hunts=sorted(p.name for p in s.glob('MC_hunt_*.cfg')); assert len(hunts)==7
+status={'schema_version':'1','system':'vsr-rs','source_revision':initial['revision'],
+ 'recorded_utc':datetime.datetime.now(datetime.timezone.utc).isoformat(),
+ 'status':'incomplete','phase':'model-checking','converged':False,
+ 'trace_validation':{'status':'pass','passed':7,'failed':0,'records':884,'event_types':33,'results':'output/trace-round1.json'},
+ 'model_checking':{'status':'timeout','config':'MC.cfg','log':'output/MC_round1b.out','driver_log':'output/MC_round1b.driver.log',
+ 'timeout_minutes':30,'workers':64,'heap_gib':48,'offheap_gib':96,'violations_observed':0,'exhaustive':False,'last_reported_progress':last,
+ 'coverage_note':'Last periodic TLC observation before managed timeout; not necessarily the exact count at process exit. Depth is reached search depth, not a completed graph diameter.'},
+ 'hunting':{'status':'not_run','reason':'Phase 2 did not complete; convergence precondition unmet','configs':hunts},
+ 'spec_modified':False,'source_modified_by_validation':False,'integration_evidence':'output/integration-evidence.md'}
+(s/'validation-status.json').write_text(json.dumps(status,indent=2)+'\n')
+(out/'MC_round1b.progress.json').write_text(json.dumps(progress,indent=2)+'\n')
+findings={'schema_version':'2','system':'vsr-rs','generated_by':'validation-workflow','validation_status':'incomplete','converged':False,'hunting_status':'not_run','findings':[]}
+(s/'findings.json').write_text(json.dumps(findings,indent=2)+'\n')
+rows='\n'.join(f'| `{c}` | 0 (not run) | Not run: convergence precondition unmet |' for c in hunts)
+report=f'''# Bug Report — vsr-rs
+
+## Summary
+
+**INCOMPLETE: trace validation passed; MC.cfg timed out; the spec has not converged and bug hunting was not started.** This is an interim report of an inconclusive validation run, not a completed no-bug result.
+
+- Source revision: `{initial['revision']}`. The preexisting Phase 2.5 instrumentation was preserved.
+- Implementation traces: **7/7 passed**, 884 records, 33 event types including Init. TraceMatched and full normalized post-state checks remained active. The installed `run_trace_validation_parallel` Python handler was used directly because this session did not expose the MCP transport. Parsed per-trace outcomes, commands and hashes are in [trace-round1.json](output/trace-round1.json); raw logs are `output/specula_*.round1.tlc.log` (for example [rolling recovery](output/specula_rolling_recovery.round1.tlc.log)).
+- Phase 2: unchanged **MC.cfg**, BFS, 64 workers, 48 GiB heap + 96 GiB off-heap, managed **30-minute timeout**. No invariant violation was observed. Last periodic observation at **{last['utc']} UTC**: **{last['states_generated']:,} generated, {last['distinct_states']:,} distinct, depth {last['depth']}, {last['queue']:,} queued**. These are last reported counts, not an exhaustive diameter or necessarily exact exit counts.
+- Convergence: **not achieved**. Hunting configurations completed: **0/7**. No Case A/B repair or MC Case C finding was established.
+- `findings.json` contains zero **MC findings from this incomplete run**. It does not mean all hunting scenarios passed. The integration evidence below is retained implementation evidence and is not relabeled as a newly discovered MC counterexample.
+
+## Workflow decision
+
+The installed validation workflow requires Phase 2 to complete before Phase 3, and hunting explicitly has the precondition: **"Spec has converged (Phase 3 passed)."** The 30-minute rule ends this run; a timeout with a nonempty queue does not satisfy that precondition. No configuration bound, safety oracle, transport assumption, or phase gate was relaxed. Repeating the same fresh BFS would revisit the same shallow prefix and does not establish completion.
+
+Methodology: [validation-workflow SKILL.md](/home/ubuntu/.codex/skills/validation-workflow/SKILL.md), [full guide](/home/ubuntu/.codex/skills/validation-workflow/guide.md). Machine-readable execution state: [validation-status.json](validation-status.json).
+
+## Model-checking evidence
+
+Enabled `MC.cfg` invariants: `CommittedPrefixAgreement`, `DistinctQuorumAndPrimary`, `NoAssertionFailure`, and `MCTypeOK`. This configuration has one crash, two invocations and no integration framing. The extension invariants and broader crash/view-change/liveness combinations in hunting configs were not checked by this run.
+
+Raw logs: [MC_round1b.out](output/MC_round1b.out), [managed launch/wait log](output/MC_round1b.driver.log), [periodic progress](output/MC_round1b.progress.json). The first launch exited before initialization (cause not established) and is retained in `output/MC_round1.out`; it is not counted as a checking run. The successful launch kept the prescribed PID waiter and launcher in one bounded foreground command. The provider interruption did not stop or restart TLC: the same wrapper PID 1103522 continued, and its waiter was reattached ([resumed wait](output/MC_round1b.resumed-wait.log)). The standard background wrapper writes overlapping header/progress copies to its raw log; the raw bytes are preserved and the progress JSON deduplicates exact repeated observations only.
+
+## Retained integration finding: incomplete peer frame becomes a successful altered write
+
+This run re-audited a maintainer-actionable **kvstore integration data-integrity defect** already established by the supplied implementation experiments. `run_peer_acceptor` uses `lines()` and accepts a nonempty unterminated line at clean EOF (`examples/kvstore/main.rs:397-411`). A strict prefix of a valid PREPARE ending inside its final PUT value is still accepted by `decode` (`237-254`). The core library receives an already-altered typed operation; it is not a core protocol defect under intact-message delivery.
+
+The verified byte evidence contains **1,794,048 surviving bytes** from the unchanged sender's **33,554,458-byte encoded body**, with no newline. The value becomes **1,794,022 of 33,554,432 bytes**. These are every byte surviving the actual sender interruption, not an arbitrarily selected substring. A separate acceptor connection forwards all those bytes unchanged. Complete fragmented forwarding preserves content; the synchronized reset/read-error case dispatches nothing. EOF after the complete payload, before only its newline, is content-preserving.
+
+The freshly validated EOF trace preserves the original Put(AA), admits Put(A), commits A after view change, accepts the original client's success, and returns A to a different client's later Get; the recovered replica retains A. Duplicate Prepare processing keeps an existing slot (`lib.rs:716-730`), so retransmission is not an unconditional repair. With one successful write and no intervening write, the later read has no legal sequential explanation.
+
+An independent retained three-binary experiment sends a real 16 MiB SET, briefly deschedules the receiver, crashes the original primary during its write, resumes the receiver, observes **+OK**, then issues a fresh-connection GET returning a **2,623,764-byte strict prefix of 16,777,216 bytes**. Its binary, driver, result and process logs match their recorded hashes. That run does not retain a raw peer/EOF capture; the separately audited sender/acceptor experiment establishes the framing mechanism. Neither experiment was re-executed in this Phase 3 validation.
+
+Full sequence, source anchors, bytes/hashes, independent-route limits and repair direction: [integration-evidence.md](output/integration-evidence.md), [evidence-audit.md](output/evidence-audit.md). Require a complete delimiter-terminated frame before decoding; combining two writes does not make TCP transmission atomic. Other reply/log-frame variants remain unconfirmed and are not counted as additional findings.
+
+## Not Reproduced
+
+The table records **unexecuted** hunting configs, not no-violation passes.
+
+| Config | States explored by this phase | Result |
+|---|---:|---|
+{rows}
+
+## Coverage and assurance limits
+
+- The finite rolling trace covers recovery during view change, authentic response overwrites, sequential recoveries of all three replicas, cross-client order, and partial publication after persistence. None is a general safety proof.
+- The actual minority trace skips unavailable primary 1 with healthy replicas {{0,2}} and continues serving requests. The supplied S5-minority hunt instead uses healthy {{1,2}} and cannot cover skipping a future unavailable primary. Its liveness premise is a synchronous drain/tick subcase with three total calls, not an infinite-work theorem.
+- DVC quorum omission and response-map overwrite are faithfully modeled, including the actual persisted-floor and exact latest-primary guards. No core bug follows merely from those implementation choices.
+- The history observer checks installations; it is not a direct recoverability oracle over every set of current replica/buffer states. N=2 trace coverage has zero failure budget, with no one-crash availability claim.
+- Novelty exclusions were preserved. No simulator was run, no Rust regression or fix commit was created, and no external issue/PR/message was published.
+
+Detailed question mapping: [coverage-assessment.md](output/coverage-assessment.md), [core-audit.md](output/core-audit.md). Original inputs and hashes: [initial-manifest.json](output/initial-manifest.json). Final bindings: `output/final-manifest.json`.
+'''
+(s/'bug-report.md').write_text(report)
+with (s/'changelog.md').open('a') as f:
+ f.write(f'- [incomplete] MC.cfg reached its managed 30-minute timeout with no observed violation; last periodic counts: {last["states_generated"]:,} generated, {last["distinct_states"]:,} distinct, depth {last["depth"]}, {last["queue"]:,} queued. No Case A/B fix or Case C finding.\n\n## Result\n**Not converged.** Trace validation passed 7/7; Phase 2 timed out with unexplored states. All seven hunting configs remain unrun because the convergence precondition was not met. `bug-report.md`, `findings.json`, and `validation-status.json` explicitly record the incomplete status. No spec/source changes or relaxed bounds.\n')
+with (s/'validation-results.md').open('a') as f:
+ f.write('\n## Phase 3 validation outcome — 2026-09-06\n\nFresh trace validation passed 7/7. Unchanged MC.cfg reached the mandated 30-minute deadline with an unexplored queue: **INCOMPLETE, NOT CONVERGED**. Hunting was not started. See [bug-report.md](bug-report.md) and [validation-status.json](validation-status.json); the earlier generation/smoke results above do not satisfy this convergence gate.\n')
+print(json.dumps(status,indent=2))

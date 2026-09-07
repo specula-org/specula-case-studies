@@ -1,0 +1,1913 @@
+diff --git a/Cargo.toml b/Cargo.toml
+index d7462fc8654877d20d6aab3f4754cb9753519b43..6349cecc5ae9cfda83c9c6e4715968bca5f043ef 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -9,7 +9,11 @@ path = "lib.rs"
+ [workspace]
+ members = ["simulator"]
+ 
++[features]
++specula-trace = ["dep:serde_json"]
++
+ [dependencies]
++serde_json = { version = "1", optional = true }
+ log = "0.4.17"
+ 
+ [dev-dependencies]
+diff --git a/examples/kvstore/main.rs b/examples/kvstore/main.rs
+index 5007ea501202e1b7abf04b1150112c18860046fa..f9f5f7950f4f172b89da59fe156e6c60337b99be 100644
+--- a/examples/kvstore/main.rs
++++ b/examples/kvstore/main.rs
+@@ -398,7 +398,12 @@ fn run_peer_acceptor(listener: TcpListener, events: Sender<Event>) {
+     for stream in listener.incoming().flatten() {
+         let events = events.clone();
+         thread::spawn(move || {
+-            for line in BufReader::new(stream).lines().map_while(Result::ok) {
++            for line in BufReader::new(stream).lines().inspect(|result| {
++                #[cfg(all(test, feature = "specula-trace"))]
++                specula_harness::frame_probe::observe_line_result(result);
++                #[cfg(not(all(test, feature = "specula-trace")))]
++                let _ = result;
++            }).map_while(Result::ok) {
+                 match decode(&line) {
+                     Ok(Frame::Message(message)) => {
+                         let _ = events.send(Event::Message(message));
+@@ -409,6 +414,8 @@ fn run_peer_acceptor(listener: TcpListener, events: Sender<Event>) {
+                     Err(err) => warn!("bad message from peer: {err}"),
+                 }
+             }
++            #[cfg(all(test, feature = "specula-trace"))]
++            specula_harness::frame_probe::observe_connection_end();
+         });
+     }
+ }
+@@ -762,3 +769,8 @@ fn main() {
+         }
+     }
+ }
++
++// SPECULA_OWNER_HARNESS: coordinated calls into the real implementation.
++#[cfg(all(test, feature = "specula-trace"))]
++#[path = "specula_harness.rs"]
++mod specula_harness;
+diff --git a/examples/kvstore/specula_frame_probe.rs b/examples/kvstore/specula_frame_probe.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..9809cc7a03f22b7730fd6a97ba35ac756d9519bf
+--- /dev/null
++++ b/examples/kvstore/specula_frame_probe.rs
+@@ -0,0 +1,430 @@
++//! Localhost-only regression experiments using the unchanged kvstore sender,
++//! encoder, decoder, and acceptor. No operation or network payload is invented.
++use super::super::{decode, encode, run_peer_acceptor, run_sender, Event, Frame};
++use super::*;
++use std::io::{ErrorKind, Read};
++use std::net::{Shutdown, TcpListener, TcpStream};
++use std::os::fd::AsRawFd;
++use std::path::Path;
++use std::process::{Child, Command, Stdio};
++use std::sync::{
++    mpsc::{self, Sender},
++    OnceLock,
++};
++use std::time::Duration;
++
++#[derive(Debug)]
++enum LineResult {
++    Ok(usize),
++    Error(ErrorKind),
++    End,
++}
++static OBSERVER: OnceLock<Mutex<Option<Sender<LineResult>>>> = OnceLock::new();
++pub(crate) fn observe_line_result(result: &std::io::Result<String>) {
++    if let Some(tx) = OBSERVER
++        .get_or_init(Default::default)
++        .lock()
++        .unwrap()
++        .as_ref()
++    {
++        let observation = match result {
++            Ok(line) => LineResult::Ok(line.len()),
++            Err(e) => LineResult::Error(e.kind()),
++        };
++        let _ = tx.send(observation);
++    }
++}
++pub(crate) fn observe_connection_end() {
++    if let Some(tx) = OBSERVER
++        .get_or_init(Default::default)
++        .lock()
++        .unwrap()
++        .as_ref()
++    {
++        let _ = tx.send(LineResult::End);
++    }
++}
++unsafe extern "C" {
++    fn setsockopt(fd: i32, level: i32, name: i32, val: *const std::ffi::c_void, len: u32) -> i32;
++}
++fn socket_option<T>(fd: i32, name: i32, value: &T) {
++    // Linux SOL_SOCKET=1, SO_RCVBUF=8, SO_LINGER=13.
++    assert_eq!(
++        unsafe {
++            setsockopt(
++                fd,
++                1,
++                name,
++                value as *const T as *const _,
++                std::mem::size_of::<T>() as u32,
++            )
++        },
++        0
++    );
++}
++fn full_value() -> String {
++    "A".repeat(32 * 1024 * 1024)
++}
++fn hash(path: &Path) -> String {
++    let out = Command::new("sha256sum").arg(path).output().unwrap();
++    assert!(out.status.success());
++    String::from_utf8(out.stdout)
++        .unwrap()
++        .split_whitespace()
++        .next()
++        .unwrap()
++        .to_owned()
++}
++fn write_evidence(dir: &Path, name: &str, data: &[u8]) -> Value {
++    let p = dir.join(name);
++    std::fs::write(&p, data).unwrap();
++    json!({"file":name,"bytes":data.len(),"sha256":hash(&p)})
++}
++
++/// Invoked only as a local child process by start_sender. The sender body is
++/// the original function; SIGKILL interrupts its ordinary blocking write_all.
++#[test]
++#[ignore]
++fn sender_child() {
++    let dir = PathBuf::from(std::env::var("SPECULA_FRAME_CHILD_DIR").unwrap());
++    let address = std::env::var("SPECULA_FRAME_CHILD_ADDR")
++        .unwrap()
++        .parse()
++        .unwrap();
++    let original = std::fs::read_to_string(dir.join("encoded-body.bin")).unwrap();
++    let frame = decode(&original).unwrap();
++    assert_eq!(encode(&frame), original);
++    let (tx, rx) = mpsc::channel();
++    let (events, _) = mpsc::channel();
++    tx.send((1, frame)).unwrap();
++    drop(tx);
++    std::fs::write(dir.join("sender-entered"), std::process::id().to_string()).unwrap();
++    run_sender(0, vec![address, address, address], rx, events);
++    std::fs::write(dir.join("sender-returned"), b"write_all completed").unwrap();
++}
++struct PartialProbe {
++    child: Child,
++    socket: TcpStream,
++    bytes: Vec<u8>,
++    original: Vec<u8>,
++    dir: PathBuf,
++    pid: u32,
++}
++struct Interrupted {
++    bytes: Vec<u8>,
++    original: Vec<u8>,
++    dir: PathBuf,
++    pid: u32,
++}
++fn start_sender(message: &Message<Operation>, dir: &Path, partial: bool) -> PartialProbe {
++    create_dir_all(dir).unwrap();
++    for marker in ["sender-entered", "sender-returned"] {
++        let _ = std::fs::remove_file(dir.join(marker));
++    }
++    let original = encode(&Frame::Message(message.clone())).into_bytes();
++    write_evidence(dir, "encoded-body.bin", &original);
++    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
++    if partial {
++        socket_option(listener.as_raw_fd(), 8, &4096i32);
++    }
++    listener.set_nonblocking(true).unwrap();
++    let child = Command::new(std::env::current_exe().unwrap())
++        .args([
++            "--exact",
++            "specula_harness::frame_probe::sender_child",
++            "--ignored",
++            "--nocapture",
++        ])
++        .env("SPECULA_FRAME_CHILD_DIR", dir)
++        .env(
++            "SPECULA_FRAME_CHILD_ADDR",
++            listener.local_addr().unwrap().to_string(),
++        )
++        .stdout(Stdio::from(File::create(dir.join("sender.log")).unwrap()))
++        .stderr(Stdio::from(
++            File::create(dir.join("sender.stderr")).unwrap(),
++        ))
++        .spawn()
++        .unwrap();
++    let pid = child.id();
++    let start = std::time::Instant::now();
++    let socket = loop {
++        match listener.accept() {
++            Ok((s, _)) => break s,
++            Err(e) if e.kind() == ErrorKind::WouldBlock => {
++                assert!(
++                    start.elapsed() < Duration::from_secs(10),
++                    "local sender connect timed out"
++                );
++                std::thread::sleep(Duration::from_millis(5));
++            }
++            Err(e) => panic!("accept: {e}"),
++        }
++    };
++    socket
++        .set_read_timeout(Some(Duration::from_secs(10)))
++        .unwrap();
++    PartialProbe {
++        child,
++        socket,
++        bytes: vec![],
++        original,
++        dir: dir.to_owned(),
++        pid,
++    }
++}
++fn begin_partial(message: &Message<Operation>, dir: &Path) -> PartialProbe {
++    let mut p = start_sender(message, dir, true);
++    let mut buf = [0u8; 4096];
++    // TCP may split the header itself across reads. Wait only until the
++    // actual accumulated prefix contains the final value token.
++    loop {
++        let n = p.socket.read(&mut buf).unwrap();
++        assert!(n > 0);
++        p.bytes.extend_from_slice(&buf[..n]);
++        assert!(p.original.starts_with(&p.bytes));
++        assert!(p.bytes.len() < p.original.len());
++        assert!(!p.bytes.contains(&b'\n'));
++        if matches!(decode(std::str::from_utf8(&p.bytes).unwrap()),Ok(Frame::Message(Message::Prepare{op:Operation::Put(_,v),..})) if !v.is_empty())
++        {
++            break;
++        }
++        assert!(
++            p.bytes.len() < 16384,
++            "valid encoder header exceeded experiment bound"
++        );
++    }
++    assert!(p.child.try_wait().unwrap().is_none());
++    assert!(!dir.join("sender-returned").exists());
++    write_evidence(dir, "initial-received-prefix.bin", &p.bytes);
++    p
++}
++impl PartialProbe {
++    fn kill_and_drain(mut self) -> Interrupted {
++        assert!(self.child.try_wait().unwrap().is_none());
++        self.child.kill().unwrap();
++        let status = self.child.wait().unwrap();
++        assert!(!status.success());
++        // Every surviving byte is retained. EOF is measured by read_to_end,
++        // while read errors cause this experiment to fail rather than relabel.
++        self.socket
++            .read_to_end(&mut self.bytes)
++            .expect("sender crash must yield measured clean EOF for this witness");
++        assert!(self.original.starts_with(&self.bytes));
++        assert!(self.bytes.len() < self.original.len());
++        assert!(!self.bytes.contains(&b'\n'));
++        assert!(!self.dir.join("sender-returned").exists());
++        let raw = write_evidence(&self.dir, "received-prefix.bin", &self.bytes);
++        let metadata = json!({"revision":"3ac0104a567092139534c9022205d02281a2da41","parent_pid":std::process::id(),"sender_pid":self.pid,
++            "sender_status":status.to_string(),"sender_function":"examples/kvstore/main.rs:run_sender (unchanged)",
++            "source_eof":"read_to_end returned Ok after child SIGKILL","sender_returned":false,
++            "strict_prefix":true,"contains_newline":false,"received":raw,
++            "original":{"file":"encoded-body.bin","bytes":self.original.len(),"sha256":hash(&self.dir.join("encoded-body.bin"))},
++            "transport":"localhost byte-preserving store-and-forward proxy; all surviving sender bytes forwarded without shortening"});
++        std::fs::write(
++            self.dir.join("provenance.json"),
++            serde_json::to_vec_pretty(&metadata).unwrap(),
++        )
++        .unwrap();
++        Interrupted {
++            bytes: self.bytes,
++            original: self.original,
++            dir: self.dir,
++            pid: self.pid,
++        }
++    }
++}
++fn accept_bytes(
++    bytes: &[u8],
++    reset: bool,
++    fragmented: bool,
++    dir: &Path,
++) -> Option<Message<Operation>> {
++    let (ltx, lrx) = mpsc::channel();
++    *OBSERVER.get_or_init(Default::default).lock().unwrap() = Some(ltx);
++    let (tx, rx) = mpsc::channel();
++    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
++    let addr = listener.local_addr().unwrap();
++    // The shipped acceptor owns a blocking infinite accept loop. Its thread is
++    // confined to this test executable and exits with it; per-connection worker
++    // completion is synchronized by the read observation and dispatch channel.
++    std::thread::spawn(move || run_peer_acceptor(listener, tx));
++    let mut socket = TcpStream::connect(addr).unwrap();
++    socket
++        .set_write_timeout(Some(Duration::from_secs(10)))
++        .unwrap();
++    if fragmented {
++        for chunk in bytes.chunks(7) {
++            socket.write_all(chunk).unwrap();
++        }
++    } else {
++        socket.write_all(bytes).unwrap();
++    }
++    let line = if reset {
++        // All supplied bytes are valid sender traffic; the injected fault is
++        // the connection's RST. Actual lines() error proves no dispatch.
++        #[repr(C)]
++        struct Linger {
++            on: i32,
++            seconds: i32,
++        }
++        socket_option(socket.as_raw_fd(), 13, &Linger { on: 1, seconds: 0 });
++        drop(socket);
++        lrx.recv_timeout(Duration::from_secs(10))
++            .expect("read-error observation")
++    } else {
++        socket.shutdown(Shutdown::Write).unwrap();
++        lrx.recv_timeout(Duration::from_secs(10))
++            .expect("line observation")
++    };
++    // End is emitted after map_while and every possible dispatch have
++    // completed. No-dispatch is now checked after a synchronization boundary.
++    assert!(matches!(
++        lrx.recv_timeout(Duration::from_secs(10))
++            .expect("receive loop completion"),
++        LineResult::End
++    ));
++    let result = if reset {
++        assert!(
++            matches!(line, LineResult::Error(ErrorKind::ConnectionReset)),
++            "actual line outcome {line:?}"
++        );
++        assert!(
++            matches!(rx.try_recv(), Err(mpsc::TryRecvError::Empty)),
++            "read error dispatched a message"
++        );
++        None
++    } else {
++        assert!(
++            matches!(line,LineResult::Ok(n) if n==bytes.len()-usize::from(bytes.last()==Some(&b'\n')))
++        );
++        match rx.recv_timeout(Duration::from_secs(10)).unwrap() {
++            Event::Message(m) => Some(m),
++            _ => panic!("unexpected event"),
++        }
++    };
++    *OBSERVER.get().unwrap().lock().unwrap() = None;
++    std::fs::write(dir.join("receiver.json"),serde_json::to_vec_pretty(&json!({"line_result":format!("{line:?}"),"receive_loop_completed":true,"dispatched":result.is_some(),"reset":reset,"fragmented":fragmented,"forwarded_bytes":bytes.len(),"forwarded_sha256":hash(&dir.join(if reset||!fragmented{"received-prefix.bin"}else{"received-complete.bin"}))})).unwrap()).unwrap();
++    result
++}
++impl Interrupted {
++    fn prefix_value(&self) -> String {
++        assert!(self.original.starts_with(&self.bytes));
++        assert!(self.pid > 0);
++        match decode(std::str::from_utf8(&self.bytes).unwrap()).unwrap() {
++            Frame::Message(Message::Prepare {
++                op: Operation::Put(_, v),
++                ..
++            }) => v,
++            _ => panic!("unsupported frame"),
++        }
++    }
++    fn finish_clean_eof(self) -> Message<Operation> {
++        accept_bytes(&self.bytes, false, false, &self.dir).unwrap()
++    }
++    fn finish_reset(self) {
++        assert!(accept_bytes(&self.bytes, true, false, &self.dir).is_none());
++    }
++}
++fn complete_fragmented(message: &Message<Operation>, dir: &Path) -> Message<Operation> {
++    let mut p = start_sender(message, dir, false);
++    p.socket.read_to_end(&mut p.bytes).unwrap();
++    assert!(p.child.wait().unwrap().success());
++    let mut expected = p.original.clone();
++    expected.push(b'\n');
++    assert_eq!(p.bytes, expected);
++    let evidence = write_evidence(dir, "received-complete.bin", &p.bytes);
++    std::fs::write(dir.join("provenance.json"),serde_json::to_vec_pretty(&json!({"revision":"3ac0104a567092139534c9022205d02281a2da41","sender_pid":p.pid,"parent_pid":std::process::id(),"sender_returned":true,"content_preserving":true,"received":evidence})).unwrap()).unwrap();
++    accept_bytes(&p.bytes, false, true, dir).unwrap()
++}
++fn frame_message(c: &Cluster, id: usize) -> Message<Operation> {
++    match &c.frames[id].sent.payload {
++        Payload::Message(m) => m.clone(),
++        _ => panic!("not protocol frame"),
++    }
++}
++
++#[test]
++fn specula_frame_complete() {
++    let mut c = Cluster::new("specula_frame_complete", 3, true);
++    c.request(100, Operation::Put("k".into(), "AA".into()));
++    c.deliver(0);
++    for id in 0..2 {
++        let actual = complete_fragmented(
++            &frame_message(&c, id),
++            &c.trace_dir.join(format!("frame-evidence/complete-{id}")),
++        );
++        c.frame_complete(id, actual);
++    }
++    c.pump(400);
++    c.idle(0);
++    c.pump(400);
++    c.request(101, Operation::Get("k".into()));
++    c.pump(400);
++    assert_eq!(c.responses.last().unwrap()["result"], "AA");
++    c.finish();
++}
++#[test]
++fn specula_frame_eof() {
++    let raw = full_value();
++    register_value(&raw, "AA");
++    let mut c = Cluster::new("specula_frame_eof", 3, true);
++    c.request(100, Operation::Put("k".into(), raw));
++    c.deliver(0);
++    let probe = begin_partial(
++        &frame_message(&c, 0),
++        &c.trace_dir.join("frame-evidence/eof"),
++    );
++    c.frame_partial(0);
++    let interrupted = probe.kill_and_drain();
++    c.crash(0);
++    let prefix = interrupted.prefix_value();
++    register_value(&prefix, "A");
++    let actual = interrupted.finish_clean_eof();
++    c.frame_eof(0, actual);
++    c.pump(400);
++    // Surviving replica 1 starts a view using the actual admitted log. Replica
++    // 2 learns that log via unchanged StartView; there is no transport mutation.
++    for _ in 0..4 {
++        c.idle(1);
++        c.pump(400);
++    }
++    assert_eq!(c.replica(1).status(), Status::Normal);
++    assert_eq!(c.replica(1).view_number(), 1);
++    c.idle(1);
++    c.pump(400);
++    c.client_idle(100);
++    c.pump(400);
++    assert!(c
++        .responses
++        .iter()
++        .any(|r| r["client"] == 100 && r["result"] == "nil"));
++    c.request(101, Operation::Get("k".into()));
++    c.client_idle(101);
++    c.pump(400);
++    assert_eq!(c.responses.last().unwrap()["result"], "A");
++    c.recover(0);
++    c.pump(400);
++    assert_eq!(c.replica(0).state_machine().map.get("k"), Some(&prefix));
++    c.finish();
++}
++#[test]
++fn specula_frame_reset() {
++    let raw = full_value();
++    register_value(&raw, "AA");
++    let mut c = Cluster::new("specula_frame_reset", 3, true);
++    c.request(100, Operation::Put("k".into(), raw));
++    c.deliver(0);
++    let probe = begin_partial(
++        &frame_message(&c, 0),
++        &c.trace_dir.join("frame-evidence/reset"),
++    );
++    c.frame_partial(0);
++    let interrupted = probe.kill_and_drain();
++    c.crash(0);
++    interrupted.finish_reset();
++    c.frame_error(0);
++    assert_eq!(c.replica(1).op_number(), 0);
++    assert!(c.network().is_empty());
++    c.finish();
++}
+diff --git a/examples/kvstore/specula_harness.rs b/examples/kvstore/specula_harness.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..411bc12564e1fc2c560b0a48cd08a394e2bc3cec
+--- /dev/null
++++ b/examples/kvstore/specula_harness.rs
+@@ -0,0 +1,561 @@
++//! Coordinated owner of real Replica/Client and the shipped kvstore Store.
++//! Derived from tests/cluster.rs's message-driving test infrastructure.
++use super::{persist_view, Op as Operation, Store};
++use serde_json::{json, Value};
++use std::collections::{BTreeMap, VecDeque};
++use std::fs::{create_dir_all, File};
++use std::io::{BufWriter, Write};
++use std::path::PathBuf;
++use std::sync::Mutex;
++use std::time::{SystemTime, UNIX_EPOCH};
++use vsr_rs::specula_observe::{self as observe, TraceStateMachine, TraceValue};
++use vsr_rs::{Client, Config, LogEntry, Message, Replica, Reply, Status};
++
++// Literal core values are preserved. The frame experiment registers exactly
++// two proven byte strings (long original and actual received prefix).
++fn value(v: &str) -> Value {
++    observe::normalize_value(v)
++}
++fn register_value(raw: &str, normalized: &str) {
++    observe::register_value(raw, normalized);
++}
++impl TraceValue for Operation {
++    fn trace_value(&self) -> Value {
++        match self {
++            Operation::Put(k, v) => {
++                assert_eq!(k, "k");
++                json!({"kind":"Put","value":value(v)})
++            }
++            Operation::Get(k) => {
++                assert_eq!(k, "k");
++                json!({"kind":"Get","value":"nil"})
++            }
++        }
++    }
++}
++impl TraceStateMachine for Store {
++    fn trace_app(&self) -> Value {
++        assert!(self.map.keys().all(|k| k == "k"));
++        self.map.get("k").cloned().trace_value()
++    }
++}
++
++#[derive(Clone)]
++enum Payload {
++    Message(Message<Operation>),
++    Reply(Reply<Option<String>>),
++}
++#[derive(Clone)]
++struct Envelope {
++    src: usize,
++    dst: usize,
++    payload: Payload,
++}
++impl Envelope {
++    fn normalized(&self) -> Value {
++        match &self.payload {
++            Payload::Message(m) => observe::normalize_message(self.src, self.dst, m),
++            Payload::Reply(r) => observe::normalize_reply(self.src, r),
++        }
++    }
++}
++struct Node {
++    replica: Option<Replica<Store>>,
++    durable: usize,
++    owner: &'static str,
++    incarnation: u64,
++    messages: VecDeque<Envelope>,
++    replies: VecDeque<Envelope>,
++    path: PathBuf,
++}
++struct FrameState {
++    sent: Envelope,
++    stage: &'static str,
++    admitted: Envelope,
++}
++struct Cluster {
++    config: Config,
++    nodes: Vec<Node>,
++    clients: BTreeMap<usize, Client<Operation>>,
++    retained: BTreeMap<usize, Value>,
++    queue: VecDeque<Envelope>,
++    frames: Vec<FrameState>,
++    integration: bool,
++    phase: &'static str,
++    healthy: Vec<usize>,
++    invocations: Vec<Value>,
++    responses: Vec<Value>,
++    happens_before: Vec<Value>,
++    history: Vec<Value>,
++    writer: Mutex<Option<BufWriter<File>>>,
++    trace_dir: PathBuf,
++}
++fn insert_set(xs: &mut Vec<Value>, x: Value) {
++    if !xs.contains(&x) {
++        xs.push(x);
++    }
++}
++impl Cluster {
++    fn new(name: &str, n: usize, integration: bool) -> Self {
++        let trace_dir =
++            PathBuf::from(std::env::var("SPECULA_TRACE_DIR").expect("SPECULA_TRACE_DIR"));
++        create_dir_all(&trace_dir).unwrap();
++        let run_dir = trace_dir.join(format!(".{name}-views"));
++        create_dir_all(&run_dir).unwrap();
++        let mut config = Config::new();
++        for _ in 0..n {
++            config.add_replica();
++        }
++        config.set_primary_timeout(3);
++        let nodes = (0..n)
++            .map(|i| {
++                let path = run_dir.join(format!("replica-{i}.view"));
++                persist_view(path.to_str().unwrap(), &mut None, 0);
++                Node {
++                    replica: Some(Replica::new(i, config.clone(), Store::default())),
++                    durable: 0,
++                    owner: "ready",
++                    incarnation: 0,
++                    messages: VecDeque::new(),
++                    replies: VecDeque::new(),
++                    path,
++                }
++            })
++            .collect();
++        let mut c = Self {
++            config: config.clone(),
++            nodes,
++            clients: [100, 101]
++                .into_iter()
++                .map(|id| (id, Client::new(id, config.clone())))
++                .collect(),
++            retained: [100, 101]
++                .into_iter()
++                .map(|id| (id, observe::neutral_entry()))
++                .collect(),
++            queue: VecDeque::new(),
++            frames: vec![],
++            integration,
++            phase: "faults",
++            healthy: (0..n).collect(),
++            invocations: vec![],
++            responses: vec![],
++            happens_before: vec![],
++            history: vec![],
++            writer: Mutex::new(Some(BufWriter::new(
++                File::create(trace_dir.join(format!("{name}.ndjson"))).unwrap(),
++            ))),
++            trace_dir,
++        };
++        c.emit(
++            "Init",
++            json!({"config":{"revision":"3ac0104a567092139534c9022205d02281a2da41",
++            "servers":(0..n).collect::<Vec<_>>(),"clients":[100,101],"values":["A","AA","B"],
++            "primary_timeout":3,"failure_budget":(n-1)/2,"integration_mode":integration,
++            "full_value":"AA","prefix_value":"A"}}),
++        );
++        c
++    }
++    fn replica(&self, i: usize) -> &Replica<Store> {
++        self.nodes[i].replica.as_ref().expect("node is down")
++    }
++    fn state(&self, i: usize) -> Value {
++        let node = &self.nodes[i];
++        let mut s = if let Some(r) = &node.replica {
++            observe::replica_snapshot(r)
++        } else {
++            let mut s =
++                observe::replica_snapshot(&Replica::new(i, self.config.clone(), Store::default()));
++            s["status"] = json!("Down");
++            s
++        };
++        // Drained outputs remain owned here until one PublishOutput at a time.
++        let mut msgs: Vec<_> = node.messages.iter().map(Envelope::normalized).collect();
++        msgs.extend(s["messages"].as_array().unwrap().iter().cloned());
++        let mut reps: Vec<_> = node.replies.iter().map(Envelope::normalized).collect();
++        reps.extend(s["replies"].as_array().unwrap().iter().cloned());
++        s["messages"] = json!(msgs);
++        s["replies"] = json!(reps);
++        s
++    }
++    fn network(&self) -> Vec<Value> {
++        self.queue.iter().map(Envelope::normalized).collect()
++    }
++    fn snapshot(&self) -> Value {
++        let mut net = vec![];
++        for m in self.network() {
++            insert_set(&mut net, m);
++        }
++        json!({"replicas":self.nodes.iter().enumerate().map(|(id,n)| json!({"id":id,"durable":n.durable,
++            "owner":n.owner,"incarnation":n.incarnation,"state":self.state(id)})).collect::<Vec<_>>(),
++            "clients":self.clients.iter().map(|(id,c)| {let mut s=observe::client_snapshot(c,&self.retained[id]);s["id"]=json!(id);s}).collect::<Vec<_>>(),
++            "network":net,"frames":self.frames.iter().enumerate().map(|(id,f)|json!({"id":id,"sent":f.sent.normalized(),"stage":f.stage,"admitted":f.admitted.normalized()})).collect::<Vec<_>>(),
++            "nextFrame":self.frames.len(),"phase":self.phase,"healthySet":self.healthy,
++            "invocations":self.invocations,"responses":self.responses,"happensBefore":self.happens_before,"committedHistory":self.history})
++    }
++    fn emit(&mut self, name: &str, mut fields: Value) {
++        for i in 0..self.nodes.len() {
++            for e in self.state(i)["executed"].as_array().unwrap() {
++                insert_set(&mut self.history, e.clone());
++            }
++        }
++        fields["tag"] = json!("trace");
++        fields["event"] = json!(name);
++        fields["ts"] = json!(SystemTime::now()
++            .duration_since(UNIX_EPOCH)
++            .unwrap()
++            .as_nanos()
++            .to_string());
++        fields["post"] = self.snapshot();
++        let mut guard = self.writer.lock().unwrap();
++        let out = guard.as_mut().unwrap();
++        serde_json::to_writer(&mut *out, &fields).unwrap();
++        writeln!(out).unwrap();
++        out.flush().unwrap();
++    }
++    fn finish(&mut self) {
++        if let Some(mut out) = self.writer.lock().unwrap().take() {
++            out.flush().unwrap();
++        }
++    }
++    fn drain_owner(&mut self, i: usize) {
++        let node = &mut self.nodes[i];
++        let r = node.replica.as_mut().unwrap();
++        node.messages
++            .extend(r.drain_messages().map(|(dst, m)| Envelope {
++                src: i,
++                dst,
++                payload: Payload::Message(m),
++            }));
++        node.replies.extend(r.drain_replies().map(|r| Envelope {
++            src: i,
++            dst: r.client_id,
++            payload: Payload::Reply(r),
++        }));
++    }
++    fn persist(&mut self, i: usize) {
++        assert_eq!(self.nodes[i].owner, "persist");
++        let view = self.replica(i).view_number();
++        let node = &mut self.nodes[i];
++        let mut previous = Some(node.durable);
++        persist_view(node.path.to_str().unwrap(), &mut previous, view);
++        assert_eq!(
++            std::fs::read_to_string(&node.path)
++                .unwrap()
++                .trim()
++                .parse::<usize>()
++                .unwrap(),
++            view
++        );
++        node.durable = view;
++        self.drain_owner(i);
++        let node = &mut self.nodes[i];
++        node.owner = if node.messages.is_empty() && node.replies.is_empty() {
++            "ready"
++        } else {
++            "publish"
++        };
++        self.emit("PersistView", json!({"node":i}));
++    }
++    fn publish(&mut self, i: usize) {
++        let n = &mut self.nodes[i];
++        assert_eq!(n.owner, "publish");
++        assert_eq!(n.durable, n.replica.as_ref().unwrap().view_number());
++        let m = n
++            .messages
++            .pop_front()
++            .or_else(|| n.replies.pop_front())
++            .unwrap();
++        n.owner = if n.messages.is_empty() && n.replies.is_empty() {
++            "ready"
++        } else {
++            "publish"
++        };
++        if self.integration
++            && matches!(
++                &m.payload,
++                Payload::Message(Message::Prepare {
++                    op: Operation::Put(..),
++                    ..
++                })
++            )
++        {
++            self.frames.push(FrameState {
++                sent: m.clone(),
++                admitted: m,
++                stage: "queued",
++            });
++        } else {
++            self.queue.push_back(m);
++        }
++        self.emit("PublishOutput", json!({"node":i}));
++    }
++    fn flush(&mut self, i: usize) {
++        if self.nodes[i].owner == "persist" {
++            self.persist(i);
++        }
++        while self.nodes[i].owner == "publish" {
++            self.publish(i);
++        }
++    }
++    fn request(&mut self, id: usize, op: Operation) {
++        assert!(
++            !observe::client_snapshot(&self.clients[&id], &self.retained[&id])["pending"]
++                .as_bool()
++                .unwrap()
++        );
++        let normalized = op.trace_value();
++        let c = self.clients.get_mut(&id).unwrap();
++        let request = c.on_request(op.clone());
++        let e = observe::entry(&LogEntry {
++            client_id: id,
++            request_number: request,
++            op,
++        });
++        self.retained.insert(id, e.clone());
++        self.invocations.push(e);
++        for r in &self.responses {
++            self.happens_before
++                .push(json!([[r["client"], r["request"]], [id, request]]));
++        }
++        self.queue.extend(c.drain().map(|(dst, m)| Envelope {
++            src: id,
++            dst,
++            payload: Payload::Message(m),
++        }));
++        self.emit("ClientOnRequest", json!({"client":id,"op":normalized}));
++    }
++    fn client_idle(&mut self, id: usize) {
++        if !observe::client_snapshot(&self.clients[&id], &self.retained[&id])["pending"]
++            .as_bool()
++            .unwrap()
++        {
++            return;
++        }
++        let c = self.clients.get_mut(&id).unwrap();
++        c.on_idle();
++        self.queue.extend(c.drain().map(|(dst, m)| Envelope {
++            src: id,
++            dst,
++            payload: Payload::Message(m),
++        }));
++        self.emit("ClientOnIdle", json!({"client":id}));
++    }
++    fn idle_raw(&mut self, i: usize) {
++        assert_eq!(self.nodes[i].owner, "ready");
++        self.nodes[i].replica.as_mut().unwrap().on_idle();
++        self.nodes[i].owner = "persist";
++        self.emit("OnIdle", json!({"node":i}));
++    }
++    fn idle(&mut self, i: usize) {
++        self.idle_raw(i);
++        self.flush(i);
++    }
++    fn receive(&mut self, index: usize) {
++        let m = self.queue.remove(index).unwrap();
++        let normalized = m.normalized();
++        let keep = self.queue.iter().any(|x| x.normalized() == normalized);
++        if let Payload::Reply(r) = m.payload {
++            let accepted = self
++                .clients
++                .get_mut(&m.dst)
++                .unwrap()
++                .on_reply(r.request_number, r.view_number);
++            if accepted {
++                self.responses.push(json!({"client":r.client_id,"request":r.request_number,"result":r.result.trace_value()}));
++            }
++            self.emit("ClientOnReply", json!({"message":normalized,"keep":keep}));
++            return;
++        }
++        if self.nodes[m.dst].owner == "down" {
++            if !keep {
++                self.emit("DiscardUnavailable", json!({"message":normalized}));
++            }
++            return;
++        }
++        assert_eq!(self.nodes[m.dst].owner, "ready");
++        let s = self.state(m.dst);
++        let event = if s["status"] == "Recovering" && normalized["kind"] != "RecoveryResponse" {
++            "RecoveringDrop".to_owned()
++        } else {
++            match normalized["kind"].as_str().unwrap() {
++                "Prepare" => if s["status"] != "Normal"
++                    || s["view"] != normalized["view"]
++                    || self.replica(m.dst).is_primary()
++                {
++                    "OnPrepareRejected"
++                } else {
++                    let len = s["log"].as_array().unwrap().len() as u64;
++                    let op = normalized["opnum"].as_u64().unwrap();
++                    if op > len + 1 {
++                        "OnPrepareGap"
++                    } else if op == len + 1 {
++                        "OnPrepareAppend"
++                    } else {
++                        "OnPrepareDuplicate"
++                    }
++                }
++                .to_owned(),
++                "NewState" => if s["status"] == "StateTransfer" {
++                    "OnNewStateTransfer"
++                } else if s["status"] == "ViewChange" && s["catching"] == true {
++                    "OnNewStateCatchUp"
++                } else {
++                    "OnNewStateIgnored"
++                }
++                .to_owned(),
++                kind => format!("On{kind}"),
++            }
++        };
++        if let Payload::Message(msg) = m.payload {
++            self.nodes[m.dst].replica.as_mut().unwrap().on_message(msg);
++        }
++        self.nodes[m.dst].owner = "persist";
++        self.emit(
++            &event,
++            json!({"node":m.dst,"message":normalized,"keep":keep}),
++        );
++    }
++    fn deliver(&mut self, index: usize) {
++        let dst = self.queue[index].dst;
++        self.receive(index);
++        if dst < self.nodes.len() {
++            self.flush(dst);
++        }
++    }
++    fn deliver_where(&mut self, p: impl Fn(&Value) -> bool) -> bool {
++        if let Some(i) = self.queue.iter().position(|m| p(&m.normalized())) {
++            self.deliver(i);
++            true
++        } else {
++            false
++        }
++    }
++    fn pump(&mut self, limit: usize) {
++        for _ in 0..limit {
++            if self.queue.is_empty() {
++                return;
++            }
++            self.deliver(0);
++        }
++        assert!(self.queue.is_empty(), "pump bound exceeded");
++    }
++    fn lose(&mut self, index: usize) {
++        assert_eq!(self.phase, "faults");
++        let m = self.queue.remove(index).unwrap().normalized();
++        if !self.queue.iter().any(|x| x.normalized() == m) {
++            self.emit("LoseMessage", json!({"message":m}));
++        }
++    }
++    fn lose_where(&mut self, p: impl Fn(&Value) -> bool) -> bool {
++        if let Some(i) = self.queue.iter().position(|m| p(&m.normalized())) {
++            self.lose(i);
++            true
++        } else {
++            false
++        }
++    }
++    fn crash(&mut self, i: usize) {
++        assert_eq!(self.phase, "faults");
++        assert_ne!(self.nodes[i].owner, "down");
++        let unavailable = self
++            .nodes
++            .iter()
++            .filter(|n| n.replica.as_ref().map_or(true, Replica::is_recovering))
++            .count();
++        assert!(self.replica(i).is_recovering() || unavailable < (self.nodes.len() - 1) / 2);
++        let n = &mut self.nodes[i];
++        n.replica = None;
++        n.messages.clear();
++        n.replies.clear();
++        n.owner = "down";
++        for f in &mut self.frames {
++            if f.sent.src == i {
++                f.stage = match f.stage {
++                    "queued" => "lost",
++                    "partial" => "eof",
++                    s => s,
++                };
++            }
++        }
++        self.emit("Crash", json!({"node":i}));
++    }
++    fn recover_raw(&mut self, i: usize) {
++        let n = &mut self.nodes[i];
++        assert_eq!(n.owner, "down");
++        n.incarnation += 1;
++        let durable = std::fs::read_to_string(&n.path)
++            .unwrap()
++            .trim()
++            .parse::<usize>()
++            .unwrap();
++        assert_eq!(durable, n.durable);
++        n.replica = Some(Replica::recover(
++            i,
++            self.config.clone(),
++            Store::default(),
++            durable,
++            n.incarnation,
++        ));
++        n.owner = "persist";
++        self.emit("Recover", json!({"node":i}));
++    }
++    fn recover(&mut self, i: usize) {
++        self.recover_raw(i);
++        self.flush(i);
++    }
++    fn stabilize(&mut self, healthy: Vec<usize>) {
++        assert_eq!(self.phase, "faults");
++        assert!(healthy.len() >= self.config.quorum());
++        for i in 0..self.nodes.len() {
++            if !healthy.contains(&i) {
++                assert_eq!(self.nodes[i].owner, "down");
++            }
++        }
++        self.healthy = healthy.clone();
++        self.phase = "stable";
++        self.emit("Stabilize", json!({"healthy":healthy}));
++    }
++    // Called only after matching observations from the real socket experiment.
++    fn frame_partial(&mut self, id: usize) {
++        assert_eq!(self.frames[id].stage, "queued");
++        self.frames[id].stage = "partial";
++        self.emit("RunSenderBeginPartial", json!({"frame":id}));
++    }
++    fn frame_complete(&mut self, id: usize, actual: Message<Operation>) {
++        let f = &mut self.frames[id];
++        assert!(["queued", "partial"].contains(&f.stage));
++        let m = Envelope {
++            src: f.sent.src,
++            dst: f.sent.dst,
++            payload: Payload::Message(actual),
++        };
++        assert_eq!(m.normalized(), f.sent.normalized());
++        f.stage = "complete";
++        self.queue.push_back(m);
++        self.emit("RunSenderComplete", json!({"frame":id}));
++    }
++    fn frame_eof(&mut self, id: usize, actual: Message<Operation>) {
++        let f = &mut self.frames[id];
++        assert_eq!(f.stage, "eof");
++        let m = Envelope {
++            src: f.sent.src,
++            dst: f.sent.dst,
++            payload: Payload::Message(actual),
++        };
++        f.admitted = m.clone();
++        f.stage = "admitted";
++        self.queue.push_back(m);
++        self.emit("RunPeerAcceptorEOF", json!({"frame":id}));
++    }
++    fn frame_error(&mut self, id: usize) {
++        assert!(["partial", "eof"].contains(&self.frames[id].stage));
++        self.frames[id].stage = "lost";
++        self.emit("RunPeerAcceptorReadError", json!({"frame":id}));
++    }
++}
++
++#[path = "specula_frame_probe.rs"]
++pub(crate) mod frame_probe;
++#[path = "specula_scenarios.rs"]
++mod scenarios;
+diff --git a/examples/kvstore/specula_scenarios.rs b/examples/kvstore/specula_scenarios.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..fb95c1ea1071e2c7719f9b466ba80866ab892637
+--- /dev/null
++++ b/examples/kvstore/specula_scenarios.rs
+@@ -0,0 +1,367 @@
++//! Deterministic extensions of tests/cluster.rs's real Replica/Client owner.
++//! These functions schedule calls and queued messages; all protocol decisions
++//! and key-value operations execute in the shipped library and kvstore Store.
++
++use super::*;
++use serde_json::Value;
++use vsr_rs::Status;
++
++fn put(value: &str) -> Operation {
++    Operation::Put("k".into(), value.into())
++}
++
++fn get() -> Operation {
++    Operation::Get("k".into())
++}
++
++fn deliver_matching(c: &mut Cluster, predicate: impl Fn(&Value) -> bool) {
++    assert!(
++        c.deliver_where(predicate),
++        "expected queued message; queue={:?}",
++        c.network()
++    );
++}
++
++fn drain_matching(c: &mut Cluster, predicate: impl Fn(&Value) -> bool) {
++    for _ in 0..400 {
++        if !c.deliver_where(|m| predicate(m)) {
++            return;
++        }
++    }
++    panic!("bounded selective drain exhausted; queue={:?}", c.network());
++}
++
++fn completed(c: &Cluster, client: usize, request: usize, result: &str) {
++    let state = c.snapshot();
++    assert!(
++        state["responses"]
++            .as_array()
++            .unwrap()
++            .iter()
++            .any(|r| { r["client"] == client && r["request"] == request && r["result"] == result }),
++        "missing completion ({client}, {request}, {result}); responses={}",
++        state["responses"]
++    );
++}
++
++fn pending(c: &Cluster, client: usize) -> bool {
++    c.snapshot()["clients"]
++        .as_array()
++        .unwrap()
++        .iter()
++        .find(|row| row["id"] == client)
++        .unwrap()["pending"]
++        .as_bool()
++        .unwrap()
++}
++
++fn normal_at_same_view(c: &Cluster, nodes: &[usize]) -> bool {
++    let view = c.replica(nodes[0]).view_number();
++    nodes.iter().all(|&node| {
++        c.replica(node).status() == Status::Normal && c.replica(node).view_number() == view
++    })
++}
++
++fn retry_and_pump(c: &mut Cluster, client: usize) {
++    if pending(c, client) {
++        c.client_idle(client);
++    }
++    c.pump(400);
++}
++
++/// Reorders real Prepare messages as test_prepare_reordered_during_state_transfer
++/// does, while respecting the documented single outstanding request per client.
++/// Real primary retransmission and StateTransfer idle retry create duplicates;
++/// no message payload or trace event is manufactured by the scenario.
++#[test]
++fn specula_normal_transfer() {
++    let mut c = Cluster::new("specula_normal_transfer", 3, false);
++    c.request(100, put("AA"));
++    deliver_matching(&mut c, |m| m["kind"] == "Request" && m["dst"] == 0);
++    c.idle(0); // Commit before retransmitted Prepare, exactly as on_idle emits.
++    deliver_matching(&mut c, |m| m["kind"] == "Prepare" && m["dst"] == 1);
++    deliver_matching(&mut c, |m| m["kind"] == "Prepare" && m["dst"] == 1);
++    deliver_matching(&mut c, |m| m["kind"] == "PrepareOk" && m["src"] == 1);
++    assert!(c.lose_where(|m| m["kind"] == "Reply" && m["dst"] == 100));
++    c.client_idle(100); // Cached reply repairs actual client-visible reply loss.
++    drain_matching(&mut c, |m| m["dst"] != 2);
++    completed(&c, 100, 0, "nil");
++
++    c.request(101, get()); // Invoked after the other client's accepted reply.
++    deliver_matching(&mut c, |m| m["kind"] == "Request" && m["dst"] == 0);
++    deliver_matching(&mut c, |m| {
++        m["kind"] == "Prepare" && m["dst"] == 2 && m["opnum"] == 2
++    });
++    assert_eq!(c.replica(2).status(), Status::StateTransfer);
++    // Earlier op arrives only after the gap started state transfer: rejected.
++    deliver_matching(&mut c, |m| {
++        m["kind"] == "Prepare" && m["dst"] == 2 && m["opnum"] == 1
++    });
++    c.idle(2); // A second authentic GetState produces a delayed equal NewState.
++    deliver_matching(&mut c, |m| m["kind"] == "GetState" && m["src"] == 2);
++    deliver_matching(&mut c, |m| m["kind"] == "GetState" && m["src"] == 2);
++    deliver_matching(&mut c, |m| m["kind"] == "NewState" && m["dst"] == 2);
++    assert_eq!(c.replica(2).status(), Status::Normal);
++    deliver_matching(&mut c, |m| m["kind"] == "NewState" && m["dst"] == 2);
++    c.pump(400);
++    c.idle(0);
++    c.pump(400);
++    completed(&c, 101, 0, "AA");
++    for node in 0..3 {
++        assert_eq!(c.replica(node).commit_number(), 2);
++        assert_eq!(
++            c.replica(node)
++                .state_machine()
++                .map
++                .get("k")
++                .map(String::as_str),
++            Some("AA")
++        );
++    }
++
++    // Keep replica 2 outside a completed view change, then let a new-view
++    // Prepare overtake StartView. The real rejected-Prepare path asks for the
++    // suffix after its committed prefix and installs it through CatchUp.
++    for _ in 0..5 {
++        if c.replica(1).status() == Status::ViewChange {
++            break;
++        }
++        c.idle(1);
++    }
++    drain_matching(&mut c, |m| m["dst"] != 2);
++    assert_eq!(c.replica(1).view_number(), 1);
++    assert_eq!(c.replica(1).status(), Status::Normal);
++    assert_eq!(c.replica(2).view_number(), 0);
++    c.request(100, put("B"));
++    c.client_idle(100);
++    deliver_matching(&mut c, |m| m["kind"] == "Request" && m["dst"] == 1);
++    deliver_matching(&mut c, |m| {
++        m["kind"] == "Prepare" && m["dst"] == 2 && m["view"] == 1
++    });
++    assert_eq!(c.replica(2).status(), Status::ViewChange);
++    deliver_matching(&mut c, |m| m["kind"] == "GetState" && m["src"] == 2);
++    deliver_matching(&mut c, |m| m["kind"] == "NewState" && m["dst"] == 2);
++    assert_eq!(c.replica(2).status(), Status::Normal);
++    c.pump(400);
++    completed(&c, 100, 1, "nil");
++    c.request(101, get());
++    retry_and_pump(&mut c, 101);
++    completed(&c, 101, 1, "B");
++    c.idle(1);
++    c.pump(400);
++    for node in 0..3 {
++        assert_eq!(c.replica(node).commit_number(), 4);
++    }
++    c.finish();
++}
++
++/// Extends test_recovery_after_reboot with delayed immutable response snapshots,
++/// recovery concurrent with a view change, and sequential reboots of all nodes.
++#[test]
++fn specula_rolling_recovery() {
++    let mut c = Cluster::new("specula_rolling_recovery", 3, false);
++    c.request(100, put("AA"));
++    c.pump(400);
++    c.idle(0);
++    c.pump(400);
++    completed(&c, 100, 0, "nil");
++
++    c.crash(2);
++    c.recover(2);
++    // Keep the view-0 response snapshots in transport across the view change.
++    deliver_matching(&mut c, |m| m["kind"] == "Recovery" && m["dst"] == 0);
++    deliver_matching(&mut c, |m| m["kind"] == "Recovery" && m["dst"] == 1);
++    c.request(101, get());
++    deliver_matching(&mut c, |m| m["kind"] == "Request" && m["dst"] == 0);
++    deliver_matching(&mut c, |m| m["kind"] == "Prepare" && m["dst"] == 2);
++    assert!(c.replica(2).is_recovering());
++    drain_matching(&mut c, |m| m["dst"] != 2 && m["kind"] != "Reply");
++    assert_eq!(c.replica(0).commit_number(), 2);
++
++    // Replica 1 suspects primary 0 while replica 2 is still recovering.
++    for _ in 0..5 {
++        if c.replica(1).status() == Status::ViewChange {
++            break;
++        }
++        c.idle(1);
++    }
++    assert_eq!(c.replica(1).view_number(), 1);
++    drain_matching(&mut c, |m| m["dst"] != 2 && m["kind"] != "Reply");
++    assert_eq!(c.replica(1).status(), Status::Normal);
++    assert_eq!(c.replica(1).view_number(), 1);
++
++    c.idle(2);
++    deliver_matching(&mut c, |m| m["kind"] == "Recovery" && m["dst"] == 0);
++    deliver_matching(&mut c, |m| m["kind"] == "Recovery" && m["dst"] == 1);
++    // Newer response is overwritten by an older authentic response from the
++    // same sender. There is still only one distinct responder at this point.
++    deliver_matching(&mut c, |m| {
++        m["kind"] == "RecoveryResponse" && m["src"] == 0 && m["view"] == 1
++    });
++    deliver_matching(&mut c, |m| {
++        m["kind"] == "RecoveryResponse" && m["src"] == 0 && m["view"] == 0
++    });
++    assert!(c.replica(2).is_recovering());
++    deliver_matching(&mut c, |m| {
++        m["kind"] == "RecoveryResponse" && m["src"] == 1 && m["view"] == 1
++    });
++    assert_eq!(c.replica(2).status(), Status::Normal);
++    assert_eq!(c.replica(2).view_number(), 1);
++    c.pump(400);
++    completed(&c, 101, 0, "AA");
++    c.idle(1);
++    c.pump(400);
++
++    // Start view 2 on replica 0, persist it, then release just the first SVC.
++    // Crash loses its unpublished second SVC but preserves the first envelope.
++    for _ in 0..5 {
++        c.idle_raw(0);
++        if c.replica(0).status() == Status::ViewChange {
++            break;
++        }
++        c.flush(0);
++    }
++    assert_eq!(c.replica(0).view_number(), 2);
++    c.persist(0);
++    c.publish(0);
++    c.crash(0);
++    c.recover(0);
++    c.pump(400);
++    for _ in 0..8 {
++        if normal_at_same_view(&c, &[0, 1, 2]) {
++            break;
++        }
++        for node in 0..3 {
++            c.idle(node);
++            c.pump(400);
++        }
++    }
++    assert!(normal_at_same_view(&c, &[0, 1, 2]));
++    assert!(c.replica(0).view_number() >= 2);
++
++    c.request(100, put("B"));
++    retry_and_pump(&mut c, 100);
++    completed(&c, 100, 1, "nil");
++    let primary = c.replica(0).view_number() % 3;
++    c.idle(primary);
++    c.pump(400);
++    c.crash(1);
++    c.recover(1);
++    c.pump(400);
++    assert!(normal_at_same_view(&c, &[0, 1, 2]));
++    c.request(101, get());
++    retry_and_pump(&mut c, 101);
++    completed(&c, 101, 1, "B");
++    c.idle(primary);
++    c.pump(400);
++    for node in 0..3 {
++        assert_eq!(c.replica(node).commit_number(), 4);
++        assert_eq!(
++            c.replica(node)
++                .state_machine()
++                .map
++                .get("k")
++                .map(String::as_str),
++            Some("B")
++        );
++    }
++    c.finish();
++}
++
++/// The round-robin primary of view 1 is permanently down. After Stabilize every
++/// healthy node gets one idle per round and each call's output is fully drained.
++/// This is finite progress coverage, not a proof of eventual service.
++#[test]
++fn specula_stable_minority() {
++    let mut c = Cluster::new("specula_stable_minority", 3, false);
++    c.request(100, put("AA"));
++    c.pump(400);
++    c.idle(0);
++    c.pump(400);
++    c.crash(1);
++    for _ in 0..5 {
++        if c.replica(2).status() == Status::ViewChange {
++            break;
++        }
++        c.idle(2);
++    }
++    c.pump(400);
++    for node in [0, 2] {
++        assert_eq!(c.replica(node).view_number(), 1);
++        assert_eq!(c.replica(node).status(), Status::ViewChange);
++    }
++    c.stabilize(vec![0, 2]);
++    c.request(101, get());
++    c.pump(400);
++    for _ in 0..12 {
++        for node in [0, 2] {
++            c.idle(node);
++            c.pump(400);
++        }
++        retry_and_pump(&mut c, 101);
++        if normal_at_same_view(&c, &[0, 2]) && !pending(&c, 101) {
++            break;
++        }
++    }
++    assert!(normal_at_same_view(&c, &[0, 2]));
++    assert!(c.replica(2).view_number() >= 2);
++    completed(&c, 101, 0, "AA");
++    c.request(100, put("B"));
++    retry_and_pump(&mut c, 100);
++    completed(&c, 100, 1, "nil");
++    c.request(101, get());
++    retry_and_pump(&mut c, 101);
++    completed(&c, 101, 1, "B");
++    // Additional stable rounds establish repeated service after the skipped view.
++    for _ in 0..3 {
++        for node in [0, 2] {
++            c.idle(node);
++            c.pump(400);
++        }
++    }
++    for node in [0, 2] {
++        assert_eq!(c.replica(node).commit_number(), 4);
++    }
++    c.finish();
++}
++
++/// N=2 traces declare failure_budget=0. Both members remain available; the
++/// request must await both acknowledgments and a view change uses both states.
++#[test]
++fn specula_two_replica() {
++    let mut c = Cluster::new("specula_two_replica", 2, false);
++    c.request(100, put("AA"));
++    deliver_matching(&mut c, |m| m["kind"] == "Request");
++    assert_eq!(c.replica(0).commit_number(), 0);
++    c.idle(0);
++    deliver_matching(&mut c, |m| m["kind"] == "Prepare");
++    deliver_matching(&mut c, |m| m["kind"] == "Prepare");
++    assert_eq!(c.replica(0).commit_number(), 0);
++    c.pump(400);
++    completed(&c, 100, 0, "nil");
++    c.idle(0);
++    c.pump(400);
++    c.request(101, get());
++    c.pump(400);
++    completed(&c, 101, 0, "AA");
++    for _ in 0..5 {
++        if c.replica(1).status() == Status::ViewChange {
++            break;
++        }
++        c.idle(1);
++    }
++    c.pump(400);
++    assert!(normal_at_same_view(&c, &[0, 1]));
++    assert_eq!(c.replica(1).view_number(), 1);
++    c.request(100, put("B"));
++    retry_and_pump(&mut c, 100);
++    completed(&c, 100, 1, "nil");
++    c.request(101, get());
++    retry_and_pump(&mut c, 101);
++    completed(&c, 101, 1, "B");
++    c.idle(1);
++    c.pump(400);
++    assert_eq!(c.replica(0).commit_number(), 4);
++    assert_eq!(c.replica(1).commit_number(), 4);
++    c.finish();
++}
+diff --git a/lib.rs b/lib.rs
+index c1669644ae5a481ad6d7b65a31c69d653aa789a2..b82a28f24cacee500c82844f22447b9bb6f30ae5 100644
+--- a/lib.rs
++++ b/lib.rs
+@@ -20,6 +20,11 @@
+ //! at once, as shown by Michael et al. in "Recovering Shared Objects Without
+ //! Stable Storage".
+ 
++// SPECULA_OBSERVER_HOOKS: observation only; protocol behavior remains unchanged.
++#[cfg(feature = "specula-trace")]
++#[path = "specula_observe.rs"]
++pub mod specula_observe;
++
+ use log::trace;
+ use std::{
+     collections::{BTreeMap, BTreeSet},
+@@ -472,6 +477,12 @@ pub struct Replica<SM: StateMachine> {
+     recovery_responses: BTreeMap<ReplicaID, RecoveryResponse<SM::Input>>,
+     outbox: Vec<(ReplicaID, Message<SM::Input>)>,
+     replies: Vec<Reply<SM::Output>>,
++    #[cfg(feature = "specula-trace")]
++    observed_executions: Vec<specula_observe::Execution<SM::Input, SM::Output>>,
++    #[cfg(feature = "specula-trace")]
++    observed_dvc: BTreeMap<ReplicaID, (ReplicaID, Message<SM::Input>)>,
++    #[cfg(feature = "specula-trace")]
++    observed_recovery_responses: BTreeMap<ReplicaID, (ReplicaID, Message<SM::Input>)>,
+ }
+ 
+ impl<SM: StateMachine> Replica<SM> {
+@@ -499,6 +510,12 @@ impl<SM: StateMachine> Replica<SM> {
+             recovery_responses: BTreeMap::new(),
+             outbox: Vec::new(),
+             replies: Vec::new(),
++            #[cfg(feature = "specula-trace")]
++            observed_executions: Vec::new(),
++            #[cfg(feature = "specula-trace")]
++            observed_dvc: BTreeMap::new(),
++            #[cfg(feature = "specula-trace")]
++            observed_recovery_responses: BTreeMap::new(),
+         }
+     }
+ 
+@@ -995,6 +1012,8 @@ impl<SM: StateMachine> Replica<SM> {
+         self.start_view_change_from.clear();
+         self.do_view_change_sent = false;
+         self.do_view_change_from.clear();
++        #[cfg(feature = "specula-trace")]
++        self.observed_dvc.clear();
+     }
+ 
+     /// Sends `DoViewChange` once `f` other replicas want the same view.
+@@ -1041,6 +1060,15 @@ impl<SM: StateMachine> Replica<SM> {
+     /// view: the log is the one from the latest normal view, the longest if
+     /// several, which by quorum intersection holds every committed op.
+     fn record_do_view_change(&mut self, replica_id: ReplicaID, dvc: DoViewChange<SM::Input>) {
++        #[cfg(feature = "specula-trace")]
++        self.observed_dvc.insert(replica_id, (self.self_id, Message::DoViewChange {
++            view_number: self.view_number,
++            replica_id,
++            last_normal_view: dvc.last_normal_view,
++            log: dvc.log.clone(),
++            op_number: dvc.log.len(),
++            commit_number: dvc.commit_number,
++        }));
+         self.do_view_change_from.insert(replica_id, dvc);
+         if self.do_view_change_from.len() < self.config.quorum() {
+             return;
+@@ -1166,6 +1194,13 @@ impl<SM: StateMachine> Replica<SM> {
+         if self.status != Status::Recovering || nonce != self.recovery_nonce {
+             return;
+         }
++        #[cfg(feature = "specula-trace")]
++        self.observed_recovery_responses.insert(replica_id, (self.self_id, Message::RecoveryResponse {
++            view_number,
++            nonce,
++            replica_id,
++            state: state.clone(),
++        }));
+         self.recovery_responses
+             .insert(replica_id, RecoveryResponse { view_number, state });
+         if self.recovery_responses.len() < self.config.quorum() {
+@@ -1199,6 +1234,8 @@ impl<SM: StateMachine> Replica<SM> {
+             state.commit_number
+         );
+         self.recovery_responses.clear();
++        #[cfg(feature = "specula-trace")]
++        self.observed_recovery_responses.clear();
+         self.view_number = latest_view;
+         self.install_log(state.log);
+         self.commit_up_to(state.commit_number, false);
+@@ -1361,8 +1398,17 @@ impl<SM: StateMachine> Replica<SM> {
+     /// without running it again.
+     fn commit_op(&mut self, op_idx: usize) -> Reply<SM::Output> {
+         let entry = self.log[op_idx].clone();
++        #[cfg(feature = "specula-trace")]
++        let observed_entry = entry.clone();
+         let result = self.state_machine.apply(entry.op);
+         self.commit_number += 1;
++        #[cfg(feature = "specula-trace")]
++        self.observed_executions.push(specula_observe::Execution {
++            pos: self.commit_number,
++            entry: observed_entry,
++            result: result.clone(),
++            view: self.view_number,
++        });
+         if let Some(client) = self.client_table.get_mut(&entry.client_id) {
+             if client.request_number == entry.request_number {
+                 client.reply = Some(result.clone());
+diff --git a/specula_observe.rs b/specula_observe.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..2e396eee41c24514444f4beb74fbbb6cc63806ad
+--- /dev/null
++++ b/specula_observe.rs
+@@ -0,0 +1,371 @@
++//! Read-only access to real VSR state; enabled only for trace collection.
++//!
++//! Serialization bounds live on these accessors, never on protocol handlers.
++//! Execution and received-message provenance are captured by feature-gated
++//! hooks inside the real implementation and remain typed until serialization.
++
++use crate::{Client, LogEntry, Message, Replica, Reply, StateMachine};
++use serde_json::{json, Value};
++use std::collections::BTreeMap;
++use std::fmt::Debug;
++use std::sync::{Mutex, OnceLock};
++
++/// Equality-preserving normalization into the vocabulary of Trace.tla.
++pub trait TraceValue {
++    fn trace_value(&self) -> Value;
++}
++
++fn value_dictionary() -> &'static Mutex<BTreeMap<String, String>> {
++    static VALUES: OnceLock<Mutex<BTreeMap<String, String>>> = OnceLock::new();
++    VALUES.get_or_init(|| {
++        Mutex::new(BTreeMap::from([
++            ("A".to_owned(), "A".to_owned()),
++            ("AA".to_owned(), "AA".to_owned()),
++            ("B".to_owned(), "B".to_owned()),
++        ]))
++    })
++}
++
++/// Register a raw application value before observing it. Registrations never
++/// change an existing value's meaning; callers must preserve equality among
++/// values that occur in the same scenario. This permits a proven long wire
++/// value and its strict prefix to use the finite AA/A trace vocabulary.
++pub fn register_value(raw: &str, normalized: &str) {
++    assert!(
++        matches!(normalized, "A" | "AA" | "B"),
++        "unsupported normalized value: {normalized:?}"
++    );
++    assert_ne!(
++        raw, "nil",
++        "the literal nil value is outside this trace abstraction"
++    );
++    let mut values = value_dictionary()
++        .lock()
++        .expect("trace value dictionary poisoned");
++    if let Some(previous) = values.get(raw) {
++        assert_eq!(
++            previous, normalized,
++            "a registered raw value cannot change meaning"
++        );
++    } else {
++        values.insert(raw.to_owned(), normalized.to_owned());
++    }
++}
++
++pub fn normalize_value(raw: &str) -> Value {
++    let values = value_dictionary()
++        .lock()
++        .expect("trace value dictionary poisoned");
++    json!(values.get(raw).unwrap_or_else(|| panic!(
++        "unregistered application value outside trace abstraction: {raw:?}"
++    )))
++}
++
++impl TraceValue for str {
++    fn trace_value(&self) -> Value {
++        normalize_value(self)
++    }
++}
++
++impl TraceValue for String {
++    fn trace_value(&self) -> Value {
++        normalize_value(self)
++    }
++}
++
++impl TraceValue for Option<String> {
++    fn trace_value(&self) -> Value {
++        self.as_deref().map(normalize_value).unwrap_or(json!("nil"))
++    }
++}
++
++/// Read the actual application value; never reconstruct it from the log.
++pub trait TraceStateMachine: StateMachine {
++    fn trace_app(&self) -> Value;
++}
++
++#[derive(Debug)]
++pub(crate) struct Execution<Input, Output> {
++    pub pos: usize,
++    pub entry: LogEntry<Input>,
++    pub result: Output,
++    pub view: usize,
++}
++
++pub fn neutral_entry() -> Value {
++    json!({"client": -1, "request": -1, "op": {"kind": "Get", "value": "nil"}})
++}
++
++pub fn entry<Op: TraceValue>(e: &LogEntry<Op>) -> Value {
++    json!({"client": e.client_id, "request": e.request_number, "op": e.op.trace_value()})
++}
++
++fn entries<Op: TraceValue>(log: &[LogEntry<Op>]) -> Vec<Value> {
++    log.iter().map(entry).collect()
++}
++
++fn neutral_message(src: usize, dst: usize) -> Value {
++    json!({
++        "kind": "Commit", "src": src, "dst": dst, "view": 0,
++        "opnum": 0, "commit": 0, "entry": neutral_entry(), "log": [],
++        "start": 0, "lastNormal": 0, "nonce": 0, "hasState": false,
++        "result": "nil"
++    })
++}
++
++/// Serialize the exact immutable queued message. For variants with no sender
++/// payload, `src` must be the sender supplied by the real owner/transport.
++pub fn normalize_message<Op: TraceValue>(src: usize, dst: usize, m: &Message<Op>) -> Value {
++    let mut v = neutral_message(src, dst);
++    match m {
++        Message::Request {
++            client_id,
++            request_number,
++            op,
++        } => {
++            assert_eq!(
++                src, *client_id,
++                "request provenance must be the actual client"
++            );
++            v["kind"] = json!("Request");
++            v["entry"] =
++                json!({"client": client_id, "request": request_number, "op": op.trace_value()});
++        }
++        Message::Prepare {
++            view_number,
++            op_number,
++            client_id,
++            request_number,
++            op,
++            commit_number,
++        } => {
++            v["kind"] = json!("Prepare");
++            v["view"] = json!(view_number);
++            v["opnum"] = json!(op_number);
++            v["commit"] = json!(commit_number);
++            v["entry"] =
++                json!({"client": client_id, "request": request_number, "op": op.trace_value()});
++        }
++        Message::PrepareOk {
++            view_number,
++            op_number,
++            replica_id,
++        } => {
++            assert_eq!(src, *replica_id, "PrepareOk sender provenance");
++            v["kind"] = json!("PrepareOk");
++            v["view"] = json!(view_number);
++            v["opnum"] = json!(op_number);
++        }
++        Message::Commit {
++            view_number,
++            commit_number,
++        } => {
++            v["kind"] = json!("Commit");
++            v["view"] = json!(view_number);
++            v["commit"] = json!(commit_number);
++        }
++        Message::GetState {
++            replica_id,
++            view_number,
++            op_number,
++        } => {
++            assert_eq!(src, *replica_id, "GetState sender provenance");
++            v["kind"] = json!("GetState");
++            v["view"] = json!(view_number);
++            v["opnum"] = json!(op_number);
++        }
++        Message::NewState {
++            view_number,
++            log,
++            op_number_start,
++            op_number_end,
++            commit_number,
++        } => {
++            v["kind"] = json!("NewState");
++            v["view"] = json!(view_number);
++            v["log"] = json!(entries(log));
++            v["start"] = json!(op_number_start);
++            v["opnum"] = json!(op_number_end);
++            v["commit"] = json!(commit_number);
++        }
++        Message::StartViewChange {
++            view_number,
++            replica_id,
++        } => {
++            assert_eq!(src, *replica_id, "StartViewChange sender provenance");
++            v["kind"] = json!("StartViewChange");
++            v["view"] = json!(view_number);
++        }
++        Message::DoViewChange {
++            view_number,
++            replica_id,
++            last_normal_view,
++            log,
++            op_number,
++            commit_number,
++        } => {
++            assert_eq!(src, *replica_id, "DoViewChange sender provenance");
++            v["kind"] = json!("DoViewChange");
++            v["view"] = json!(view_number);
++            v["lastNormal"] = json!(last_normal_view);
++            v["log"] = json!(entries(log));
++            v["opnum"] = json!(op_number);
++            v["commit"] = json!(commit_number);
++        }
++        Message::StartView {
++            view_number,
++            log,
++            op_number,
++            commit_number,
++        } => {
++            v["kind"] = json!("StartView");
++            v["view"] = json!(view_number);
++            v["log"] = json!(entries(log));
++            v["opnum"] = json!(op_number);
++            v["commit"] = json!(commit_number);
++        }
++        Message::Recovery {
++            replica_id,
++            nonce,
++            view_number,
++        } => {
++            assert_eq!(src, *replica_id, "Recovery sender provenance");
++            v["kind"] = json!("Recovery");
++            v["nonce"] = json!(nonce);
++            v["view"] = json!(view_number);
++        }
++        Message::RecoveryResponse {
++            view_number,
++            nonce,
++            replica_id,
++            state,
++        } => {
++            assert_eq!(src, *replica_id, "RecoveryResponse sender provenance");
++            v["kind"] = json!("RecoveryResponse");
++            v["view"] = json!(view_number);
++            v["nonce"] = json!(nonce);
++            v["hasState"] = json!(state.is_some());
++            if let Some(state) = state {
++                v["log"] = json!(entries(&state.log));
++                v["commit"] = json!(state.commit_number);
++            }
++        }
++    }
++    v
++}
++
++pub fn normalize_reply<Output: TraceValue>(src: usize, r: &Reply<Output>) -> Value {
++    let mut v = neutral_message(src, r.client_id);
++    v["kind"] = json!("Reply");
++    v["view"] = json!(r.view_number);
++    v["entry"]["client"] = json!(r.client_id);
++    v["entry"]["request"] = json!(r.request_number);
++    v["result"] = r.result.trace_value();
++    v
++}
++
++pub fn replica_snapshot<SM>(r: &Replica<SM>) -> Value
++where
++    SM: TraceStateMachine,
++    SM::Input: TraceValue,
++    SM::Output: TraceValue,
++{
++    assert_eq!(
++        r.observed_dvc.len(),
++        r.do_view_change_from.len(),
++        "DVC provenance and actual map diverged"
++    );
++    assert_eq!(
++        r.observed_recovery_responses.len(),
++        r.recovery_responses.len(),
++        "recovery provenance and actual map diverged"
++    );
++    let acks: Vec<Value> = r
++        .acks
++        .iter()
++        .map(|(opnum, from)| json!({"opnum": opnum, "from": from}))
++        .collect();
++    let table: Vec<Value> = r
++        .client_table
++        .iter()
++        .map(|(client, e)| {
++            json!({
++                "client": client, "request": e.request_number,
++                "hasReply": e.reply.is_some(),
++                "result": e.reply.as_ref().map(TraceValue::trace_value).unwrap_or(json!("nil"))
++            })
++        })
++        .collect();
++    let dvc: Vec<Value> = r
++        .do_view_change_from
++        .iter()
++        .map(|(src, actual)| {
++            let (dst, message) = r
++                .observed_dvc
++                .get(src)
++                .expect("missing DVC reception provenance");
++            let normalized = normalize_message(*src, *dst, message);
++            assert_eq!(normalized["log"], json!(entries(&actual.log)));
++            assert_eq!(normalized["lastNormal"], json!(actual.last_normal_view));
++            assert_eq!(normalized["commit"], json!(actual.commit_number));
++            normalized
++        })
++        .collect();
++    let responses: Vec<Value> = r
++        .recovery_responses
++        .iter()
++        .map(|(src, actual)| {
++            let (dst, message) = r
++                .observed_recovery_responses
++                .get(src)
++                .expect("missing RecoveryResponse reception provenance");
++            let normalized = normalize_message(*src, *dst, message);
++            assert_eq!(normalized["view"], json!(actual.view_number));
++            assert_eq!(normalized["hasState"], json!(actual.state.is_some()));
++            if let Some(state) = &actual.state {
++                assert_eq!(normalized["log"], json!(entries(&state.log)));
++                assert_eq!(normalized["commit"], json!(state.commit_number));
++            }
++            normalized
++        })
++        .collect();
++    let messages: Vec<Value> = r
++        .outbox
++        .iter()
++        .map(|(dst, message)| normalize_message(r.self_id, *dst, message))
++        .collect();
++    let replies: Vec<Value> = r
++        .replies
++        .iter()
++        .map(|reply| normalize_reply(r.self_id, reply))
++        .collect();
++    let executed: Vec<Value> = r.observed_executions.iter().map(|e| json!({
++        "pos": e.pos, "entry": entry(&e.entry), "result": e.result.trace_value(), "view": e.view
++    })).collect();
++    json!({
++        "status": format!("{:?}", r.status), "view": r.view_number,
++        "lastNormal": r.last_normal_view, "log": entries(&r.log), "commit": r.commit_number,
++        "acks": acks, "table": table, "heard": r.heard_from_primary,
++        "waiting": r.idle_periods_waiting, "attempts": r.view_change_attempts,
++        "stable": r.idle_periods_stable, "svc": r.start_view_change_from,
++        "dvcSent": r.do_view_change_sent, "dvc": dvc, "catching": r.catching_up,
++        "nonce": r.recovery_nonce, "responses": responses, "messages": messages,
++        "replies": replies, "app": r.state_machine.trace_app(), "executed": executed
++    })
++}
++
++/// `last_entry` is retained invocation metadata after the real Client clears
++/// pending; pending=true always serializes the real pending request itself.
++pub fn client_snapshot<Op>(c: &Client<Op>, last_entry: &Value) -> Value
++where
++    Op: Clone + Debug + TraceValue,
++{
++    let pending_entry = match &c.pending {
++        Some((request, op)) => {
++            json!({"client": c.client_id, "request": request, "op": op.trace_value()})
++        }
++        None => last_entry.clone(),
++    };
++    json!({"id": c.client_id, "view": c.view_number, "next": c.next_request_number,
++        "pending": c.pending.is_some(), "entry": pending_entry})
++}

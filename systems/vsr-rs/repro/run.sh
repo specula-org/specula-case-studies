@@ -5,8 +5,8 @@ script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 revision=3ac0104a567092139534c9022205d02281a2da41
 case_name=${1:-all}
 case "$case_name" in
-  all|CR-1|CR-2|CR-3) ;;
-  *) echo "Usage: bash run.sh [all|CR-1|CR-2|CR-3] [local-vsr-repository]" >&2; exit 2 ;;
+  all|CR-1|CR-2|CR-3|CR-4) ;;
+  *) echo "Usage: bash run.sh [all|CR-1|CR-2|CR-3|CR-4] [local-vsr-repository]" >&2; exit 2 ;;
 esac
 for command in git tar cargo python3 timeout; do
   command -v "$command" >/dev/null || { echo "Missing command: $command" >&2; exit 2; }
@@ -40,4 +40,7 @@ if [[ "$case_name" == all || "$case_name" == CR-2 ]]; then
 fi
 if [[ "$case_name" == all || "$case_name" == CR-3 ]]; then
   timeout --kill-after=5s 2m python3 "$script_dir/test_bugCR-3_sender_stall.py"
+fi
+if [[ "$case_name" == all || "$case_name" == CR-4 ]]; then
+  timeout --kill-after=5s 3m python3 "$script_dir/test_bugCR-4_peer_eof_prefix.py"
 fi
