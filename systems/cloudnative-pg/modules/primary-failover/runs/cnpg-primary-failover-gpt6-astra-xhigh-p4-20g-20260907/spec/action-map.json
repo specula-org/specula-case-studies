@@ -1,0 +1,4016 @@
+[
+  {
+    "name": "Reconcile_GetCluster",
+    "params": {},
+    "location": "OC:300-329,382-390",
+    "scenarios": [
+      1,
+      3,
+      4,
+      5
+    ],
+    "guards": [
+      "s.env.operatorUp",
+      "s.op.pc=\"idle\""
+    ],
+    "updates": [
+      [
+        "op.cluster",
+        "s.op.cache"
+      ],
+      [
+        "op.pc",
+        "\"resources\""
+      ]
+    ],
+    "note": "GET response; retain this reconcile snapshot.",
+    "fault": null
+  },
+  {
+    "name": "GetManagedResources",
+    "params": {},
+    "location": "OC:383-390; OS:298-323; pkg/reconciler/persistentvolumeclaim/status.go:233-235",
+    "scenarios": [
+      5
+    ],
+    "guards": [
+      "s.env.operatorUp",
+      "s.op.pc=\"resources\""
+    ],
+    "updates": [
+      [
+        "op.active",
+        "{n \\in Server:s.pods[n].active}"
+      ],
+      [
+        "op.ready",
+        "{n \\in Server:s.pods[n].active /\\ s.pods[n].ready}"
+      ],
+      [
+        "op.pc",
+        "\"resourceStatus\""
+      ]
+    ],
+    "note": "",
+    "fault": null
+  },
+  {
+    "name": "UpdateResourceStatus",
+    "params": {},
+    "location": "OS:257-263,298-323,401-404; pkg/reconciler/persistentvolumeclaim/status.go:233-235",
+    "scenarios": [
+      5
+    ],
+    "guards": [
+      "s.env.operatorUp",
+      "s.env.operatorAPI",
+      "s.op.pc=\"resourceStatus\"",
+      "LET c == [s.op.cluster EXCEPT !.readyCount=Cardinality(s.op.ready), !.target=IF @#s.op.cluster.current /\\ (s.op.ready={} \\/ @ \\notin s.op.active) THEN s.op.cluster.current ELSE @] IN (c=s.op.cluster \\/ s.op.cluster.rv=s.cluster.rv)"
+    ],
+    "updates": [
+      [
+        "cluster",
+        "LET c == [s.op.cluster EXCEPT !.readyCount=Cardinality(s.op.ready), !.target=IF @#s.op.cluster.current /\\ (s.op.ready={} \\/ @ \\notin s.op.active) THEN s.op.cluster.current ELSE @] IN IF c=s.op.cluster THEN s.cluster ELSE [c EXCEPT !.rv=ClusterRV]"
+      ],
+      [
+        "op.cluster",
+        "LET c == [s.op.cluster EXCEPT !.readyCount=Cardinality(s.op.ready), !.target=IF @#s.op.cluster.current /\\ (s.op.ready={} \\/ @ \\notin s.op.active) THEN s.op.cluster.current ELSE @] IN IF c=s.op.cluster THEN c ELSE [c EXCEPT !.rv=ClusterRV]"
+      ],
+      [
+        "op.pc",
+        "\"transitionGuard\""
+      ]
+    ],
+    "note": "Ready count is refreshed by EnrichStatus before testing target activity; a no-op does not refresh the caller.",
+    "fault": null
+  },
+  {
+    "name": "UpdateResourceStatus_Conflict",
+    "params": {},
+    "location": "OC:389-398; OS:401-404",
+    "scenarios": [
+      5
+    ],
+    "guards": [
+      "s.env.operatorUp",
+      "s.op.pc=\"resourceStatus\"",
+      "s.op.cluster.rv#s.cluster.rv",
+      "s.op.cluster.readyCount#Cardinality(s.op.ready) \\/ (s.op.cluster.target#s.op.cluster.current /\\ (s.op.ready={} \\/ s.op.cluster.target\\notin s.op.active))"
+    ],
+    "updates": [
+      [
+        "op.pc",
+        "\"idle\""
+      ]
+    ],
+    "note": "A conflicting status update retries the reconcile; other legitimate status fields may have changed.",
+    "fault": null
+  },
+  {
+    "name": "Reconcile_TransitionGuard",
+    "params": {},
+    "location": "OC:408-428,454-455",
+    "scenarios": [
+      5
+    ],
+    "guards": [
+      "s.env.operatorUp",
+      "s.op.pc=\"transitionGuard\""
+    ],
+    "updates": [
+      [
+        "op.pc",
+        "IF s.op.cluster.current#s.op.cluster.target THEN \"guardLabel\" ELSE \"collect\""
+      ],
+      [
+        "op.collected",
+        "{}"
+      ],
+      [
+        "op.http",
+        "[n \\in Server |-> EmptyHTTP]"
+      ]
+    ],
+    "note": "",
+    "fault": null
+  },
+  {
+    "name": "MarkOldPrimaryAsUnhealthy",
+    "params": {},
+    "location": "OC:413-427; OR:144-158,202-229",
+    "scenarios": [
+      1,
+      2,
+      5
+    ],
+    "guards": [
+      "s.env.operatorUp",
+      "s.env.operatorAPI",
+      "s.op.pc \\in {\"guardLabel\",\"pendingLabel\"}"
+    ],
+    "updates": [
+      [
+        "pods[s.op.cluster.current].label",
+        "\"unhealthy\""
+      ],
+      [
+        "op.pc",
+        "IF s.op.pc=\"guardLabel\" THEN \"idle\" ELSE \"receivers\""
+      ]
+    ],
+    "note": "Routing label only. Existing SQL and replication sessions are retained.",
+    "fault": null
+  },
+  {
+    "name": "GetReplicaStatusFromPodViaHTTP",
+    "params": {
+      "n": "Server"
+    },
+    "location": "RC:134-137,143-178,181-201; PS:282-325",
+    "scenarios": [
+      3,
+      4,
+      5
+    ],
+    "guards": [
+      "s.env.operatorUp",
+      "s.op.pc=\"collect\"",
+      "n \\in s.op.active\\s.op.collected",
+      "\\A m \\in s.op.active\\s.op.collected : Rank(n)<=Rank(m)"
+    ],
+    "updates": [
+      [
+        "op.http[n]",
+        "IF s.env.http[n] /\\ Manager(n) /\\ DBReady(n) THEN [ok |-> TRUE, primary |-> s.data[n].diskRole=\"primary\", receiver |-> Receiver(n), received |-> s.data[n].received, replayed |-> s.data[n].replayed] ELSE EmptyHTTP"
+      ],
+      [
+        "op.collected",
+        "s.op.collected \\cup {n}"
+      ]
+    ],
+    "note": "One HTTP observation at a time in Pod-name order; errors have zero receiver/LSN fields.",
+    "fault": null
+  },
+  {
+    "name": "EvaluatePodReadinessGuards",
+    "params": {},
+    "location": "OC:476-485,636-685; PS:282-325",
+    "scenarios": [
+      1,
+      3,
+      4,
+      5
+    ],
+    "guards": [
+      "s.env.operatorUp",
+      "s.op.pc=\"collect\"",
+      "s.op.collected=s.op.active"
+    ],
+    "updates": [
+      [
+        "op.pc",
+        "IF s.op.active={} THEN \"idle\" ELSE LET b==Best(s.op.active) IN IF Cardinality(ObservedPrimaries)>1 \\/ (s.op.http[b].ok /\\ b\\notin s.op.ready) \\/ (s.op.cluster.current=s.op.cluster.target /\\ s.op.cluster.current\\in s.op.ready /\\ ~s.op.http[s.op.cluster.current].ok) THEN \"idle\" ELSE \"choose\""
+      ]
+    ],
+    "note": "",
+    "fault": null
+  },
+  {
+    "name": "ReconcileTargetPrimaryForNonReplicaCluster",
+    "params": {},
+    "location": "OR:99-139; OC:545-547",
+    "scenarios": [
+      1,
+      4,
+      5
+    ],
+    "guards": [
+      "s.env.operatorUp",
+      "s.op.pc=\"choose\"",
+      "~s.op.requested \\/ s.op.cluster.current\\notin ObservedPrimaries",
+      "s.op.active#{}"
+    ],
+    "updates": [
+      [
+        "op.candidate",
+        "Best(s.op.active)"
+      ],
+      [
+        "op.purpose",
+        "\"failover\""
+      ],
+      [
+        "op.pc",
+        "LET b==Best(s.op.active) IN IF s.op.cluster.target=b \\/ ~s.op.http[b].ok THEN \"idle\" ELSE IF s.op.cluster.current=s.op.cluster.target /\\ FailoverQuorumEnabled THEN \"quorumGet\" ELSE \"failoverPhaseGet\""
+      ]
+    ],
+    "note": "Failover-delay policy is an elapsed precondition of this step; no fixed-latency claim is checked.",
+    "fault": null
+  },
+  {
+    "name": "EvaluateQuorumCheck_Get",
+    "params": {},
+    "location": "OQ:48-60; OQ:76-117",
+    "scenarios": [
+      4,
+      5
+    ],
+    "guards": [
+      "s.env.operatorUp",
+      "s.op.pc=\"quorumGet\""
+    ],
+    "updates": [
+      [
+        "op.quorum",
+        "s.op.qcache"
+      ],
+      [
+        "op.pc",
+        "\"quorumDecision\""
+      ]
+    ],
+    "note": "Operator informer read; instance-manager quorum reads below are direct API reads.",
+    "fault": null
+  },
+  {
+    "name": "DeliverFailoverQuorum",
+    "params": {},
+    "location": "OQ:48-60; OC:120-135 (cached client)",
+    "scenarios": [
+      4
+    ],
+    "guards": [
+      "s.env.operatorUp",
+      "s.env.operatorAPI",
+      "s.op.qcache#s.quorum"
+    ],
+    "updates": [
+      [
+        "op.qcache",
+        "s.quorum"
+      ]
+    ],
+    "note": "Deliver latest real object; old observation remains valid until delivery.",
+    "fault": null
+  },
+  {
+    "name": "EvaluateQuorumCheckWithStatus",
+    "params": {},
+    "location": "OQ:76-117; OR:114-139",
+    "scenarios": [
+      4,
+      5
+    ],
+    "guards": [
+      "s.env.operatorUp",
+      "s.op.pc=\"quorumDecision\""
+    ],
+    "updates": [
+      [
+        "op.pc",
+        "IF QuorumAllows(s.op.quorum,ObservedReady) THEN \"failoverPhaseGet\" ELSE \"idle\""
+      ]
+    ],
+    "note": "",
+    "fault": null
+  },
+  {
+    "name": "UpdatePrimaryPod_Select",
+    "params": {},
+    "location": "OU:229-264; OR:298-329",
+    "scenarios": [
+      1,
+      2,
+      3,
+      5
+    ],
+    "guards": [
+      "s.env.operatorUp",
+      "s.op.pc=\"choose\"",
+      "s.op.requested",
+      "s.op.cluster.current\\in ObservedPrimaries",
+      "s.op.cluster.current=s.op.cluster.target",
+      "s.op.active\\{s.op.cluster.current}#{}",
+      "LET n==Best(s.op.active\\{s.op.cluster.current}) IN n\\in ObservedReady /\\ s.op.http[n].receiver"
+    ],
+    "updates": [
+      [
+        "op.candidate",
+        "Best(s.op.active\\{s.op.cluster.current})"
+      ],
+      [
+        "op.purpose",
+        "\"planned\""
+      ],
+      [
+        "op.pc",
+        "\"plannedPhaseGet\""
+      ],
+      [
+        "op.requested",
+        "FALSE"
+      ]
+    ],
+    "note": "Supported rolling/drain selection; no manual promotion override. Selected receiver must be active.",
+    "fault": null
+  },
+  {
+    "name": "UpdatePrimaryPod_Wait",
+    "params": {},
+    "location": "OU:242-255; OR:299-312",
+    "scenarios": [
+      3,
+      5
+    ],
+    "guards": [
+      "s.env.operatorUp",
+      "s.op.pc=\"choose\"",
+      "s.op.requested",
+      "s.op.cluster.current\\in ObservedPrimaries",
+      "s.op.active\\{s.op.cluster.current}={} \\/ (LET n==Best(s.op.active\\{s.op.cluster.current}) IN n\\notin ObservedReady \\/ ~s.op.http[n].receiver)"
+    ],
+    "updates": [
+      [
+        "op.pc",
+        "\"idle\""
+      ]
+    ],
+    "note": "",
+    "fault": null
+  },
+  {
+    "name": "RegisterPhase_Get",
+    "params": {},
+    "location": "OS:765-776; SP:52-61",
+    "scenarios": [
+      1,
+      2,
+      3,
+      4,
+      5
+    ],
+    "guards": [
+      "s.env.operatorUp",
+      "s.op.pc \\in {\"failoverPhaseGet\",\"plannedPhaseGet\",\"selectedPhaseGet\"}"
+    ],
+    "updates": [
+      [
+        "op.phaseRead",
+        "s.op.cache"
+      ],
+      [
+        "op.pc",
+        "IF s.op.pc=\"failoverPhaseGet\" THEN \"failoverPhasePatch\" ELSE IF s.op.pc=\"plannedPhaseGet\" THEN \"plannedPhasePatch\" ELSE \"selectedPhasePatch\""
+      ]
+    ],
+    "note": "",
+    "fault": null
+  },
+  {
+    "name": "RegisterPhase_Patch",
+    "params": {},
+    "location": "SP:63-75; OR:135-139,176-196; OU:170-174",
+    "scenarios": [
+      1,
+      2,
+      3,
+      4,
+      5
+    ],
+    "guards": [
+      "s.env.operatorUp",
+      "s.env.operatorAPI",
+      "s.op.pc \\in {\"failoverPhasePatch\",\"plannedPhasePatch\",\"selectedPhasePatch\"}",
+      "s.op.phaseRead.phase=(IF s.op.purpose=\"planned\" THEN \"switchover\" ELSE \"failover\") \\/ s.op.phaseRead.rv=s.cluster.rv"
+    ],
+    "updates": [
+      [
+        "cluster",
+        "IF s.op.phaseRead.phase=(IF s.op.purpose=\"planned\" THEN \"switchover\" ELSE \"failover\") THEN s.cluster ELSE [s.cluster EXCEPT !.phase=IF s.op.purpose=\"planned\" THEN \"switchover\" ELSE \"failover\", !.rv=ClusterRV]"
+      ],
+      [
+        "op.cluster",
+        "IF s.op.phaseRead.phase=(IF s.op.purpose=\"planned\" THEN \"switchover\" ELSE \"failover\") THEN s.op.cluster ELSE [s.cluster EXCEPT !.phase=IF s.op.purpose=\"planned\" THEN \"switchover\" ELSE \"failover\", !.rv=ClusterRV]"
+      ],
+      [
+        "op.pc",
+        "IF s.op.pc=\"failoverPhasePatch\" THEN \"pendingPatch\" ELSE \"targetPatch\""
+      ]
+    ],
+    "note": "Conditional patch refreshes caller status on change; no-op preserves caller snapshot.",
+    "fault": null
+  },
+  {
+    "name": "RegisterPhase_Conflict",
+    "params": {},
+    "location": "SP:52-75",
+    "scenarios": [
+      5
+    ],
+    "guards": [
+      "s.env.operatorUp",
+      "s.op.pc \\in {\"failoverPhasePatch\",\"plannedPhasePatch\",\"selectedPhasePatch\"}",
+      "s.op.phaseRead.rv#s.cluster.rv",
+      "s.op.phaseRead.phase#(IF s.op.purpose=\"planned\" THEN \"switchover\" ELSE \"failover\")"
+    ],
+    "updates": [
+      [
+        "op.pc",
+        "IF s.op.pc=\"failoverPhasePatch\" THEN \"failoverPhaseGet\" ELSE IF s.op.pc=\"plannedPhasePatch\" THEN \"plannedPhaseGet\" ELSE \"selectedPhaseGet\""
+      ]
+    ],
+    "note": "",
+    "fault": null
+  },
+  {
+    "name": "SetPrimaryInstance_Pending",
+    "params": {},
+    "location": "OR:129-159; OS:752-760",
+    "scenarios": [
+      1,
+      4,
+      5
+    ],
+    "guards": [
+      "s.env.operatorUp",
+      "s.env.operatorAPI",
+      "s.op.pc=\"pendingPatch\""
+    ],
+    "updates": [
+      [
+        "cluster.target",
+        "Pending"
+      ],
+      [
+        "cluster.rv",
+        "ClusterRV"
+      ],
+      [
+        "op.cluster.target",
+        "Pending"
+      ],
+      [
+        "op.cluster.rv",
+        "ClusterRV"
+      ],
+      [
+        "op.pc",
+        "\"pendingLabel\""
+      ]
+    ],
+    "note": "Merge patch of target only; no added optimistic precondition.",
+    "fault": null
+  },
+  {
+    "name": "AreWalReceiversDown",
+    "params": {},
+    "location": "OR:161-196; PS:331-341",
+    "scenarios": [
+      1,
+      4,
+      5
+    ],
+    "guards": [
+      "s.env.operatorUp",
+      "s.op.pc=\"receivers\""
+    ],
+    "updates": [
+      [
+        "op.pc",
+        "IF AllObservedReceiversDown THEN \"selectedPhaseGet\" ELSE \"idle\""
+      ]
+    ],
+    "note": "Uses the already-collected sequential HTTP snapshot, not new reads.",
+    "fault": null
+  },
+  {
+    "name": "SetPrimaryInstance_Target",
+    "params": {},
+    "location": "OR:196,329; OS:752-760; OU:170-174",
+    "scenarios": [
+      1,
+      2,
+      3,
+      4,
+      5
+    ],
+    "guards": [
+      "s.env.operatorUp",
+      "s.env.operatorAPI",
+      "s.op.pc=\"targetPatch\"",
+      "s.op.candidate\\in Server"
+    ],
+    "updates": [
+      [
+        "cluster.target",
+        "s.op.candidate"
+      ],
+      [
+        "cluster.rv",
+        "ClusterRV"
+      ],
+      [
+        "op.cluster.target",
+        "s.op.candidate"
+      ],
+      [
+        "op.cluster.rv",
+        "ClusterRV"
+      ],
+      [
+        "op.pc",
+        "\"idle\""
+      ]
+    ],
+    "note": "",
+    "fault": null
+  },
+  {
+    "name": "DeliverCluster",
+    "params": {
+      "n": "Server"
+    },
+    "location": "CMD:185-215; IC:136-164",
+    "scenarios": [
+      1,
+      3,
+      4,
+      5
+    ],
+    "guards": [
+      "Reconciler(n)",
+      "s.env.api[n]",
+      "s.cache[n]#s.cluster"
+    ],
+    "updates": [
+      [
+        "cache[n]",
+        "s.cluster"
+      ]
+    ],
+    "note": "",
+    "fault": null
+  },
+  {
+    "name": "InstanceReconcile_GetCluster",
+    "params": {
+      "n": "Server"
+    },
+    "location": "IC:136-164,206-217",
+    "scenarios": [
+      1,
+      3,
+      4,
+      5
+    ],
+    "guards": [
+      "Reconciler(n)",
+      "s.inst[n].pc=\"idle\""
+    ],
+    "updates": [
+      [
+        "inst[n].snapshot",
+        "s.cache[n]"
+      ],
+      [
+        "inst[n].pc",
+        "\"files\""
+      ]
+    ],
+    "note": "",
+    "fault": null
+  },
+  {
+    "name": "RefreshConfigurationFiles",
+    "params": {
+      "n": "Server"
+    },
+    "location": "IC:206-217,417-453; pkg/management/postgres/configuration.go:69-99; SY:45-79",
+    "scenarios": [
+      1,
+      3,
+      4
+    ],
+    "guards": [
+      "Reconciler(n)",
+      "s.inst[n].pc=\"files\""
+    ],
+    "updates": [
+      [
+        "data[n].fileConfig",
+        "SyncConfig(s.inst[n].snapshot,n)"
+      ],
+      [
+        "inst[n].reloadNeeded",
+        "s.data[n].fileConfig#SyncConfig(s.inst[n].snapshot,n)"
+      ],
+      [
+        "inst[n].pc",
+        "IF s.inst[n].initialized THEN \"ready\" ELSE \"initialize\""
+      ]
+    ],
+    "note": "",
+    "fault": null
+  },
+  {
+    "name": "VerifyPgDataCoherenceForPrimary",
+    "params": {
+      "n": "Server"
+    },
+    "location": "IS:41-49,72-85; IC:212-227",
+    "scenarios": [
+      1
+    ],
+    "guards": [
+      "Reconciler(n)",
+      "s.inst[n].pc=\"initialize\"",
+      "s.data[n].diskRole=\"replica\" \\/ s.inst[n].snapshot.target=n"
+    ],
+    "updates": [
+      [
+        "inst[n].initialized",
+        "TRUE"
+      ],
+      [
+        "inst[n].pc",
+        "\"ready\""
+      ]
+    ],
+    "note": "Startup permission is not coupled to any lease read or acquisition.",
+    "fault": null
+  },
+  {
+    "name": "VerifyPgDataCoherenceForPrimary_Wait",
+    "params": {
+      "n": "Server"
+    },
+    "location": "IS:87-110",
+    "scenarios": [
+      1,
+      5
+    ],
+    "guards": [
+      "Reconciler(n)",
+      "s.inst[n].pc=\"initialize\"",
+      "s.data[n].diskRole=\"primary\"",
+      "s.inst[n].snapshot.target#n",
+      "s.inst[n].snapshot.current#s.inst[n].snapshot.target \\/ ~Writer(s.inst[n].snapshot.current)"
+    ],
+    "updates": [
+      [
+        "inst[n].pc",
+        "\"idle\""
+      ]
+    ],
+    "note": "",
+    "fault": null
+  },
+  {
+    "name": "VerifyPgDataCoherenceForPrimary_Archive",
+    "params": {
+      "n": "Server"
+    },
+    "location": "IS:108-146",
+    "scenarios": [
+      1
+    ],
+    "guards": [
+      "Reconciler(n)",
+      "s.inst[n].pc=\"initialize\"",
+      "s.data[n].diskRole=\"primary\"",
+      "s.inst[n].snapshot.target#n",
+      "s.inst[n].snapshot.current=s.inst[n].snapshot.target",
+      "Writer(s.inst[n].snapshot.current)",
+      "s.env.io[n]"
+    ],
+    "updates": [
+      [
+        "archive",
+        "IF ArchiveEnabled THEN s.archive \\cup {[timeline |-> s.data[n].timeline, prefix |-> s.data[n].durable]} ELSE s.archive"
+      ],
+      [
+        "inst[n].pc",
+        "\"rewind\""
+      ]
+    ],
+    "note": "",
+    "fault": null
+  },
+  {
+    "name": "Rewind_Demote",
+    "params": {
+      "n": "Server"
+    },
+    "location": "IS:146-152; PG:1011-1028",
+    "scenarios": [
+      1,
+      5
+    ],
+    "guards": [
+      "Reconciler(n)",
+      "s.inst[n].pc=\"rewind\"",
+      "Writer(s.inst[n].snapshot.current)",
+      "s.env.io[n]"
+    ],
+    "updates": [
+      [
+        "data[n].diskRole",
+        "\"replica\""
+      ],
+      [
+        "data[n].generated",
+        "s.data[s.inst[n].snapshot.current].durable"
+      ],
+      [
+        "data[n].received",
+        "s.data[s.inst[n].snapshot.current].durable"
+      ],
+      [
+        "data[n].durable",
+        "s.data[s.inst[n].snapshot.current].durable"
+      ],
+      [
+        "data[n].replayed",
+        "s.data[s.inst[n].snapshot.current].durable"
+      ],
+      [
+        "data[n].timeline",
+        "s.data[s.inst[n].snapshot.current].timeline"
+      ],
+      [
+        "inst[n].initialized",
+        "TRUE"
+      ],
+      [
+        "inst[n].pc",
+        "\"ready\""
+      ]
+    ],
+    "note": "Rewind is completed before any standby start; disk durability is retained across earlier crashes.",
+    "fault": null
+  },
+  {
+    "name": "RunPostgresAndWait",
+    "params": {
+      "n": "Server"
+    },
+    "location": "LP:62-103,129-140",
+    "scenarios": [
+      1
+    ],
+    "guards": [
+      "Reconciler(n)",
+      "s.inst[n].initialized",
+      "s.data[n].pgState=\"down\"",
+      "s.env.io[n]"
+    ],
+    "updates": [
+      [
+        "data[n].pgState",
+        "\"running\""
+      ],
+      [
+        "data[n].stopWrites",
+        "FALSE"
+      ],
+      [
+        "data[n].runtimeConfig",
+        "s.data[n].fileConfig"
+      ],
+      [
+        "life[n].postgresExited",
+        "FALSE"
+      ],
+      [
+        "life[n].archiveComplete",
+        "FALSE"
+      ]
+    ],
+    "note": "Actual postmaster start occurs after initialization, before reconcilePrimary.",
+    "fault": null
+  },
+  {
+    "name": "InstanceIsReady",
+    "params": {
+      "n": "Server"
+    },
+    "location": "IC:229-246",
+    "scenarios": [
+      1,
+      3,
+      4,
+      5
+    ],
+    "guards": [
+      "Reconciler(n)",
+      "s.inst[n].pc=\"ready\""
+    ],
+    "updates": [
+      [
+        "inst[n].pc",
+        "IF DBReady(n) THEN \"primary\" ELSE \"idle\""
+      ]
+    ],
+    "note": "The readiness guard precedes both promotion and old-primary retirement.",
+    "fault": null
+  },
+  {
+    "name": "ReconcilePrimary",
+    "params": {
+      "n": "Server"
+    },
+    "location": "IC:1203-1226",
+    "scenarios": [
+      1,
+      2,
+      3
+    ],
+    "guards": [
+      "Reconciler(n)",
+      "s.inst[n].pc=\"primary\""
+    ],
+    "updates": [
+      [
+        "inst[n].pc",
+        "IF s.inst[n].snapshot.target=n THEN \"acquire\" ELSE \"oldPrimary\""
+      ]
+    ],
+    "note": "",
+    "fault": null
+  },
+  {
+    "name": "Acquire",
+    "params": {
+      "n": "Server"
+    },
+    "location": "LR:147-162; IC:1215-1234",
+    "scenarios": [
+      1,
+      2,
+      3
+    ],
+    "guards": [
+      "Reconciler(n)",
+      "s.inst[n].pc=\"acquire\""
+    ],
+    "updates": [
+      [
+        "elect[n]",
+        "IF s.elect[n].captured=0 THEN [s.elect[n] EXCEPT !.captured=s.inst[n].snapshot.leaseGeneration, !.pc=\"preGet\", !.pollAge=0] ELSE s.elect[n]"
+      ],
+      [
+        "inst[n].pc",
+        "\"acquireWait\""
+      ],
+      [
+        "inst[n].acquireAge",
+        "0"
+      ]
+    ],
+    "note": "Only the first call captures the lease profile. Caller timeout does not cancel the runnable.",
+    "fault": null
+  },
+  {
+    "name": "Acquire_Return",
+    "params": {
+      "n": "Server"
+    },
+    "location": "LR:158-162; IC:1237-1259",
+    "scenarios": [
+      1,
+      2,
+      3
+    ],
+    "guards": [
+      "Reconciler(n)",
+      "s.inst[n].pc=\"acquireWait\"",
+      "s.elect[n].firstAcquired"
+    ],
+    "updates": [
+      [
+        "inst[n].pc",
+        "IF s.data[n].diskRole=\"primary\" THEN \"completePatch\" ELSE \"receiverWait\""
+      ]
+    ],
+    "note": "Closed heldCh is a one-shot notification, not a fresh ownership predicate.",
+    "fault": null
+  },
+  {
+    "name": "Acquire_Deadline",
+    "params": {
+      "n": "Server"
+    },
+    "location": "IC:1215-1234; LR:150-162",
+    "scenarios": [
+      1
+    ],
+    "guards": [
+      "Reconciler(n)",
+      "s.inst[n].pc=\"acquireWait\"",
+      "~s.elect[n].firstAcquired",
+      "s.inst[n].acquireAge>=LeaseProfiles[s.inst[n].snapshot.leaseGeneration].duration+3*LeaseProfiles[s.inst[n].snapshot.leaseGeneration].retry"
+    ],
+    "updates": [
+      [
+        "inst[n].pc",
+        "\"idle\""
+      ]
+    ],
+    "note": "Caller retry is separate from the background preAcquire goroutine.",
+    "fault": null
+  },
+  {
+    "name": "WaitForWalReceiverDown",
+    "params": {
+      "n": "Server"
+    },
+    "location": "IC:1295-1306,1343-1359",
+    "scenarios": [
+      1,
+      2,
+      3
+    ],
+    "guards": [
+      "Reconciler(n)",
+      "s.inst[n].pc=\"receiverWait\"",
+      "s.inst[n].snapshot.current=n \\/ ~Receiver(n)"
+    ],
+    "updates": [
+      [
+        "inst[n].pc",
+        "\"promoteRequest\""
+      ]
+    ],
+    "note": "Checks the selected node itself, even if operator HTTP receiver fields were unavailable.",
+    "fault": null
+  },
+  {
+    "name": "PromoteAndWait_Request",
+    "params": {
+      "n": "Server"
+    },
+    "location": "PR:35-56; IC:1304-1309",
+    "scenarios": [
+      1,
+      2,
+      3,
+      4
+    ],
+    "guards": [
+      "Reconciler(n)",
+      "s.inst[n].pc=\"promoteRequest\"",
+      "DBReady(n)",
+      "s.data[n].diskRole=\"replica\""
+    ],
+    "updates": [
+      [
+        "data[n].promotePC",
+        "\"requested\""
+      ],
+      [
+        "inst[n].pc",
+        "\"promoteWait\""
+      ]
+    ],
+    "note": "pg_ctl promotion request; PostgreSQL finishes available WAL before the physical role changes.",
+    "fault": null
+  },
+  {
+    "name": "PromoteAndWait_Complete",
+    "params": {
+      "n": "Server"
+    },
+    "location": "PR:58-93; FD:68-86; IC:1255-1268",
+    "scenarios": [
+      1,
+      2,
+      3,
+      4
+    ],
+    "guards": [
+      "Running(n)",
+      "s.env.io[n]",
+      "s.data[n].promotePC=\"requested\"",
+      "s.data[n].replayed=s.data[n].durable",
+      "s.data[n].received=s.data[n].durable",
+      "\\A a \\in s.archive : a.timeline=s.data[n].timeline /\\ Prefix(s.data[n].durable,a.prefix) => Len(a.prefix)<=Len(s.data[n].durable)"
+    ],
+    "updates": [
+      [
+        "data[n].diskRole",
+        "\"primary\""
+      ],
+      [
+        "data[n].generated",
+        "s.data[n].durable"
+      ],
+      [
+        "data[n].receiver",
+        "None"
+      ],
+      [
+        "data[n].timeline",
+        "<<n,s.data[n].replayed>>"
+      ],
+      [
+        "data[n].promotePC",
+        "\"done\""
+      ],
+      [
+        "history",
+        "s.history \\cup {[node |-> n, retained |-> s.data[n].durable, fork |-> s.data[n].replayed, acks |-> s.acks, cleanFrom |-> s.elect[n].cleanFrom, cleanAcks |-> s.elect[n].cleanAcks, timeline |-> <<n,s.data[n].replayed>>]}"
+      ]
+    ],
+    "note": "Missing archive successor is an observed end-of-WAL, not proof the previous primary finished archiving.",
+    "fault": null
+  },
+  {
+    "name": "PromoteAndWait_Return",
+    "params": {
+      "n": "Server"
+    },
+    "location": "PR:66-93; IC:1256-1266",
+    "scenarios": [
+      1,
+      3,
+      4
+    ],
+    "guards": [
+      "Reconciler(n)",
+      "s.inst[n].pc=\"promoteWait\"",
+      "s.data[n].promotePC=\"done\""
+    ],
+    "updates": [
+      [
+        "inst[n].pc",
+        "\"completePatch\""
+      ]
+    ],
+    "note": "",
+    "fault": null
+  },
+  {
+    "name": "ReconcilePrimary_CompleteStatus",
+    "params": {
+      "n": "Server"
+    },
+    "location": "IC:1237,1262-1268",
+    "scenarios": [
+      1,
+      3,
+      4,
+      5
+    ],
+    "guards": [
+      "Reconciler(n)",
+      "s.env.api[n]",
+      "s.inst[n].pc=\"completePatch\""
+    ],
+    "updates": [
+      [
+        "cluster",
+        "IF s.inst[n].snapshot.current=n THEN s.cluster ELSE [s.cluster EXCEPT !.current=n, !.rv=ClusterRV]"
+      ],
+      [
+        "inst[n].snapshot.current",
+        "n"
+      ],
+      [
+        "inst[n].pc",
+        "\"oldPrimary\""
+      ]
+    ],
+    "note": "Merge patch of currentPrimary; source has no fresh target/version precondition.",
+    "fault": null
+  },
+  {
+    "name": "ReconcileOldPrimary",
+    "params": {
+      "n": "Server"
+    },
+    "location": "IC:614-639",
+    "scenarios": [
+      1,
+      2,
+      3,
+      5
+    ],
+    "guards": [
+      "Reconciler(n)",
+      "s.inst[n].pc=\"oldPrimary\""
+    ],
+    "updates": [
+      [
+        "inst[n].pc",
+        "IF s.inst[n].snapshot.target#n /\\ s.data[n].diskRole=\"primary\" THEN \"retiring\" ELSE \"config\""
+      ],
+      [
+        "life[n]",
+        "IF s.inst[n].snapshot.target#n /\\ s.data[n].diskRole=\"primary\" THEN [s.life[n] EXCEPT !.cause=\"demotion\", !.phase=\"requested\", !.stopAge=0] ELSE s.life[n]"
+      ]
+    ],
+    "note": "Send lifecycle command and wait. Demotion never reuses heldCh in the same manager process.",
+    "fault": null
+  },
+  {
+    "name": "ReconcileConfiguration",
+    "params": {
+      "n": "Server"
+    },
+    "location": "IC:277-299; IQ:98-109",
+    "scenarios": [
+      3,
+      4
+    ],
+    "guards": [
+      "Reconciler(n)",
+      "s.inst[n].pc=\"config\""
+    ],
+    "updates": [
+      [
+        "inst[n].pc",
+        "IF s.inst[n].reloadNeeded THEN IF ManageQuorum(n) THEN \"resetGet\" ELSE \"reload\" ELSE \"metadata\""
+      ]
+    ],
+    "note": "",
+    "fault": null
+  },
+  {
+    "name": "ResetFailoverQuorumObject_Get",
+    "params": {
+      "n": "Server"
+    },
+    "location": "IQ:34-49; CMD:219-230",
+    "scenarios": [
+      4
+    ],
+    "guards": [
+      "Reconciler(n)",
+      "s.env.api[n]",
+      "s.inst[n].pc=\"resetGet\""
+    ],
+    "updates": [
+      [
+        "inst[n].qread",
+        "s.quorum"
+      ],
+      [
+        "inst[n].pc",
+        "\"resetUpdate\""
+      ]
+    ],
+    "note": "",
+    "fault": null
+  },
+  {
+    "name": "ResetFailoverQuorumObject_Update",
+    "params": {
+      "n": "Server"
+    },
+    "location": "IQ:39-49; IC:288-291",
+    "scenarios": [
+      4
+    ],
+    "guards": [
+      "Reconciler(n)",
+      "s.env.api[n]",
+      "s.inst[n].pc=\"resetUpdate\"",
+      "s.inst[n].qread.rv=s.quorum.rv"
+    ],
+    "updates": [
+      [
+        "quorum",
+        "[EmptyQuorum EXCEPT !.rv=QuorumRV]"
+      ],
+      [
+        "inst[n].pc",
+        "\"reload\""
+      ]
+    ],
+    "note": "",
+    "fault": null
+  },
+  {
+    "name": "FailoverQuorum_Conflict",
+    "params": {
+      "n": "Server"
+    },
+    "location": "IQ:39-49,80-95",
+    "scenarios": [
+      4
+    ],
+    "guards": [
+      "Reconciler(n)",
+      "s.inst[n].pc\\in {\"resetUpdate\",\"quorumUpdate\"}",
+      "s.inst[n].qread.rv#s.quorum.rv"
+    ],
+    "updates": [
+      [
+        "inst[n].pc",
+        "IF s.inst[n].pc=\"resetUpdate\" THEN \"resetGet\" ELSE \"quorumRead\""
+      ]
+    ],
+    "note": "",
+    "fault": null
+  },
+  {
+    "name": "Reload",
+    "params": {
+      "n": "Server"
+    },
+    "location": "IC:288-295; PG:727-756",
+    "scenarios": [
+      3,
+      4
+    ],
+    "guards": [
+      "Reconciler(n)",
+      "s.inst[n].pc=\"reload\"",
+      "Running(n)"
+    ],
+    "updates": [
+      [
+        "inst[n].pc",
+        "\"reloadWait\""
+      ]
+    ],
+    "note": "pg_ctl reload request is separate from runtime application.",
+    "fault": null
+  },
+  {
+    "name": "ProcessConfigReloadAndManageRestart",
+    "params": {
+      "n": "Server"
+    },
+    "location": "IC:291-299; PG:1100-1115,1120-1150",
+    "scenarios": [
+      3,
+      4
+    ],
+    "guards": [
+      "Reconciler(n)",
+      "s.inst[n].pc=\"reloadWait\"",
+      "DBReady(n)"
+    ],
+    "updates": [
+      [
+        "data[n].runtimeConfig",
+        "s.data[n].fileConfig"
+      ],
+      [
+        "inst[n].reloadNeeded",
+        "FALSE"
+      ],
+      [
+        "inst[n].pc",
+        "\"metadata\""
+      ]
+    ],
+    "note": "Successful observed config hash; no historical hash-check regression is modeled.",
+    "fault": null
+  },
+  {
+    "name": "GetSynchronousReplicationMetadata",
+    "params": {
+      "n": "Server"
+    },
+    "location": "IQ:54-78; PG:1156-1181",
+    "scenarios": [
+      4
+    ],
+    "guards": [
+      "Reconciler(n)",
+      "s.inst[n].pc=\"metadata\"",
+      "~ManageQuorum(n) \\/ DBReady(n)"
+    ],
+    "updates": [
+      [
+        "inst[n].metadata",
+        "IF ManageQuorum(n) THEN [EmptyQuorum EXCEPT !.primary=n, !.members=s.data[n].runtimeConfig.members\\{n}, !.number=s.data[n].runtimeConfig.number, !.generation=s.data[n].runtimeConfig.generation, !.timeline=s.data[n].timeline] ELSE EmptyQuorum"
+      ],
+      [
+        "inst[n].pc",
+        "IF ManageQuorum(n) THEN \"quorumRead\" ELSE \"idle\""
+      ]
+    ],
+    "note": "Read runtime metadata once before conflict retries; provenance is diagnostic, not an extra guard.",
+    "fault": null
+  },
+  {
+    "name": "UpdateFailoverQuorumObject_Get",
+    "params": {
+      "n": "Server"
+    },
+    "location": "IQ:80-89; CMD:219-230",
+    "scenarios": [
+      4
+    ],
+    "guards": [
+      "Reconciler(n)",
+      "s.env.api[n]",
+      "s.inst[n].pc=\"quorumRead\""
+    ],
+    "updates": [
+      [
+        "inst[n].qread",
+        "s.quorum"
+      ],
+      [
+        "inst[n].pc",
+        "\"quorumUpdate\""
+      ]
+    ],
+    "note": "",
+    "fault": null
+  },
+  {
+    "name": "UpdateFailoverQuorumObject_Update",
+    "params": {
+      "n": "Server"
+    },
+    "location": "IQ:88-95",
+    "scenarios": [
+      4
+    ],
+    "guards": [
+      "Reconciler(n)",
+      "s.env.api[n]",
+      "s.inst[n].pc=\"quorumUpdate\"",
+      "s.inst[n].qread.rv=s.quorum.rv"
+    ],
+    "updates": [
+      [
+        "quorum",
+        "IF [s.quorum EXCEPT !.rv=0]=s.inst[n].metadata THEN s.quorum ELSE [s.inst[n].metadata EXCEPT !.rv=QuorumRV]"
+      ],
+      [
+        "inst[n].pc",
+        "\"idle\""
+      ]
+    ],
+    "note": "",
+    "fault": null
+  },
+  {
+    "name": "TryTakeOver_Get",
+    "params": {
+      "n": "Server"
+    },
+    "location": "LR:295-310; LL:42-53",
+    "scenarios": [
+      1,
+      2
+    ],
+    "guards": [
+      "Reconciler(n)",
+      "s.elect[n].pc=\"preGet\"",
+      "s.env.api[n]"
+    ],
+    "updates": [
+      [
+        "elect[n].read",
+        "s.lease"
+      ],
+      [
+        "elect[n].pc",
+        "\"preCheck\""
+      ]
+    ],
+    "note": "",
+    "fault": null
+  },
+  {
+    "name": "TryTakeOver_ReadError",
+    "params": {
+      "n": "Server"
+    },
+    "location": "LR:302-304,383-397",
+    "scenarios": [
+      1
+    ],
+    "guards": [
+      "Reconciler(n)",
+      "s.elect[n].pc=\"preGet\"",
+      "~s.env.api[n]"
+    ],
+    "updates": [
+      [
+        "elect[n].pc",
+        "\"preWait\""
+      ],
+      [
+        "elect[n].pollAge",
+        "0"
+      ]
+    ],
+    "note": "",
+    "fault": null
+  },
+  {
+    "name": "TryTakeOver_OwnHolder",
+    "params": {
+      "n": "Server"
+    },
+    "location": "LR:308-310,443-450",
+    "scenarios": [
+      1
+    ],
+    "guards": [
+      "Reconciler(n)",
+      "s.elect[n].pc=\"preCheck\"",
+      "s.elect[n].read.holder=n"
+    ],
+    "updates": [
+      [
+        "elect[n].pc",
+        "\"signal\""
+      ]
+    ],
+    "note": "Own-holder observation is accepted without first renewing.",
+    "fault": null
+  },
+  {
+    "name": "TryTakeOver_EmptyHolder",
+    "params": {
+      "n": "Server"
+    },
+    "location": "LR:313-318",
+    "scenarios": [
+      1,
+      2
+    ],
+    "guards": [
+      "Reconciler(n)",
+      "s.elect[n].pc=\"preCheck\"",
+      "s.elect[n].read.holder=None"
+    ],
+    "updates": [
+      [
+        "elect[n].pc",
+        "\"claim\""
+      ]
+    ],
+    "note": "",
+    "fault": null
+  },
+  {
+    "name": "TryTakeOver_ForeignHolder",
+    "params": {
+      "n": "Server"
+    },
+    "location": "LR:320-334,340-342",
+    "scenarios": [
+      1
+    ],
+    "guards": [
+      "Reconciler(n)",
+      "s.elect[n].pc=\"preCheck\"",
+      "s.elect[n].read.holder\\notin {None,n}"
+    ],
+    "updates": [
+      [
+        "elect[n].pc",
+        "IF s.elect[n].takeoverObserved /\\ s.elect[n].takeoverObservation.holder=s.elect[n].read.holder /\\ s.elect[n].takeoverObservation.renew=s.elect[n].read.renew /\\ s.elect[n].takeoverAge>=LeaseProfiles[s.elect[n].captured].duration THEN \"claim\" ELSE \"preWait\""
+      ],
+      [
+        "elect[n].takeoverAge",
+        "IF ~s.elect[n].takeoverObserved \\/ s.elect[n].takeoverObservation.holder#s.elect[n].read.holder \\/ s.elect[n].takeoverObservation.renew#s.elect[n].read.renew THEN 0 ELSE s.elect[n].takeoverAge"
+      ],
+      [
+        "elect[n].takeoverObservation",
+        "s.elect[n].read"
+      ],
+      [
+        "elect[n].takeoverObserved",
+        "TRUE"
+      ],
+      [
+        "elect[n].pollAge",
+        "0"
+      ]
+    ],
+    "note": "Foreign record uses the candidate captured duration. No retirement occurs in this branch, even after a previous acquisition.",
+    "fault": null
+  },
+  {
+    "name": "PreAcquire_Retry",
+    "params": {
+      "n": "Server"
+    },
+    "location": "LR:370-398",
+    "scenarios": [
+      1
+    ],
+    "guards": [
+      "Reconciler(n)",
+      "s.elect[n].pc=\"preWait\"",
+      "s.elect[n].pollAge>=LeaseProfiles[s.elect[n].captured].retry"
+    ],
+    "updates": [
+      [
+        "elect[n].pc",
+        "\"preGet\""
+      ]
+    ],
+    "note": "",
+    "fault": null
+  },
+  {
+    "name": "Claim",
+    "params": {
+      "n": "Server"
+    },
+    "location": "LR:344-360; LL:73-95",
+    "scenarios": [
+      1,
+      2
+    ],
+    "guards": [
+      "Reconciler(n)",
+      "s.env.api[n]",
+      "s.elect[n].pc=\"claim\"",
+      "s.elect[n].read.rv=s.lease.rv"
+    ],
+    "updates": [
+      [
+        "lease",
+        "[s.lease EXCEPT !.holder=n, !.duration=LeaseProfiles[s.elect[n].captured].duration, !.renew=LeaseRV, !.rv=LeaseRV, !.cleanFrom=None, !.cleanAcks={}]"
+      ],
+      [
+        "elect[n].cleanFrom",
+        "s.elect[n].read.cleanFrom"
+      ],
+      [
+        "elect[n].cleanAcks",
+        "s.elect[n].read.cleanAcks"
+      ],
+      [
+        "elect[n].read",
+        "[s.lease EXCEPT !.holder=n, !.duration=LeaseProfiles[s.elect[n].captured].duration, !.renew=LeaseRV, !.rv=LeaseRV, !.cleanFrom=None, !.cleanAcks={}]"
+      ],
+      [
+        "elect[n].takeoverObserved",
+        "FALSE"
+      ],
+      [
+        "elect[n].pc",
+        "\"signal\""
+      ]
+    ],
+    "note": "Conditional API update. Only a matching resourceVersion can succeed.",
+    "fault": null
+  },
+  {
+    "name": "Claim_ConflictOrError",
+    "params": {
+      "n": "Server"
+    },
+    "location": "LR:348-357,383-397",
+    "scenarios": [
+      1
+    ],
+    "guards": [
+      "Reconciler(n)",
+      "s.elect[n].pc=\"claim\"",
+      "~s.env.api[n] \\/ s.elect[n].read.rv#s.lease.rv"
+    ],
+    "updates": [
+      [
+        "elect[n].pc",
+        "\"preWait\""
+      ],
+      [
+        "elect[n].pollAge",
+        "0"
+      ]
+    ],
+    "note": "",
+    "fault": null
+  },
+  {
+    "name": "RunLeaderElection_FirstAcquired",
+    "params": {
+      "n": "Server"
+    },
+    "location": "LR:443-450",
+    "scenarios": [
+      1,
+      2
+    ],
+    "guards": [
+      "Reconciler(n)",
+      "s.elect[n].pc=\"signal\""
+    ],
+    "updates": [
+      [
+        "elect[n].firstAcquired",
+        "TRUE"
+      ],
+      [
+        "elect[n].pc",
+        "\"runGet\""
+      ],
+      [
+        "elect[n].mode",
+        "\"acquire\""
+      ],
+      [
+        "elect[n].observed",
+        "FALSE"
+      ],
+      [
+        "elect[n].renewAge",
+        "0"
+      ],
+      [
+        "elect[n].pollAge",
+        "0"
+      ]
+    ],
+    "note": "heldCh closes before le.Run calls its own acquire, and never reopens in this process.",
+    "fault": null
+  },
+  {
+    "name": "LeaderElection_Retry",
+    "params": {
+      "n": "Server"
+    },
+    "location": "LE:253-275,284-306",
+    "scenarios": [
+      1
+    ],
+    "guards": [
+      "Reconciler(n)",
+      "s.elect[n].pc\\in {\"runIdle\",\"renewStart\"}",
+      "s.elect[n].pc=\"renewStart\" \\/ s.elect[n].pollAge>=LeaseProfiles[s.elect[n].captured].retry"
+    ],
+    "updates": [
+      [
+        "elect[n].pc",
+        "IF s.elect[n].mode=\"renew\" THEN \"renewFast\" ELSE \"runGet\""
+      ]
+    ],
+    "note": "",
+    "fault": null
+  },
+  {
+    "name": "LeaderElection_RenewFast",
+    "params": {
+      "n": "Server"
+    },
+    "location": "LE:454-466; LL:73-95",
+    "scenarios": [
+      1
+    ],
+    "guards": [
+      "Reconciler(n)",
+      "s.env.api[n]",
+      "s.elect[n].pc=\"renewFast\"",
+      "s.elect[n].read.rv=s.lease.rv",
+      "s.elect[n].read.holder=n",
+      "s.elect[n].observeAge<s.elect[n].read.duration"
+    ],
+    "updates": [
+      [
+        "lease",
+        "[s.lease EXCEPT !.holder=n, !.duration=LeaseProfiles[s.elect[n].captured].duration, !.renew=LeaseRV, !.rv=LeaseRV]"
+      ],
+      [
+        "elect[n].read",
+        "[s.lease EXCEPT !.holder=n, !.duration=LeaseProfiles[s.elect[n].captured].duration, !.renew=LeaseRV, !.rv=LeaseRV]"
+      ],
+      [
+        "elect[n].observation",
+        "[s.lease EXCEPT !.holder=n, !.duration=LeaseProfiles[s.elect[n].captured].duration, !.renew=LeaseRV, !.rv=LeaseRV]"
+      ],
+      [
+        "elect[n].pc",
+        "\"runIdle\""
+      ],
+      [
+        "elect[n].observeAge",
+        "0"
+      ],
+      [
+        "elect[n].renewAge",
+        "0"
+      ],
+      [
+        "elect[n].pollAge",
+        "0"
+      ]
+    ],
+    "note": "",
+    "fault": null
+  },
+  {
+    "name": "LeaderElection_Fallback",
+    "params": {
+      "n": "Server"
+    },
+    "location": "LE:454-470",
+    "scenarios": [
+      1
+    ],
+    "guards": [
+      "Reconciler(n)",
+      "s.elect[n].pc=\"renewFast\"",
+      "~s.env.api[n] \\/ s.elect[n].read.rv#s.lease.rv \\/ s.elect[n].read.holder#n \\/ s.elect[n].observeAge>=s.elect[n].read.duration"
+    ],
+    "updates": [
+      [
+        "elect[n].pc",
+        "\"runGet\""
+      ]
+    ],
+    "note": "",
+    "fault": null
+  },
+  {
+    "name": "LeaderElection_Get",
+    "params": {
+      "n": "Server"
+    },
+    "location": "LE:470-490; LL:42-53",
+    "scenarios": [
+      1
+    ],
+    "guards": [
+      "Reconciler(n)",
+      "s.env.api[n]",
+      "s.elect[n].pc=\"runGet\""
+    ],
+    "updates": [
+      [
+        "elect[n].read",
+        "s.lease"
+      ],
+      [
+        "elect[n].pc",
+        "\"runCheck\""
+      ]
+    ],
+    "note": "",
+    "fault": null
+  },
+  {
+    "name": "LeaderElection_GetError",
+    "params": {
+      "n": "Server"
+    },
+    "location": "LE:470-474,284-306",
+    "scenarios": [
+      1
+    ],
+    "guards": [
+      "Reconciler(n)",
+      "~s.env.api[n]",
+      "s.elect[n].pc=\"runGet\""
+    ],
+    "updates": [
+      [
+        "elect[n].pc",
+        "\"runIdle\""
+      ],
+      [
+        "elect[n].pollAge",
+        "0"
+      ]
+    ],
+    "note": "",
+    "fault": null
+  },
+  {
+    "name": "LeaderElection_Check",
+    "params": {
+      "n": "Server"
+    },
+    "location": "LE:486-508",
+    "scenarios": [
+      1
+    ],
+    "guards": [
+      "Reconciler(n)",
+      "s.elect[n].pc=\"runCheck\""
+    ],
+    "updates": [
+      [
+        "elect[n].pc",
+        "IF s.elect[n].read.holder\\in {None,n} \\/ (s.elect[n].observed /\\ s.elect[n].observation.rv=s.elect[n].read.rv /\\ s.elect[n].observeAge>=s.elect[n].read.duration) THEN \"runUpdate\" ELSE \"runIdle\""
+      ],
+      [
+        "elect[n].observeAge",
+        "IF ~s.elect[n].observed \\/ s.elect[n].observation.rv#s.elect[n].read.rv THEN 0 ELSE s.elect[n].observeAge"
+      ],
+      [
+        "elect[n].observation",
+        "s.elect[n].read"
+      ],
+      [
+        "elect[n].observed",
+        "TRUE"
+      ],
+      [
+        "elect[n].pollAge",
+        "0"
+      ]
+    ],
+    "note": "Unlike tryTakeOver, client-go uses the observed record duration; the fresh first foreign read always starts a new observation window.",
+    "fault": null
+  },
+  {
+    "name": "LeaderElection_Update",
+    "params": {
+      "n": "Server"
+    },
+    "location": "LE:497-514; LL:73-95",
+    "scenarios": [
+      1
+    ],
+    "guards": [
+      "Reconciler(n)",
+      "s.env.api[n]",
+      "s.elect[n].pc=\"runUpdate\"",
+      "s.elect[n].read.rv=s.lease.rv"
+    ],
+    "updates": [
+      [
+        "lease",
+        "[s.lease EXCEPT !.holder=n, !.duration=LeaseProfiles[s.elect[n].captured].duration, !.renew=LeaseRV, !.rv=LeaseRV]"
+      ],
+      [
+        "elect[n].read",
+        "[s.lease EXCEPT !.holder=n, !.duration=LeaseProfiles[s.elect[n].captured].duration, !.renew=LeaseRV, !.rv=LeaseRV]"
+      ],
+      [
+        "elect[n].observation",
+        "[s.lease EXCEPT !.holder=n, !.duration=LeaseProfiles[s.elect[n].captured].duration, !.renew=LeaseRV, !.rv=LeaseRV]"
+      ],
+      [
+        "elect[n].mode",
+        "\"renew\""
+      ],
+      [
+        "elect[n].pc",
+        "IF s.elect[n].mode=\"acquire\" THEN \"renewStart\" ELSE \"runIdle\""
+      ],
+      [
+        "elect[n].observeAge",
+        "0"
+      ],
+      [
+        "elect[n].renewAge",
+        "0"
+      ],
+      [
+        "elect[n].pollAge",
+        "0"
+      ]
+    ],
+    "note": "",
+    "fault": null
+  },
+  {
+    "name": "LeaderElection_UpdateError",
+    "params": {
+      "n": "Server"
+    },
+    "location": "LE:508-511,284-306",
+    "scenarios": [
+      1
+    ],
+    "guards": [
+      "Reconciler(n)",
+      "s.elect[n].pc=\"runUpdate\"",
+      "~s.env.api[n] \\/ s.elect[n].read.rv#s.lease.rv"
+    ],
+    "updates": [
+      [
+        "elect[n].pc",
+        "\"runIdle\""
+      ],
+      [
+        "elect[n].pollAge",
+        "0"
+      ]
+    ],
+    "note": "",
+    "fault": null
+  },
+  {
+    "name": "RunLeaderElection_RenewDeadline",
+    "params": {
+      "n": "Server"
+    },
+    "location": "LE:284-306; LR:479-490",
+    "scenarios": [
+      1
+    ],
+    "guards": [
+      "Reconciler(n)",
+      "s.elect[n].mode=\"renew\"",
+      "s.elect[n].pc\\in {\"runIdle\",\"renewStart\",\"renewFast\",\"runGet\",\"runCheck\",\"runUpdate\"}",
+      "s.elect[n].renewAge>=LeaseProfiles[s.elect[n].captured].renew+LeaseProfiles[s.elect[n].captured].retry"
+    ],
+    "updates": [
+      [
+        "elect[n].pc",
+        "\"verifyGet\""
+      ]
+    ],
+    "note": "Expiry of an existing renewal timer is reactive; this is not an injected failed renewal.",
+    "fault": null
+  },
+  {
+    "name": "ClassifyLeaseAfterRun_Get",
+    "params": {
+      "n": "Server"
+    },
+    "location": "LR:489-493",
+    "scenarios": [
+      1
+    ],
+    "guards": [
+      "Reconciler(n)",
+      "s.env.api[n]",
+      "s.elect[n].pc=\"verifyGet\""
+    ],
+    "updates": [
+      [
+        "elect[n].read",
+        "s.lease"
+      ],
+      [
+        "elect[n].pc",
+        "\"verifyCheck\""
+      ]
+    ],
+    "note": "",
+    "fault": null
+  },
+  {
+    "name": "ClassifyLeaseAfterRun_Unverifiable",
+    "params": {
+      "n": "Server"
+    },
+    "location": "LR:269-270,489-503",
+    "scenarios": [
+      1
+    ],
+    "guards": [
+      "Reconciler(n)",
+      "~s.env.api[n]",
+      "s.elect[n].pc=\"verifyGet\""
+    ],
+    "updates": [
+      [
+        "elect[n].pc",
+        "\"preGet\""
+      ]
+    ],
+    "note": "No evidence of preemption: retry; enabled isolation remains independent.",
+    "fault": null
+  },
+  {
+    "name": "ClassifyLeaseAfterRun_Held",
+    "params": {
+      "n": "Server"
+    },
+    "location": "LR:273-276,493-515",
+    "scenarios": [
+      1
+    ],
+    "guards": [
+      "Reconciler(n)",
+      "s.elect[n].pc=\"verifyCheck\"",
+      "s.elect[n].read.holder=n"
+    ],
+    "updates": [
+      [
+        "elect[n].pc",
+        "\"preGet\""
+      ]
+    ],
+    "note": "",
+    "fault": null
+  },
+  {
+    "name": "ClassifyLeaseAfterRun_Preempted",
+    "params": {
+      "n": "Server"
+    },
+    "location": "LR:273-274,504-512; CM:530-532",
+    "scenarios": [
+      1,
+      2
+    ],
+    "guards": [
+      "Reconciler(n)",
+      "s.elect[n].pc=\"verifyCheck\"",
+      "s.elect[n].read.holder#n"
+    ],
+    "updates": [
+      [
+        "elect[n].pc",
+        "\"stopped\""
+      ],
+      [
+        "life[n].cause",
+        "\"preempted\""
+      ],
+      [
+        "life[n].cancelled",
+        "TRUE"
+      ],
+      [
+        "life[n].graceAge",
+        "0"
+      ]
+    ],
+    "note": "Terminal error cancels the manager; it does not synchronously kill PostgreSQL.",
+    "fault": null
+  },
+  {
+    "name": "PostgresLifecycle_Cancelled",
+    "params": {
+      "n": "Server"
+    },
+    "location": "LC:122-135",
+    "scenarios": [
+      1,
+      2
+    ],
+    "guards": [
+      "~s.life[n].containerExited",
+      "s.life[n].cancelled",
+      "s.life[n].phase=\"none\""
+    ],
+    "updates": [
+      [
+        "life[n].phase",
+        "IF s.life[n].upgrade THEN \"done\" ELSE \"requested\""
+      ],
+      [
+        "life[n].lifecycleDone",
+        "s.life[n].upgrade"
+      ],
+      [
+        "life[n].stopAge",
+        "0"
+      ],
+      [
+        "elect[n].pc",
+        "\"stopped\""
+      ]
+    ],
+    "note": "",
+    "fault": null
+  },
+  {
+    "name": "TryShuttingDownSmartFast_Checkpoint",
+    "params": {
+      "n": "Server"
+    },
+    "location": "LC:132-149; PG:581-590,1635-1667",
+    "scenarios": [
+      1,
+      2,
+      3
+    ],
+    "guards": [
+      "~s.life[n].containerExited",
+      "s.life[n].phase=\"requested\"",
+      "~s.life[n].upgrade"
+    ],
+    "updates": [
+      [
+        "life[n].phase",
+        "\"checkpoint\""
+      ]
+    ],
+    "note": "Request/checkpoint boundary precedes any signal that stops accepting SQL.",
+    "fault": null
+  },
+  {
+    "name": "Shutdown_StopRequest",
+    "params": {
+      "n": "Server"
+    },
+    "location": "PG:589-618,645-673,690-709",
+    "scenarios": [
+      1,
+      2,
+      3
+    ],
+    "guards": [
+      "~s.life[n].containerExited",
+      "s.life[n].phase=\"checkpoint\"",
+      "s.env.io[n] \\/ s.life[n].cancelled"
+    ],
+    "updates": [
+      [
+        "life[n].phase",
+        "IF s.life[n].cause=\"demotion\" THEN \"fast\" ELSE \"smart\""
+      ],
+      [
+        "life[n].stopAge",
+        "0"
+      ],
+      [
+        "data[n].pgState",
+        "IF Running(n) THEN \"stopping\" ELSE \"down\""
+      ],
+      [
+        "data[n].stopWrites",
+        "s.life[n].cause=\"demotion\""
+      ]
+    ],
+    "note": "Fast mode stops existing transactions. Smart mode can leave preexisting sessions writing; a cancelled checkpoint returns without proving SQL retirement.",
+    "fault": null
+  },
+  {
+    "name": "TryShuttingDownSmartFast_Fallback",
+    "params": {
+      "n": "Server"
+    },
+    "location": "PG:645-673",
+    "scenarios": [
+      2
+    ],
+    "guards": [
+      "~s.life[n].containerExited",
+      "s.life[n].phase=\"smart\"",
+      "s.life[n].stopAge>=SmartDelay"
+    ],
+    "updates": [
+      [
+        "life[n].phase",
+        "\"fast\""
+      ],
+      [
+        "life[n].stopAge",
+        "0"
+      ],
+      [
+        "data[n].stopWrites",
+        "TRUE"
+      ]
+    ],
+    "note": "Fast fallback retains the configured maxStopDelay; no old implicit 60-second timeout is modeled.",
+    "fault": null
+  },
+  {
+    "name": "Shutdown_ClientsFinished",
+    "params": {
+      "n": "Server"
+    },
+    "location": "PG:626-680; FD:40-53",
+    "scenarios": [
+      2,
+      3
+    ],
+    "guards": [
+      "~s.life[n].containerExited",
+      "s.life[n].phase\\in {\"smart\",\"fast\"}",
+      "s.env.io[n]"
+    ],
+    "updates": [
+      [
+        "data[n].stopWrites",
+        "TRUE"
+      ],
+      [
+        "life[n].phase",
+        "\"archive\""
+      ]
+    ],
+    "note": "All writers have retired; a clean shutdown now finishes WAL flush/archive.",
+    "fault": null
+  },
+  {
+    "name": "Shutdown_ArchiveComplete",
+    "params": {
+      "n": "Server"
+    },
+    "location": "PG:581-623; LP:134-140; FD:40-46,78-86",
+    "scenarios": [
+      2,
+      3
+    ],
+    "guards": [
+      "~s.life[n].containerExited",
+      "s.life[n].phase=\"archive\"",
+      "s.env.io[n]",
+      "s.data[n].diskRole=\"replica\" \\/ s.data[n].durable=s.data[n].generated"
+    ],
+    "updates": [
+      [
+        "archive",
+        "IF ArchiveEnabled THEN s.archive\\cup {[timeline |-> s.data[n].timeline, prefix |-> s.data[n].durable]} ELSE s.archive"
+      ],
+      [
+        "life[n].archiveComplete",
+        "TRUE"
+      ],
+      [
+        "life[n].phase",
+        "\"pgExit\""
+      ]
+    ],
+    "note": "",
+    "fault": null
+  },
+  {
+    "name": "RunPostgresAndWait_Exit",
+    "params": {
+      "n": "Server"
+    },
+    "location": "LP:134-140; LC:116-120,132-149",
+    "scenarios": [
+      1,
+      2,
+      3
+    ],
+    "guards": [
+      "~s.life[n].containerExited",
+      "s.life[n].phase=\"pgExit\"",
+      "s.life[n].immediate \\/ (\\A r\\in Server:Running(r) /\\ s.data[r].receiver=n /\\ s.env.wal[r] => Prefix(s.data[n].durable,s.sent[r]))"
+    ],
+    "updates": [
+      [
+        "data[n].pgState",
+        "\"down\""
+      ],
+      [
+        "data[n].stopWrites",
+        "TRUE"
+      ],
+      [
+        "data[n].receiver",
+        "None"
+      ],
+      [
+        "life[n].postgresExited",
+        "TRUE"
+      ],
+      [
+        "life[n].phase",
+        "\"done\""
+      ]
+    ],
+    "note": "",
+    "fault": null
+  },
+  {
+    "name": "PostgresLifecycle_Return",
+    "params": {
+      "n": "Server"
+    },
+    "location": "LC:73-75,116-149; CMD:379-385",
+    "scenarios": [
+      2,
+      3
+    ],
+    "guards": [
+      "~s.life[n].containerExited",
+      "s.life[n].phase=\"done\"",
+      "~s.life[n].lifecycleDone"
+    ],
+    "updates": [
+      [
+        "life[n].lifecycleDone",
+        "TRUE"
+      ],
+      [
+        "life[n].cancelled",
+        "TRUE"
+      ],
+      [
+        "elect[n].pc",
+        "\"stopped\""
+      ]
+    ],
+    "note": "Ordinary SIGTERM and demotion reach manager cancellation only after lifecycle return.",
+    "fault": null
+  },
+  {
+    "name": "EngageStopProcedure_GraceExpired",
+    "params": {
+      "n": "Server"
+    },
+    "location": "CM:57,513-518,602-606",
+    "scenarios": [
+      2
+    ],
+    "guards": [
+      "Manager(n)",
+      "s.life[n].cancelled",
+      "~s.life[n].lifecycleDone",
+      "~s.life[n].graceExpired",
+      "s.life[n].graceAge>=ManagerGrace"
+    ],
+    "updates": [
+      [
+        "life[n].graceExpired",
+        "TRUE"
+      ]
+    ],
+    "note": "",
+    "fault": null
+  },
+  {
+    "name": "ManagerStart_Return",
+    "params": {
+      "n": "Server"
+    },
+    "location": "CM:602-614; CMD:450-460",
+    "scenarios": [
+      2
+    ],
+    "guards": [
+      "Manager(n)",
+      "s.life[n].cancelled",
+      "s.life[n].lifecycleDone \\/ s.life[n].graceExpired"
+    ],
+    "updates": [
+      [
+        "life[n].managerReturned",
+        "TRUE"
+      ],
+      [
+        "life[n].releasePC",
+        "\"get\""
+      ],
+      [
+        "elect[n].pc",
+        "\"stopped\""
+      ]
+    ],
+    "note": "Runnable completion and manager grace expiry are different explanations for return.",
+    "fault": null
+  },
+  {
+    "name": "Release_UpgradeSkip",
+    "params": {
+      "n": "Server"
+    },
+    "location": "LR:188-194; CMD:392-399",
+    "scenarios": [
+      2
+    ],
+    "guards": [
+      "s.life[n].managerReturned",
+      "s.life[n].releasePC=\"get\"",
+      "s.life[n].upgrade"
+    ],
+    "updates": [
+      [
+        "life[n].releasePC",
+        "\"done\""
+      ]
+    ],
+    "note": "",
+    "fault": null
+  },
+  {
+    "name": "Release_Get",
+    "params": {
+      "n": "Server"
+    },
+    "location": "LR:196-208",
+    "scenarios": [
+      2
+    ],
+    "guards": [
+      "s.life[n].managerReturned",
+      "s.life[n].releasePC=\"get\"",
+      "~s.life[n].upgrade",
+      "s.env.api[n]"
+    ],
+    "updates": [
+      [
+        "life[n].releaseRead",
+        "s.lease"
+      ],
+      [
+        "life[n].releasePC",
+        "\"check\""
+      ]
+    ],
+    "note": "",
+    "fault": null
+  },
+  {
+    "name": "Release_Check",
+    "params": {
+      "n": "Server"
+    },
+    "location": "LR:204-208,216-221",
+    "scenarios": [
+      2
+    ],
+    "guards": [
+      "s.life[n].releasePC=\"check\""
+    ],
+    "updates": [
+      [
+        "life[n].releasePC",
+        "IF s.life[n].releaseRead.holder=n THEN \"update\" ELSE \"done\""
+      ]
+    ],
+    "note": "",
+    "fault": null
+  },
+  {
+    "name": "Release_Update",
+    "params": {
+      "n": "Server"
+    },
+    "location": "LR:210-221; LL:73-95; CMD:392-399",
+    "scenarios": [
+      2,
+      3
+    ],
+    "guards": [
+      "s.life[n].releasePC=\"update\"",
+      "s.env.api[n]",
+      "s.life[n].releaseRead.rv=s.lease.rv"
+    ],
+    "updates": [
+      [
+        "lease",
+        "[s.lease EXCEPT !.holder=None, !.duration=IF s.elect[n].captured=0 THEN LeaseProfiles[1].released ELSE LeaseProfiles[s.elect[n].captured].released, !.rv=LeaseRV, !.renew=LeaseRV, !.cleanFrom=n, !.cleanAcks=IF s.life[n].immediate THEN {} ELSE AckRecords(n)]"
+      ],
+      [
+        "life[n].releasePC",
+        "\"done\""
+      ]
+    ],
+    "note": "No PostgreSQL-exit/archive-completion guard exists here. Clean evidence is recorded, not asserted.",
+    "fault": null
+  },
+  {
+    "name": "Release_Error",
+    "params": {
+      "n": "Server"
+    },
+    "location": "LR:196-203,216-221; CMD:396-398",
+    "scenarios": [
+      2
+    ],
+    "guards": [
+      "s.life[n].releasePC\\in {\"get\",\"update\"}",
+      "~s.env.api[n] \\/ (s.life[n].releasePC=\"update\" /\\ s.life[n].releaseRead.rv#s.lease.rv)"
+    ],
+    "updates": [
+      [
+        "life[n].releasePC",
+        "\"done\""
+      ]
+    ],
+    "note": "The defer makes one attempt; a foreign-holder read instead takes Release_Check.",
+    "fault": null
+  },
+  {
+    "name": "Run_ContainerExit",
+    "params": {
+      "n": "Server"
+    },
+    "location": "CMD:450-475; LC:102-104; FD:82-86",
+    "scenarios": [
+      1,
+      2
+    ],
+    "guards": [
+      "s.life[n].managerReturned",
+      "s.life[n].releasePC=\"done\"",
+      "~s.life[n].containerExited",
+      "~s.life[n].upgrade"
+    ],
+    "updates": [
+      [
+        "life[n].containerExited",
+        "TRUE"
+      ],
+      [
+        "life[n].postgresExited",
+        "TRUE"
+      ],
+      [
+        "data[n].pgState",
+        "\"down\""
+      ],
+      [
+        "data[n].stopWrites",
+        "TRUE"
+      ],
+      [
+        "data[n].receiver",
+        "None"
+      ],
+      [
+        "data[n].generated",
+        "s.data[n].durable"
+      ],
+      [
+        "data[n].received",
+        "s.data[n].durable"
+      ],
+      [
+        "inst[n].pc",
+        "\"stopped\""
+      ],
+      [
+        "elect[n].pc",
+        "\"stopped\""
+      ]
+    ],
+    "note": "Normal Pod namespace teardown stops remaining postmaster processes. It does not imply archiving completed.",
+    "fault": null
+  },
+  {
+    "name": "IsHealthy_GetCluster",
+    "params": {
+      "n": "Server"
+    },
+    "location": "LV:56-88",
+    "scenarios": [
+      1,
+      2
+    ],
+    "guards": [
+      "Reconciler(n)",
+      "Running(n)",
+      "s.data[n].diskRole=\"primary\"",
+      "s.life[n].isolationPC=\"idle\""
+    ],
+    "updates": [
+      [
+        "life[n].isolationAPI",
+        "s.env.api[n]"
+      ],
+      [
+        "life[n].isolationPC",
+        "\"ping\""
+      ]
+    ],
+    "note": "Direct API probe result, separate from the instance informer cache.",
+    "fault": null
+  },
+  {
+    "name": "IsHealthy_Ping",
+    "params": {
+      "n": "Server"
+    },
+    "location": "LV:79-87,108-122; pkg/management/postgres/webserver/probes/pinger.go:104-113",
+    "scenarios": [
+      1,
+      2
+    ],
+    "guards": [
+      "Reconciler(n)",
+      "s.life[n].isolationPC=\"ping\""
+    ],
+    "updates": [
+      [
+        "life[n].isolationPeers",
+        "s.env.peer[n]"
+      ],
+      [
+        "life[n].isolationPC",
+        "\"result\""
+      ]
+    ],
+    "note": "",
+    "fault": null
+  },
+  {
+    "name": "IsHealthy_IsolationProbe",
+    "params": {
+      "n": "Server"
+    },
+    "location": "LV:72-88,108-115; LC:137-149",
+    "scenarios": [
+      1,
+      2
+    ],
+    "guards": [
+      "Reconciler(n)",
+      "s.life[n].isolationPC=\"result\""
+    ],
+    "updates": [
+      [
+        "life[n]",
+        "IF ~s.life[n].isolationAPI /\\ ~s.life[n].isolationPeers /\\ s.life[n].cause=\"none\" THEN [s.life[n] EXCEPT !.cause=\"isolation\", !.phase=\"requested\", !.stopAge=0, !.isolationPC=\"idle\"] ELSE [s.life[n] EXCEPT !.isolationPC=\"idle\"]"
+      ]
+    ],
+    "note": "Threshold-completed kubelet probe abstraction. API success compensates peer failure; retirement follows the SIGTERM order.",
+    "fault": null
+  },
+  {
+    "name": "TryShuttingDownFastImmediate_Immediate",
+    "params": {
+      "n": "Server"
+    },
+    "location": "PG:687-709; FD:40-53",
+    "scenarios": [
+      2,
+      3
+    ],
+    "guards": [
+      "~s.life[n].containerExited",
+      "s.life[n].phase=\"fast\"",
+      "s.life[n].cause=\"demotion\"",
+      "s.life[n].stopAge>=FastDelay"
+    ],
+    "updates": [
+      [
+        "life[n].phase",
+        "\"pgExit\""
+      ],
+      [
+        "life[n].immediate",
+        "TRUE"
+      ],
+      [
+        "data[n].stopWrites",
+        "TRUE"
+      ]
+    ],
+    "note": "Current immediate fallback is retained. Loss after explicit immediate shutdown is excluded from clean-archive promises.",
+    "fault": null
+  },
+  {
+    "name": "TryShuttingDownSmartFast_StopTimeout",
+    "params": {
+      "n": "Server"
+    },
+    "location": "PG:660-677; LC:132-149",
+    "scenarios": [
+      2
+    ],
+    "guards": [
+      "~s.life[n].containerExited",
+      "s.life[n].phase=\"fast\"",
+      "s.life[n].cause#\"demotion\"",
+      "s.life[n].stopAge>=FastDelay"
+    ],
+    "updates": [
+      [
+        "life[n].phase",
+        "\"done\""
+      ]
+    ],
+    "note": "Configured maxStopDelay expires: pg_ctl returns an error; lifecycle return still does not prove PostgreSQL exit.",
+    "fault": null
+  },
+  {
+    "name": "GenerateWAL",
+    "params": {
+      "n": "Server",
+      "w": "WAL"
+    },
+    "location": "FD:291-307,399-405; SY:45-79",
+    "scenarios": [
+      2,
+      3,
+      4
+    ],
+    "guards": [
+      "Writer(n)",
+      "w\\notin s.usedWAL"
+    ],
+    "updates": [
+      [
+        "data[n].generated",
+        "Append(s.data[n].generated,w)"
+      ],
+      [
+        "usedWAL",
+        "s.usedWAL\\cup {w}"
+      ]
+    ],
+    "note": "Client request introduces a unique normalized WAL identity; an unacknowledged request is not protected.",
+    "fault": "requests"
+  },
+  {
+    "name": "FlushWAL",
+    "params": {
+      "n": "Server"
+    },
+    "location": "FD:291-294,399-405; PG:1156-1181 (metadata observation)",
+    "scenarios": [
+      2,
+      3,
+      4
+    ],
+    "guards": [
+      "Running(n)",
+      "s.env.io[n]",
+      "IF s.data[n].diskRole=\"primary\" THEN s.data[n].durable#s.data[n].generated ELSE s.data[n].durable#s.data[n].received"
+    ],
+    "updates": [
+      [
+        "data[n].durable",
+        "IF s.data[n].diskRole=\"primary\" THEN s.data[n].generated ELSE s.data[n].received"
+      ]
+    ],
+    "note": "PostgreSQL durable flush; a required synchronous ack cannot use merely received or sent WAL.",
+    "fault": null
+  },
+  {
+    "name": "SendWAL",
+    "params": {
+      "n": "Server"
+    },
+    "location": "FD:24-29,291-294; PS:305-312",
+    "scenarios": [
+      3,
+      4
+    ],
+    "guards": [
+      "Running(n)",
+      "Receiver(n)",
+      "s.env.wal[n]",
+      "Running(s.data[n].receiver)",
+      "s.data[s.data[n].receiver].diskRole=\"primary\"",
+      "s.data[n].timeline=s.data[s.data[n].receiver].timeline",
+      "Prefix(s.data[n].received,s.data[s.data[n].receiver].durable)",
+      "s.sent[n]#s.data[s.data[n].receiver].durable"
+    ],
+    "updates": [
+      [
+        "sent[n]",
+        "s.data[s.data[n].receiver].durable"
+      ]
+    ],
+    "note": "WAL sender snapshot; sent is separate from receiver flush and replay.",
+    "fault": null
+  },
+  {
+    "name": "ReceiveWAL",
+    "params": {
+      "n": "Server"
+    },
+    "location": "FD:24-29,291-294; PS:305-312",
+    "scenarios": [
+      3,
+      4
+    ],
+    "guards": [
+      "Running(n)",
+      "Receiver(n)",
+      "s.env.wal[n]",
+      "s.env.io[n]",
+      "Prefix(s.data[n].received,s.sent[n])",
+      "s.sent[n]#s.data[n].received"
+    ],
+    "updates": [
+      [
+        "data[n].received",
+        "s.sent[n]"
+      ]
+    ],
+    "note": "",
+    "fault": null
+  },
+  {
+    "name": "ReplayWAL",
+    "params": {
+      "n": "Server"
+    },
+    "location": "IC:1304-1309; PR:35-66; FD:68-86",
+    "scenarios": [
+      2,
+      3,
+      4
+    ],
+    "guards": [
+      "Running(n)",
+      "s.data[n].diskRole=\"replica\"",
+      "s.env.io[n]",
+      "Prefix(s.data[n].replayed,s.data[n].durable)",
+      "s.data[n].replayed#s.data[n].durable"
+    ],
+    "updates": [
+      [
+        "data[n].replayed",
+        "s.data[n].durable"
+      ]
+    ],
+    "note": "",
+    "fault": null
+  },
+  {
+    "name": "AcknowledgeCommit",
+    "params": {
+      "n": "Server",
+      "witnesses": "SUBSET Server"
+    },
+    "location": "FD:291-307,399-405; SY:45-79",
+    "scenarios": [
+      2,
+      3,
+      4
+    ],
+    "guards": [
+      "Writer(n)",
+      "s.data[n].durable#<<>>",
+      "witnesses\\subseteq s.data[n].runtimeConfig.members\\{n}",
+      "Cardinality(witnesses)>=s.data[n].runtimeConfig.number",
+      "\\A r\\in witnesses : Running(r) /\\ s.data[r].receiver=n /\\ s.env.wal[r] /\\ s.data[r].timeline=s.data[n].timeline /\\ Prefix(s.data[n].durable,s.data[r].durable)",
+      "~\\E a\\in s.acks : a.primary=n /\\ a.prefix=s.data[n].durable /\\ a.timeline=s.data[n].timeline"
+    ],
+    "updates": [
+      [
+        "acks",
+        "s.acks\\cup {[primary |-> n, prefix |-> s.data[n].durable, timeline |-> s.data[n].timeline, members |-> s.data[n].runtimeConfig.members, number |-> s.data[n].runtimeConfig.number, generation |-> s.data[n].runtimeConfig.generation, witnesses |-> witnesses, copies |-> [r\\in witnesses |-> s.data[r].durable]]}"
+      ]
+    ],
+    "note": "Client observes a durable synchronous commit. Required number never shrinks when a standby becomes unavailable.",
+    "fault": null
+  },
+  {
+    "name": "ArchiveWAL",
+    "params": {
+      "n": "Server"
+    },
+    "location": "FD:68-86; IS:135-143",
+    "scenarios": [
+      2,
+      3
+    ],
+    "guards": [
+      "ArchiveEnabled",
+      "Running(n)",
+      "s.data[n].diskRole=\"primary\"",
+      "s.env.io[n]",
+      "s.data[n].durable#<<>>",
+      "[timeline |-> s.data[n].timeline, prefix |-> s.data[n].durable]\\notin s.archive"
+    ],
+    "updates": [
+      [
+        "archive",
+        "IF ArchiveEnabled THEN s.archive\\cup {[timeline |-> s.data[n].timeline, prefix |-> s.data[n].durable]} ELSE s.archive"
+      ]
+    ],
+    "note": "",
+    "fault": null
+  },
+  {
+    "name": "RestoreArchiveWAL",
+    "params": {
+      "n": "Server",
+      "a": "s.archive"
+    },
+    "location": "FD:68-86; IC:1304-1309",
+    "scenarios": [
+      2,
+      3
+    ],
+    "guards": [
+      "ArchiveEnabled",
+      "Running(n)",
+      "s.data[n].diskRole=\"replica\"",
+      "s.env.io[n]",
+      "a.timeline=s.data[n].timeline",
+      "Prefix(s.data[n].received,a.prefix)",
+      "Len(a.prefix)>Len(s.data[n].received)"
+    ],
+    "updates": [
+      [
+        "data[n].received",
+        "a.prefix"
+      ]
+    ],
+    "note": "Restore precedes durable flush/replay; missing next archive record permits promotion.",
+    "fault": null
+  },
+  {
+    "name": "WalReceiverDown",
+    "params": {
+      "n": "Server"
+    },
+    "location": "IC:1343-1359; PS:331-341; FD:24-29",
+    "scenarios": [
+      1,
+      2,
+      3,
+      5
+    ],
+    "guards": [
+      "Receiver(n)",
+      "~Running(n) \\/ ~Running(s.data[n].receiver) \\/ ~s.env.wal[n] \\/ (s.data[s.data[n].receiver].stopWrites /\\ s.life[s.data[n].receiver].phase=\"pgExit\" /\\ Prefix(s.data[s.data[n].receiver].durable,s.sent[n]))",
+      "~s.env.wal[n] \\/ ~Running(n) \\/ (s.data[n].received=s.sent[n] /\\ s.data[n].durable=s.data[n].received)"
+    ],
+    "updates": [
+      [
+        "data[n].receiver",
+        "None"
+      ],
+      [
+        "sent[n]",
+        "s.data[n].received"
+      ]
+    ],
+    "note": "A normal drained stream consumes sent WAL before exit; transport failure can disconnect without a final prefix.",
+    "fault": null
+  },
+  {
+    "name": "WalReceiverConnect",
+    "params": {
+      "n": "Server",
+      "p": "Server"
+    },
+    "location": "OR:144-147,202-229; IC:448-451; FD:24-37",
+    "scenarios": [
+      1,
+      3,
+      5
+    ],
+    "guards": [
+      "Running(n)",
+      "s.data[n].diskRole=\"replica\"",
+      "~Receiver(n)",
+      "s.env.wal[n]",
+      "Writer(p)",
+      "s.pods[p].label=\"primary\"",
+      "s.pods[p].ready",
+      "Prefix(s.data[n].durable,s.data[p].durable)",
+      "s.data[n].promotePC=\"none\""
+    ],
+    "updates": [
+      [
+        "data[n].receiver",
+        "p"
+      ],
+      [
+        "data[n].timeline",
+        "s.data[p].timeline"
+      ],
+      [
+        "sent[n]",
+        "s.data[n].received"
+      ]
+    ],
+    "note": "New connections obey -rw labels; existing streams are not severed by a label patch.",
+    "fault": null
+  },
+  {
+    "name": "ReadinessProbe",
+    "params": {
+      "n": "Server"
+    },
+    "location": "IC:239-242; pkg/utils/pod_conditions.go:35-64",
+    "scenarios": [
+      1,
+      5
+    ],
+    "guards": [
+      "s.pods[n].ready#(s.pods[n].active /\\ DBReady(n) /\\ s.env.probe[n])"
+    ],
+    "updates": [
+      [
+        "pods[n].ready",
+        "s.pods[n].active /\\ DBReady(n) /\\ s.env.probe[n]"
+      ]
+    ],
+    "note": "",
+    "fault": null
+  },
+  {
+    "name": "ReconcileMetadata",
+    "params": {
+      "n": "Server"
+    },
+    "location": "OC:410-427; OR:199-229 (retry fix); FD:29-31",
+    "scenarios": [
+      1,
+      5
+    ],
+    "guards": [
+      "s.env.operatorUp",
+      "s.env.operatorAPI",
+      "s.cluster.current=s.cluster.target",
+      "s.pods[n].active"
+    ],
+    "updates": [
+      [
+        "pods[n].label",
+        "IF n=s.cluster.current THEN \"primary\" ELSE \"replica\""
+      ]
+    ],
+    "note": "Normal label convergence remains enabled after successful handoff.",
+    "fault": null
+  },
+  {
+    "name": "RequestPlannedSwitchover",
+    "params": {},
+    "location": "OU:157-174,212-264; OR:65-78,262-329",
+    "scenarios": [
+      1,
+      2,
+      3,
+      5
+    ],
+    "guards": [
+      "~s.op.requested",
+      "s.cluster.current=s.cluster.target"
+    ],
+    "updates": [
+      [
+        "op.requested",
+        "TRUE"
+      ]
+    ],
+    "note": "Rollout/drain stimulus, not a direct target patch.",
+    "fault": "planned"
+  },
+  {
+    "name": "ManagerCancellation",
+    "params": {
+      "n": "Server"
+    },
+    "location": "CM:530-532; LC:122-135",
+    "scenarios": [
+      2
+    ],
+    "guards": [
+      "Reconciler(n)",
+      "~s.life[n].cancelled",
+      "s.life[n].cause=\"none\""
+    ],
+    "updates": [
+      [
+        "life[n].cause",
+        "\"manager\""
+      ],
+      [
+        "life[n].cancelled",
+        "TRUE"
+      ],
+      [
+        "life[n].graceAge",
+        "0"
+      ]
+    ],
+    "note": "",
+    "fault": "cancellation"
+  },
+  {
+    "name": "TerminationSignal",
+    "params": {
+      "n": "Server"
+    },
+    "location": "LC:137-149",
+    "scenarios": [
+      2
+    ],
+    "guards": [
+      "Reconciler(n)",
+      "s.life[n].cause=\"none\""
+    ],
+    "updates": [
+      [
+        "life[n].cause",
+        "\"sigterm\""
+      ],
+      [
+        "life[n].phase",
+        "\"requested\""
+      ],
+      [
+        "life[n].stopAge",
+        "0"
+      ]
+    ],
+    "note": "",
+    "fault": "signals"
+  },
+  {
+    "name": "OnlineUpgrade",
+    "params": {
+      "n": "Server"
+    },
+    "location": "LR:175-194; LC:126-129; CMD:379-385",
+    "scenarios": [
+      2
+    ],
+    "guards": [
+      "Reconciler(n)",
+      "s.life[n].cause=\"none\""
+    ],
+    "updates": [
+      [
+        "life[n].cause",
+        "\"upgrade\""
+      ],
+      [
+        "life[n].upgrade",
+        "TRUE"
+      ],
+      [
+        "life[n].cancelled",
+        "TRUE"
+      ],
+      [
+        "life[n].graceAge",
+        "0"
+      ]
+    ],
+    "note": "",
+    "fault": "upgrades"
+  },
+  {
+    "name": "OnlineUpgrade_Exec",
+    "params": {
+      "n": "Server"
+    },
+    "location": "LR:179-186; LC:126-129",
+    "scenarios": [
+      2
+    ],
+    "guards": [
+      "s.life[n].upgrade",
+      "s.life[n].managerReturned",
+      "s.life[n].releasePC=\"done\""
+    ],
+    "updates": [
+      [
+        "life[n]",
+        "NewLife"
+      ],
+      [
+        "inst[n]",
+        "[NewInst(s.cache[n]) EXCEPT !.initialized=FALSE]"
+      ],
+      [
+        "elect[n]",
+        "NewElector"
+      ]
+    ],
+    "note": "Process replacement keeps PostgreSQL and disk state; new runnable has a new heldCh.",
+    "fault": null
+  },
+  {
+    "name": "PodCrash",
+    "params": {
+      "n": "Server"
+    },
+    "location": "LC:95-120; LP:134-140; FD:82-86",
+    "scenarios": [
+      1,
+      2,
+      4,
+      5
+    ],
+    "guards": [
+      "~s.life[n].containerExited"
+    ],
+    "updates": [
+      [
+        "life[n]",
+        "[NewLife EXCEPT !.cause=\"crash\", !.containerExited=TRUE, !.postgresExited=TRUE, !.managerReturned=TRUE, !.releasePC=\"done\"]"
+      ],
+      [
+        "data[n].pgState",
+        "\"down\""
+      ],
+      [
+        "data[n].stopWrites",
+        "TRUE"
+      ],
+      [
+        "data[n].receiver",
+        "None"
+      ],
+      [
+        "data[n].generated",
+        "s.data[n].durable"
+      ],
+      [
+        "data[n].received",
+        "s.data[n].durable"
+      ],
+      [
+        "inst[n]",
+        "[NewInst(s.cache[n]) EXCEPT !.initialized=FALSE, !.pc=\"stopped\"]"
+      ],
+      [
+        "elect[n]",
+        "NewElector"
+      ],
+      [
+        "env.restartAllowed",
+        "s.env.restartAllowed\\{n}"
+      ]
+    ],
+    "note": "Abrupt process loss does not clean-release or erase durable WAL/disk role.",
+    "fault": "crashes"
+  },
+  {
+    "name": "PodRestart",
+    "params": {
+      "n": "Server"
+    },
+    "location": "LC:102-104; IS:41-152; LR:291-294",
+    "scenarios": [
+      1,
+      4,
+      5
+    ],
+    "guards": [
+      "s.life[n].containerExited",
+      "n\\in s.env.restartAllowed",
+      "s.pods[n].active",
+      "s.env.api[n]"
+    ],
+    "updates": [
+      [
+        "life[n]",
+        "[NewLife EXCEPT !.postgresExited=TRUE]"
+      ],
+      [
+        "cache[n]",
+        "s.cluster"
+      ],
+      [
+        "inst[n]",
+        "[NewInst(s.cluster) EXCEPT !.initialized=FALSE]"
+      ],
+      [
+        "elect[n]",
+        "NewElector"
+      ],
+      [
+        "data[n].promotePC",
+        "\"none\""
+      ],
+      [
+        "data[n].pgState",
+        "\"down\""
+      ]
+    ],
+    "note": "Restart resets volatile PCs/acquisition/observation clocks while retaining disk configuration, WAL and role.",
+    "fault": null
+  },
+  {
+    "name": "PermitPodRestart",
+    "params": {
+      "n": "Server"
+    },
+    "location": "LC:102-104; FD:30-31",
+    "scenarios": [
+      1,
+      4,
+      5
+    ],
+    "guards": [
+      "~s.env.stable",
+      "n\\notin s.env.restartAllowed"
+    ],
+    "updates": [
+      [
+        "env.restartAllowed",
+        "s.env.restartAllowed\\cup {n}"
+      ]
+    ],
+    "note": "",
+    "fault": null
+  },
+  {
+    "name": "PodEviction",
+    "params": {
+      "n": "Server"
+    },
+    "location": "pkg/utils/pod_conditions.go:74-78; OS:298-323",
+    "scenarios": [
+      5
+    ],
+    "guards": [
+      "s.pods[n].active"
+    ],
+    "updates": [
+      [
+        "pods[n].active",
+        "FALSE"
+      ],
+      [
+        "pods[n].ready",
+        "FALSE"
+      ]
+    ],
+    "note": "Pod becomes inactive/terminating; this observation alone does not kill its container.",
+    "fault": "evictions"
+  },
+  {
+    "name": "APIFailure",
+    "params": {
+      "n": "Server"
+    },
+    "location": "LR:302-304,489-503",
+    "scenarios": [
+      1,
+      2,
+      4
+    ],
+    "guards": [
+      "s.env.api[n]"
+    ],
+    "updates": [
+      [
+        "env.api[n]",
+        "FALSE"
+      ]
+    ],
+    "note": "",
+    "fault": "api"
+  },
+  {
+    "name": "APIFailure_Recover",
+    "params": {
+      "n": "Server"
+    },
+    "location": "LR:302-304,489-503",
+    "scenarios": [
+      1,
+      2,
+      4
+    ],
+    "guards": [
+      "~s.env.api[n]",
+      "~s.env.stable \\/ n\\in s.env.survivors"
+    ],
+    "updates": [
+      [
+        "env.api[n]",
+        "TRUE"
+      ]
+    ],
+    "note": "",
+    "fault": null
+  },
+  {
+    "name": "HTTPFailure",
+    "params": {
+      "n": "Server"
+    },
+    "location": "RC:143-178; OC:663-685",
+    "scenarios": [
+      1,
+      4,
+      5
+    ],
+    "guards": [
+      "s.env.http[n]"
+    ],
+    "updates": [
+      [
+        "env.http[n]",
+        "FALSE"
+      ]
+    ],
+    "note": "",
+    "fault": "http"
+  },
+  {
+    "name": "HTTPFailure_Recover",
+    "params": {
+      "n": "Server"
+    },
+    "location": "RC:143-178; OC:663-685",
+    "scenarios": [
+      1,
+      4,
+      5
+    ],
+    "guards": [
+      "~s.env.http[n]",
+      "~s.env.stable \\/ n\\in s.env.survivors"
+    ],
+    "updates": [
+      [
+        "env.http[n]",
+        "TRUE"
+      ]
+    ],
+    "note": "",
+    "fault": null
+  },
+  {
+    "name": "ProbeFailure",
+    "params": {
+      "n": "Server"
+    },
+    "location": "pkg/utils/pod_conditions.go:35-64; OC:663-685",
+    "scenarios": [
+      1,
+      5
+    ],
+    "guards": [
+      "s.env.probe[n]"
+    ],
+    "updates": [
+      [
+        "env.probe[n]",
+        "FALSE"
+      ]
+    ],
+    "note": "",
+    "fault": "probe"
+  },
+  {
+    "name": "ProbeFailure_Recover",
+    "params": {
+      "n": "Server"
+    },
+    "location": "pkg/utils/pod_conditions.go:35-64; OC:663-685",
+    "scenarios": [
+      1,
+      5
+    ],
+    "guards": [
+      "~s.env.probe[n]",
+      "~s.env.stable \\/ n\\in s.env.survivors"
+    ],
+    "updates": [
+      [
+        "env.probe[n]",
+        "TRUE"
+      ]
+    ],
+    "note": "",
+    "fault": null
+  },
+  {
+    "name": "ReplicationDisconnect",
+    "params": {
+      "n": "Server"
+    },
+    "location": "IC:1343-1359; FD:24-29",
+    "scenarios": [
+      1,
+      2,
+      3,
+      4
+    ],
+    "guards": [
+      "s.env.wal[n]"
+    ],
+    "updates": [
+      [
+        "env.wal[n]",
+        "FALSE"
+      ]
+    ],
+    "note": "",
+    "fault": "wal"
+  },
+  {
+    "name": "ReplicationDisconnect_Recover",
+    "params": {
+      "n": "Server"
+    },
+    "location": "IC:1343-1359; FD:24-29",
+    "scenarios": [
+      1,
+      2,
+      3,
+      4
+    ],
+    "guards": [
+      "~s.env.wal[n]",
+      "~s.env.stable \\/ n\\in s.env.survivors"
+    ],
+    "updates": [
+      [
+        "env.wal[n]",
+        "TRUE"
+      ]
+    ],
+    "note": "",
+    "fault": null
+  },
+  {
+    "name": "PeerFailure",
+    "params": {
+      "n": "Server"
+    },
+    "location": "LV:72-88,108-115",
+    "scenarios": [
+      1
+    ],
+    "guards": [
+      "s.env.peer[n]"
+    ],
+    "updates": [
+      [
+        "env.peer[n]",
+        "FALSE"
+      ]
+    ],
+    "note": "",
+    "fault": "peer"
+  },
+  {
+    "name": "PeerFailure_Recover",
+    "params": {
+      "n": "Server"
+    },
+    "location": "LV:72-88,108-115",
+    "scenarios": [
+      1
+    ],
+    "guards": [
+      "~s.env.peer[n]",
+      "~s.env.stable \\/ n\\in s.env.survivors"
+    ],
+    "updates": [
+      [
+        "env.peer[n]",
+        "TRUE"
+      ]
+    ],
+    "note": "",
+    "fault": null
+  },
+  {
+    "name": "StorageStall",
+    "params": {
+      "n": "Server"
+    },
+    "location": "IC:239-242; PG:581-618; PR:35-66",
+    "scenarios": [
+      2,
+      4,
+      5
+    ],
+    "guards": [
+      "s.env.io[n]"
+    ],
+    "updates": [
+      [
+        "env.io[n]",
+        "FALSE"
+      ]
+    ],
+    "note": "",
+    "fault": "io"
+  },
+  {
+    "name": "StorageStall_Recover",
+    "params": {
+      "n": "Server"
+    },
+    "location": "IC:239-242; PG:581-618; PR:35-66",
+    "scenarios": [
+      2,
+      4,
+      5
+    ],
+    "guards": [
+      "~s.env.io[n]",
+      "~s.env.stable \\/ n\\in s.env.survivors"
+    ],
+    "updates": [
+      [
+        "env.io[n]",
+        "TRUE"
+      ]
+    ],
+    "note": "",
+    "fault": null
+  },
+  {
+    "name": "SQLUnavailable",
+    "params": {
+      "n": "Server"
+    },
+    "location": "IC:239-242; RC:134-137",
+    "scenarios": [
+      5
+    ],
+    "guards": [
+      "s.env.sql[n]"
+    ],
+    "updates": [
+      [
+        "env.sql[n]",
+        "FALSE"
+      ]
+    ],
+    "note": "",
+    "fault": "sql"
+  },
+  {
+    "name": "SQLUnavailable_Recover",
+    "params": {
+      "n": "Server"
+    },
+    "location": "IC:239-242; RC:134-137",
+    "scenarios": [
+      5
+    ],
+    "guards": [
+      "~s.env.sql[n]",
+      "~s.env.stable \\/ n\\in s.env.survivors"
+    ],
+    "updates": [
+      [
+        "env.sql[n]",
+        "TRUE"
+      ]
+    ],
+    "note": "",
+    "fault": null
+  },
+  {
+    "name": "OperatorCrash",
+    "params": {},
+    "location": "OC:300-428; OS:752-776",
+    "scenarios": [
+      5
+    ],
+    "guards": [
+      "s.env.operatorUp"
+    ],
+    "updates": [
+      [
+        "env.operatorUp",
+        "FALSE"
+      ],
+      [
+        "op.pc",
+        "\"idle\""
+      ]
+    ],
+    "note": "Discard volatile reconcile progress; persisted phase/pending/target survives.",
+    "fault": "operatorCrashes"
+  },
+  {
+    "name": "OperatorRecover",
+    "params": {},
+    "location": "OC:300-428",
+    "scenarios": [
+      5
+    ],
+    "guards": [
+      "~s.env.operatorUp"
+    ],
+    "updates": [
+      [
+        "env.operatorUp",
+        "TRUE"
+      ]
+    ],
+    "note": "",
+    "fault": null
+  },
+  {
+    "name": "OperatorAPIFailure",
+    "params": {},
+    "location": "OC:383-398; OQ:48-58",
+    "scenarios": [
+      4,
+      5
+    ],
+    "guards": [
+      "s.env.operatorAPI"
+    ],
+    "updates": [
+      [
+        "env.operatorAPI",
+        "FALSE"
+      ]
+    ],
+    "note": "",
+    "fault": "operatorAPI"
+  },
+  {
+    "name": "OperatorAPIRecover",
+    "params": {},
+    "location": "OC:383-398; OQ:48-58",
+    "scenarios": [
+      4,
+      5
+    ],
+    "guards": [
+      "~s.env.operatorAPI"
+    ],
+    "updates": [
+      [
+        "env.operatorAPI",
+        "TRUE"
+      ]
+    ],
+    "note": "",
+    "fault": null
+  },
+  {
+    "name": "UpdateLeaseConfiguration",
+    "params": {},
+    "location": "LR:61-76,143-156; IC:1215-1224; FD:153-180",
+    "scenarios": [
+      1
+    ],
+    "guards": [
+      "s.cluster.leaseGeneration=1"
+    ],
+    "updates": [
+      [
+        "cluster.leaseGeneration",
+        "2"
+      ],
+      [
+        "cluster.rv",
+        "ClusterRV"
+      ]
+    ],
+    "note": "A legitimate admission-valid rollout. Existing runnable keeps its captured profile.",
+    "fault": "leaseUpdates"
+  },
+  {
+    "name": "UpdateSynchronousConfiguration",
+    "params": {
+      "members": "SUBSET Server",
+      "number": "1..(Cardinality(Server)-1)"
+    },
+    "location": "SY:45-79,129-147; IC:206-210,277-299",
+    "scenarios": [
+      3,
+      4
+    ],
+    "guards": [
+      "s.cluster.generation=1",
+      "Cardinality(members)>=number",
+      "members\\{s.cluster.current}#{}",
+      "members#s.cluster.syncMembers \\/ number#s.cluster.syncNumber"
+    ],
+    "updates": [
+      [
+        "cluster.syncMembers",
+        "members"
+      ],
+      [
+        "cluster.syncNumber",
+        "number"
+      ],
+      [
+        "cluster.generation",
+        "2"
+      ],
+      [
+        "cluster.rv",
+        "ClusterRV"
+      ]
+    ],
+    "note": "Abstract validated operator-managed membership after supported cap/topology settings; no external names or direct quorum mutation.",
+    "fault": "syncUpdates"
+  },
+  {
+    "name": "RecoverEnvironment",
+    "params": {
+      "survivors": "SUBSET Server"
+    },
+    "location": "FD:20-31,350-371; OC:389-455; IC:239-299",
+    "scenarios": [
+      5
+    ],
+    "guards": [
+      "~s.env.stable",
+      "Cardinality(survivors)>=InitialSyncNumber+1",
+      "\\A n\\in survivors : Running(n) /\\ Reconciler(n) /\\ s.pods[n].active"
+    ],
+    "updates": [
+      [
+        "env.stable",
+        "TRUE"
+      ],
+      [
+        "env.survivors",
+        "survivors"
+      ],
+      [
+        "env.operatorUp",
+        "TRUE"
+      ],
+      [
+        "env.operatorAPI",
+        "TRUE"
+      ],
+      [
+        "env.api",
+        "[n \\in Server |-> TRUE]"
+      ],
+      [
+        "env.http",
+        "[n \\in Server |-> IF n\\in survivors THEN TRUE ELSE s.env.http[n]]"
+      ],
+      [
+        "env.probe",
+        "[n \\in Server |-> IF n\\in survivors THEN TRUE ELSE s.env.probe[n]]"
+      ],
+      [
+        "env.sql",
+        "[n \\in Server |-> IF n\\in survivors THEN TRUE ELSE s.env.sql[n]]"
+      ],
+      [
+        "env.io",
+        "[n \\in Server |-> IF n\\in survivors THEN TRUE ELSE s.env.io[n]]"
+      ],
+      [
+        "env.wal",
+        "[n \\in Server |-> IF n\\in survivors THEN TRUE ELSE s.env.wal[n]]"
+      ],
+      [
+        "env.peer",
+        "[n \\in Server |-> TRUE]"
+      ]
+    ],
+    "note": "Recovery suffix freezes fault injection in MC, recovers control plane and selected survivors, and does not resurrect the old primary or failed selected target.",
+    "fault": null
+  },
+  {
+    "name": "ClockTick",
+    "params": {},
+    "location": "LR:325-333,373-397; LE:284-306; CM:513-518; PG:635-673",
+    "scenarios": [
+      1,
+      2,
+      5
+    ],
+    "guards": [],
+    "updates": [
+      [
+        "inst",
+        "[n\\in Server |-> [s.inst[n] EXCEPT !.acquireAge=IF s.inst[n].pc=\"acquireWait\" THEN Inc(@) ELSE @]]"
+      ],
+      [
+        "elect",
+        "[n\\in Server |-> [s.elect[n] EXCEPT !.observeAge=IF s.elect[n].observed THEN Inc(@) ELSE @, !.takeoverAge=IF s.elect[n].takeoverObserved THEN Inc(@) ELSE @, !.pollAge=IF s.elect[n].captured>0 THEN Inc(@) ELSE @, !.renewAge=IF s.elect[n].mode=\"renew\" THEN Inc(@) ELSE @]]"
+      ],
+      [
+        "life",
+        "[n\\in Server |-> [s.life[n] EXCEPT !.graceAge=IF s.life[n].cancelled THEN Inc(@) ELSE @, !.stopAge=IF s.life[n].phase#\"none\" THEN Inc(@) ELSE @]]"
+      ]
+    ],
+    "note": "One time unit; elapsed clocks saturate above every decision threshold. Clock progress is not a finite fault budget.",
+    "fault": null
+  },
+  {
+    "name": "DeliverOperatorCluster",
+    "params": {},
+    "location": "OC:300-329; SP:52-55 (controller-runtime cached client)",
+    "scenarios": [
+      1,
+      4,
+      5
+    ],
+    "guards": [
+      "s.env.operatorUp",
+      "s.env.operatorAPI",
+      "s.op.cache#s.cluster"
+    ],
+    "updates": [
+      [
+        "op.cache",
+        "s.cluster"
+      ]
+    ],
+    "note": "The operator retains a real informer object separately from its per-loop copy.",
+    "fault": null
+  },
+  {
+    "name": "Reconcile_APIError",
+    "params": {},
+    "location": "OC:389-398; OR:135-142,176-196; SP:54-55,67-79",
+    "scenarios": [
+      4,
+      5
+    ],
+    "guards": [
+      "s.env.operatorUp",
+      "~s.env.operatorAPI",
+      "s.op.pc\\in {\"resourceStatus\",\"failoverPhasePatch\",\"plannedPhasePatch\",\"selectedPhasePatch\",\"pendingPatch\",\"targetPatch\"}"
+    ],
+    "updates": [
+      [
+        "op.pc",
+        "\"idle\""
+      ]
+    ],
+    "note": "A failed write returns/requeues; it cannot later succeed using the abandoned call.",
+    "fault": null
+  },
+  {
+    "name": "MarkOldPrimaryAsUnhealthy_Error",
+    "params": {},
+    "location": "OC:413-427; OR:151-159",
+    "scenarios": [
+      1,
+      5
+    ],
+    "guards": [
+      "s.env.operatorUp",
+      "~s.env.operatorAPI",
+      "s.op.pc\\in {\"guardLabel\",\"pendingLabel\"}"
+    ],
+    "updates": [
+      [
+        "op.pc",
+        "IF s.op.pc=\"guardLabel\" THEN \"idle\" ELSE \"receivers\""
+      ]
+    ],
+    "note": "Best-effort label failure does not block the initial failover; the transition guard retries next pass.",
+    "fault": null
+  },
+  {
+    "name": "InstanceReconcile_APIError",
+    "params": {
+      "n": "Server"
+    },
+    "location": "IC:288-300,1266-1268; IQ:42-48,83-94",
+    "scenarios": [
+      4,
+      5
+    ],
+    "guards": [
+      "Reconciler(n)",
+      "~s.env.api[n]",
+      "s.inst[n].pc\\in {\"resetGet\",\"resetUpdate\",\"quorumRead\",\"quorumUpdate\",\"completePatch\"}"
+    ],
+    "updates": [
+      [
+        "inst[n].pc",
+        "\"idle\""
+      ]
+    ],
+    "note": "Non-conflict API errors return to reconcile; already completed promotion is retained.",
+    "fault": null
+  },
+  {
+    "name": "GetSynchronousReplicationMetadata_Error",
+    "params": {
+      "n": "Server"
+    },
+    "location": "PG:1164-1169; IQ:59-62; IC:299-300",
+    "scenarios": [
+      4,
+      5
+    ],
+    "guards": [
+      "Reconciler(n)",
+      "s.inst[n].pc=\"metadata\"",
+      "ManageQuorum(n)",
+      "~DBReady(n)"
+    ],
+    "updates": [
+      [
+        "inst[n].pc",
+        "\"idle\""
+      ]
+    ],
+    "note": "Unavailable SQL metadata returns an error rather than publishing invented state.",
+    "fault": null
+  }
+]
