@@ -1,0 +1,95 @@
+
+func (s *NexusWorkflowTestSuite) TestSpeculaPrestartCancelStartToClose(chasmEnabled bool) {
+	env := s.newTestEnv(chasmEnabled, testcore.WithDedicatedCluster())
+	ctx := s.Context()
+	taskQueue := testcore.RandomizeStr(s.T().Name())
+	canStart := make(chan struct{})
+	cancelAck := make(chan struct{}, 1)
+	endpoint := env.createRandomExternalNexusServer(ctx, s.T(), nexustest.Handler{
+		OnStartOperation: func(ctx context.Context, _, operation string, _ *nexus.LazyValue, opts nexus.StartOperationOptions) (nexus.HandlerStartOperationResult[any], error) {
+			if operation == "prestart-cancel" {
+				select {
+				case <-canStart:
+				case <-ctx.Done(): return nil, ctx.Err()
+				}
+			}
+			s.T().Logf("ENDPOINT_ASYNC operation=%s request_id=%s", operation, opts.RequestID)
+			return &nexus.HandlerStartOperationResultAsync{OperationToken: opts.RequestID}, nil
+		},
+		OnCancelOperation: func(_ context.Context, _, _ string, token string, _ nexus.CancelOperationOptions) error {
+			s.T().Logf("ENDPOINT_CANCEL_ACK token=%s terminal_callback=false", token)
+			select { case cancelAck <- struct{}{}: default: }
+			return nil
+		},
+	})
+	caller := func(ctx workflow.Context, preCancel bool) error {
+		opCtx, cancel := workflow.WithCancel(ctx)
+		operation := "control"
+		if preCancel { operation = "prestart-cancel" }
+		future := workflow.NewNexusClient(endpoint, "service").ExecuteOperation(opCtx, operation, "input", workflow.NexusOperationOptions{StartToCloseTimeout: 3*time.Second})
+		if preCancel {
+			_ = workflow.Sleep(ctx, time.Millisecond)
+			cancel()
+		}
+		return future.Get(ctx, nil)
+	}
+	w := worker.New(env.SdkClient(), taskQueue, worker.Options{})
+	w.RegisterWorkflow(caller)
+	s.NoError(w.Start())
+	defer w.Stop()
+	bad, err := env.SdkClient().ExecuteWorkflow(ctx, client.StartWorkflowOptions{TaskQueue: taskQueue}, caller, true)
+	s.NoError(err)
+	defer func() { _ = env.SdkClient().TerminateWorkflow(context.Background(), bad.GetID(), bad.GetRunID(), "probe cleanup") }()
+	s.EventuallyWithT(func(t *assert.CollectT) {
+		desc, err := env.SdkClient().DescribeWorkflowExecution(ctx, bad.GetID(), bad.GetRunID())
+		require.NoError(t, err)
+		require.Len(t, desc.PendingNexusOperations, 1)
+		require.NotNil(t, desc.PendingNexusOperations[0].CancellationInfo)
+	}, 10*time.Second, 20*time.Millisecond)
+	s.T().Log("DURABLE_CANCEL_REQUEST_OBSERVED before_start_response=true")
+	close(canStart)
+	await.Rcv(s.T(), cancelAck)
+	control, err := env.SdkClient().ExecuteWorkflow(ctx, client.StartWorkflowOptions{TaskQueue: taskQueue}, caller, false)
+	s.NoError(err)
+	s.Error(control.Get(ctx, nil))
+	controlHistory := env.GetHistory(env.Namespace().String(), &commonpb.WorkflowExecution{WorkflowId: control.GetID(), RunId: control.GetRunID()})
+	timed := s.RequireHistoryEvent(controlHistory, enumspb.EVENT_TYPE_NEXUS_OPERATION_TIMED_OUT)
+	s.Equal(enumspb.TIMEOUT_TYPE_START_TO_CLOSE, timed.GetNexusOperationTimedOutEventAttributes().GetFailure().GetCause().GetTimeoutFailureInfo().GetTimeoutType())
+	s.T().Log("HEALTHY_CONTROL no_prestart_cancel start_to_close=3s terminal=TimedOut")
+	readback := func(stage string) {
+		persisted, err := env.AdminClient().DescribeMutableState(ctx, &adminservice.DescribeMutableStateRequest{Namespace: env.Namespace().String(), Execution: &commonpb.WorkflowExecution{WorkflowId: bad.GetID(), RunId: bad.GetRunID()}, Archetype: chasm.WorkflowArchetype})
+		s.NoError(err)
+		ms := persisted.DatabaseMutableState
+		nodes := ms.GetExecutionInfo().GetSubStateMachinesByType()[nexusoperations.OperationMachineType].GetMachinesById()
+		s.Len(nodes, 1)
+		s.Empty(ms.GetExecutionInfo().GetStateMachineTimers())
+		for id, node := range nodes {
+			info := &persistencespb.NexusOperationInfo{}
+			s.NoError(proto.Unmarshal(node.Data, info))
+			s.Equal("Started", info.State.String())
+			s.Equal(3*time.Second, info.StartToCloseTimeout.AsDuration())
+			s.Zero(info.ScheduleToCloseTimeout.AsDuration())
+			tasks, err := (nexusoperations.Operation{NexusOperationInfo: info}).RegenerateTasks(nil)
+			s.NoError(err)
+			s.Len(tasks, 1)
+			s.T().Logf("DB_READ stage=%s op_id=%s state=%s token=%s configured_stc=%s persisted_timer_groups=%d regenerated_tasks=%d", stage, id, info.State, info.OperationToken, info.StartToCloseTimeout.AsDuration(), len(ms.GetExecutionInfo().GetStateMachineTimers()), len(tasks))
+		}
+	}
+	readback("past_deadline")
+	env.CloseShard(env.NamespaceID().String(), bad.GetID())
+	readback("after_shard_close")
+	history := env.GetHistory(env.Namespace().String(), &commonpb.WorkflowExecution{WorkflowId: bad.GetID(), RunId: bad.GetRunID()})
+	cancelEvent := s.RequireHistoryEvent(history, enumspb.EVENT_TYPE_NEXUS_OPERATION_CANCEL_REQUESTED)
+ startedEvent := s.RequireHistoryEvent(history, enumspb.EVENT_TYPE_NEXUS_OPERATION_STARTED)
+ ackEvent := s.RequireHistoryEvent(history, enumspb.EVENT_TYPE_NEXUS_OPERATION_CANCEL_REQUEST_COMPLETED)
+ s.Less(cancelEvent.EventId, startedEvent.EventId)
+ s.Less(startedEvent.EventId, ackEvent.EventId)
+ s.T().Logf("HISTORY_ORDER cancel=%d started=%d cancel_ack=%d", cancelEvent.EventId, startedEvent.EventId, ackEvent.EventId)
+	for _, event := range history { s.NotEqual(enumspb.EVENT_TYPE_NEXUS_OPERATION_TIMED_OUT, event.EventType) }
+	_, err = env.AdminClient().RefreshWorkflowTasks(ctx, &adminservice.RefreshWorkflowTasksRequest{NamespaceId: env.NamespaceID().String(), Execution: &commonpb.WorkflowExecution{WorkflowId: bad.GetID(), RunId: bad.GetRunID()}})
+	s.NoError(err)
+	s.Error(bad.Get(ctx, nil))
+	history = env.GetHistory(env.Namespace().String(), &commonpb.WorkflowExecution{WorkflowId: bad.GetID(), RunId: bad.GetRunID()})
+	s.RequireHistoryEvent(history, enumspb.EVENT_TYPE_NEXUS_OPERATION_TIMED_OUT)
+	s.T().Log("EXPLICIT_TASK_REFRESH_COMPENSATED terminal=TimedOut")
+}

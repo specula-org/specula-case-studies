@@ -1,0 +1,97 @@
+{
+  "schema_version": "2",
+  "system": "temporal-activity",
+  "generated_by": "consolidate",
+  "findings": [
+    {
+      "id": "CR-1",
+      "title": "Attempt identity across dispatch and delayed worker replies",
+      "source": "code-review",
+      "scenario": "Scenario 1",
+      "severity": "High",
+      "invariant": null,
+      "config": null,
+      "counterexample": null,
+      "affected_code": [
+        "service/history/timer_queue_active_task_executor.go:553-636",
+        "service/history/api/recordactivitytaskstarted/api.go:118-184",
+        "service/history/api/activity_util.go:58-80",
+        "common/tasktoken/token.go:33-60"
+      ],
+      "summary": "Retry dispatch validates stamp, attempt, and start state while holding the Workflow lease, then releases that lease before asynchronous Matching delivery. History later reconstructs and validates starts, completions, failures, cancellations, and heartbeats against the current Activity state and token fields. The mechanism hypothesis is that delayed or duplicate worker-facing messages around retry handoff could expose an attempt-identity mismatch or ambiguous terminal observation. This candidate preserves the Scenario 1 handoff, token, and response-validation question for confirmation."
+    },
+    {
+      "id": "CR-2",
+      "title": "Shared timer cues conserve current deadline obligations",
+      "source": "code-review",
+      "scenario": "Scenario 2",
+      "severity": "High",
+      "invariant": null,
+      "config": null,
+      "counterexample": null,
+      "affected_code": [
+        "service/history/workflow/timer_sequence.go:118-164",
+        "service/history/timer_queue_active_task_executor.go:230-280",
+        "service/history/timer_queue_active_task_executor.go:299-305",
+        "service/history/workflow/timer_sequence.go:34-41",
+        "service/history/workflow/activity.go:72-89",
+        "service/history/workflow/mutable_state_impl.go:471-481"
+      ],
+      "summary": "Temporal uses one physical timeout cue to service the earliest logical Activity deadline, while heartbeat and retry transitions can change the current deadline set and leave duplicate cues pending. The timeout executor recomputes current logical deadlines and may process multiple Activities in one Workflow transaction rather than relying on a one-timer-per-deadline model. The mechanism hypothesis is that heartbeat extension, retry, duplicate cue execution, or reload of volatile heartbeat timing could leave eligible timeout or retry work uncovered. This candidate preserves the Scenario 2 timer-cue coverage question for confirmation."
+    },
+    {
+      "id": "CR-3",
+      "title": "Persistence result, API result, and recovery can disagree temporarily",
+      "source": "code-review",
+      "scenario": "Scenario 3",
+      "severity": "High",
+      "invariant": null,
+      "config": null,
+      "counterexample": null,
+      "affected_code": [
+        "common/persistence/sql/execution.go:334-357",
+        "common/persistence/sql/execution_util.go:23-190",
+        "common/persistence/sql/shard.go:152-176",
+        "common/persistence/sql/execution_util.go:629-695",
+        "service/history/shard/context_impl.go:1501-1549",
+        "service/history/workflow/transaction_impl.go:184-214",
+        "service/history/workflow/context.go:408-497",
+        "common/persistence/execution_manager.go:247-309"
+      ],
+      "summary": "The Activity path appends History before committing execution state, ActivityInfo, buffered events, and generated tasks in an atomic SQL execution transaction. A committed storage attempt can lose its response, while cache loss, shard ownership fencing, reacquisition, and reload independently determine later observations. The mechanism hypothesis is that external API results, durable commit state, task notifications, and recovery readback may temporarily disagree and must still converge on the acknowledged Activity outcome and required Workflow work. This candidate preserves the Scenario 3 durable-commit and recovery-observation question for confirmation."
+    },
+    {
+      "id": "CR-4",
+      "title": "Cancellation and terminal outcomes leave a Workflow Task obligation",
+      "source": "code-review",
+      "scenario": "Scenario 4",
+      "severity": "High",
+      "invariant": null,
+      "config": null,
+      "counterexample": null,
+      "affected_code": [
+        "service/history/api/respondworkflowtaskcompleted/workflow_task_completed_handler.go:680-762",
+        "service/history/api/respondactivitytaskcompleted/api.go:74-126",
+        "service/history/api/update_workflow_util.go:73-103",
+        "service/history/workflow/mutable_state_impl.go:7621-7647"
+      ],
+      "summary": "Activity cancellation is a request whose visibility to the worker is distinct from terminal completion, failure, timeout, cancellation acknowledgement, and Workflow consumption. A running Activity may still complete after CancelRequested is set, and terminal APIs request or reuse Workflow Task work while terminal events can be buffered behind an in-flight Workflow Task. The mechanism hypothesis is that competing cancellation and terminal transitions must preserve durable terminal information and the Workflow Task obligation needed to consume it, including after recovery. This candidate preserves the Scenario 4 cancellation and terminal-responsibility question for confirmation."
+    },
+    {
+      "id": "CR-5",
+      "title": "Independent observations must cover the entire execution",
+      "source": "code-review",
+      "scenario": "Scenario 5",
+      "severity": "High",
+      "invariant": null,
+      "config": null,
+      "counterexample": null,
+      "affected_code": [
+        "tests/testcore/history_task_recorder.go:83-168",
+        "common/persistence/faultinjection/fault.go:42-71",
+        "service/history/workflow/activity.go:125-149"
+      ],
+      "summary": "Public history, task-recorder, and convenience projections can omit intermediate ActivityInfo state, actual task persistence, and uncertain commit outcomes. Some fault-injection paths execute before returning errors, and retry timing fields can be derived rather than independently observed. The mechanism hypothesis is that trace validation can appear complete while relying on lossy or derived observations instead of full implementation evidence for terminal state, durable tasks, and readback after faults. This candidate preserves the Scenario 5 fidelity and observation-completeness question for confirmation."
+    }
+  ]
+}

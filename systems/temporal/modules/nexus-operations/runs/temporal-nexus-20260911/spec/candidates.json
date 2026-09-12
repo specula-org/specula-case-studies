@@ -1,0 +1,109 @@
+{
+  "schema_version": "2",
+  "system": "temporal-nexus",
+  "generated_by": "consolidate",
+  "findings": [
+    {
+      "id": "CR-1",
+      "title": "Remote acceptance and local knowledge can advance independently",
+      "source": "code-review",
+      "scenario": "Scenario 1",
+      "severity": "High",
+      "invariant": null,
+      "config": null,
+      "counterexample": null,
+      "affected_code": [
+        "service/history/hsm/nexusoperations/executors.go:202-218",
+        "service/history/hsm/nexusoperations/executors.go:264",
+        "service/history/hsm/nexusoperations/executors.go:364-449",
+        "service/history/hsm/nexusoperations/executors.go:452-480",
+        "service/history/hsm/nexusoperations/completion.go:126-163",
+        "service/history/hsm/nexusoperations/completion.go:199-247",
+        "service/history/hsm/nexusoperations/events.go:327-355"
+      ],
+      "summary": "Remote acceptance, response receipt, callback delivery, and the local conditional commit happen across separate boundaries. If an accepted start response is lost or local persistence is uncertain, a retry must reconcile the same operation request identity with any remote outcome or callback. The brief identifies RequestId as the operation identity while operation Attempt changes only on retryable failure or asynchronous start, so duplicate and late deliveries need confirmation against the real commit and completion paths. No model-checking candidate currently represents this mechanism."
+    },
+    {
+      "id": "CR-2",
+      "title": "Deferred cancellation can omit an independently required timer",
+      "source": "code-review",
+      "scenario": "Scenario 2",
+      "severity": "High",
+      "invariant": null,
+      "config": null,
+      "counterexample": null,
+      "affected_code": [
+        "service/history/hsm/nexusoperations/statemachine.go:172-181",
+        "service/history/hsm/nexusoperations/statemachine.go:364-400",
+        "service/history/hsm/nexusoperations/statemachine.go:384-389",
+        "service/history/hsm/nexusoperations/statemachine.go:398",
+        "service/history/hsm/nexusoperations/statemachine.go:423-449"
+      ],
+      "summary": "A nested cancellation transition can return before the parent emits its start-to-close timer, while cancellation acknowledgment leaves the operation running. The brief records a reproduced schedule where cancel, async Started, and cancel acknowledgment left zero persisted HSM timer groups past the deadline, with an explicit workflow-task refresh later causing timeout. Confirmation should inspect whether ordinary execution and reload publish the required timer or whether terminal callbacks and refresh paths merely mask the omitted publication. No model-checking candidate currently represents this mechanism."
+    },
+    {
+      "id": "CR-3",
+      "title": "Live terminal transition and reconstruction reclaim different capacity",
+      "source": "code-review",
+      "scenario": "Scenario 3",
+      "severity": "High",
+      "invariant": null,
+      "config": null,
+      "counterexample": null,
+      "affected_code": [
+        "service/history/hsm/nexusoperations/executors.go:614-676",
+        "service/history/hsm/nexusoperations/events.go:262-272",
+        "service/history/hsm/nexusoperations/workflow/commands.go:184-191",
+        "service/history/api/describeworkflow/api.go:706-722"
+      ],
+      "summary": "The live timeout path records a terminal result without deleting its HSM node, while event application and reconstruction paths delete terminal operation nodes. Admission counts physical collection size, but Describe hides terminal nodes, so user-visible pending status can diverge from capacity accounting. The brief records a reproduced sequence where an operation timed out, a second schedule was rejected at limit one, the database retained a TimedOut node after shard close, and Describe reported zero pending operations. No model-checking candidate currently represents this mechanism."
+    },
+    {
+      "id": "CR-4",
+      "title": "Deadline selection, queued work and stale references interact",
+      "source": "code-review",
+      "scenario": "Scenario 4",
+      "severity": "High",
+      "invariant": null,
+      "config": null,
+      "counterexample": null,
+      "affected_code": [
+        "service/history/hsm/nexusoperations/executors.go:223-249",
+        "service/history/hsm/nexusoperations/executors.go:287-289",
+        "service/history/hsm/nexusoperations/executors.go:715-749",
+        "service/history/hsm/nexusoperations/tasks.go:50-66",
+        "service/history/hsm/nexusoperations/tasks.go:98-103",
+        "service/history/hsm/nexusoperations/tasks.go:143-148",
+        "service/history/hsm/nexusoperations/tasks.go:179-184",
+        "service/history/hsm/nexusoperations/tasks.go:224-229",
+        "service/history/hsm/nexusoperations/tasks.go:261-283",
+        "service/history/hsm/nexusoperations/tasks.go:315-333",
+        "service/history/hsm/nexusoperations/statemachine_environment.go:223-324",
+        "service/history/ndc_task_util.go:235-255",
+        "service/history/hsm/nexusoperations/workflow/commands.go:194-204",
+        "service/history/hsm/nexusoperations/config.go:106-111"
+      ],
+      "summary": "Operation deadlines, request budgets, physical wakeups, and current-state validation have distinct roles. The brief records that delayed work may legally execute during a later eligible retry when validators accept the current state and identity, while persisted logical timer groups decide what a physical wakeup may do. It also records a test-verifiable policy path where an omitted schedule-to-close timeout with no run timeout bypassed a configured maximum, while an explicit long timeout was capped. No model-checking candidate currently represents this mechanism."
+    },
+    {
+      "id": "CR-5",
+      "title": "Buffered history, uncertain commit and notification must agree after reload",
+      "source": "code-review",
+      "scenario": "Scenario 5",
+      "severity": "High",
+      "invariant": null,
+      "config": null,
+      "counterexample": null,
+      "affected_code": [
+        "service/history/hsm/nexusoperations/workflow/commands.go:259-323",
+        "common/persistence/sql/execution.go:334-357",
+        "common/persistence/sql/execution_util.go:23-82",
+        "common/persistence/sql/execution_util.go:155-175",
+        "common/persistence/sql/execution_util.go:629-664",
+        "service/history/workflow/transaction_impl.go:184-213",
+        "service/history/shard/context_impl.go:1501-1548"
+      ],
+      "summary": "History storage, HSM state, buffered events, task publication, cache release, and caller-visible notification cross different persistence and observation boundaries. A terminal completion can be appended or buffered before the workflow has locally consumed that knowledge, and a persistence write can be committed even when the caller observes an uncertain error. Confirmation should separate definite noncommit from committed-but-error schedules, then check reload or shard reacquisition against workflow close and cancellation ordering. No model-checking candidate currently represents this mechanism."
+    }
+  ]
+}

@@ -1,0 +1,28 @@
+# Code Analysis Review: temporal-nexus
+
+Reviewed both documents, their linked archaeology records and saved test evidence against Temporal `0c010ce5fe8c0180aa7573c72fe8fc87c6df7025`. Checked artifact hashes, coverage counts, local links, and the principal B1–B3 source mechanisms. This review did not rerun tests or independently repeat every historical discussion review; upstream statuses are those recorded in the analysis snapshot.
+
+## Scores
+
+| Criterion | Score | Notes |
+|-----------|-------|-------|
+| Coverage Statistics | 4/5 | Detailed, clearly scoped census: 223 classified commits (108 keyword + 91 non-keyword + 24 additional), 82 bug-bearing commit records, 387 open PRs screened and 76 bug-intent file-list reviews. Reports **25 deeply read issues**, below the 30+ target; 20 additional PR discussions yield 45 discussions, not 45 issues. Archived searches contain 25 unique issues with saved bodies/comments; all 223 commit IDs appear in the linked ledgers. |
+| Scenarios | 5/5 | **Five** scenarios meet the 4–7 target. Each identifies a mechanism, historical/current evidence, affected paths, variables, actions, atomicity/granularity and priority rationale. Remote acceptance, timer publication, capacity reclamation, stale work and uncertain commit are connected to executable questions rather than presented as a bug list. |
+| Evidence Quality | 4/5 | B1–B3 have pinned source locations, concrete triggers, retained probes, database observations and healthy controls; principal causes and recorded test results check out. Historical issue/PR attribution and exact commit references exist in the supporting ledgers, but the brief generally cites PR numbers without direct commit/ledger anchors. Novelty and runtime/formal evidence limits are explicit. |
+| Model-Checkable Findings | 5/5 | **Four explicitly classified questions, MC1–MC4**, map to scenarios and expected property violations. MC2/MC3 extend the source/runtime findings B1/B2 and correctly distinguish reconfirmation from new discovery. B3 remains test-verifiable; historical fixes, diagnostics and parsing concerns are kept outside the MC target set. No completed model-checking result is claimed. |
+| Modeling Brief Completeness | 4/5 | All seven handoff sections are present: Category A overview, scenario variables/actions, modeling exclusions, five extension groups, safety/liveness properties, verification classes and references. Bounds, fairness, endpoint assumptions, transaction grouping and reload-versus-refresh semantics are specified. Finding IDs and the code-review inventory need reconciliation across the two documents. |
+| False Positive Control | 5/5 | Documents 13 non-bug issue-search exclusions with reasons, preserves four uncertain reports as uncertain, and separates out-of-scope confirmed bugs. Explicit compensation checks cover cancellation ACK semantics, duplicate callbacks, request-ID checks, task validation, timer filtering and misleading commit/metric observations. SQLite lifecycle evidence and deferred persistence faults are accurately bounded. |
+| Source Code Annotations | 4/5 | Extensive pinned file:line references throughout the scenarios, contracts, transaction audit and main findings; all checked local Markdown links resolve. Some secondary observations use incomplete shorthand or lack a nearby source pointer, particularly TV1 and the CR5/CR6/CR8 report rows. |
+
+## Overall: 31/35
+
+## Issues Found
+
+- **The issue-only depth target remains unmet.** `analysis-report.md:53–60` reports 25 issues plus 20 PRs. Reading the entire collected issue set and relevant PR discussions is useful coverage, but does not satisfy 30+ distinct issues. Retain the separate denominators and describe the shortfall explicitly; broaden relevant searches if strict target compliance is required, without padding with unrelated issues.
+- **Finding IDs change meaning between documents.** In `modeling-brief.md:166–168`, CR4 concerns header overrides and CR5 concerns bare failure conversion; `analysis-report.md:186–187` assigns those meanings to CR5 and CR4 respectively. Brief CR6 also merges material from report CR6–CR8, while the optional cache-size/Update-registry observation associated with #10549 has no explicit brief entry or exclusion. Preserve stable IDs and either retain each observation or provide an explicit mapping and exclusion reason.
+- **Historical commit evidence requires unnecessary navigation.** The brief's scenario evidence cites relevant PRs, while exact fixing commits are usually in the archaeology ledgers. Add the commit SHA or a direct ledger-section link beside each historical reference; for example, #7171 maps to `e82422a2c0dbd45f1ed349cb5864bcfe23aa72a9`. B1–B3 already have the analyzed revision and source/probe evidence; an unassigned upstream issue number should not be invented.
+- **Complete the secondary source annotations.** `analysis-report.md:181` uses `timestamp329`, `completion.go159-160` and `IsZero367-368` without consistently naming the file and using file:line syntax. CR5/CR6/CR8 at lines 187–190 should link directly to their source ranges or the earlier annotated analysis. This would make each observation independently traceable during handoff.
+
+## Verdict: PASS
+
+The analysis is a strong Code Analysis handoff with concrete mechanisms and corroborated source/runtime evidence. The issues above warrant documentation corrections but do not invalidate the principal findings or modeling plan. PASS assesses analysis quality; accepted-response-loss experiments, uncertain-write recovery, TLC and trace validation remain explicitly pending.

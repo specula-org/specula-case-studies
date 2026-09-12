@@ -1,0 +1,646 @@
+diff --git a/common/persistence/sql/execution.go b/common/persistence/sql/execution.go
+index 6b981cf70..b6b593588 100644
+--- a/common/persistence/sql/execution.go
++++ b/common/persistence/sql/execution.go
+@@ -10,6 +10,7 @@ import (
+ 	"go.temporal.io/api/serviceerror"
+ 	enumsspb "go.temporal.io/server/api/enums/v1"
+ 	persistencespb "go.temporal.io/server/api/persistence/v1"
++	"go.temporal.io/server/common/hqtrace"
+ 	"go.temporal.io/server/common/log"
+ 	p "go.temporal.io/server/common/persistence"
+ 	"go.temporal.io/server/common/persistence/serialization"
+@@ -347,14 +348,25 @@ func (m *sqlExecutionStore) UpdateWorkflowExecution(
+ 		}
+ 	}
+ 
++	hqtrace.Publication("AppendHistoryNodes", hqtrace.M{"history_batches": len(request.UpdateWorkflowNewEvents)})
+ 	// then update mutable state
+-	return m.txExecuteShardLocked(ctx,
++	err := m.txExecuteShardLocked(ctx,
+ 		"UpdateWorkflowExecution",
+ 		request.ShardID,
+ 		request.RangeID,
+ 		func(tx sqlplugin.Tx) error {
+ 			return m.updateWorkflowExecutionTx(ctx, tx, request)
+ 		})
++	if err == nil {
++		hqtrace.Publication("UpdateWorkflowExecutionCommit", hqtrace.M{"request_range": request.RangeID, "checked_range": hqtrace.Extra["checked_range"]})
++	} else {
++		name := "UpdateWorkflowExecutionFail"
++		if _, ok := err.(*p.ShardOwnershipLostError); ok {
++			name = "UpdateWorkflowExecutionFenced"
++		}
++		hqtrace.Publication(name, hqtrace.M{"error": hqtrace.Error(err), "request_range": request.RangeID})
++	}
++	return err
+ }
+ 
+ func (m *sqlExecutionStore) updateWorkflowExecutionTx(
+diff --git a/common/persistence/sql/execution_tasks.go b/common/persistence/sql/execution_tasks.go
+index 96223259c..f21b9dde2 100644
+--- a/common/persistence/sql/execution_tasks.go
++++ b/common/persistence/sql/execution_tasks.go
+@@ -9,6 +9,7 @@ import (
+ 	"time"
+ 
+ 	"go.temporal.io/api/serviceerror"
++	"go.temporal.io/server/common/hqtrace"
+ 	p "go.temporal.io/server/common/persistence"
+ 	"go.temporal.io/server/common/persistence/sql/sqlplugin"
+ 	"go.temporal.io/server/service/history/tasks"
+@@ -367,8 +368,10 @@ func (m *sqlExecutionStore) rangeCompleteTransferTasks(
+ 		InclusiveMinTaskID: request.InclusiveMinTaskKey.TaskID,
+ 		ExclusiveMaxTaskID: request.ExclusiveMaxTaskKey.TaskID,
+ 	}); err != nil {
++		hqtrace.Current("RangeCompleteTasksFail", hqtrace.M{"error": hqtrace.Error(err)})
+ 		return serviceerror.NewUnavailablef("RangeCompleteTransferTask operation failed. Error: %v", err)
+ 	}
++	hqtrace.Current("RangeCompleteTasksCommit", hqtrace.M{"lo": request.InclusiveMinTaskKey.TaskID, "hi": request.ExclusiveMaxTaskKey.TaskID})
+ 	return nil
+ }
+ 
+diff --git a/common/persistence/sql/shard.go b/common/persistence/sql/shard.go
+index f6af47f6e..d878d2cae 100644
+--- a/common/persistence/sql/shard.go
++++ b/common/persistence/sql/shard.go
+@@ -6,6 +6,7 @@ import (
+ 	"fmt"
+ 
+ 	"go.temporal.io/api/serviceerror"
++	"go.temporal.io/server/common/hqtrace"
+ 	"go.temporal.io/server/common/log"
+ 	"go.temporal.io/server/common/persistence"
+ 	"go.temporal.io/server/common/persistence/serialization"
+@@ -83,7 +84,7 @@ func (m *sqlShardStore) UpdateShard(
+ 	ctx context.Context,
+ 	request *persistence.InternalUpdateShardRequest,
+ ) error {
+-	return m.txExecute(ctx, "UpdateShard", func(tx sqlplugin.Tx) error {
++	err := m.txExecute(ctx, "UpdateShard", func(tx sqlplugin.Tx) error {
+ 		if err := lockShard(ctx,
+ 			tx,
+ 			request.ShardID,
+@@ -110,6 +111,26 @@ func (m *sqlShardStore) UpdateShard(
+ 		}
+ 		return nil
+ 	})
++	if hqtrace.Enabled {
++		name := "UpdateShardCommit"
++		if err != nil {
++			name = "UpdateShardFail"
++			if _, ok := err.(*persistence.ShardOwnershipLostError); ok {
++				name = "UpdateShardFenced"
++			}
++		}
++		if request.RangeID != request.PreviousRangeID {
++			if err == nil {
++				name = "RenewRangeLockedCommit"
++			} else {
++				name = "RenewRangeLockedFenced"
++			}
++			hqtrace.Current(name, hqtrace.M{"request_range": request.PreviousRangeID, "checked_range": hqtrace.Extra["checked_range"], "new_range": request.RangeID, "blob": request.ShardInfo, "error": hqtrace.Error(err)})
++		} else {
++			hqtrace.Emit(name, hqtrace.M{"j": 1}, hqtrace.M{"request_range": request.PreviousRangeID, "checked_range": hqtrace.Extra["checked_range"], "new_range": request.RangeID, "blob": request.ShardInfo, "error": hqtrace.Error(err)})
++		}
++	}
++	return err
+ }
+ 
+ func (m *sqlShardStore) AssertShardOwnership(
+@@ -134,6 +155,9 @@ func lockShard(
+ 	})
+ 	switch err {
+ 	case nil:
++		if hqtrace.Enabled {
++			hqtrace.Extra["checked_range"] = rangeID
++		}
+ 		if rangeID != oldRangeID {
+ 			return &persistence.ShardOwnershipLostError{
+ 				ShardID: shardID,
+@@ -160,6 +184,9 @@ func readLockShard(
+ 	})
+ 	switch err {
+ 	case nil:
++		if hqtrace.Enabled {
++			hqtrace.Extra["checked_range"] = rangeID
++		}
+ 		if rangeID != oldRangeID {
+ 			return &persistence.ShardOwnershipLostError{
+ 				ShardID: shardID,
+diff --git a/common/persistence/sql/task_v1.go b/common/persistence/sql/task_v1.go
+index 160eb46ec..c41963992 100644
+--- a/common/persistence/sql/task_v1.go
++++ b/common/persistence/sql/task_v1.go
+@@ -7,6 +7,7 @@ import (
+ 
+ 	commonpb "go.temporal.io/api/common/v1"
+ 	"go.temporal.io/api/serviceerror"
++	"go.temporal.io/server/common/hqtrace"
+ 	"go.temporal.io/server/common/log"
+ 	"go.temporal.io/server/common/persistence"
+ 	"go.temporal.io/server/common/persistence/serialization"
+@@ -95,6 +96,9 @@ func (m *sqlTaskManagerV1) CreateTasks(
+ 		resp = &persistence.CreateTasksResponse{UpdatedMetadata: false}
+ 		return nil
+ 	})
++	if err == nil {
++		hqtrace.Execution("MatchingSpoolCommit", hqtrace.M{"store": "sqlTaskManagerV1.CreateTasks", "rows": tasksRows, "request_range": request.RangeID})
++	}
+ 	return resp, err
+ }
+ 
+diff --git a/service/history/queues/action_move_group.go b/service/history/queues/action_move_group.go
+index af75e44ab..be8b4cfae 100644
+--- a/service/history/queues/action_move_group.go
++++ b/service/history/queues/action_move_group.go
+@@ -1,6 +1,9 @@
+ package queues
+ 
+ import (
++	"fmt"
++
++	"go.temporal.io/server/common/hqtrace"
+ 	"go.temporal.io/server/common/log"
+ 	"go.temporal.io/server/common/log/tag"
+ )
+@@ -76,6 +79,7 @@ func (a *actionMoveGroup) Run(readerGroup *ReaderGroup) bool {
+ 			}
+ 		}
+ 
++		hqtrace.Current("MoveGroupCollect", hqtrace.M{"groups": groupsToMove, "counts": fmt.Sprint(pendingTaskPerGroup)})
+ 		if len(groupsToMove) == 0 {
+ 			continue
+ 		}
+@@ -83,6 +87,7 @@ func (a *actionMoveGroup) Run(readerGroup *ReaderGroup) bool {
+ 		predicateForSplit := a.grouper.Predicate(groupsToMove)
+ 
+ 		var slicesToMove []Slice
++		lineage := []any{}
+ 		reader.SplitSlices(func(s Slice) ([]Slice, bool) {
+ 			// Technically we don't need this empty scope check, but it helps avoid
+ 			// unnecessary allocation and task movement.
+@@ -93,12 +98,15 @@ func (a *actionMoveGroup) Run(readerGroup *ReaderGroup) bool {
+ 			}
+ 
+ 			split, remain := s.SplitByPredicate(predicateForSplit)
++			lineage = append(lineage, hqtrace.M{"old": hqtrace.Ptr(s), "pass": hqtrace.Ptr(split), "fail": hqtrace.Ptr(remain)})
+ 			slicesToMove = append(slicesToMove, split)
+ 			return []Slice{remain}, true
+ 		})
+ 
++		hqtrace.Current("MoveGroupSplit", hqtrace.M{"moved": hqSlices(slicesToMove), "lineage": lineage})
+ 		nextReader := readerGroup.GetOrCreateReader(readerID + 1)
+ 		nextReader.MergeSlices(slicesToMove...)
++		hqtrace.Current("MoveGroupMerge", nil)
+ 		moved = true
+ 	}
+ 
+diff --git a/service/history/queues/executable.go b/service/history/queues/executable.go
+index dfab5e70f..38bf40add 100644
+--- a/service/history/queues/executable.go
++++ b/service/history/queues/executable.go
+@@ -27,6 +27,7 @@ import (
+ 	"go.temporal.io/server/common/cluster"
+ 	"go.temporal.io/server/common/dynamicconfig"
+ 	"go.temporal.io/server/common/headers"
++	"go.temporal.io/server/common/hqtrace"
+ 	"go.temporal.io/server/common/log"
+ 	"go.temporal.io/server/common/log/tag"
+ 	"go.temporal.io/server/common/metrics"
+@@ -271,6 +272,11 @@ func NewExecutable(
+ }
+ 
+ func (e *executableImpl) Execute() (retErr error) {
++	defer func() {
++		if retErr != nil && hqtrace.Extra["outcome_done"] != true {
++			hqtrace.Execution("ExecuteRetryableError", hqtrace.M{"error": hqtrace.Error(retErr)})
++		}
++	}()
+ 	startTime := e.timeSource.Now()
+ 	e.scheduleLatency = startTime.Sub(e.scheduledTime)
+ 
+@@ -296,6 +302,7 @@ func (e *executableImpl) Execute() (retErr error) {
+ 		callerInfo,
+ 	)
+ 	e.Unlock()
++	hqtrace.Execution("Execute", hqtrace.M{"terminal": e.terminalFailureCause != nil})
+ 
+ 	// Wrapped in if block to avoid unnecessary allocations when OTEL is disabled.
+ 	if telemetry.IsEnabled(e.tracer) {
+@@ -582,6 +589,17 @@ func (e *executableImpl) isUnexpectedNonRetryableError(err error) bool {
+ //
+ // Returns nil if the task should be completed, and an error if the task should be retried.
+ func (e *executableImpl) HandleErr(err error) (retErr error) {
++	hqUnexpectedBefore := e.unexpectedErrorAttempts
++	defer func() {
++		name := "HandleErrRetry"
++		if e.unexpectedErrorAttempts > hqUnexpectedBefore {
++			name = "HandleErrUnexpected"
++		}
++		if retErr == nil {
++			name = "HandleErrAck"
++		}
++		hqtrace.Execution(name, hqtrace.M{"error": hqtrace.Error(err), "returned": hqtrace.Error(retErr)})
++	}()
+ 	if err == nil {
+ 		return nil
+ 	}
+@@ -742,6 +760,7 @@ func (e *executableImpl) Cancel() {
+ func (e *executableImpl) Ack() {
+ 	e.Lock()
+ 	defer e.Unlock()
++	defer hqtrace.Execution("Ack", nil)
+ 
+ 	if e.state != ctasks.TaskStatePending {
+ 		return
+@@ -766,6 +785,7 @@ func (e *executableImpl) Ack() {
+ }
+ 
+ func (e *executableImpl) Nack(err error) {
++	defer hqtrace.Execution("Nack", nil)
+ 	state := e.State()
+ 	if state != ctasks.TaskStatePending {
+ 		return
+diff --git a/service/history/queues/queue_base.go b/service/history/queues/queue_base.go
+index 16beb8699..947e5253f 100644
+--- a/service/history/queues/queue_base.go
++++ b/service/history/queues/queue_base.go
+@@ -12,6 +12,7 @@ import (
+ 	"go.temporal.io/server/common/debug"
+ 	"go.temporal.io/server/common/dynamicconfig"
+ 	"go.temporal.io/server/common/headers"
++	"go.temporal.io/server/common/hqtrace"
+ 	"go.temporal.io/server/common/log"
+ 	"go.temporal.io/server/common/log/tag"
+ 	"go.temporal.io/server/common/metrics"
+@@ -247,6 +248,7 @@ func (p *queueBase) Stop() {
+ 	p.readerGroup.Stop()
+ 	p.rescheduler.Stop()
+ 	p.checkpointTimer.Stop()
++	hqtrace.Current("StopReaderGroup", nil)
+ }
+ 
+ func (p *queueBase) Category() tasks.Category {
+@@ -260,6 +262,13 @@ func (p *queueBase) FailoverNamespace(
+ }
+ 
+ func (p *queueBase) processNewRange() {
++	oldHigh := p.nonReadableScope.Range.InclusiveMin
++	eventName := "ProcessNewRange"
++	defer func() {
++		if oldHigh.CompareTo(p.nonReadableScope.Range.InclusiveMin) < 0 {
++			hqtrace.Current(eventName, nil)
++		}
++	}()
+ 	newMaxKey := p.shard.GetQueueExclusiveHighReadWatermark(p.category)
+ 
+ 	slices := make([]Slice, 0, 1)
+@@ -288,14 +297,17 @@ func (p *queueBase) processNewRange() {
+ 		reader.AppendSlices(slices...)
+ 		p.nextForceNewSliceTime = now.Add(forceNewSliceDuration)
+ 	} else {
++		eventName = "ProcessNewRangeMerge"
+ 		reader.MergeSlices(slices...)
+ 	}
+ }
+ 
+ func (p *queueBase) checkpoint() {
++	hqtrace.Current("CheckpointBegin", nil)
+ 	var tasksCompleted int
+-	p.readerGroup.ForEach(func(_ int64, r Reader) {
++	p.readerGroup.ForEach(func(id int64, r Reader) {
+ 		tasksCompleted += r.ShrinkSlices()
++		hqtrace.Emit("ShrinkSlices", hqtrace.M{"o": hqtrace.Owner, "r": id}, nil)
+ 	})
+ 
+ 	var checkpointAction Action
+@@ -315,8 +327,11 @@ func (p *queueBase) checkpoint() {
+ 
+ 	readerScopes := make(map[int64][]Scope)
+ 	newExclusiveDeletionHighWatermark := p.nonReadableScope.Range.InclusiveMin
+-	for readerID, reader := range p.readerGroup.Readers() {
++	readersForCheckpoint := p.readerGroup.Readers()
++	for _, readerID := range hqReaderIDs(readersForCheckpoint) {
++		reader := readersForCheckpoint[readerID]
+ 		scopes := reader.Scopes()
++		hqtrace.Emit("CheckpointScopes", hqtrace.M{"o": hqtrace.Owner, "r": readerID}, hqtrace.M{"scopes": hqScopes(scopes)})
+ 
+ 		if len(scopes) == 0 && readerID != DefaultReaderId {
+ 			p.readerGroup.RemoveReader(readerID)
+@@ -344,17 +359,25 @@ func (p *queueBase) checkpoint() {
+ 	// Emit metric before the deletion watermark comparison so we have the emit even if there's no task
+ 	// for the queue.
+ 	metrics.TaskBatchCompleteCounter.With(p.metricsHandler).Record(1)
+-	if newExclusiveDeletionHighWatermark.CompareTo(p.exclusiveDeletionHighWatermark) > 0 ||
+-		(p.updateShardRangeID() && newExclusiveDeletionHighWatermark.CompareTo(tasks.MinimumKey) > 0) {
++	doDelete := newExclusiveDeletionHighWatermark.CompareTo(p.exclusiveDeletionHighWatermark) > 0 ||
++		(p.updateShardRangeID() && newExclusiveDeletionHighWatermark.CompareTo(tasks.MinimumKey) > 0)
++	hqtrace.Current("RangeCompleteTasksBegin", hqtrace.M{"delete": doDelete, "high": newExclusiveDeletionHighWatermark.TaskID})
++	if doDelete {
+ 		// When shard rangeID is updated, perform range completion again in case the underlying persistence implementation
+ 		// serves traffic based on the persisted shardInfo.
+ 		err := p.rangeCompleteTasks(p.exclusiveDeletionHighWatermark, newExclusiveDeletionHighWatermark)
+ 		if err != nil {
++			name := "RangeCompleteTasksLostReply"
++			if hqtrace.Extra["delete_noncommit"] == true {
++				name = "RangeCompleteTasksReply"
++			}
++			hqtrace.Current(name, hqtrace.M{"error": hqtrace.Error(err)})
+ 			p.resetCheckpointTimer(err)
+ 			return
+ 		}
+ 
+ 		p.exclusiveDeletionHighWatermark = newExclusiveDeletionHighWatermark
++		hqtrace.Current("RangeCompleteTasksReply", nil)
+ 	}
+ 
+ 	err := p.updateQueueState(tasksCompleted, readerScopes)
+diff --git a/service/history/queues/reader.go b/service/history/queues/reader.go
+index 109302e0e..5e5e9f890 100644
+--- a/service/history/queues/reader.go
++++ b/service/history/queues/reader.go
+@@ -12,6 +12,7 @@ import (
+ 	"go.temporal.io/server/common/backoff"
+ 	"go.temporal.io/server/common/clock"
+ 	"go.temporal.io/server/common/dynamicconfig"
++	"go.temporal.io/server/common/hqtrace"
+ 	"go.temporal.io/server/common/log"
+ 	"go.temporal.io/server/common/log/tag"
+ 	"go.temporal.io/server/common/metrics"
+@@ -225,6 +226,9 @@ func (r *ReaderImpl) SplitSlices(splitter SliceSplitter) {
+ 
+ 	r.resetNextReadSliceLocked()
+ 	r.monitor.SetSliceCount(r.readerID, r.slices.Len())
++	if detail, ok := hqtrace.Extra["range_split"].(hqtrace.M); hqtrace.Enabled && ok {
++		hqtrace.Emit("SplitSlicesByRange", hqtrace.M{"o": hqtrace.Owner, "r": r.readerID, "cut": detail["cut"]}, detail)
++	}
+ }
+ 
+ func (r *ReaderImpl) MergeSlices(incomingSlices ...Slice) {
+@@ -315,6 +319,7 @@ func (r *ReaderImpl) ClearSlices(predicate SlicePredicate) {
+ 	}
+ 
+ 	r.resetNextReadSliceLocked()
++	hqtrace.Current("ClearSlicesComplete", nil)
+ }
+ 
+ func (r *ReaderImpl) CompactSlices(predicate SlicePredicate) {
+@@ -345,6 +350,9 @@ func (r *ReaderImpl) CompactSlices(predicate SlicePredicate) {
+ 
+ 	r.resetNextReadSliceLocked()
+ 	r.monitor.SetSliceCount(r.readerID, r.slices.Len())
++	if old, ok := hqtrace.Extra["compact_old"].(string); hqtrace.Enabled && ok {
++		hqtrace.Emit("CompactSlices", hqtrace.M{"o": hqtrace.Owner, "r": r.readerID, "i": 1}, hqtrace.M{"old": old, "new": hqtrace.Ptr(r.slices.Front().Value)})
++	}
+ }
+ 
+ // Shrink all queue slices, returning the number of tasks removed (completed)
+@@ -379,6 +387,7 @@ func (r *ReaderImpl) Notify() {
+ 	}
+ 
+ 	r.notify()
++	hqtrace.Emit("NotifyReader", hqtrace.M{"o": hqtrace.Owner, "r": r.readerID}, nil)
+ }
+ 
+ func (r *ReaderImpl) Pause(duration time.Duration) {
+@@ -463,6 +472,16 @@ func (r *ReaderImpl) loadAndSubmitTasks() {
+ 		return
+ 	}
+ 	r.retrier.Reset()
++	defer func() {
++		if !hqtrace.Enabled {
++			return
++		}
++		es := []string{}
++		for _, e := range tasks {
++			es = append(es, hqtrace.Ptr(e))
++		}
++		hqtrace.Emit("SelectTasks", hqtrace.M{"o": hqtrace.Owner, "r": r.readerID, "es": es}, hqtrace.M{"slice": hqtrace.Ptr(loadSlice), "selected_slice": hqSlice(loadSlice)})
++	}()
+ 
+ 	moreTasks := loadSlice.MoreTasks()
+ 	if len(tasks) != 0 {
+diff --git a/service/history/queues/reader_group.go b/service/history/queues/reader_group.go
+index bfbb84180..c6877300c 100644
+--- a/service/history/queues/reader_group.go
++++ b/service/history/queues/reader_group.go
+@@ -72,8 +72,8 @@ func (g *ReaderGroup) ForEach(f func(int64, Reader)) {
+ 		return
+ 	}
+ 
+-	for readerID, reader := range g.readerMap {
+-		f(readerID, reader)
++	for _, readerID := range hqReaderIDs(g.readerMap) {
++		f(readerID, g.readerMap[readerID])
+ 	}
+ }
+ 
+diff --git a/service/history/queues/rescheduler.go b/service/history/queues/rescheduler.go
+index 22a5c3ef6..db2be891f 100644
+--- a/service/history/queues/rescheduler.go
++++ b/service/history/queues/rescheduler.go
+@@ -11,6 +11,7 @@ import (
+ 	"go.temporal.io/server/common/backoff"
+ 	"go.temporal.io/server/common/clock"
+ 	"go.temporal.io/server/common/collection"
++	"go.temporal.io/server/common/hqtrace"
+ 	"go.temporal.io/server/common/log"
+ 	"go.temporal.io/server/common/log/tag"
+ 	"go.temporal.io/server/common/metrics"
+@@ -236,6 +237,7 @@ func (r *reschedulerImpl) reschedule() {
+ 
+ 			pq.Remove()
+ 			r.numExecutables--
++			hqtrace.Emit("Reschedule", hqtrace.M{"e": hqtrace.Ptr(executable)}, nil)
+ 		}
+ 	}
+ }
+diff --git a/service/history/queues/slice.go b/service/history/queues/slice.go
+index bd1bfa83d..bb4ca1c55 100644
+--- a/service/history/queues/slice.go
++++ b/service/history/queues/slice.go
+@@ -3,6 +3,7 @@ package queues
+ import (
+ 	"fmt"
+ 
++	"go.temporal.io/server/common/hqtrace"
+ 	"go.temporal.io/server/common/metrics"
+ 	"go.temporal.io/server/common/predicates"
+ 	"go.temporal.io/server/service/history/tasks"
+@@ -430,6 +431,7 @@ func (s *SliceImpl) Clear() {
+ 	s.iterators = []Iterator{
+ 		NewIterator(s.paginationFnProvider, s.scope.Range),
+ 	}
++	hqtrace.Emit("ClearSlicesBegin", hqtrace.M{"o": hqtrace.Owner, "r": hqtrace.Extra["clear_reader"], "id": hqtrace.Ptr(s)}, nil)
+ 	s.clear()
+ 
+ 	s.monitor.SetSlicePendingTaskCount(s, len(s.pendingExecutables))
+diff --git a/service/history/queues/tracker.go b/service/history/queues/tracker.go
+index ffbe1f53d..767cddcab 100644
+--- a/service/history/queues/tracker.go
++++ b/service/history/queues/tracker.go
+@@ -3,6 +3,7 @@ package queues
+ import (
+ 	"fmt"
+ 
++	"go.temporal.io/server/common/hqtrace"
+ 	ctasks "go.temporal.io/server/common/tasks"
+ 	"go.temporal.io/server/service/history/tasks"
+ )
+@@ -108,6 +109,7 @@ func (t *executableTracker) shrink() (tasks.Key, int) {
+ func (t *executableTracker) clear() {
+ 	for _, executable := range t.pendingExecutables {
+ 		executable.Cancel()
++		hqtrace.Emit("ClearCancel", hqtrace.M{"o": hqtrace.Owner, "e": hqtrace.Ptr(executable)}, nil)
+ 	}
+ 
+ 	t.pendingExecutables = make(map[tasks.Key]Executable)
+diff --git a/service/history/shard/context_impl.go b/service/history/shard/context_impl.go
+index 74e48d5c3..1c00e2182 100644
+--- a/service/history/shard/context_impl.go
++++ b/service/history/shard/context_impl.go
+@@ -36,6 +36,7 @@ import (
+ 	"go.temporal.io/server/common/finalizer"
+ 	"go.temporal.io/server/common/future"
+ 	"go.temporal.io/server/common/headers"
++	"go.temporal.io/server/common/hqtrace"
+ 	"go.temporal.io/server/common/locks"
+ 	"go.temporal.io/server/common/log"
+ 	"go.temporal.io/server/common/log/tag"
+@@ -646,14 +647,18 @@ func (s *ContextImpl) UpdateWorkflowExecution(
+ 	}
+ 
+ 	request.RangeID = s.getRangeIDLocked()
++	hqtrace.Emit("SetAndTrackTaskKeys", hqtrace.M{"o": hqtrace.Owner, "t": hqtrace.Task}, hqtrace.M{"tasks": request.UpdateWorkflowMutation.Tasks[tasks.CategoryTransfer], "range": request.RangeID})
+ 	s.wUnlock()
+ 
+ 	resp, err := s.executionManager.UpdateWorkflowExecution(ctx, request)
+ 	requestCompletionFn(err)
+-	if err = s.handleWriteError(request.RangeID, err); err != nil {
+-		return nil, err
++	err = s.handleWriteError(request.RangeID, err)
++	name := "TaskRequestCompletion"
++	if err != nil && persistence.OperationPossiblySucceeded(err) {
++		name = "TaskRequestTimeout"
+ 	}
+-	return resp, nil
++	hqtrace.Publication(name, hqtrace.M{"error": hqtrace.Error(err)})
++	return resp, err
+ }
+ 
+ func (s *ContextImpl) updateCloseTaskIDs(executionInfo *persistencespb.WorkflowExecutionInfo, tasksByCategory map[tasks.Category][]tasks.Task) {
+@@ -1180,6 +1185,9 @@ func (s *ContextImpl) renewRangeLocked(isStealing bool) error {
+ 	defer cancel()
+ 
+ 	previousRangeID := s.getRangeIDLocked()
++	if hqtrace.Enabled && hqtrace.Owner == 2 {
++		hqtrace.Current("AcquireShardBegin", hqtrace.M{"expected": previousRangeID, "snapshot": s.shardInfo, "fresh": !s.engineFuture.Ready()})
++	}
+ 	err := s.persistenceShardManager.UpdateShard(ctx, &persistence.UpdateShardRequest{
+ 		ShardInfo:       updatedShardInfo,
+ 		PreviousRangeID: previousRangeID,
+@@ -1245,6 +1253,7 @@ func (s *ContextImpl) updateShardInfo(
+ 	// If ShardUpdateMinTasksCompleted is set to 0 then we only care about whether enough time has passed
+ 	tooFewTasksCompleted := minTasksUntilUpdate <= 0 || s.tasksCompletedSinceLastUpdate < minTasksUntilUpdate
+ 	if tooFewTasksCompleted && tooEarly {
++		hqtrace.Current("SetQueueStateBatched", hqtrace.M{"too_early": tooEarly, "too_few": tooFewTasksCompleted})
+ 		s.wUnlock()
+ 		return nil
+ 	}
+@@ -1278,6 +1287,7 @@ func (s *ContextImpl) updateShardInfo(
+ 		ShardInfo:       updatedShardInfo,
+ 		PreviousRangeID: s.shardInfo.GetRangeId(),
+ 	}
++	hqtrace.Emit("SetQueueStateSnapshot", hqtrace.M{"o": hqtrace.Owner, "j": 1}, hqtrace.M{"snapshot": updatedShardInfo})
+ 	s.wUnlock()
+ 
+ 	if err := s.ioSemaphoreAcquire(s.lifecycleCtx); err != nil {
+@@ -1289,6 +1299,7 @@ func (s *ContextImpl) updateShardInfo(
+ 	defer cancel()
+ 
+ 	err := s.persistenceShardManager.UpdateShard(ctx, request)
++	defer func() { hqtrace.Emit("UpdateShardReply", hqtrace.M{"j": 1}, hqtrace.M{"error": hqtrace.Error(err)}) }()
+ 	if err != nil {
+ 		s.wLock()
+ 		defer s.wUnlock()
+@@ -2107,6 +2118,9 @@ func (s *ContextImpl) acquireShard() {
+ 		// we know engineFuture must be ready here, and we can notify queue processor
+ 		// to trigger a load as queue max level can be updated to a newer value
+ 		s.notifyQueueProcessor()
++		if hqtrace.Enabled && hqtrace.Owner == 2 {
++			hqtrace.Current("AcquireShardComplete", hqtrace.M{"engine_ready": s.engineFuture.Ready()})
++		}
+ 		// This runs until the lifecycleCtx is cancelled, so we only need to start it once
+ 		s.queueMetricEmitter.Do(func() {
+ 			go s.monitorQueueMetrics()
+diff --git a/service/history/transfer_queue_active_task_executor.go b/service/history/transfer_queue_active_task_executor.go
+index 1cfc694af..078b42f33 100644
+--- a/service/history/transfer_queue_active_task_executor.go
++++ b/service/history/transfer_queue_active_task_executor.go
+@@ -23,6 +23,7 @@ import (
+ 	"go.temporal.io/server/chasm"
+ 	"go.temporal.io/server/common"
+ 	"go.temporal.io/server/common/definition"
++	"go.temporal.io/server/common/hqtrace"
+ 	"go.temporal.io/server/common/locks"
+ 	"go.temporal.io/server/common/log"
+ 	"go.temporal.io/server/common/log/tag"
+@@ -283,6 +284,7 @@ func (t *transferQueueActiveTaskExecutor) processActivityTask(
+ 	// the rest of logic is making RPC call, which takes time.
+ 	release(nil)
+ 
++	hqtrace.Execution("ProcessTransferTaskEligible", hqtrace.M{"task": task})
+ 	return t.pushActivity(ctx, task, timeout, directive, priority, historyi.TransactionPolicyActive)
+ }
+ 
+@@ -336,6 +338,7 @@ func (t *transferQueueActiveTaskExecutor) processWorkflowTask(
+ 	// which will call history back (with RecordWorkflowTaskStarted), and it will try to get workflow lock again.
+ 	release(nil)
+ 
++	hqtrace.Execution("ProcessTransferTaskEligible", hqtrace.M{"task": transferTask})
+ 	err = t.pushWorkflowTask(
+ 		ctx,
+ 		transferTask,
+diff --git a/service/history/transfer_queue_task_executor_base.go b/service/history/transfer_queue_task_executor_base.go
+index 989b9d780..b267ba6cc 100644
+--- a/service/history/transfer_queue_task_executor_base.go
++++ b/service/history/transfer_queue_task_executor_base.go
+@@ -13,6 +13,7 @@ import (
+ 	"go.temporal.io/server/chasm"
+ 	"go.temporal.io/server/common"
+ 	"go.temporal.io/server/common/debug"
++	"go.temporal.io/server/common/hqtrace"
+ 	"go.temporal.io/server/common/locks"
+ 	"go.temporal.io/server/common/log"
+ 	"go.temporal.io/server/common/log/tag"
+@@ -117,6 +118,14 @@ func (t *transferQueueTaskExecutorBase) pushActivity(
+ 		Stamp:                  task.Stamp,
+ 		Priority:               priority,
+ 	})
++	if hqtrace.Enabled && hqtrace.Extra["matching_committed"] == true {
++		if err == nil {
++			hqtrace.Execution("MatchingReply", nil)
++		} else {
++			hqtrace.Extra["outcome_done"] = true
++			hqtrace.Execution("MatchingLostReply", hqtrace.M{"error": hqtrace.Error(err)})
++		}
++	}
+ 	if _, isNotFound := err.(*serviceerror.NotFound); isNotFound {
+ 		// NotFound error is not expected for AddTasks calls
+ 		// but will be ignored by task error handling logic, so log it here
+@@ -171,6 +180,14 @@ func (t *transferQueueTaskExecutorBase) pushWorkflowTask(
+ 		Priority:               priority,
+ 		Stamp:                  task.Stamp,
+ 	})
++	if hqtrace.Enabled && hqtrace.Extra["matching_committed"] == true {
++		if err == nil {
++			hqtrace.Execution("MatchingReply", nil)
++		} else {
++			hqtrace.Extra["outcome_done"] = true
++			hqtrace.Execution("MatchingLostReply", hqtrace.M{"error": hqtrace.Error(err)})
++		}
++	}
+ 	if _, isNotFound := err.(*serviceerror.NotFound); isNotFound {
+ 		// NotFound error is not expected for AddTasks calls
+ 		// but will be ignored by task error handling logic, so log it here

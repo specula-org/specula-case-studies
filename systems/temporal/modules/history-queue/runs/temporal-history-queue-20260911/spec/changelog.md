@@ -1,0 +1,34 @@
+# Validation changelog — temporal-history-queue
+
+Revision: `0c010ce5fe8c0180aa7573c72fe8fc87c6df7025`; SQL/SQLite WAL.
+Input snapshot: `output/validation-20260911/input/`. Earlier generation and harness changes remain recorded in `checks/validation.md` and `../harness/REPORT.md`.
+
+## Round 1 - Trace Validation
+- [init] Checked all inputs, nine hunting configs, instrumentation mapping, and harness documentation. `Trace.cfg` enables `TraceMatched`; every event checks the complete observed post-state. Four implementation traces and eight negative controls are available.
+- [pass] Regenerated four real SQLite schedules (320 total records including Init/Endpoint); all full-state replays and eight negative controls pass. Evidence: `../harness/evidence/run-20260911T190900Z-aO6gVU/`.
+- [tool] The MCP server fails at startup with `Server has no attribute list_tools` (installed SDK/API mismatch). Called the installed tool handlers directly through `output/validation-20260911/handler_call.py`; `run_trace_validation_parallel` passes all four traces. Server failure log is retained.
+
+## Round 1 - Model Checking
+- [fix-spec] AcquireShardComplete (Case B): a pending acquisition reply revived a stopped owner. The shard lifecycle rejects this transition (`ContextImpl.transition`, stopping/stopped cases; acquireShard's rejected-completion cleanup). Preserve range/key-reset effects of completed renewal, clear the receipt, and retain stopped mode without publishing an engine/notification.
+- [fix-spec] SelectTasks (Case B): order new executable bindings by persisted TaskKey rather than logical task identity (`sqlite/execution.go` ascending task_id query; `slice.go:SelectTasks` preserves page order). Restrict this atomic successful-read projection to active-shard admission (`ContextImpl.GetHistoryTasks/errorByState`). Already-admitted/prefetched pages and partial read errors remain explicit unmodeled paths.
+- [fix-spec] MC fairness (Case B): all six service relations now assign `faults' = faults`, matching ordinary MCNext actions and the complete `mcvars` tuple. The old temporal setup failed at enabledness evaluation.
+- [fix-spec] MC snapshot traffic: remove the ordinary-writer initiation counter and its cfg overrides. Reusable snapshot slots bound concurrent writes; ordinary initiation remains repeatable. Other supplied population/fault bounds are unchanged.
+- [fix-spec] S2 hunt preparation: expand its namespace population from two to three so a two-group proper subset can actually widen at PredicateLimit=1. This is a semantic group-count abstraction; real predicate-byte inflation remains outside the model. No hunting search has run.
+- [incomplete] Initial background wrapper exited before exploration; PID wait confirmed termination. Foreground replacement reached 21,987,920 generated / 7,332,772 distinct / 6,445,034 queued, depth 12 (last progress), then was deliberately terminated (143) after the new multi-slice trace exposed a base-spec mismatch. This search is superseded, not a pass.
+
+## Round 2 - Trace Validation
+- [fix] ClearSlicesBegin: both new cursor implementation traces stopped at their second selected slice (healthy line45/state44). Coarse debugger hits307/308/309 = 1/1/0; base inspection finds the idle-only guard false while cancelTodo is empty. Inconsistency error: `reader.go:ClearSlices` loops over multiple slices under one reader lock; `tracker.clear` clears each tracker before the next slice. Support ordered continuation, preserve the lock until ClearSlicesComplete, and clear the preceding tracker at the next measured boundary. Full post-state equality remains unchanged. Evidence: `output/validation-20260911/cursor-debug-{coarse,fine}.json`.
+- [evidence] Added real Transfer executor cursor-stall and healthy schedules, including SQLite row/scope readback, three poll/checkpoint/Notify cycles, and fresh acquisition with real post-reload dispatch. This extends prior CR-1 source/native evidence; it is not model-checking discovery.
+- [fix] SelectTasks observation: stalled trace line67/state66 passes the base action but its post-state comparison fails. Once the removed list element advances to nil, the queue probe loses access to the just-exhausted detached slice and the reducer retains its old iterator. Capture that real `loadSlice` at the existing post-selection hook and use its measured snapshot for the detached record. This is a capture-lifetime defect; the base transition and equality checks are unchanged. Regenerate traces from native runs; do not patch prior observations.
+- [fix] Synthetic late-DLQ witness still scheduled HandleErrRetry after MatchingLostReply, despite the prior harness phase correctly changing the latter to unexpected-error classification. The finite witness stopped at pc33. Update only its next action to HandleErrUnexpected and align its synthetic trace tag with Trace's active envelope. Base/MC behavior is unchanged; this is a stale diagnostic fixture, not a Temporal finding.
+- [pass] Final regenerated suite: six complete implementation traces, 534 records, 46/65 named actions, all eight negative controls rejected. The stalled SQLite snapshot is preserved and independently decoded after the Go process exits.
+
+## Round 2 - Model Checking
+- [validation] Full MC.cfg BFS uses unchanged task/fault bounds, 16 workers, 12GiB heap +24GiB off-heap, and a 30-minute deadline. Final output/status is recorded in validation-report.md and validation-status.json.
+- [validation] Stopped-owner and reversed-allocation endpoint checks pass (8/11 states). Six finite composition schedules pass (62/68/72/33/66/56 states); a 26-state widening/overlap witness reaches its required endpoint. These diagnostics do not replace baseline convergence or count as post-convergence hunts.
+- [source-check] CR-1 now has full real-executor trace/control/reload evidence; CR-2 duplicate-count inflation is reproduced with empty-scope compensation; CR-3's finite-contention premise is narrowed by real semaphore/lifecycle controls. See validation-report.md; none is relabelled as an MC-first discovery.
+- [cleanup] Archived 82 generated Trace_TTrace files under `output/validation-20260911/trace-exploration-archive/`, then ran the installed clean_traces handler. Raw implementation traces, debugger outputs, negative controls, and all model-checking evidence remain preserved.
+- [tool] get_tlc_summary cannot parse a timed-out log without a counterexample (no trace format to detect). Its error is preserved in `output/validation-20260911/mc-summary.log`; final statistics use the explicitly labelled last TLC progress receipt and outer exit124.
+
+## Result
+Not converged. Six implementation traces and eight negative controls pass. Round 2 MC.cfg: INCOMPLETE at30 minutes, exit124; last progress 130,208,773 generated / 40,246,046 distinct / 36,081,667 queued / depth13. Post-convergence hunting: not run (precondition unmet), zero MC findings established.

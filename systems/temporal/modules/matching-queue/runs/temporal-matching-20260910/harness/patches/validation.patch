@@ -1,0 +1,176 @@
+--- a/base.tla
++++ b/base.tla
+@@ -259,7 +259,7 @@
+     \* service/matching/db.go:575-597; service/matching/pri_task_writer.go:124-137; service/matching/pri_backlog_manager.go:108-116
+     /\ owner' = [owner EXCEPT ![o].maxRead = writer[o].id,
+           ![o].dirty = @ \/ reply = "ok",
+-          ![o].skipFinal = @ \/ reply = "condition",
++          ![o].skipFinal = @,
+           ![o].life = IF reply = "condition" THEN "unload" ELSE @]
+     \* service/matching/db.go:575-597; service/matching/pri_task_writer.go:124-137; service/matching/pri_backlog_manager.go:108-116
+     /\ writer' = [writer EXCEPT ![o].reply = reply,
+@@ -410,7 +410,7 @@
+     \* Parameter domains: finite actors/identities, or an actual queue membership.
+     /\ o \in Owners
+     \* service/matching/pri_task_reader.go:163-177,214-217
+-    /\ Running(o) /\ reader[o].pc = "idle" /\ owner[o].notify /\ ReaderFree(o)
++    /\ owner[o].life \in {"ready", "stopping", "stopped"} /\ reader[o].pc = "idle" /\ owner[o].notify /\ ReaderFree(o)
+     \* service/matching/pri_task_reader.go:163-177,214-217
+     /\ owner' = [owner EXCEPT ![o].notify = FALSE]
+     \* service/matching/pri_task_reader.go:163-177,214-217
+@@ -458,7 +458,7 @@
+     \* Parameter domains: finite actors/identities, or an actual queue membership.
+     /\ o \in Owners
+     \* service/matching/pri_task_reader.go:177-186,231-232,415-427
+-    /\ reader[o].pc = "store" /\ Running(o)
++    /\ reader[o].pc = "store" /\ owner[o].life \in {"ready", "stopping", "stopped"}
+     \* service/matching/pri_task_reader.go:177-186,231-232,415-427
+     /\ reader' = [reader EXCEPT ![o].pc = "backoff"]
+     /\ UNCHANGED <<durable, catalog, owner, writer, metadata, dispatch, calls, history, audit>>
+@@ -468,7 +468,7 @@
+     \* Parameter domains: finite actors/identities, or an actual queue membership.
+     /\ o \in Owners
+     \* service/matching/pri_task_reader.go:415-427
+-    /\ reader[o].pc = "backoff" /\ Running(o)
++    /\ reader[o].pc = "backoff" /\ owner[o].life \in {"ready", "stopping", "stopped"}
+     \* service/matching/pri_task_reader.go:415-427
+     /\ reader' = [reader EXCEPT ![o] = IdleReader]
+     \* service/matching/pri_task_reader.go:415-427
+@@ -745,7 +745,7 @@
+     /\ dispatch' = [dispatch EXCEPT ![p].pc = IF dispatch[p].appendReply = "ok" THEN "finish" ELSE "replacementFailed",
+                ![p].reply = IF dispatch[p].appendReply = "ok" THEN "replaced" ELSE "respool"]
+     \* service/matching/pri_backlog_manager.go:367-387; service/matching/pri_task_reader.go:137-139
+-    /\ owner' = [owner EXCEPT ![dispatch[p].owner].skipFinal = @ \/ dispatch[p].appendReply # "ok",
++    /\ owner' = [owner EXCEPT ![dispatch[p].owner].skipFinal = @,
+                ![dispatch[p].owner].life = IF dispatch[p].appendReply # "ok" THEN "unload" ELSE @]
+     /\ UNCHANGED <<durable, catalog, writer, reader, metadata, calls, history, audit>>
+ 
+@@ -1038,8 +1038,8 @@
+             ![o].maxRead = IF ok /\ take THEN (metadata[o].newRange-1)*RangeSize ELSE @,
+             ![o].notify = @ \/ (ok /\ take),
+             ![o].life = IF take THEN (IF ok THEN "ready" ELSE "cold")
+-                         ELSE IF metadata[o].outcome = "condition" THEN "unload" ELSE @,
+-            ![o].skipFinal = @ \/ metadata[o].outcome = "condition",
++                         ELSE IF metadata[o].outcome = "condition" /\ ~stop THEN "unload" ELSE @,
++            ![o].skipFinal = @,
+             ![o].stopStep = IF stop THEN "cancel" ELSE @]
+     \* service/matching/db.go:196-207,241-255; service/matching/pri_task_writer.go:140-149,217-224; service/matching/pri_backlog_manager.go:108-116
+     /\ metadata' = [metadata EXCEPT ![o] = IdleMetadata]
+@@ -1062,7 +1062,7 @@
+     \* service/matching/pri_backlog_manager.go:108-116,374-387; service/matching/physical_task_queue_manager.go:319-334
+     /\ owner[o].life = "unload" /\ owner[o].skipFinal
+     \* service/matching/pri_backlog_manager.go:108-116,374-387; service/matching/physical_task_queue_manager.go:319-334
+-    /\ owner' = [owner EXCEPT ![o].life = "stopping", ![o].stopStep = "cancel"]
++    /\ owner' = [owner EXCEPT ![o].life = "stopping", ![o].stopStep = "cancel", ![o].skipFinal = TRUE]
+     /\ UNCHANGED <<durable, catalog, writer, reader, metadata, dispatch, calls, history, audit>>
+ 
+ \* Refresh cached reader ack before the final SyncState; queue context is not yet canceled.
+@@ -1085,9 +1085,11 @@
+     \* service/matching/pri_backlog_manager.go:142-144
+     /\ owner[o].life = "stopping" /\ owner[o].stopStep = "sync" /\ DBFree(o)
+     \* service/matching/pri_backlog_manager.go:142-144
+-    /\ metadata' = [metadata EXCEPT ![o] = [IdleMetadata EXCEPT !.pc = "store",
+-           !.kind = "sync", !.expect = owner[o].range, !.newRange = owner[o].range,
+-           !.ack = owner[o].cachedAck]]
++    /\ \E kind \in {"sync", "verify"} :
++          /\ (kind = "sync" \/ ~owner[o].dirty)
++          /\ metadata' = [metadata EXCEPT ![o] = [IdleMetadata EXCEPT !.pc = "store",
++               !.kind = kind, !.expect = owner[o].range, !.newRange = owner[o].range,
++               !.ack = owner[o].cachedAck]]
+     \* service/matching/pri_backlog_manager.go:142-144
+     /\ owner' = [owner EXCEPT ![o].stopStep = "wait"]
+     /\ UNCHANGED <<durable, catalog, writer, reader, dispatch, calls, history, audit>>
+@@ -1099,8 +1101,7 @@
+     \* service/matching/physical_task_queue_manager.go:327-334
+     /\ owner[o].life = "stopping" /\ owner[o].stopStep = "cancel"
+     \* service/matching/physical_task_queue_manager.go:327-334
+-    /\ owner' = [owner EXCEPT ![o].life = "stopped", ![o].notify = FALSE,
+-          ![o].queued = {}, ![o].adding = {}]
++    /\ owner' = [owner EXCEPT ![o].life = "stopped"]
+     /\ UNCHANGED <<durable, catalog, writer, reader, metadata, dispatch, calls, history, audit>>
+ 
+ \* Process failure freezes local callbacks; durable effects already submitted may still commit.
+@@ -1284,7 +1285,16 @@
+ \* No unconditional Worker-receipt or strict scheduling-order claim is made.
+ EventuallyDischarged == \A w \in Work : (w \in audit.accepted) ~> Discharged(w)
+ 
++\* The actual atomic skipFinalUpdate.Store(true), including errShutdown after Stop.
++SignalIfFatal(o) ==
++    /\ o \in Owners /\ Alive(o)
++    /\ owner[o].life \in {"unload", "stopped"}
++    /\ owner' = [owner EXCEPT ![o].skipFinal = TRUE,
++         ![o].life = IF @ = "ready" THEN "unload" ELSE @]
++    /\ UNCHANGED <<durable, catalog, writer, reader, metadata, dispatch, calls, history, audit>>
++
+ RawNext ==
++    \/ \E o \in Owners : SignalIfFatal(o)
+     \/ \E a \in CallIds : \E w \in Work : \E o \in Owners : AddTask(a, w, o)
+     \/ \E a \in CallIds : TrySyncMatchFallback(a)
+     \/ \E a \in CallIds : \E p \in Pollers : TrySyncMatch(a, p)
+--- a/Trace.tla
++++ b/Trace.tla
+@@ -8,7 +8,12 @@
+ JsonFile ==
+     IF "JSON" \in DOMAIN IOEnv THEN IOEnv.JSON
+     ELSE "../traces/trace.ndjson"
+-RawLog == ndJsonDeserialize(JsonFile)
++TransportLog == ndJsonDeserialize(JsonFile)
++RawLog == [i \in 1..Len(TransportLog) |->
++    LET e == TransportLog[i] IN
++    IF DOMAIN e = {"tag", "ts", "record"} /\ e.tag = "trace" /\ e.ts \in STRING
++    THEN e.record
++    ELSE Assert(FALSE, "Invalid timestamped trace transport envelope")]
+ TaggedLog == SelectSeq(RawLog, LAMBDA e :
+     IF "tag" \in DOMAIN e THEN e.tag = "temporal-matching" ELSE FALSE)
+ Header == TaggedLog[1]
+@@ -66,7 +71,8 @@
+       [] OTHER -> TRUE
+ 
+ PostKeys(event) ==
+-    CASE event = "TraceEnd" -> AllKeys
++    CASE event = "SignalIfFatal" -> {"owner"}
++      [] event = "TraceEnd" -> AllKeys
+       [] event = "AddTask" -> {"calls"}
+       [] event = "TrySyncMatchFallback" -> {"calls"}
+       [] event = "TrySyncMatch" -> {"dispatch", "calls"}
+@@ -171,6 +177,12 @@
+     /\ e.tag = "temporal-matching" /\ e.seq = l /\ e.event = event
+     /\ e.node = node /\ e.queue = Header.queue /\ DOMAIN e.args = args
+ 
++TraceSignalIfFatal(e) ==
++    /\ Envelope(e, "SignalIfFatal", e.args.o, {"o"})
++    /\ Track(B!SignalIfFatal(e.args.o))
++    /\ ValidatePostState(e)
++    /\ l' = l + 1
++
+ TraceInit ==
+     /\ Assert(Len(TaggedLog) >= 3, "Need bootstrap, at least one action and TraceEnd")
+     /\ DOMAIN Header = {"tag", "seq", "event", "source", "revision", "queue", "config", "post"}
+@@ -788,7 +800,8 @@
+     /\ l' = l + 1
+ 
+ MatchEvent(e) ==
+-    CASE e.event = "TraceEnd" -> TraceEnd(e)
++    CASE e.event = "SignalIfFatal" -> TraceSignalIfFatal(e)
++      [] e.event = "TraceEnd" -> TraceEnd(e)
+       [] e.event = "AddTask" -> TraceAddTask(e)
+       [] e.event = "TrySyncMatchFallback" -> TraceTrySyncMatchFallback(e)
+       [] e.event = "TrySyncMatch" -> TraceTrySyncMatch(e)
+--- a/MC.tla
++++ b/MC.tla
+@@ -193,6 +193,7 @@
+     \/ \E o \in Owners : MCUpdateTaskQueueReplyLost(o)
+     \/ \E o \in Owners : (B!UpdateTaskQueueReturn(o) /\ UNCHANGED faults)
+     \/ \E o \in Owners : MCStopBegin(o)
++    \/ \E o \in Owners : (B!SignalIfFatal(o) /\ UNCHANGED faults)
+     \/ \E o \in Owners : (B!UnloadAfterError(o) /\ UNCHANGED faults)
+     \/ \E o \in Owners : (B!StopRefreshAck(o) /\ UNCHANGED faults)
+     \/ \E o \in Owners : (B!StopSyncState(o) /\ UNCHANGED faults)
+@@ -283,6 +284,7 @@
+     /\ \A o \in Owners : SF_mcvars(Track(B!VerifyOwnership(o)) /\ UNCHANGED faults)
+     /\ \A o \in Owners : SF_mcvars(Track(B!UpdateTaskQueueConditionFailed(o)) /\ UNCHANGED faults)
+     /\ \A o \in Owners : SF_mcvars(Track(B!UpdateTaskQueueReturn(o)) /\ UNCHANGED faults)
++    /\ \A o \in Owners : SF_mcvars(Track(B!SignalIfFatal(o)) /\ UNCHANGED faults)
+     /\ \A o \in Owners : SF_mcvars(Track(B!UnloadAfterError(o)) /\ UNCHANGED faults)
+     /\ \A o \in Owners : SF_mcvars(Track(B!StopRefreshAck(o)) /\ UNCHANGED faults)
+     /\ \A o \in Owners : SF_mcvars(Track(B!StopSyncState(o)) /\ UNCHANGED faults)

@@ -1,0 +1,1963 @@
+[
+  {
+    "name": "AddTask",
+    "params": [
+      [
+        "a",
+        "CallIds"
+      ],
+      [
+        "w",
+        "Work"
+      ],
+      [
+        "o",
+        "Owners"
+      ]
+    ],
+    "touched": [
+      "calls"
+    ],
+    "ref": "service/matching/task_queue_partition_manager.go:612-619",
+    "trigger": "S1/S4: an external Add attempt, including retry with the same logical work.",
+    "kind": "add",
+    "checks": null,
+    "postKeys": [
+      "calls"
+    ],
+    "traceNode": "e.args.o",
+    "traceExtraArgs": []
+  },
+  {
+    "name": "TrySyncMatchFallback",
+    "params": [
+      [
+        "a",
+        "CallIds"
+      ]
+    ],
+    "touched": [
+      "calls"
+    ],
+    "ref": "service/matching/pri_matcher.go:415-430; service/matching/task_queue_partition_manager.go:644-659",
+    "trigger": "No waiting eligible poller or backlog present; persist on this partition.",
+    "kind": "react",
+    "checks": null,
+    "postKeys": [
+      "calls"
+    ],
+    "traceNode": "calls[e.args.a].owner",
+    "traceExtraArgs": []
+  },
+  {
+    "name": "TrySyncMatch",
+    "params": [
+      [
+        "a",
+        "CallIds"
+      ],
+      [
+        "p",
+        "Pollers"
+      ]
+    ],
+    "touched": [
+      "dispatch",
+      "calls"
+    ],
+    "ref": "service/matching/pri_matcher.go:390-421; service/matching/matching_engine.go:3511-3527",
+    "trigger": "S4: sync pair is not yet an accepted start.",
+    "kind": "sync",
+    "checks": null,
+    "postKeys": [
+      "dispatch",
+      "calls"
+    ],
+    "traceNode": "calls[e.args.a].owner",
+    "traceExtraArgs": []
+  },
+  {
+    "name": "SpoolTask",
+    "params": [
+      [
+        "a",
+        "CallIds"
+      ]
+    ],
+    "touched": [
+      "owner",
+      "calls"
+    ],
+    "ref": "service/matching/pri_backlog_manager.go:248-252; service/matching/pri_task_writer.go:68-98",
+    "trigger": "Enqueue into appendCh; pending requests may accumulate while writer is busy.",
+    "kind": "react",
+    "checks": null,
+    "postKeys": [
+      "owner",
+      "calls"
+    ],
+    "traceNode": "calls[e.args.a].owner",
+    "traceExtraArgs": []
+  },
+  {
+    "name": "TaskWriterDequeue",
+    "params": [
+      [
+        "o",
+        "Owners"
+      ]
+    ],
+    "touched": [
+      "writer",
+      "owner"
+    ],
+    "ref": "service/matching/pri_task_writer.go:162-170,182-190",
+    "trigger": "Single writer receives FIFO append request; selected MaxTaskBatchSize=1.",
+    "kind": "react",
+    "checks": null,
+    "postKeys": [
+      "owner",
+      "writer"
+    ],
+    "traceNode": "e.args.o",
+    "traceExtraArgs": []
+  },
+  {
+    "name": "AssignTaskIDs",
+    "params": [
+      [
+        "o",
+        "Owners"
+      ]
+    ],
+    "touched": [
+      "writer",
+      "catalog",
+      "owner"
+    ],
+    "ref": "service/matching/pri_task_writer.go:108-121",
+    "trigger": "Reserve the next ID before I/O. IDs are never reused, including rejection.",
+    "kind": "react",
+    "checks": null,
+    "postKeys": [
+      "catalog",
+      "owner",
+      "writer"
+    ],
+    "traceNode": "e.args.o",
+    "traceExtraArgs": []
+  },
+  {
+    "name": "CreateTasksBegin",
+    "params": [
+      [
+        "o",
+        "Owners"
+      ]
+    ],
+    "touched": [
+      "writer"
+    ],
+    "ref": "service/matching/db.go:528-573",
+    "trigger": "Acquire the per-owner DB mutex and capture previous max; SQL V1 ignores metadata piggyback.",
+    "kind": "react",
+    "checks": null,
+    "postKeys": [
+      "writer"
+    ],
+    "traceNode": "e.args.o",
+    "traceExtraArgs": []
+  },
+  {
+    "name": "CreateTasksCommit",
+    "params": [
+      [
+        "o",
+        "Owners"
+      ]
+    ],
+    "touched": [
+      "durable",
+      "writer",
+      "audit"
+    ],
+    "ref": "common/persistence/sql/task_v1.go:80-98,187-205",
+    "trigger": "Atomic insert plus range lock/condition transaction; no partial batch commit.",
+    "kind": "react",
+    "checks": null,
+    "postKeys": [
+      "durable",
+      "writer"
+    ],
+    "traceNode": "e.args.o",
+    "traceExtraArgs": [
+      "tasks",
+      "actualRange",
+      "expectedRange"
+    ]
+  },
+  {
+    "name": "CreateTasksConditionFailed",
+    "params": [
+      [
+        "o",
+        "Owners"
+      ]
+    ],
+    "touched": [
+      "writer"
+    ],
+    "ref": "common/persistence/sql/task_v1.go:80-98,187-205",
+    "trigger": "Range mismatch rejects the whole transaction; a reactive result, not a fault budget.",
+    "kind": "react",
+    "checks": null,
+    "postKeys": [
+      "writer"
+    ],
+    "traceNode": "e.args.o",
+    "traceExtraArgs": [
+      "actualRange",
+      "expectedRange"
+    ]
+  },
+  {
+    "name": "CreateTasksReject",
+    "params": [
+      [
+        "o",
+        "Owners"
+      ],
+      [
+        "result",
+        "{\"limit\", \"noCommit\"}"
+      ]
+    ],
+    "touched": [
+      "writer"
+    ],
+    "ref": "service/matching/db.go:677-697; common/persistence/sql/task_v1.go:80-98",
+    "trigger": "Inject persistence limit rejection or an uncommitted failed transaction.",
+    "kind": "storeFail",
+    "checks": null,
+    "postKeys": [
+      "writer"
+    ],
+    "traceNode": "e.args.o",
+    "traceExtraArgs": []
+  },
+  {
+    "name": "CreateTasksReturn",
+    "params": [
+      [
+        "o",
+        "Owners"
+      ],
+      [
+        "reply",
+        "{\"ok\", \"definite\", \"unknown\", \"condition\"}"
+      ]
+    ],
+    "touched": [
+      "owner",
+      "writer"
+    ],
+    "ref": "service/matching/db.go:575-597; service/matching/pri_task_writer.go:124-137; service/matching/pri_backlog_manager.go:108-116",
+    "trigger": "Release DB mutex only after maxRead advances, even on failed writes.",
+    "kind": "react",
+    "checks": null,
+    "postKeys": [
+      "owner",
+      "writer"
+    ],
+    "traceNode": "e.args.o",
+    "traceExtraArgs": []
+  },
+  {
+    "name": "CreateTasksUncertainReturn",
+    "params": [
+      [
+        "o",
+        "Owners"
+      ]
+    ],
+    "touched": [
+      "owner",
+      "writer",
+      "audit"
+    ],
+    "ref": "service/matching/db.go:575-596,677-697; service/matching/pri_task_writer.go:125-133",
+    "trigger": "A committed transaction returns Unavailable/timeout; no successful reader signal.",
+    "kind": "uncertain",
+    "checks": null,
+    "postKeys": [
+      "owner",
+      "writer"
+    ],
+    "traceNode": "e.args.o",
+    "traceExtraArgs": []
+  },
+  {
+    "name": "SignalNewTasksBypass",
+    "params": [
+      [
+        "o",
+        "Owners"
+      ]
+    ],
+    "touched": [
+      "owner",
+      "writer"
+    ],
+    "ref": "service/matching/pri_task_reader.go:382-412",
+    "trigger": "Reader-lock region of successful direct bypass; matcher insertion follows separately.",
+    "kind": "react",
+    "checks": null,
+    "postKeys": [
+      "owner",
+      "writer"
+    ],
+    "traceNode": "e.args.o",
+    "traceExtraArgs": []
+  },
+  {
+    "name": "SignalNewTasksWake",
+    "params": [
+      [
+        "o",
+        "Owners"
+      ]
+    ],
+    "touched": [
+      "owner",
+      "writer"
+    ],
+    "ref": "service/matching/pri_task_reader.go:390-403",
+    "trigger": "Bypass failed: enqueue the coalescing reader wakeup without advancing read.",
+    "kind": "react",
+    "checks": null,
+    "postKeys": [
+      "owner",
+      "writer"
+    ],
+    "traceNode": "e.args.o",
+    "traceExtraArgs": []
+  },
+  {
+    "name": "AddTaskToMatcher",
+    "params": [
+      [
+        "o",
+        "Owners"
+      ],
+      [
+        "r",
+        "owner[o].adding"
+      ]
+    ],
+    "touched": [
+      "owner"
+    ],
+    "ref": "service/matching/pri_task_reader.go:298-314; service/matching/physical_task_queue_manager.go:601-610",
+    "trigger": "Outside reader lock: insert registered work into the fixed unversioned matcher.",
+    "kind": "react",
+    "checks": null,
+    "postKeys": [
+      "owner"
+    ],
+    "traceNode": "e.args.o",
+    "traceExtraArgs": []
+  },
+  {
+    "name": "AddTaskToMatcherClosed",
+    "params": [
+      [
+        "o",
+        "Owners"
+      ],
+      [
+        "r",
+        "owner[o].adding"
+      ]
+    ],
+    "touched": [
+      "owner"
+    ],
+    "ref": "service/matching/pri_task_reader.go:316-338",
+    "trigger": "Canceled queue rejects insertion; retry acquire exits without acknowledging the registered record.",
+    "kind": "react",
+    "checks": null,
+    "postKeys": [
+      "owner"
+    ],
+    "traceNode": "e.args.o",
+    "traceExtraArgs": []
+  },
+  {
+    "name": "SignalReadersDone",
+    "params": [
+      [
+        "o",
+        "Owners"
+      ]
+    ],
+    "touched": [
+      "writer"
+    ],
+    "ref": "service/matching/pri_task_reader.go:410-412; service/matching/pri_task_writer.go:136-137",
+    "trigger": "Return from signalReaders only after the bypass insertion returns.",
+    "kind": "react",
+    "checks": null,
+    "postKeys": [
+      "writer"
+    ],
+    "traceNode": "e.args.o",
+    "traceExtraArgs": []
+  },
+  {
+    "name": "TaskWriterPublish",
+    "params": [
+      [
+        "o",
+        "Owners"
+      ]
+    ],
+    "touched": [
+      "calls",
+      "writer"
+    ],
+    "ref": "service/matching/pri_task_writer.go:168-174",
+    "trigger": "Publish the buffered append result; caller receipt is a separate selection.",
+    "kind": "react",
+    "checks": null,
+    "postKeys": [
+      "writer",
+      "calls"
+    ],
+    "traceNode": "e.args.o",
+    "traceExtraArgs": []
+  },
+  {
+    "name": "AppendTaskReceive",
+    "params": [
+      [
+        "a",
+        "CallIds"
+      ]
+    ],
+    "touched": [
+      "calls",
+      "audit"
+    ],
+    "ref": "service/matching/pri_task_writer.go:89-96; service/matching/task_queue_partition_manager.go:659-668",
+    "trigger": "Add returns success only after receiving the successful append response.",
+    "kind": "react",
+    "checks": null,
+    "postKeys": [
+      "calls"
+    ],
+    "traceNode": "calls[e.args.a].owner",
+    "traceExtraArgs": []
+  },
+  {
+    "name": "AppendTaskShutdown",
+    "params": [
+      [
+        "a",
+        "CallIds"
+      ]
+    ],
+    "touched": [
+      "calls"
+    ],
+    "ref": "service/matching/pri_task_writer.go:72-96",
+    "trigger": "Queue shutdown can win receipt selection even if the submitted write committed.",
+    "kind": "react",
+    "checks": null,
+    "postKeys": [
+      "calls"
+    ],
+    "traceNode": "calls[e.args.a].owner",
+    "traceExtraArgs": []
+  },
+  {
+    "name": "AddTaskReply",
+    "params": [
+      [
+        "a",
+        "CallIds"
+      ]
+    ],
+    "touched": [
+      "calls"
+    ],
+    "ref": "service/matching/task_queue_partition_manager.go:638,659-670",
+    "trigger": "Caller observes the server response.",
+    "kind": "react",
+    "checks": null,
+    "postKeys": [
+      "calls"
+    ],
+    "traceNode": "calls[e.args.a].owner",
+    "traceExtraArgs": []
+  },
+  {
+    "name": "AddTaskReplyLost",
+    "params": [
+      [
+        "a",
+        "CallIds"
+      ]
+    ],
+    "touched": [
+      "calls"
+    ],
+    "ref": "service/matching/task_queue_partition_manager.go:638,659-670",
+    "trigger": "External transport loses the response; successful server acceptance remains.",
+    "kind": "loss",
+    "checks": null,
+    "postKeys": [
+      "calls"
+    ],
+    "traceNode": "calls[e.args.a].owner",
+    "traceExtraArgs": []
+  },
+  {
+    "name": "GetTasksPump",
+    "params": [
+      [
+        "o",
+        "Owners"
+      ]
+    ],
+    "touched": [
+      "owner",
+      "reader"
+    ],
+    "ref": "service/matching/pri_task_reader.go:163-177,214-217",
+    "trigger": "Consume wake; capture reader lower bound under reader lock. No periodic scan is invented.",
+    "kind": "react",
+    "checks": null,
+    "postKeys": [
+      "owner",
+      "reader"
+    ],
+    "traceNode": "e.args.o",
+    "traceExtraArgs": []
+  },
+  {
+    "name": "GetTaskBatchMax",
+    "params": [
+      [
+        "o",
+        "Owners"
+      ]
+    ],
+    "touched": [
+      "reader"
+    ],
+    "ref": "service/matching/pri_task_reader.go:219-244; service/matching/db.go:120-129",
+    "trigger": "Capture maxRead separately through the DB mutex.",
+    "kind": "react",
+    "checks": null,
+    "postKeys": [
+      "reader"
+    ],
+    "traceNode": "e.args.o",
+    "traceExtraArgs": []
+  },
+  {
+    "name": "GetTasksIssue",
+    "params": [
+      [
+        "o",
+        "Owners"
+      ]
+    ],
+    "touched": [
+      "reader"
+    ],
+    "ref": "service/matching/pri_task_reader.go:222-230; service/matching/db.go:700-715",
+    "trigger": "Unfenced GetTasks I/O for [low+1,upper+1).",
+    "kind": "react",
+    "checks": null,
+    "postKeys": [
+      "reader"
+    ],
+    "traceNode": "e.args.o",
+    "traceExtraArgs": []
+  },
+  {
+    "name": "GetTasksSnapshot",
+    "params": [
+      [
+        "o",
+        "Owners"
+      ]
+    ],
+    "touched": [
+      "reader"
+    ],
+    "ref": "common/persistence/sql/task_v1.go:114-155; common/persistence/sql/sqlplugin/sqlite/task_v1.go:45-74",
+    "trigger": "Actual ordered SQL read result; empty means no row in this interval at its snapshot.",
+    "kind": "react",
+    "checks": null,
+    "postKeys": [
+      "reader"
+    ],
+    "traceNode": "e.args.o",
+    "traceExtraArgs": [
+      "tasks",
+      "min",
+      "max",
+      "limit"
+    ]
+  },
+  {
+    "name": "GetTasksError",
+    "params": [
+      [
+        "o",
+        "Owners"
+      ]
+    ],
+    "touched": [
+      "reader",
+      "owner"
+    ],
+    "ref": "service/matching/pri_task_reader.go:177-186,231-232,415-427",
+    "trigger": "Read I/O error schedules an explicit backoff wakeup.",
+    "kind": "readFail",
+    "checks": null,
+    "postKeys": [
+      "owner",
+      "reader"
+    ],
+    "traceNode": "e.args.o",
+    "traceExtraArgs": []
+  },
+  {
+    "name": "BackoffSignal",
+    "params": [
+      [
+        "o",
+        "Owners"
+      ]
+    ],
+    "touched": [
+      "owner"
+    ],
+    "ref": "service/matching/pri_task_reader.go:415-427",
+    "trigger": "An independently pending timer signals under the reader lock; it does not reset a newer read.",
+    "kind": "react",
+    "checks": null,
+    "postKeys": [
+      "owner",
+      "reader"
+    ],
+    "traceNode": "e.args.o",
+    "traceExtraArgs": []
+  },
+  {
+    "name": "GetTaskBatchReturn",
+    "params": [
+      [
+        "o",
+        "Owners"
+      ]
+    ],
+    "touched": [
+      "reader"
+    ],
+    "ref": "service/matching/pri_task_reader.go:222-244",
+    "trigger": "An empty SQL page scans the next bounded interval, up to the real ten-iteration limit.",
+    "kind": "react",
+    "checks": null,
+    "postKeys": [
+      "reader"
+    ],
+    "traceNode": "e.args.o",
+    "traceExtraArgs": []
+  },
+  {
+    "name": "ProcessTaskBatch",
+    "params": [
+      [
+        "o",
+        "Owners"
+      ]
+    ],
+    "touched": [
+      "owner",
+      "reader"
+    ],
+    "ref": "service/matching/pri_task_reader.go:247-295",
+    "trigger": "Update read for every row, then filter expired, already-acked and outstanding duplicates under lock.",
+    "kind": "react",
+    "checks": null,
+    "postKeys": [
+      "owner",
+      "reader"
+    ],
+    "traceNode": "e.args.o",
+    "traceExtraArgs": []
+  },
+  {
+    "name": "ProcessTaskBatchDone",
+    "params": [
+      [
+        "o",
+        "Owners"
+      ]
+    ],
+    "touched": [
+      "reader",
+      "owner"
+    ],
+    "ref": "service/matching/pri_task_reader.go:198-200,280-282",
+    "trigger": "Pump signals the next read after adding the complete processed batch.",
+    "kind": "react",
+    "checks": null,
+    "postKeys": [
+      "owner",
+      "reader"
+    ],
+    "traceNode": "e.args.o",
+    "traceExtraArgs": []
+  },
+  {
+    "name": "SetReadLevelAfterGapStale",
+    "params": [
+      [
+        "o",
+        "Owners"
+      ]
+    ],
+    "touched": [
+      "owner",
+      "reader"
+    ],
+    "ref": "service/matching/pri_task_reader.go:484-497",
+    "trigger": "Keep the fixed stale-gap guard; never restore an older read or ack.",
+    "kind": "react",
+    "checks": null,
+    "postKeys": [
+      "owner",
+      "reader"
+    ],
+    "traceNode": "e.args.o",
+    "traceExtraArgs": []
+  },
+  {
+    "name": "SetReadLevelAfterGap",
+    "params": [
+      [
+        "o",
+        "Owners"
+      ]
+    ],
+    "touched": [
+      "owner",
+      "reader"
+    ],
+    "ref": "service/matching/pri_task_reader.go:190-195,498-511",
+    "trigger": "Nonempty outstanding prefix: move read alone, leaving ack unchanged.",
+    "kind": "react",
+    "checks": null,
+    "postKeys": [
+      "owner",
+      "reader"
+    ],
+    "traceNode": "e.args.o",
+    "traceExtraArgs": []
+  },
+  {
+    "name": "SetReadLevelAfterGapAck",
+    "params": [
+      [
+        "o",
+        "Owners"
+      ]
+    ],
+    "touched": [
+      "owner",
+      "reader"
+    ],
+    "ref": "service/matching/pri_task_reader.go:498-511",
+    "trigger": "Hold reader lock while propagating the new gap ack to the DB cache; read update follows.",
+    "kind": "react",
+    "checks": null,
+    "postKeys": [
+      "owner",
+      "reader"
+    ],
+    "traceNode": "e.args.o",
+    "traceExtraArgs": []
+  },
+  {
+    "name": "UpdateAckLevelAfterGap",
+    "params": [
+      [
+        "o",
+        "Owners"
+      ]
+    ],
+    "touched": [
+      "owner",
+      "reader"
+    ],
+    "ref": "service/matching/db.go:336-355; service/matching/pri_task_reader.go:509-511,190-195",
+    "trigger": "DB cache update and release of the nested DB/reader critical section; no metadata persistence.",
+    "kind": "react",
+    "checks": null,
+    "postKeys": [
+      "owner",
+      "reader"
+    ],
+    "traceNode": "e.args.o",
+    "traceExtraArgs": []
+  },
+  {
+    "name": "PollTask",
+    "params": [
+      [
+        "o",
+        "Owners"
+      ],
+      [
+        "r",
+        "owner[o].queued"
+      ],
+      [
+        "p",
+        "Pollers"
+      ]
+    ],
+    "touched": [
+      "owner",
+      "dispatch"
+    ],
+    "ref": "service/matching/matching_engine.go:1015-1035,3511-3527,3590-3606",
+    "trigger": "A poller matches one queued record; History request construction is a separate step.",
+    "kind": "react",
+    "checks": null,
+    "postKeys": [
+      "owner",
+      "dispatch"
+    ],
+    "traceNode": "e.args.o",
+    "traceExtraArgs": []
+  },
+  {
+    "name": "RecordTaskStartedBegin",
+    "params": [
+      [
+        "p",
+        "Pollers"
+      ],
+      [
+        "q",
+        "StartIds"
+      ]
+    ],
+    "touched": [
+      "dispatch"
+    ],
+    "ref": "service/matching/matching_engine.go:3494-3527,3575-3606",
+    "trigger": "After matching and the rate-limit wait, construct a fresh RequestId and issue History RPC.",
+    "kind": "react",
+    "checks": null,
+    "postKeys": [
+      "dispatch"
+    ],
+    "traceNode": "dispatch[e.args.p].owner",
+    "traceExtraArgs": []
+  },
+  {
+    "name": "RecordTaskStartedPrecheckError",
+    "params": [
+      [
+        "p",
+        "Pollers"
+      ],
+      [
+        "result",
+        "{\"transient\", \"respool\", \"busy\"}"
+      ]
+    ],
+    "touched": [
+      "dispatch"
+    ],
+    "ref": "service/matching/matching_engine.go:3494-3503,3575-3584",
+    "trigger": "Rate limiter/context fails before constructing a History request. No accepted start is invented.",
+    "kind": "historyFail",
+    "checks": null,
+    "postKeys": [
+      "dispatch"
+    ],
+    "traceNode": "dispatch[e.args.p].owner",
+    "traceExtraArgs": []
+  },
+  {
+    "name": "RecordTaskStarted",
+    "params": [
+      [
+        "p",
+        "Pollers"
+      ]
+    ],
+    "touched": [
+      "history",
+      "dispatch"
+    ],
+    "ref": "service/history/api/recordworkflowtaskstarted/api.go:68-111; service/history/api/recordactivitytaskstarted/api.go:150-183",
+    "trigger": "External History effect: accepted start, same-ID idempotence, obsolete or already started.",
+    "kind": "react",
+    "checks": null,
+    "postKeys": [
+      "dispatch",
+      "history"
+    ],
+    "traceNode": "dispatch[e.args.p].owner",
+    "traceExtraArgs": [
+      "work",
+      "request"
+    ]
+  },
+  {
+    "name": "RecordTaskStartedError",
+    "params": [
+      [
+        "p",
+        "Pollers"
+      ],
+      [
+        "result",
+        "{\"transient\", \"respool\", \"busy\"}"
+      ]
+    ],
+    "touched": [
+      "dispatch"
+    ],
+    "ref": "service/matching/matching_engine.go:865-879,1113-1123; service/matching/pri_task_reader.go:119-139",
+    "trigger": "History fails without accepting: transient versus nontransient start error.",
+    "kind": "historyFail",
+    "checks": null,
+    "postKeys": [
+      "dispatch"
+    ],
+    "traceNode": "dispatch[e.args.p].owner",
+    "traceExtraArgs": []
+  },
+  {
+    "name": "RecordTaskStartedReply",
+    "params": [
+      [
+        "p",
+        "Pollers"
+      ]
+    ],
+    "touched": [
+      "dispatch"
+    ],
+    "ref": "service/matching/matching_engine.go:808-885,1035-1128",
+    "trigger": "Return the independently recorded History result to Matching.",
+    "kind": "react",
+    "checks": null,
+    "postKeys": [
+      "dispatch"
+    ],
+    "traceNode": "dispatch[e.args.p].owner",
+    "traceExtraArgs": []
+  },
+  {
+    "name": "RecordTaskStartedRetryRPC",
+    "params": [
+      [
+        "p",
+        "Pollers"
+      ]
+    ],
+    "touched": [
+      "dispatch"
+    ],
+    "ref": "service/matching/matching_engine.go:3527,3606; service/history/api/recordworkflowtaskstarted/api.go:98-111",
+    "trigger": "Lost response retried inside the same History RPC scope retains RequestId.",
+    "kind": "loss",
+    "checks": null,
+    "postKeys": [
+      "dispatch"
+    ],
+    "traceNode": "dispatch[e.args.p].owner",
+    "traceExtraArgs": []
+  },
+  {
+    "name": "RecordTaskStartedReplyLost",
+    "params": [
+      [
+        "p",
+        "Pollers"
+      ]
+    ],
+    "touched": [
+      "dispatch"
+    ],
+    "ref": "service/matching/matching_engine.go:3527-3529,3606; service/matching/pri_task_reader.go:123-132",
+    "trigger": "Lost History response becomes a transient error; accepted History effect is retained.",
+    "kind": "loss",
+    "checks": null,
+    "postKeys": [
+      "dispatch"
+    ],
+    "traceNode": "dispatch[e.args.p].owner",
+    "traceExtraArgs": []
+  },
+  {
+    "name": "FinishSyncTask",
+    "params": [
+      [
+        "p",
+        "Pollers"
+      ]
+    ],
+    "touched": [
+      "calls",
+      "audit",
+      "dispatch"
+    ],
+    "ref": "service/matching/task.go:373-395; service/matching/pri_matcher.go:391-412; service/matching/task_queue_partition_manager.go:619-659",
+    "trigger": "Publish the sync response into its buffer; Add consumption is SyncTaskReceive.",
+    "kind": "react",
+    "checks": null,
+    "postKeys": [
+      "dispatch",
+      "calls"
+    ],
+    "traceNode": "dispatch[e.args.p].owner",
+    "traceExtraArgs": []
+  },
+  {
+    "name": "CompleteTaskTransient",
+    "params": [
+      [
+        "p",
+        "Pollers"
+      ]
+    ],
+    "touched": [
+      "owner",
+      "dispatch"
+    ],
+    "ref": "service/matching/pri_task_reader.go:119-133",
+    "trigger": "Transient completion re-adds the same record, preserving outstanding status.",
+    "kind": "react",
+    "checks": null,
+    "postKeys": [
+      "owner",
+      "dispatch"
+    ],
+    "traceNode": "dispatch[e.args.p].owner",
+    "traceExtraArgs": []
+  },
+  {
+    "name": "RespoolTaskAfterError",
+    "params": [
+      [
+        "p",
+        "Pollers"
+      ]
+    ],
+    "touched": [
+      "owner",
+      "dispatch"
+    ],
+    "ref": "service/matching/pri_task_reader.go:135-140; service/matching/pri_backlog_manager.go:360-369",
+    "trigger": "Replacement joins appendCh while original remains outstanding and reader lock is released.",
+    "kind": "react",
+    "checks": null,
+    "postKeys": [
+      "owner",
+      "dispatch"
+    ],
+    "traceNode": "dispatch[e.args.p].owner",
+    "traceExtraArgs": []
+  },
+  {
+    "name": "TaskWriterPublishReplacement",
+    "params": [
+      [
+        "o",
+        "Owners"
+      ]
+    ],
+    "touched": [
+      "dispatch",
+      "writer"
+    ],
+    "ref": "service/matching/pri_task_writer.go:172-174",
+    "trigger": "Publish replacement result to its buffered channel; writer can start later work before callback resumes.",
+    "kind": "react",
+    "checks": null,
+    "postKeys": [
+      "writer",
+      "dispatch"
+    ],
+    "traceNode": "e.args.o",
+    "traceExtraArgs": []
+  },
+  {
+    "name": "RespoolTaskReturn",
+    "params": [
+      [
+        "p",
+        "Pollers"
+      ]
+    ],
+    "touched": [
+      "dispatch",
+      "owner"
+    ],
+    "ref": "service/matching/pri_backlog_manager.go:367-387; service/matching/pri_task_reader.go:137-139",
+    "trigger": "Callback consumes success or final error; failed replacement unloads without original ack.",
+    "kind": "react",
+    "checks": null,
+    "postKeys": [
+      "owner",
+      "dispatch"
+    ],
+    "traceNode": "dispatch[e.args.p].owner",
+    "traceExtraArgs": []
+  },
+  {
+    "name": "RespoolTaskRetry",
+    "params": [
+      [
+        "p",
+        "Pollers"
+      ]
+    ],
+    "touched": [
+      "owner",
+      "dispatch"
+    ],
+    "ref": "service/matching/pri_backlog_manager.go:367-369",
+    "trigger": "ThrottleRetry appends a new replacement attempt at channel tail, without releasing original.",
+    "kind": "react",
+    "checks": null,
+    "postKeys": [
+      "owner",
+      "dispatch"
+    ],
+    "traceNode": "dispatch[e.args.p].owner",
+    "traceExtraArgs": []
+  },
+  {
+    "name": "RespoolTaskShutdown",
+    "params": [
+      [
+        "p",
+        "Pollers"
+      ]
+    ],
+    "touched": [
+      "dispatch",
+      "owner"
+    ],
+    "ref": "service/matching/pri_task_writer.go:72-96; service/matching/pri_backlog_manager.go:374-387",
+    "trigger": "Shutdown wins the replacement receipt selection; an already submitted store write may still commit.",
+    "kind": "react",
+    "checks": null,
+    "postKeys": [
+      "owner",
+      "dispatch"
+    ],
+    "traceNode": "dispatch[e.args.p].owner",
+    "traceExtraArgs": []
+  },
+  {
+    "name": "CompleteTaskAck",
+    "params": [
+      [
+        "p",
+        "Pollers"
+      ]
+    ],
+    "touched": [
+      "owner",
+      "audit",
+      "dispatch"
+    ],
+    "ref": "service/matching/pri_task_reader.go:142-156,452-479",
+    "trigger": "Mark completion and pop only the completed minimum prefix. Reader lock remains held through GC/cache.",
+    "kind": "react",
+    "checks": null,
+    "postKeys": [
+      "owner",
+      "dispatch"
+    ],
+    "traceNode": "dispatch[e.args.p].owner",
+    "traceExtraArgs": []
+  },
+  {
+    "name": "AckTaskLockedDrained",
+    "params": [
+      [
+        "o",
+        "Owners"
+      ]
+    ],
+    "touched": [
+      "owner"
+    ],
+    "ref": "service/matching/pri_task_reader.go:448-449,476-479; service/matching/db.go:120-129",
+    "trigger": "The drained check acquires DB mutex while holding reader lock; keep its blocking boundary.",
+    "kind": "react",
+    "checks": null,
+    "postKeys": [
+      "owner"
+    ],
+    "traceNode": "e.args.o",
+    "traceExtraArgs": []
+  },
+  {
+    "name": "MaybeGCLocked",
+    "params": [
+      [
+        "o",
+        "Owners"
+      ],
+      [
+        "launch",
+        "BOOLEAN"
+      ]
+    ],
+    "touched": [
+      "owner"
+    ],
+    "ref": "service/matching/pri_task_reader.go:149-156,522-540",
+    "trigger": "Capture GC bound under the same reader lock; timer/gap eligibility abstracts scheduling.",
+    "kind": "react",
+    "checks": null,
+    "postKeys": [
+      "owner"
+    ],
+    "traceNode": "e.args.o",
+    "traceExtraArgs": []
+  },
+  {
+    "name": "UpdateAckLevelAndBacklogStats",
+    "params": [
+      [
+        "o",
+        "Owners"
+      ]
+    ],
+    "touched": [
+      "owner",
+      "dispatch"
+    ],
+    "ref": "service/matching/pri_task_reader.go:156; service/matching/db.go:336-355",
+    "trigger": "Completion updates cached ack under DB mutex; poll response can return only after callback completes.",
+    "kind": "react",
+    "checks": null,
+    "postKeys": [
+      "owner",
+      "dispatch"
+    ],
+    "traceNode": "e.args.o",
+    "traceExtraArgs": []
+  },
+  {
+    "name": "PollTaskQueueResponse",
+    "params": [
+      [
+        "p",
+        "Pollers"
+      ]
+    ],
+    "touched": [
+      "history",
+      "dispatch"
+    ],
+    "ref": "service/matching/matching_engine.go:885-887,1128-1130",
+    "trigger": "Worker receives successful poll response after task.finish, separately from History acceptance.",
+    "kind": "react",
+    "checks": null,
+    "postKeys": [
+      "dispatch",
+      "history"
+    ],
+    "traceNode": "dispatch[e.args.p].owner",
+    "traceExtraArgs": []
+  },
+  {
+    "name": "PollTaskQueueResponseLost",
+    "params": [
+      [
+        "p",
+        "Pollers"
+      ]
+    ],
+    "touched": [
+      "dispatch"
+    ],
+    "ref": "service/matching/matching_engine.go:885-887,1128-1130",
+    "trigger": "External transport loses Worker receipt; this does not revoke accepted History start.",
+    "kind": "loss",
+    "checks": null,
+    "postKeys": [
+      "dispatch"
+    ],
+    "traceNode": "dispatch[e.args.p].owner",
+    "traceExtraArgs": []
+  },
+  {
+    "name": "ExpireTask",
+    "params": [
+      [
+        "w",
+        "Work"
+      ]
+    ],
+    "touched": [
+      "history"
+    ],
+    "ref": "service/matching/task_validation.go:217-219",
+    "trigger": "Environment clock crosses the captured nonzero task expiry; SQL retains the row.",
+    "kind": "expiry",
+    "checks": null,
+    "postKeys": [
+      "history"
+    ],
+    "traceNode": "0",
+    "traceExtraArgs": []
+  },
+  {
+    "name": "ObsoleteTask",
+    "params": [
+      [
+        "w",
+        "Work"
+      ]
+    ],
+    "touched": [
+      "history"
+    ],
+    "ref": "service/history/api/recordworkflowtaskstarted/api.go:68-78; service/history/api/recordactivitytaskstarted/api.go:178-183",
+    "trigger": "External History marks this logical stamp obsolete; successor stamp is outside this work identity.",
+    "kind": "obsolete",
+    "checks": null,
+    "postKeys": [
+      "history"
+    ],
+    "traceNode": "0",
+    "traceExtraArgs": []
+  },
+  {
+    "name": "FinishExpiredTask",
+    "params": [
+      [
+        "o",
+        "Owners"
+      ],
+      [
+        "r",
+        "owner[o].queued"
+      ],
+      [
+        "p",
+        "Pollers"
+      ]
+    ],
+    "touched": [
+      "owner",
+      "dispatch"
+    ],
+    "ref": "service/matching/pri_matcher.go:211-216,268-271; service/matching/pri_task_reader.go:364-366",
+    "trigger": "Observed legitimate expiry completes a previously loaded record.",
+    "kind": "react",
+    "checks": null,
+    "postKeys": [
+      "owner",
+      "dispatch"
+    ],
+    "traceNode": "e.args.o",
+    "traceExtraArgs": []
+  },
+  {
+    "name": "SyncStateBegin",
+    "params": [
+      [
+        "o",
+        "Owners"
+      ],
+      [
+        "kind",
+        "{\"sync\", \"verify\"}"
+      ]
+    ],
+    "touched": [
+      "metadata"
+    ],
+    "ref": "service/matching/db.go:298-333",
+    "trigger": "Periodic metadata write or read-only ownership check; retain both idle-queue paths.",
+    "kind": "react",
+    "checks": null,
+    "postKeys": [
+      "metadata"
+    ],
+    "traceNode": "e.args.o",
+    "traceExtraArgs": []
+  },
+  {
+    "name": "RenewLeaseBegin",
+    "params": [
+      [
+        "o",
+        "Owners"
+      ]
+    ],
+    "touched": [
+      "metadata"
+    ],
+    "ref": "service/matching/pri_task_writer.go:108-116,212-224; service/matching/db.go:152-165",
+    "trigger": "Reactive allocation-block renewal; no counter limit on normal ID exhaustion.",
+    "kind": "react",
+    "checks": null,
+    "postKeys": [
+      "metadata"
+    ],
+    "traceNode": "e.args.o",
+    "traceExtraArgs": []
+  },
+  {
+    "name": "TakeOverTaskQueueBegin",
+    "params": [
+      [
+        "o",
+        "Owners"
+      ]
+    ],
+    "touched": [
+      "owner",
+      "metadata"
+    ],
+    "ref": "service/matching/db.go:152-159,176-183",
+    "trigger": "Fresh manager lifetime begins the supported conditional reacquisition path.",
+    "kind": "takeover",
+    "checks": null,
+    "postKeys": [
+      "owner",
+      "metadata"
+    ],
+    "traceNode": "e.args.o",
+    "traceExtraArgs": []
+  },
+  {
+    "name": "TakeOverTaskQueueSnapshot",
+    "params": [
+      [
+        "o",
+        "Owners"
+      ]
+    ],
+    "touched": [
+      "metadata"
+    ],
+    "ref": "service/matching/db.go:179-196",
+    "trigger": "Capture persisted metadata before CAS; old owner SyncState may commit in between.",
+    "kind": "react",
+    "checks": null,
+    "postKeys": [
+      "metadata"
+    ],
+    "traceNode": "e.args.o",
+    "traceExtraArgs": []
+  },
+  {
+    "name": "UpdateTaskQueueCommit",
+    "params": [
+      [
+        "o",
+        "Owners"
+      ]
+    ],
+    "touched": [
+      "durable",
+      "metadata",
+      "audit"
+    ],
+    "ref": "common/persistence/sql/task_queues.go:86-127; service/matching/db.go:241-255",
+    "trigger": "Atomic metadata CAS. A takeover may overwrite a newer ack with its earlier safe snapshot.",
+    "kind": "react",
+    "checks": null,
+    "postKeys": [
+      "durable",
+      "metadata"
+    ],
+    "traceNode": "e.args.o",
+    "traceExtraArgs": [
+      "actualRange",
+      "expectedRange"
+    ]
+  },
+  {
+    "name": "VerifyOwnership",
+    "params": [
+      [
+        "o",
+        "Owners"
+      ]
+    ],
+    "touched": [
+      "metadata"
+    ],
+    "ref": "service/matching/db.go:318-333",
+    "trigger": "Unchanged metadata still checks owner range; mismatch is fatal.",
+    "kind": "react",
+    "checks": null,
+    "postKeys": [
+      "metadata"
+    ],
+    "traceNode": "e.args.o",
+    "traceExtraArgs": [
+      "actualRange"
+    ]
+  },
+  {
+    "name": "UpdateTaskQueueConditionFailed",
+    "params": [
+      [
+        "o",
+        "Owners"
+      ]
+    ],
+    "touched": [
+      "metadata"
+    ],
+    "ref": "common/persistence/sql/task_queues.go:97-106; common/persistence/sql/task_v1.go:187-205",
+    "trigger": "Failed CAS cannot modify either durable range or metadata.",
+    "kind": "react",
+    "checks": null,
+    "postKeys": [
+      "metadata"
+    ],
+    "traceNode": "e.args.o",
+    "traceExtraArgs": [
+      "actualRange",
+      "expectedRange"
+    ]
+  },
+  {
+    "name": "UpdateTaskQueueError",
+    "params": [
+      [
+        "o",
+        "Owners"
+      ]
+    ],
+    "touched": [
+      "metadata"
+    ],
+    "ref": "service/matching/db.go:246-251,319-325",
+    "trigger": "Store rejects/does not commit the metadata operation.",
+    "kind": "storeFail",
+    "checks": null,
+    "postKeys": [
+      "metadata"
+    ],
+    "traceNode": "e.args.o",
+    "traceExtraArgs": []
+  },
+  {
+    "name": "UpdateTaskQueueReplyLost",
+    "params": [
+      [
+        "o",
+        "Owners"
+      ]
+    ],
+    "touched": [
+      "metadata"
+    ],
+    "ref": "service/matching/db.go:246-255",
+    "trigger": "Committed metadata or lease response is lost; local range remains old.",
+    "kind": "uncertain",
+    "checks": null,
+    "postKeys": [
+      "metadata"
+    ],
+    "traceNode": "e.args.o",
+    "traceExtraArgs": []
+  },
+  {
+    "name": "UpdateTaskQueueReturn",
+    "params": [
+      [
+        "o",
+        "Owners"
+      ]
+    ],
+    "touched": [
+      "owner",
+      "metadata",
+      "writer"
+    ],
+    "ref": "service/matching/db.go:196-207,241-255; service/matching/pri_task_writer.go:140-149,217-224; service/matching/pri_backlog_manager.go:108-116",
+    "trigger": "Apply lease response locally, initialize fresh reader from captured ack, or report failure.",
+    "kind": "react",
+    "checks": null,
+    "postKeys": [
+      "owner",
+      "metadata",
+      "writer"
+    ],
+    "traceNode": "e.args.o",
+    "traceExtraArgs": []
+  },
+  {
+    "name": "StopBegin",
+    "params": [
+      [
+        "o",
+        "Owners"
+      ]
+    ],
+    "touched": [
+      "owner"
+    ],
+    "ref": "service/matching/physical_task_queue_manager.go:319-328",
+    "trigger": "External supported unload marks stopped status before final backlog synchronization.",
+    "kind": "stop",
+    "checks": null,
+    "postKeys": [
+      "owner"
+    ],
+    "traceNode": "e.args.o",
+    "traceExtraArgs": []
+  },
+  {
+    "name": "UnloadAfterError",
+    "params": [
+      [
+        "o",
+        "Owners"
+      ]
+    ],
+    "touched": [
+      "owner"
+    ],
+    "ref": "service/matching/pri_backlog_manager.go:108-116,374-387; service/matching/physical_task_queue_manager.go:319-334",
+    "trigger": "Reactive fatal-conflict/replacement-failure unload skips final metadata write.",
+    "kind": "react",
+    "checks": null,
+    "postKeys": [
+      "owner"
+    ],
+    "traceNode": "e.args.o",
+    "traceExtraArgs": []
+  },
+  {
+    "name": "StopRefreshAck",
+    "params": [
+      [
+        "o",
+        "Owners"
+      ]
+    ],
+    "touched": [
+      "owner"
+    ],
+    "ref": "service/matching/pri_backlog_manager.go:125-140",
+    "trigger": "Refresh cached reader ack before the final SyncState; queue context is not yet canceled.",
+    "kind": "react",
+    "checks": null,
+    "postKeys": [
+      "owner"
+    ],
+    "traceNode": "e.args.o",
+    "traceExtraArgs": []
+  },
+  {
+    "name": "StopSyncState",
+    "params": [
+      [
+        "o",
+        "Owners"
+      ]
+    ],
+    "touched": [
+      "metadata",
+      "owner"
+    ],
+    "ref": "service/matching/pri_backlog_manager.go:142-144",
+    "trigger": "Start final metadata persistence; errors are ignored by Stop.",
+    "kind": "react",
+    "checks": null,
+    "postKeys": [
+      "owner",
+      "metadata"
+    ],
+    "traceNode": "e.args.o",
+    "traceExtraArgs": []
+  },
+  {
+    "name": "StopCancel",
+    "params": [
+      [
+        "o",
+        "Owners"
+      ]
+    ],
+    "touched": [
+      "owner"
+    ],
+    "ref": "service/matching/physical_task_queue_manager.go:327-334",
+    "trigger": "Cancel queue after final update. In-flight store I/O and callbacks may still finish.",
+    "kind": "react",
+    "checks": null,
+    "postKeys": [
+      "owner"
+    ],
+    "traceNode": "e.args.o",
+    "traceExtraArgs": []
+  },
+  {
+    "name": "Crash",
+    "params": [
+      [
+        "o",
+        "Owners"
+      ]
+    ],
+    "touched": [
+      "owner"
+    ],
+    "ref": "service/matching/db.go:176-207; service/matching/pri_task_writer.go:68-98",
+    "trigger": "Process failure freezes local callbacks; durable effects already submitted may still commit.",
+    "kind": "crash",
+    "checks": null,
+    "postKeys": [
+      "owner"
+    ],
+    "traceNode": "e.args.o",
+    "traceExtraArgs": []
+  },
+  {
+    "name": "CompleteTasksLessThan",
+    "params": [
+      [
+        "o",
+        "Owners"
+      ]
+    ],
+    "touched": [
+      "durable",
+      "owner",
+      "audit"
+    ],
+    "ref": "service/matching/db.go:741-765; common/persistence/sql/task_v1.go:158-184; common/persistence/sql/sqlplugin/sqlite/task_v1.go:28-31,77-96",
+    "trigger": "Unfenced SQL deletion uses the captured exclusive bound gcBound+1 and row limit, even for an old owner.",
+    "kind": "react",
+    "checks": null,
+    "postKeys": [
+      "durable",
+      "owner"
+    ],
+    "traceNode": "e.args.o",
+    "traceExtraArgs": [
+      "deleted",
+      "max",
+      "limit"
+    ]
+  },
+  {
+    "name": "DoGCReturn",
+    "params": [
+      [
+        "o",
+        "Owners"
+      ]
+    ],
+    "touched": [
+      "owner"
+    ],
+    "ref": "service/matching/pri_task_reader.go:543-577",
+    "trigger": "Clear inGC; exactly a full delete batch does not prove the captured interval is exhausted.",
+    "kind": "react",
+    "checks": null,
+    "postKeys": [
+      "owner"
+    ],
+    "traceNode": "e.args.o",
+    "traceExtraArgs": []
+  },
+  {
+    "name": "DoGCError",
+    "params": [
+      [
+        "o",
+        "Owners"
+      ]
+    ],
+    "touched": [
+      "owner"
+    ],
+    "ref": "service/matching/pri_task_reader.go:550-568",
+    "trigger": "GC failure/lost result retains gcLast; durable deletion, if already committed, is not undone.",
+    "kind": "storeFail",
+    "checks": null,
+    "postKeys": [
+      "owner"
+    ],
+    "traceNode": "e.args.o",
+    "traceExtraArgs": []
+  },
+  {
+    "name": "DiscardCrashedWriter",
+    "params": [
+      [
+        "o",
+        "Owners"
+      ]
+    ],
+    "touched": [
+      "writer"
+    ],
+    "ref": "service/matching/pri_task_writer.go:68-98,152-179",
+    "trigger": "Crash boundary: discard a local writer frame only after submitted store effect has resolved.",
+    "kind": "react",
+    "checks": null,
+    "postKeys": [
+      "writer"
+    ],
+    "traceNode": "e.args.o",
+    "traceExtraArgs": []
+  },
+  {
+    "name": "PollerDisconnect",
+    "params": [
+      [
+        "p",
+        "Pollers"
+      ]
+    ],
+    "touched": [
+      "dispatch"
+    ],
+    "ref": "service/matching/matching_engine.go:1002-1035,1128-1130",
+    "trigger": "Crashed Matching connection ends after any independently submitted History effect resolves.",
+    "kind": "react",
+    "checks": null,
+    "postKeys": [
+      "dispatch"
+    ],
+    "traceNode": "dispatch[e.args.p].owner",
+    "traceExtraArgs": []
+  },
+  {
+    "name": "PollTaskErrorReturn",
+    "params": [
+      [
+        "p",
+        "Pollers"
+      ]
+    ],
+    "touched": [
+      "dispatch"
+    ],
+    "ref": "service/matching/pri_task_reader.go:137-139; service/matching/matching_engine.go:865-882,1113-1126",
+    "trigger": "Failed completion callback returns to its poll invocation; a later poll can use this slot.",
+    "kind": "react",
+    "checks": null,
+    "postKeys": [
+      "dispatch"
+    ],
+    "traceNode": "dispatch[e.args.p].owner",
+    "traceExtraArgs": []
+  },
+  {
+    "name": "SignalIfFatal",
+    "params": [
+      [
+        "o",
+        "Owners"
+      ]
+    ],
+    "touched": [
+      "owner"
+    ],
+    "ref": "service/matching/pri_backlog_manager.go:108-119,373-390 (instrumented checkout)",
+    "trigger": "Observe the actual skipFinalUpdate.Store(true) separately from the error-return hook, including errShutdown after cancellation.",
+    "kind": "react",
+    "checks": null,
+    "postKeys": [
+      "owner"
+    ],
+    "traceNode": "e.args.o",
+    "traceExtraArgs": []
+  },
+  {
+    "name": "SyncTaskReceive",
+    "params": [
+      [
+        "a",
+        "CallIds"
+      ]
+    ],
+    "touched": [
+      "calls",
+      "audit"
+    ],
+    "ref": "service/matching/task.go:getResponse; pri_matcher.go:trySyncMatch",
+    "trigger": "Receive an already-published sync response independently of Worker progress.",
+    "kind": "react",
+    "checks": null,
+    "postKeys": [
+      "calls"
+    ],
+    "traceNode": "calls[e.args.a].owner",
+    "traceExtraArgs": []
+  },
+  {
+    "name": "RenewLeaseRetry",
+    "params": [
+      [
+        "o",
+        "Owners"
+      ]
+    ],
+    "touched": [
+      "writer"
+    ],
+    "ref": "service/matching/pri_task_writer.go:renewLeaseWithRetry",
+    "trigger": "Retry a failed allocation lease attempt without consuming another request or owner lifetime.",
+    "kind": "react",
+    "checks": null,
+    "postKeys": [
+      "writer"
+    ],
+    "traceNode": "e.args.o",
+    "traceExtraArgs": []
+  },
+  {
+    "name": "RenewLeaseFailure",
+    "params": [
+      [
+        "o",
+        "Owners"
+      ]
+    ],
+    "touched": [
+      "writer"
+    ],
+    "ref": "service/matching/pri_task_writer.go:assignTaskIDs",
+    "trigger": "Publish a terminal allocation error without allocating or acknowledging a replacement record.",
+    "kind": "react",
+    "checks": null,
+    "postKeys": [
+      "writer"
+    ],
+    "traceNode": "e.args.o",
+    "traceExtraArgs": []
+  }
+]
