@@ -1,0 +1,15 @@
+# temporal-matching current harness
+
+Source is `0c010ce5fe8c0180aa7573c72fe8fc87c6df7025`. The runner uses the canonical specs in `../spec/`. The retained `validation/` directory and older logs/model-checks describe Phase 2.5 snapshots.
+
+Run `bash harness/run.sh` from `.specula-output/`, or set SOURCE_DIR and SPECULA_TRACE_DIR explicitly. The 24 scenarios use real Matching priority queue code and file-backed SQLite SQL TaskStore V1, with controlled History interfaces. New matcher is enabled, fairness disabled, priority 3, singleton writes, read batch 3/reload 1 and GC batch 2; per-trace queue-config files record actual ranges and timers. Idle timeout is one hour. The obsolete-validator scenario waits the real ten-minute age threshold; the runner uses the supported TEMPORAL_TEST_TIMEOUT=13m and an outer 15-minute test cap. Previous trace files are archived by the runner.
+
+`verify.py` replays complete scenarios, rejects zero-state success, requires TraceMatched and nonempty complete exploration, and checks eight corrupted copies (stored identity, queue, read bound, required field, History request, bootstrap state/revision/evidence class). Root-validator traces use TraceValidator and validate the holder map through TraceEnd. A canceled validity request cannot establish obsolescence. SQL audit rows, actual read requests/results, request identities and independent final owner/store readbacks remain the observation source; no missing state is generated from the model.
+
+`src/` contains native emitters and scenarios; `post-keys.json` gives mandatory complete groups; `patches/instrumentation.patch` contains only source observation/scheduling hooks; `SOURCE_POINTS.md` lists applied anchors. `apply.sh` handles exact already-applied patches and preserves conflicting edits. `clean.sh` reverses only the exact patch and removes byte-identical helper modules. Update src copies and the narrow patch together after changing hooks.
+
+Important corrected boundaries: sync publication versus Add receipt; allocation-renewal retry/final failure; definite-but-retryable replacement rejection; pending backoff versus a concurrently active reader; retry within one acquisition lifetime; root-validator handoff, validity result and callback completion. Source selection, outcomes, queue keys and every reported post field remain strict.
+
+The separate `run-fair-diagnostic.sh` executes a controlled real SQLite V2 late-completion reproduction plus a window-closed control. It uses real fair reader/writer/store with controlled matcher and History-result interfaces, exact map counter 1000 and dither off. Its outputs are implementation diagnostics; they are not priority traces or a converged fairness model. See `../spec/fairness-diagnostic.md`.
+
+Current evidence is indexed in `../spec/validation-report.md`. The original 32 traces and initial models remain historical evidence. The active corpus is `../spec/output/continuation-20260911/final-traces/`. Actual process-crash/transport teardown, general History durability/lifecycle, other store backends and a complete V2 model remain explicit limits.

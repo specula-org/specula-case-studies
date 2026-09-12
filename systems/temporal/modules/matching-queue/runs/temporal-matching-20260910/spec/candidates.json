@@ -1,0 +1,104 @@
+{
+  "schema_version": "2",
+  "system": "temporal-matching",
+  "generated_by": "consolidate",
+  "findings": [
+    {
+      "id": "CR-1",
+      "title": "Acceptance, uncertain persistence, and fresh ownership",
+      "source": "code-review",
+      "scenario": "Scenario 1: Acceptance, uncertain persistence, and fresh ownership",
+      "severity": "High",
+      "invariant": null,
+      "config": null,
+      "counterexample": null,
+      "affected_code": [
+        "service/matching/pri_task_writer.go:68",
+        "service/matching/pri_task_writer.go:94",
+        "service/matching/pri_task_writer.go:124",
+        "service/matching/db.go:176",
+        "service/matching/db.go:241",
+        "service/matching/db.go:575"
+      ],
+      "summary": "Durable task append, local notification, caller receipt, and owner reacquisition are separate effects. A write can be submitted and possibly committed before shutdown or a lost response determines what the caller observes, while readers are only signaled after successful write handling. A fresh owner reconstructs obligations from persisted queue metadata and prior allocation bounds, so uncertain admission and takeover need confirmation against the real store and reload path. This candidate covers whether accepted still-eligible work remains represented by durable records, delivery, replay, or a valid retry after uncertainty."
+    },
+    {
+      "id": "CR-2",
+      "title": "Read snapshots, bypass, and proof of an empty interval",
+      "source": "code-review",
+      "scenario": "Scenario 2: Read snapshots, bypass, and proof of an empty interval",
+      "severity": "High",
+      "invariant": null,
+      "config": null,
+      "counterexample": null,
+      "affected_code": [
+        "service/matching/pri_task_reader.go:214",
+        "service/matching/pri_task_reader.go:224",
+        "service/matching/pri_task_reader.go:247",
+        "service/matching/pri_task_reader.go:382",
+        "service/matching/pri_task_reader.go:484",
+        "service/matching/db.go:700",
+        "common/persistence/cassandra/matching_task_store_v1.go:154",
+        "common/persistence/cassandra/matching_task_store_v1.go:187"
+      ],
+      "summary": "A reader request captures bounds before storage I/O, but bypass insertion and task completion can change the current outstanding and acknowledgement frontier before the read result is processed. The implementation filters expired, already-acked, and duplicate tasks, and it rejects stale gaps, so the candidate is about the exact proof that an interval is empty. The brief also raises a backend-conditional paging question: an empty task page may advance the read level to the upper bound while a continuation token is ignored. Confirmation must determine whether the selected backend can produce such a nonterminal empty page and whether that can skip eligible work."
+    },
+    {
+      "id": "CR-3",
+      "title": "Completion prefix, delayed metadata, and old-owner cleanup",
+      "source": "code-review",
+      "scenario": "Scenario 3: Completion prefix, delayed metadata, and old-owner cleanup",
+      "severity": "High",
+      "invariant": null,
+      "config": null,
+      "counterexample": null,
+      "affected_code": [
+        "service/matching/pri_task_reader.go:452",
+        "service/matching/pri_task_reader.go:522",
+        "service/matching/db.go:298",
+        "service/matching/db.go:741",
+        "service/matching/pri_backlog_manager.go:108",
+        "service/matching/physical_task_queue_manager.go:319"
+      ],
+      "summary": "The priority reader can advance an in-memory acknowledgement prefix when completed records drain, and GC can delete records below a captured ack-derived bound independently of durable metadata synchronization. Stop and ownership replacement can refresh cached reader ack, cancel work, or skip final metadata updates on ownership conflict. Persisted ack may lag or regress across takeover even when an old owner has outstanding cleanup. This candidate asks whether deletion remains semantically safe for still-required work without assuming GC is fenced by the durable ack value."
+    },
+    {
+      "id": "CR-4",
+      "title": "History outcomes and replacement before original acknowledgement",
+      "source": "code-review",
+      "scenario": "Scenario 4: History outcomes and replacement before original acknowledgement",
+      "severity": "High",
+      "invariant": null,
+      "config": null,
+      "counterexample": null,
+      "affected_code": [
+        "service/matching/pri_task_reader.go:114",
+        "service/matching/pri_backlog_manager.go:360",
+        "service/matching/matching_engine.go:885",
+        "service/matching/matching_engine.go:1128",
+        "service/matching/matching_engine.go:3511",
+        "service/matching/matching_engine.go:3590",
+        "service/history/api/recordworkflowtaskstarted/api.go:98",
+        "service/history/api/recordactivitytaskstarted/api.go:150"
+      ],
+      "summary": "A dispatched task can be discharged by History, retried as the same record, or re-spooled as replacement work depending on the start result. Replacement failure returns before acknowledging the original record and can trigger unload with final metadata skipped. Matching may finish the queue record before the poll response reaches the worker, while History request idempotence and fresh outer attempt RequestIds define a separate acceptance boundary. This candidate covers whether logical work keeps a valid delivery, retry, or disposal path when History replies, worker receipt, replacement writes, and unload interleave."
+    },
+    {
+      "id": "CR-5",
+      "title": "Fairness eviction during unlocked replacement",
+      "source": "code-review",
+      "scenario": "Scenario 5: Fairness eviction during unlocked replacement (separate extension)",
+      "severity": "High",
+      "invariant": null,
+      "config": null,
+      "counterexample": null,
+      "affected_code": [
+        "service/matching/fair_task_reader.go:153",
+        "service/matching/fair_task_reader.go:514",
+        "service/matching/fair_task_reader.go:608",
+        "service/matching/fair_task_writer.go:214"
+      ],
+      "summary": "In the fairness reader, a completion path can verify membership, release the reader lock for replacement I/O, and then resume acknowledgement after other merge activity has changed tracked records and read boundaries. The brief describes a schedule where a failed-start callback pauses during replacement, fresh-key work evicts matched records, the replacement commits, and later completions may let ack cross another evicted eligible task. This is a separate fairness extension rather than part of the initial fixed-priority baseline, but it is still a code-review Scenario candidate. Confirmation should check the real V2 persistence path, merge trimming, ack markers, and pending replacement callback behavior before judging it."
+    }
+  ]
+}

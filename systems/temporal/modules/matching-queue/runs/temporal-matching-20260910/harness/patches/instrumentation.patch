@@ -1,0 +1,681 @@
+diff --git a/common/persistence/sql/task_queues.go b/common/persistence/sql/task_queues.go
+index 686db0f05..49f9cd5a0 100644
+--- a/common/persistence/sql/task_queues.go
++++ b/common/persistence/sql/task_queues.go
+@@ -124,6 +124,7 @@ func (m *taskQueueStore) UpdateTaskQueue(
+ 		resp = &persistence.UpdateTaskQueueResponse{}
+ 		return nil
+ 	})
++	SpeculaProbe(ctx, "UpdateTaskQueueTransaction", request, err, m.version)
+ 	return resp, err
+ }
+ 
+diff --git a/common/persistence/sql/task_v1.go b/common/persistence/sql/task_v1.go
+index 160eb46ec..4c4d9f092 100644
+--- a/common/persistence/sql/task_v1.go
++++ b/common/persistence/sql/task_v1.go
+@@ -95,6 +95,7 @@ func (m *sqlTaskManagerV1) CreateTasks(
+ 		resp = &persistence.CreateTasksResponse{UpdatedMetadata: false}
+ 		return nil
+ 	})
++	SpeculaProbe(ctx, "CreateTasksTransaction", request, tasksRows, err)
+ 	return resp, err
+ }
+ 
+@@ -133,6 +134,7 @@ func (m *sqlTaskManagerV1) GetTasks(
+ 		return nil, serviceerror.NewUnavailablef("GetTasks operation failed. Failed to get rows. Error: %v", err)
+ 	}
+ 
++	SpeculaProbe(ctx, "GetTasksSnapshot", request, rows)
+ 	response := &persistence.InternalGetTasksResponse{
+ 		Tasks: make([]*commonpb.DataBlob, len(rows)),
+ 	}
+@@ -181,6 +183,7 @@ func (m *sqlTaskManagerV1) CompleteTasksLessThan(
+ 	if err != nil {
+ 		return 0, serviceerror.NewUnavailablef("rowsAffected returned error: %v", err)
+ 	}
++	SpeculaProbe(ctx, "CompleteTasksLessThan", request, int(nRows))
+ 	return int(nRows), nil
+ }
+ 
+@@ -196,6 +199,7 @@ func lockTaskQueue(
+ 		RangeHash:   tqHash,
+ 		TaskQueueID: tqId,
+ 	}, v)
++	SpeculaProbe(ctx, "SQLRangeCondition", oldRangeID, rangeID, err, v)
+ 	switch err {
+ 	case nil:
+ 		if rangeID != oldRangeID {
+diff --git a/service/matching/db.go b/service/matching/db.go
+index b88651869..e890aacc2 100644
+--- a/service/matching/db.go
++++ b/service/matching/db.go
+@@ -155,6 +155,8 @@ func (db *taskQueueDB) RenewLease(
+ 	db.Lock()
+ 	defer db.Unlock()
+ 
++	ctx = speculaDBContext(ctx, db)
++	speculaProbe("RenewLeaseBegin", db)
+ 	if db.rangeID == 0 {
+ 		if err := db.takeOverTaskQueueLocked(ctx); err != nil {
+ 			return taskQueueState{}, err
+@@ -183,6 +185,7 @@ func (db *taskQueueDB) takeOverTaskQueueLocked(
+ 	})
+ 	switch err.(type) {
+ 	case nil:
++		speculaProbe("TakeOverTaskQueueSnapshot", db, response)
+ 		db.rangeID = response.RangeID
+ 		// If we are the draining one, then assume the other has tasks, so we can migrate
+ 		// backwards safely.
+@@ -239,6 +242,7 @@ func (db *taskQueueDB) takeOverTaskQueueLocked(
+ }
+ 
+ func (db *taskQueueDB) updateTaskQueueLocked(ctx context.Context, incrementRangeId bool) error {
++	ctx = speculaDBContext(ctx, db)
+ 	newRangeID := db.rangeID
+ 	if incrementRangeId {
+ 		newRangeID++
+@@ -252,6 +256,7 @@ func (db *taskQueueDB) updateTaskQueueLocked(ctx context.Context, incrementRange
+ 	}
+ 	db.lastWrite = time.Now()
+ 	db.rangeID = newRangeID
++	speculaProbe("MetadataLocalUpdated", db)
+ 	return nil
+ }
+ 
+@@ -305,6 +310,9 @@ func (db *taskQueueDB) SyncState(ctx context.Context) error {
+ 	// mistake the queue for idle, even if a future partition kind has a longer TTL.
+ 	ttl := min(24*time.Hour, cmp.Or(db.queue.Partition().PersistenceTTL(), 24*time.Hour))
+ 	needWrite := db.lastChange.After(db.lastWrite) || time.Since(db.lastWrite) > ttl/2
++	ctx = speculaDBContext(ctx, db)
++	speculaProbe("SyncStateBegin", db, needWrite)
++	defer speculaProbe("SyncStateReturn", db)
+ 	if !needWrite {
+ 		// If we don't write, though, we wouldn't know if someone else has stolen ownership
+ 		// momentarily (this could happen due to eventual consistency of membership updates).
+@@ -324,6 +332,7 @@ func (db *taskQueueDB) verifyOwnershipLocked(ctx context.Context) error {
+ 	if err != nil {
+ 		return err
+ 	}
++	speculaProbe("VerifyOwnership", db, response)
+ 	if response.RangeID != db.rangeID {
+ 		return &persistence.ConditionFailedError{
+ 			Msg: fmt.Sprintf("task queue ownership lost: stored rangeID %d, in-memory rangeID %d",
+@@ -336,6 +345,7 @@ func (db *taskQueueDB) verifyOwnershipLocked(ctx context.Context) error {
+ func (db *taskQueueDB) updateAckLevelAndBacklogStats(subqueue subqueueIndex, newAckLevel int64, countDelta int64, oldestTime time.Time) {
+ 	db.Lock()
+ 	defer db.Unlock()
++	defer speculaProbe("DBAckCache", db)
+ 
+ 	dbQueue := db.subqueues[subqueue]
+ 	if newAckLevel < dbQueue.AckLevel {
+@@ -560,6 +570,8 @@ func (db *taskQueueDB) CreateTasks(
+ 	// We piggyback the metadata update if enough time has passed since the last write.
+ 	updateMetadata := db.shouldUpdateMetadataOnAppendLocked()
+ 
++	ctx = speculaDBContext(ctx, db)
++	speculaProbe("CreateTasksBegin", db, reqs)
+ 	resp, err := db.store.CreateTasks(
+ 		ctx,
+ 		&persistence.CreateTasksRequest{
+@@ -594,6 +606,7 @@ func (db *taskQueueDB) CreateTasks(
+ 			db.subqueues[i].ApproximateBacklogCount -= int64(len(update.tasks))
+ 		}
+ 	}
++	speculaProbe("CreateTasksReturn", db, err)
+ 	return createTasksResponse{bySubqueue: updates}, err
+ }
+ 
+@@ -704,7 +717,7 @@ func (db *taskQueueDB) GetTasks(
+ 	exclusiveMaxTaskID int64,
+ 	batchSize int,
+ ) (*persistence.GetTasksResponse, error) {
+-	return db.store.GetTasks(ctx, &persistence.GetTasksRequest{
++	return db.store.GetTasks(speculaDBContext(ctx, db), &persistence.GetTasksRequest{
+ 		NamespaceID:        db.queue.NamespaceId(),
+ 		TaskQueue:          db.queue.PersistenceName(),
+ 		TaskType:           db.queue.TaskType(),
+@@ -722,7 +735,7 @@ func (db *taskQueueDB) GetFairTasks(
+ 	inclusiveMinLevel fairLevel,
+ 	batchSize int,
+ ) (*persistence.GetTasksResponse, error) {
+-	return db.store.GetTasks(ctx, &persistence.GetTasksRequest{
++	return db.store.GetTasks(speculaDBContext(ctx, db), &persistence.GetTasksRequest{
+ 		NamespaceID:        db.queue.NamespaceId(),
+ 		TaskQueue:          db.queue.PersistenceName(),
+ 		TaskType:           db.queue.TaskType(),
+@@ -744,7 +757,7 @@ func (db *taskQueueDB) CompleteTasksLessThan(
+ 	limit int,
+ 	subqueue subqueueIndex,
+ ) (int, error) {
+-	n, err := db.store.CompleteTasksLessThan(ctx, &persistence.CompleteTasksLessThanRequest{
++	n, err := db.store.CompleteTasksLessThan(speculaDBContext(ctx, db), &persistence.CompleteTasksLessThanRequest{
+ 		NamespaceID:        db.queue.NamespaceId(),
+ 		TaskQueueName:      db.queue.PersistenceName(),
+ 		TaskType:           db.queue.TaskType(),
+@@ -774,7 +787,7 @@ func (db *taskQueueDB) CompleteFairTasksLessThan(
+ 	limit int,
+ 	subqueue subqueueIndex,
+ ) (int, error) {
+-	n, err := db.store.CompleteTasksLessThan(ctx, &persistence.CompleteTasksLessThanRequest{
++	n, err := db.store.CompleteTasksLessThan(speculaDBContext(ctx, db), &persistence.CompleteTasksLessThanRequest{
+ 		NamespaceID:        db.queue.NamespaceId(),
+ 		TaskQueueName:      db.queue.PersistenceName(),
+ 		TaskType:           db.queue.TaskType(),
+diff --git a/service/matching/fair_backlog_manager.go b/service/matching/fair_backlog_manager.go
+index a905b81c1..f22c2bfb0 100644
+--- a/service/matching/fair_backlog_manager.go
++++ b/service/matching/fair_backlog_manager.go
+@@ -364,6 +364,7 @@ func (c *fairBacklogManagerImpl) InternalStatus() []*taskqueuespb.InternalTaskQu
+ }
+ 
+ func (c *fairBacklogManagerImpl) respoolTaskAfterError(task *persistencespb.TaskInfo) error {
++	speculaProbe("FairRespoolGate", c, task)
+ 	// We cannot just remove it from persistence because then it will be lost.
+ 	// We handle this by writing the task back to persistence with a higher taskID.
+ 	// This will allow subsequent tasks to make progress, and hopefully by the time this task is picked-up
+diff --git a/service/matching/matcher_data.go b/service/matching/matcher_data.go
+index 07cb8cc6e..ed56060d7 100644
+--- a/service/matching/matcher_data.go
++++ b/service/matching/matcher_data.go
+@@ -265,6 +265,7 @@ func (d *matcherData) EnqueueTaskNoWait(task *internalTask) error {
+ 
+ 	task.initMatch(d)
+ 	d.tasks.Add(task)
++	speculaProbe("AddTaskToMatcher", task)
+ 	d.findAndWakeMatches()
+ 	return nil
+ }
+@@ -550,6 +551,9 @@ func (d *matcherData) findAndWakeMatches() (rateLimited bool) {
+ 		// ready to signal match
+ 		d.tasks.Remove(task)
+ 		d.pollers.Remove(poller)
++		if poller.forwardCtx != nil {
++			speculaProbe("PollTask", task, poller.forwardCtx.Value(identityKey))
++		}
+ 
+ 		// TODO(pri): maybe we can allow tasks to have costs other than 1
+ 		d.rateLimitManager.consumeTokens(now, task, 1)
+diff --git a/service/matching/matching_engine.go b/service/matching/matching_engine.go
+index af4595c23..756e46ad6 100644
+--- a/service/matching/matching_engine.go
++++ b/service/matching/matching_engine.go
+@@ -806,6 +806,7 @@ pollLoop:
+ 			requestClone.WorkerVersionCapabilities.BuildId = ""
+ 		}
+ 		resp, err := e.recordWorkflowTaskStarted(ctx, requestClone, task)
++		speculaProbe("RecordTaskStartedReply", task, err)
+ 		if err != nil {
+ 			switch err := err.(type) {
+ 			case *serviceerror.Internal:
+@@ -879,6 +880,7 @@ pollLoop:
+ 				}
+ 			}
+ 
++			speculaProbe("PollTaskErrorReturn", task)
+ 			continue pollLoop
+ 		}
+ 
+@@ -3492,6 +3494,7 @@ func (e *matchingEngineImpl) recordWorkflowTaskStarted(
+ 		metrics.TaskTypeTag(""), // Added to make tags consistent with history task executor.
+ 	)
+ 	if e.rateLimiter != nil {
++		speculaProbe("HistoryLimiterGate", task)
+ 		err := e.rateLimiter.Wait(ctx, quotas.Request{
+ 			API:        "RecordWorkflowTaskStarted",
+ 			Token:      1,
+@@ -3499,6 +3502,7 @@ func (e *matchingEngineImpl) recordWorkflowTaskStarted(
+ 			CallerType: headers.CallerTypeAPI,
+ 		})
+ 		if err != nil {
++			speculaProbe("RecordTaskStartedPrecheckError", task, err)
+ 			return nil, err
+ 		}
+ 	}
+@@ -3524,6 +3528,7 @@ func (e *matchingEngineImpl) recordWorkflowTaskStarted(
+ 		TargetDeploymentVersion:    sentTargetVersion,
+ 	}
+ 
++	speculaProbe("RecordTaskStartedBegin", task, recordStartedRequest)
+ 	resp, err := e.historyClient.RecordWorkflowTaskStarted(ctx, recordStartedRequest)
+ 	if err != nil {
+ 		return nil, err
+diff --git a/service/matching/physical_task_queue_manager.go b/service/matching/physical_task_queue_manager.go
+index c625f71eb..4f19166d3 100644
+--- a/service/matching/physical_task_queue_manager.go
++++ b/service/matching/physical_task_queue_manager.go
+@@ -324,6 +324,7 @@ func (c *physicalTaskQueueManagerImpl) Stop(unloadCause unloadCause) {
+ 	) {
+ 		return
+ 	}
++	speculaProbe("StopBegin", c)
+ 	// this may attempt to write one final ack update, do this before canceling tqCtx
+ 	c.backlogMgr.Stop()
+ 	if m := c.getDrainBacklogMgr(); m != nil {
+@@ -332,6 +333,7 @@ func (c *physicalTaskQueueManagerImpl) Stop(unloadCause unloadCause) {
+ 	c.matcher.Stop()
+ 	c.liveness.Stop()
+ 	c.tqCtxCancel()
++	speculaProbe("StopCancel", c)
+ 
+ 	// Emitting zero values for backlog gauges to prevent stale values persisting after a partition is unloaded.
+ 	// The call is placed here instead of backlogMgr.Stop() since there could be a race condition where a task is
+diff --git a/service/matching/pri_backlog_manager.go b/service/matching/pri_backlog_manager.go
+index 70d03d4fb..76ba41cf1 100644
+--- a/service/matching/pri_backlog_manager.go
++++ b/service/matching/pri_backlog_manager.go
+@@ -112,6 +112,7 @@ func (c *priBacklogManagerImpl) signalIfFatal(err error) bool {
+ 	if _, ok := errors.AsType[*persistence.ConditionFailedError](err); ok {
+ 		c.metricsHandler.Counter(metrics.ConditionFailedErrorPerTaskQueueCounter.Name()).Record(1)
+ 		c.skipFinalUpdate.Store(true)
++		speculaProbe("SignalIfFatal", c)
+ 		c.pqMgr.UnloadFromPartitionManager(unloadCauseConflict)
+ 		return true
+ 	}
+@@ -138,6 +139,7 @@ func (c *priBacklogManagerImpl) Stop() {
+ 		c.db.updateAckLevelAndBacklogStats(subqueueIndex(i), ackLevel, 0, time.Time{})
+ 	}
+ 	c.subqueueLock.Unlock()
++	speculaProbe("StopRefreshAck", c)
+ 
+ 	ctx, cancel := context.WithTimeout(c.tqCtx, ioTimeout)
+ 	_ = c.db.SyncState(ctx)
+@@ -367,6 +369,7 @@ func (c *priBacklogManagerImpl) respoolTaskAfterError(task *persistencespb.TaskI
+ 	err := backoff.ThrottleRetryContext(c.tqCtx, func(context.Context) error {
+ 		return c.SpoolTask(task)
+ 	}, persistenceOperationRetryPolicy, common.IsPersistenceTransientError)
++	speculaProbe("RespoolTaskReturn", c, task, err)
+ 	if err == nil {
+ 		return nil
+ 	}
+@@ -383,6 +386,7 @@ func (c *priBacklogManagerImpl) respoolTaskAfterError(task *persistencespb.TaskI
+ 		tag.WorkflowTaskQueueType(c.queueKey().TaskType()))
+ 	// Skip final update since persistence is having problems.
+ 	c.skipFinalUpdate.Store(true)
++	speculaProbe("SignalIfFatal", c)
+ 	c.pqMgr.UnloadFromPartitionManager(unloadCauseOtherError)
+ 	return err
+ }
+diff --git a/service/matching/pri_matcher.go b/service/matching/pri_matcher.go
+index 7e44ae83c..3b0369a88 100644
+--- a/service/matching/pri_matcher.go
++++ b/service/matching/pri_matcher.go
+@@ -247,6 +247,7 @@ func (tm *priTaskMatcher) forwardTask(task *internalTask) (bool, error) {
+ }
+ 
+ func (tm *priTaskMatcher) validateTasksOnRoot(retrier backoff.Retrier) {
++	speculaProbe("ValidatorGate", tm)
+ 	ctxs := []context.Context{tm.tqCtx}
+ 	poller := &waitingPoller{taskForwarderType: validatorTaskForwarder}
+ 	for {
+@@ -265,10 +266,14 @@ func (tm *priTaskMatcher) validateTasksOnRoot(retrier backoff.Retrier) {
+ 			continue
+ 		}
+ 
++		speculaProbe("ValidationMatch", task)
+ 		maybeValid := tm.validator == nil || tm.validator.maybeValidate(task.event.AllocatedTaskInfo, tm.partition.TaskType())
++		speculaProbe("ValidationResult", task, maybeValid)
+ 		if !maybeValid {
+ 			// We found an invalid one, complete it and go back for another immediately.
++			speculaProbe("FinishExpiredTask", task)
+ 			task.finish(taskFinishResult{dropReason: getDroppedTaskExpiryReason(task)})
++			speculaProbe("ValidationDone", task)
+ 
+ 			// Stay alive as long as we're invalidating tasks
+ 			tm.markAlive()
+@@ -277,6 +282,7 @@ func (tm *priTaskMatcher) validateTasksOnRoot(retrier backoff.Retrier) {
+ 		} else {
+ 			// Task was valid, put it back and slow down checking.
+ 			task.finish(taskFinishResult{err: errReprocessTask, consumedToken: true})
++			speculaProbe("ValidationDone", task)
+ 			// retrier's max interval is backlogTaskForwardTimeout, so for just valid tasks,
+ 			// this loop will essentially be limited to that interval.
+ 			util.InterruptibleSleep(tm.tqCtx, retrier.NextBackOff(nil))
+diff --git a/service/matching/pri_task_reader.go b/service/matching/pri_task_reader.go
+index ceb643422..b7de3e190 100644
+--- a/service/matching/pri_task_reader.go
++++ b/service/matching/pri_task_reader.go
+@@ -128,12 +128,14 @@ func (tr *priTaskReader) completeTask(task *internalTask, res taskResponse) {
+ 		// trying the same task immediately. maybe also: after a few attempts on the same task,
+ 		// let it get cycled to the end of the queue, in case there's some task/wf-specific
+ 		// thing.
++		speculaProbe("CompleteTaskTransient", tr, task)
+ 		tr.addTaskToMatcher(task)
+ 		return
+ 	}
+ 
+ 	// On other errors: ask backlog manager to re-spool to persistence
+ 	if err != nil {
++		speculaProbe("RespoolCallbackBegin", tr, task)
+ 		if tr.backlogMgr.respoolTaskAfterError(task.event.Data) != nil {
+ 			return // task queue will unload now
+ 		}
+@@ -153,21 +155,28 @@ func (tr *priTaskReader) completeTask(task *internalTask, res taskResponse) {
+ 		tr.SignalTaskLoading()
+ 	}
+ 
++	speculaProbe("MaybeGCLocked", tr)
+ 	tr.backlogMgr.db.updateAckLevelAndBacklogStats(tr.subqueue, tr.ackLevel, -numAcked, tr.backlogAge.oldestTime())
++	speculaProbe("UpdateAckLevelAndBacklogStats", tr)
+ }
+ 
+ // nolint:revive // can simplify later
+ func (tr *priTaskReader) getTasksPump() {
++	defer speculaProbe("ReaderExited", tr)
+ 	ctx := tr.backlogMgr.tqCtx
+ 
+ 	tr.SignalTaskLoading() // prime pump
+ 	for {
++		speculaProbe("ReaderLoopGate", tr)
+ 		select {
+ 		case <-ctx.Done():
+ 			return
+ 		case <-tr.notifyC:
+ 		}
+ 
++		tr.lock.Lock()
++		speculaProbe("GetTasksPump", tr)
++		tr.lock.Unlock()
+ 		if tr.getLoadedTasks() > tr.backlogMgr.config.GetTasksReloadAt() {
+ 			// Too many loaded already, ignore this signal. We'll get another signal when
+ 			// loadedTasks drops low enough.
+@@ -188,6 +197,7 @@ func (tr *priTaskReader) getTasksPump() {
+ 		tr.retrier.Reset()
+ 
+ 		if len(batch.tasks) == 0 {
++			speculaProbe("GapGate", tr)
+ 			tr.setReadLevelAfterGap(batch.readLevel)
+ 			if !batch.isReadBatchDone {
+ 				tr.SignalTaskLoading()
+@@ -198,6 +208,7 @@ func (tr *priTaskReader) getTasksPump() {
+ 		tr.processTaskBatch(batch.tasks)
+ 		// There may be more tasks.
+ 		tr.SignalTaskLoading()
++		speculaProbe("ProcessTaskBatchDone", tr)
+ 	}
+ }
+ 
+@@ -217,10 +228,12 @@ func (tr *priTaskReader) getTaskBatch(ctx context.Context) (getTasksBatchRespons
+ 	tr.lock.Unlock()
+ 
+ 	maxReadLevel := tr.backlogMgr.db.GetMaxReadLevel(tr.subqueue)
++	speculaProbe("GetTaskBatchMax", tr, maxReadLevel)
+ 
+ 	// counter i is used to break and let caller check whether taskqueue is still alive and needs to resume read.
+ 	for i := 0; i < 10 && readLevel < maxReadLevel; i++ {
+ 		upper := min(readLevel+tr.backlogMgr.config.RangeSize, maxReadLevel)
++		speculaProbe("GetTasksIssue", tr, readLevel, upper, i)
+ 		response, err := tr.backlogMgr.db.GetTasks(
+ 			ctx,
+ 			tr.subqueue,
+@@ -231,6 +244,7 @@ func (tr *priTaskReader) getTaskBatch(ctx context.Context) (getTasksBatchRespons
+ 		if err != nil {
+ 			return getTasksBatchResponse{}, err
+ 		}
++		speculaProbe("GetTaskBatchReturn", tr, readLevel, upper, i, response.Tasks)
+ 		// return as long as it grabs any tasks
+ 		if len(response.Tasks) > 0 {
+ 			return getTasksBatchResponse{tasks: response.Tasks}, nil
+@@ -276,6 +290,7 @@ func (tr *priTaskReader) processTaskBatch(tasks []*persistencespb.AllocatedTaskI
+ 	})
+ 
+ 	tr.recordNewTasksLocked(tasks)
++	speculaProbe("ProcessTaskBatch", tr, tasks)
+ 
+ 	tr.lock.Unlock()
+ 
+@@ -307,6 +322,7 @@ func (tr *priTaskReader) addNewTasks(tasks []*persistencespb.AllocatedTaskInfo)
+ }
+ 
+ func (tr *priTaskReader) addTaskToMatcher(task *internalTask) {
++	speculaProbe("MatcherRegistration", tr, task)
+ 	task.resetMatcherState()
+ 	err := tr.backlogMgr.addSpooledTask(task)
+ 	if err == nil {
+@@ -319,6 +335,7 @@ func (tr *priTaskReader) addTaskToMatcher(task *internalTask) {
+ 		// This should only be due to persistence problems. Retry in a new goroutine
+ 		// to not block other tasks, up to some concurrency limit.
+ 		if tr.addRetries.Acquire(tr.backlogMgr.tqCtx, 1) != nil {
++			speculaProbe("AddTaskToMatcherClosed", tr, task)
+ 			return
+ 		}
+ 		go tr.retryAddAfterError(task)
+@@ -400,12 +417,14 @@ func (tr *priTaskReader) signalNewTasks(resp subqueueCreateTasksResponse) {
+ 	if !canAddDirect {
+ 		tr.lock.Unlock()
+ 		tr.SignalTaskLoading()
++		speculaProbe("SignalNewTasksWake", tr)
+ 		return
+ 	}
+ 
+ 	tr.readLevel = resp.maxReadLevelAfter
+ 
+ 	tr.recordNewTasksLocked(resp.tasks)
++	speculaProbe("SignalNewTasksBypass", tr, resp.tasks)
+ 
+ 	tr.lock.Unlock()
+ 
+@@ -418,13 +437,16 @@ func (tr *priTaskReader) backoffSignal(duration time.Duration) {
+ 
+ 	if tr.backoffTimer == nil {
+ 		tr.backoffTimer = time.AfterFunc(duration, func() {
++			speculaProbe("BackoffFireGate", tr)
+ 			tr.lock.Lock()
+ 			defer tr.lock.Unlock()
+ 
+ 			tr.SignalTaskLoading() // re-enqueue the event
+ 			tr.backoffTimer = nil
++			speculaProbe("BackoffSignal", tr)
+ 		})
+ 	}
++	speculaProbe("GetTasksError", tr)
+ }
+ 
+ // ack manager
+@@ -473,11 +495,13 @@ func (tr *priTaskReader) ackTaskLocked(taskId int64) int64 {
+ 		numAcked += 1
+ 	}
+ 
++	speculaProbe("CompleteTaskAck", tr, taskId)
+ 	// Also if we're completely drained, we can move the ack level up to the read level.
+ 	if tr.isDrainedLocked() {
+ 		tr.ackLevel = tr.readLevel
+ 	}
+ 
++	speculaProbe("AckTaskLockedDrained", tr)
+ 	return numAcked
+ }
+ 
+@@ -493,8 +517,10 @@ func (tr *priTaskReader) setReadLevelAfterGap(newReadLevel int64) {
+ 		// level, it advanced it to the max. But that couples the logic more than desired, so just
+ 		// defensively signal another read here.
+ 		tr.SignalTaskLoading()
++		speculaProbe("SetReadLevelAfterGapStale", tr, newReadLevel)
+ 		return
+ 	}
++	speculaGapAck := tr.ackLevel == tr.readLevel
+ 	if tr.ackLevel == tr.readLevel {
+ 		// This is called after we read a range and find no tasks. The range we read was tr.readLevel to newReadLevel.
+ 		// (We know this because nothing should change tr.readLevel except the getTasksPump loop itself, after initialization.
+@@ -503,12 +529,14 @@ func (tr *priTaskReader) setReadLevelAfterGap(newReadLevel int64) {
+ 		// acked all tasks up to newReadLevel too. This lets us advance the ack level on a task queue with no activity
+ 		// but where the rangeid has moved higher, to prevent excessive reads on the next load.
+ 		tr.ackLevel = newReadLevel
++		speculaProbe("SetReadLevelAfterGapAck", tr, newReadLevel)
+ 		// Push the updated ack level to the db. If we didn't do this here, the updated ack level
+ 		// wouldn't reach the db until another task is written and acked, which could be far in the
+ 		// future. This also lets the approximate backlog count reset if we've reached max read level.
+ 		tr.backlogMgr.db.updateAckLevelAndBacklogStats(tr.subqueue, tr.ackLevel, 0, tr.backlogAge.oldestTime())
+ 	}
+ 	tr.readLevel = newReadLevel
++	speculaProbe("GapDone", tr, speculaGapAck)
+ }
+ 
+ func (tr *priTaskReader) getLevels() (readLevel, ackLevel int64) {
+@@ -526,6 +554,7 @@ func (tr *priTaskReader) maybeGCLocked() {
+ 	tr.inGC = true
+ 	tr.lastGCTime = time.Now()
+ 	// gc in new goroutine so poller doesn't have to wait
++	speculaProbe("GCLaunch", tr, tr.ackLevel)
+ 	go tr.doGC(tr.ackLevel)
+ }
+ 
+@@ -542,11 +571,14 @@ func (tr *priTaskReader) shouldGCLocked() bool {
+ 
+ // called in new goroutine
+ func (tr *priTaskReader) doGC(ackLevel int64) {
++	speculaProbe("GCStoreGate", tr)
++	defer speculaProbe("GCDone", tr)
+ 	wasComplete, err := tr.doGCAt(ackLevel)
+ 
+ 	tr.lock.Lock()
+ 	defer tr.lock.Unlock()
+ 
++	defer speculaProbe("DoGCReturn", tr, err)
+ 	tr.inGC = false
+ 	if err != nil {
+ 		return
+@@ -573,6 +605,7 @@ func (tr *priTaskReader) doGCAt(ackLevel int64) (bool, error) {
+ 	// - sql: return number of rows affected (should be <= batchSize)
+ 	// if we get UnknownNumRowsAffected or a smaller number than our limit, we know we got
+ 	// everything <= ackLevel, so we can reset ours. if not, we may have to try again.
++	speculaProbe("GCCount", tr, n)
+ 	wasComplete := n == persistence.UnknownNumRowsAffected || n < batchSize
+ 	return wasComplete, err
+ }
+diff --git a/service/matching/pri_task_writer.go b/service/matching/pri_task_writer.go
+index ba1705aef..d0c1e7cb2 100644
+--- a/service/matching/pri_task_writer.go
++++ b/service/matching/pri_task_writer.go
+@@ -71,6 +71,7 @@ func (w *priTaskWriter) appendTask(
+ ) error {
+ 	select {
+ 	case <-w.backlogMgr.tqCtx.Done():
++		speculaProbe("AppendTaskShutdown", w, taskInfo)
+ 		return errShutdown
+ 	default:
+ 		// noop
+@@ -86,13 +87,16 @@ func (w *priTaskWriter) appendTask(
+ 
+ 	select {
+ 	case w.appendCh <- req:
++		speculaProbe("SpoolTask", w, req)
+ 		select {
+ 		case err := <-ch:
++			speculaProbe("AppendTaskReceive", w, req, err)
+ 			metrics.TaskWriteLatencyPerTaskQueue.With(w.backlogMgr.metricsHandler).Record(time.Since(startTime))
+ 			return err
+ 		case <-w.backlogMgr.tqCtx.Done():
+ 			// if we are shutting down, this request will never make
+ 			// it to persistence, just bail out and fail this request
++			speculaProbe("AppendTaskShutdown", w, taskInfo)
+ 			return errShutdown
+ 		}
+ 	default: // channel is full, throttle
+@@ -111,12 +115,15 @@ func (w *priTaskWriter) assignTaskIDs(reqs []*writeTaskRequest) error {
+ 			// we ran out of current allocation block
+ 			newBlock, err := w.allocTaskIDBlock(w.taskIDBlock.end)
+ 			if err != nil {
++				speculaProbe("RenewLeaseFailure", w, err)
+ 				return err
+ 			}
+ 			w.taskIDBlock = newBlock
++			speculaProbe("LeaseBlockReturned", w)
+ 		}
+ 		reqs[i].id = w.taskIDBlock.start
+ 		w.taskIDBlock.start++
++		speculaProbe("AssignTaskIDs", w, reqs[i])
+ 	}
+ 	return nil
+ }
+@@ -133,7 +140,9 @@ func (w *priTaskWriter) appendTasks(reqs []*writeTaskRequest) error {
+ 		return err
+ 	}
+ 
++	speculaProbe("SignalReadersGate", w)
+ 	w.backlogMgr.signalReaders(resp)
++	speculaProbe("SignalReadersDone", w)
+ 	return nil
+ }
+ 
+@@ -146,6 +155,7 @@ func (w *priTaskWriter) initState() error {
+ 	w.taskIDBlock = rangeIDToTaskIDBlock(state.rangeID, w.config.RangeSize)
+ 	w.currentTaskIDBlock = w.taskIDBlock
+ 	w.backlogMgr.initState(state, nil)
++	speculaProbe("OwnerInitialized", w)
+ 	return nil
+ }
+ 
+@@ -164,13 +174,16 @@ func (w *priTaskWriter) taskWriterLoop() {
+ 			// read a batch of requests from the channel
+ 			reqs = append(reqs[:0], request)
+ 			reqs = w.getWriteBatch(reqs)
++			speculaProbe("TaskWriterDequeue", w, reqs)
+ 
+ 			err := w.assignTaskIDs(reqs)
+ 			if err == nil {
+ 				err = w.appendTasks(reqs)
+ 			}
+ 			for _, req := range reqs {
++				speculaProbe("WriterPublishGate", w)
+ 				req.responseCh <- err
++				speculaProbe("TaskWriterPublish", w, req, err)
+ 			}
+ 
+ 		case <-w.backlogMgr.tqCtx.Done():
+@@ -197,7 +210,11 @@ func (w *priTaskWriter) renewLeaseWithRetry(
+ ) (taskQueueState, error) {
+ 	var newState taskQueueState
+ 	op := func(ctx context.Context) (err error) {
++		speculaProbe("RenewLeaseAttempt", w)
+ 		newState, err = w.db.RenewLease(ctx)
++		if err != nil {
++			speculaProbe("RenewLeaseErrorReturn", w, err)
++		}
+ 		return
+ 	}
+ 	metrics.LeaseRequestPerTaskQueueCounter.With(w.backlogMgr.metricsHandler).Record(1)
+diff --git a/service/matching/task.go b/service/matching/task.go
+index 9e6fe02a5..487e1dd07 100644
+--- a/service/matching/task.go
++++ b/service/matching/task.go
+@@ -323,7 +323,10 @@ func (task *internalTask) getResponse() (taskResponse, bool) {
+ 	if task.responseC == nil {
+ 		return taskResponse{}, false
+ 	}
+-	return <-task.responseC, true
++	speculaProbe("SyncReceiveGate", task)
++	res := <-task.responseC
++	speculaProbe("SyncTaskReceive", task, res)
++	return res, true
+ }
+ 
+ func (task *internalTask) getPriority() *commonpb.Priority {
+@@ -390,6 +393,7 @@ func (task *internalTask) finishInternal(res taskResponse, consumedToken bool) {
+ 	switch {
+ 	case task.responseC != nil:
+ 		task.responseC <- res
++		speculaProbe("FinishSyncTask", task, res)
+ 	case task.event.completionFunc != nil:
+ 		// TODO: this probably should not be done synchronously in PollWorkflow/ActivityTaskQueue
+ 		task.event.completionFunc(task, res)
+diff --git a/service/matching/task_queue_partition_manager.go b/service/matching/task_queue_partition_manager.go
+index 65eddd439..9fa811ec8 100644
+--- a/service/matching/task_queue_partition_manager.go
++++ b/service/matching/task_queue_partition_manager.go
+@@ -612,6 +612,7 @@ reredirectTask:
+ 	behavior := directive.GetBehavior()
+ 	forwarded := params.forwardInfo != nil
+ 
++	speculaProbe("AddTask", syncMatchQueue, params.taskInfo)
+ 	var outcome syncMatchOutcome
+ 	if isActive {
+ 		outcome, err = syncMatchQueue.TrySyncMatch(ctx, syncMatchTask)
+@@ -656,6 +657,7 @@ reredirectTask:
+ 		assignedBuildId = spoolQueue.QueueKey().Version().BuildId()
+ 	}
+ 
++	speculaProbe("TrySyncMatchFallback", spoolQueue, params.taskInfo)
+ 	err = spoolQueue.SpoolTask(params.taskInfo)
+ 	if err == nil {
+ 		spoolQueue.RecordTaskAdd(metrics.TaskAddResultBacklog, forwarded, behavior)

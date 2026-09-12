@@ -1,0 +1,638 @@
+diff --git a/common/persistence/execution_manager.go b/common/persistence/execution_manager.go
+index 327ae6341..df89ef7d9 100644
+--- a/common/persistence/execution_manager.go
++++ b/common/persistence/execution_manager.go
+@@ -21,6 +21,7 @@ import (
+ 	"go.temporal.io/server/common/persistence/transitionhistory"
+ 	"go.temporal.io/server/common/persistence/versionhistory"
+ 	"go.temporal.io/server/common/softassert"
++	"go.temporal.io/server/common/speculatrace"
+ 	"go.temporal.io/server/service/history/tasks"
+ )
+ 
+@@ -244,7 +245,13 @@ func (m *executionManagerImpl) UpdateWorkflowExecution(
+ 		NewWorkflowNewEvents:    newWorkflowNewEvents,
+ 	}
+ 
++	if speculatrace.Active(updateMutation.ExecutionInfo.NamespaceId) {
++		speculatrace.Emit("PersistenceWriteRequest", "persistence", updateMutation.ExecutionInfo.NamespaceId, updateMutation.ExecutionInfo.WorkflowId, updateMutation.ExecutionState.RunId, map[string]any{"range_id": request.RangeID, "db_record_version": updateMutation.DBRecordVersion, "execution_info": speculatrace.Proto(updateMutation.ExecutionInfo), "execution_state": speculatrace.Proto(updateMutation.ExecutionState), "new_buffered_events": updateMutation.NewBufferedEvents, "clear_buffered_events": updateMutation.ClearBufferedEvents, "events": request.UpdateWorkflowEvents, "tasks": speculaPhysicalTasks(updateMutation.Tasks)})
++	}
+ 	err = m.persistence.UpdateWorkflowExecution(ctx, newRequest)
++	if speculatrace.Active(updateMutation.ExecutionInfo.NamespaceId) {
++		m.speculaReadback(ctx, request, err)
++	}
+ 	switch err.(type) {
+ 	case nil:
+ 		m.deleteHistoryTasks(ctx, request.ShardID, updateMutation.BestEffortDeleteTasks, updateMutation.ExecutionInfo.WorkflowId)
+@@ -497,6 +504,7 @@ func (m *executionManagerImpl) GetWorkflowExecution(
+ 		DBRecordVersion:   response.DBRecordVersion,
+ 		MutableStateStats: *statusOfInternalWorkflow(response.State, state, nil),
+ 	}
++	speculatrace.Emit("PersistenceReadback", "persistence", request.NamespaceID, request.WorkflowID, request.RunID, map[string]any{"readback_id": ctx.Value(speculaReadContextKey{}), "state": speculatrace.State(state), "db_record_version": response.DBRecordVersion, "error": speculatrace.Error(respErr), "shard_id": request.ShardID})
+ 	return newResponse, respErr
+ }
+ 
+@@ -983,6 +991,7 @@ func (m *executionManagerImpl) GetHistoryTasks(
+ 		}
+ 		task.SetTaskID(internalTask.Key.TaskID)
+ 
++		speculatrace.Emit("QueueRead", "persistence", task.GetNamespaceID(), task.GetWorkflowID(), task.GetRunID(), map[string]any{"readback_id": ctx.Value(speculaReadContextKey{}), "task": task, "category": request.TaskCategory.ID(), "task_id": task.GetTaskID(), "visibility_time": task.GetVisibilityTime()})
+ 		historyTasks = append(historyTasks, task)
+ 	}
+ 
+diff --git a/common/persistence/faultinjection/fault.go b/common/persistence/faultinjection/fault.go
+index c9280045c..75338da56 100644
+--- a/common/persistence/faultinjection/fault.go
++++ b/common/persistence/faultinjection/fault.go
+@@ -7,6 +7,7 @@ import (
+ 	enumspb "go.temporal.io/api/enums/v1"
+ 	"go.temporal.io/api/serviceerror"
+ 	"go.temporal.io/server/common/persistence"
++	"go.temporal.io/server/common/speculatrace"
+ )
+ 
+ type (
+@@ -62,8 +63,10 @@ func (f *fault) inject(op func() error) error {
+ 	if f == nil {
+ 		return op()
+ 	}
++	speculatrace.Emit("PersistenceFault", "persistence", "", "", "", map[string]any{"execute_operation": f.execOp, "injected_error": speculatrace.Error(f.err)})
+ 	if f.execOp {
+ 		err := op()
++		speculatrace.Emit("PersistenceFaultUnderlyingResult", "persistence", "", "", "", map[string]any{"error": speculatrace.Error(err)})
+ 		if err != nil {
+ 			return err
+ 		}
+diff --git a/common/persistence/faultinjection/store_fault_generator.go b/common/persistence/faultinjection/store_fault_generator.go
+index a13ae1e85..80e909d2d 100644
+--- a/common/persistence/faultinjection/store_fault_generator.go
++++ b/common/persistence/faultinjection/store_fault_generator.go
+@@ -2,6 +2,7 @@ package faultinjection
+ 
+ import (
+ 	"go.temporal.io/server/common/config"
++	"go.temporal.io/server/common/speculatrace"
+ )
+ 
+ type (
+@@ -44,6 +45,10 @@ func runtimeFaultInjector(injector config.FaultInjector) faultInjector {
+ 		if err == nil {
+ 			return nil
+ 		}
++		if _, ok := err.(speculatrace.ExecuteAndTimeout); ok {
++			f := newFault("ExecuteAndTimeout", 1.0, target.Method)
++			return &f
++		}
+ 		f := newFaultFromError(err, 1.0)
+ 		return &f
+ 	}
+diff --git a/common/persistence/shard_manager.go b/common/persistence/shard_manager.go
+index 58dfdc676..fe23c8890 100644
+--- a/common/persistence/shard_manager.go
++++ b/common/persistence/shard_manager.go
+@@ -7,6 +7,7 @@ import (
+ 	persistencespb "go.temporal.io/server/api/persistence/v1"
+ 	"go.temporal.io/server/common/persistence/serialization"
+ 	"go.temporal.io/server/common/primitives/timestamp"
++	"go.temporal.io/server/common/speculatrace"
+ )
+ 
+ type shardManagerImpl struct {
+@@ -85,7 +86,13 @@ func (m *shardManagerImpl) UpdateShard(
+ 		ShardInfo:       shardInfoBlob,
+ 		PreviousRangeID: request.PreviousRangeID,
+ 	}
+-	return m.shardStore.UpdateShard(ctx, internalRequest)
++	err = m.shardStore.UpdateShard(ctx, internalRequest)
++	event := "ShardUpdate"
++	if err == nil && request.PreviousRangeID != request.ShardInfo.GetRangeId() {
++		event = "ReacquireShard"
++	}
++	speculatrace.Emit(event, "recovery", "", "", "", map[string]any{"previous_range_id": request.PreviousRangeID, "range_id": request.ShardInfo.GetRangeId(), "shard_id": request.ShardInfo.GetShardId(), "error": speculatrace.Error(err)})
++	return err
+ }
+ 
+ func (m *shardManagerImpl) AssertShardOwnership(
+diff --git a/common/persistence/sql/execution.go b/common/persistence/sql/execution.go
+index 6b981cf70..2c81abac3 100644
+--- a/common/persistence/sql/execution.go
++++ b/common/persistence/sql/execution.go
+@@ -15,6 +15,7 @@ import (
+ 	"go.temporal.io/server/common/persistence/serialization"
+ 	"go.temporal.io/server/common/persistence/sql/sqlplugin"
+ 	"go.temporal.io/server/common/primitives"
++	"go.temporal.io/server/common/speculatrace"
+ )
+ 
+ type sqlExecutionStore struct {
+@@ -347,14 +348,17 @@ func (m *sqlExecutionStore) UpdateWorkflowExecution(
+ 		}
+ 	}
+ 
++	speculatrace.Emit("AppendHistoryNodes", "persistence", request.UpdateWorkflowMutation.NamespaceID, request.UpdateWorkflowMutation.WorkflowID, request.UpdateWorkflowMutation.ExecutionState.RunId, map[string]any{"range_id": request.RangeID, "db_record_version": request.UpdateWorkflowMutation.DBRecordVersion, "appends": request.UpdateWorkflowNewEvents})
+ 	// then update mutable state
+-	return m.txExecuteShardLocked(ctx,
++	err := m.txExecuteShardLocked(ctx,
+ 		"UpdateWorkflowExecution",
+ 		request.ShardID,
+ 		request.RangeID,
+ 		func(tx sqlplugin.Tx) error {
+ 			return m.updateWorkflowExecutionTx(ctx, tx, request)
+ 		})
++	speculatrace.Emit("SQLCommitResult", "persistence", request.UpdateWorkflowMutation.NamespaceID, request.UpdateWorkflowMutation.WorkflowID, request.UpdateWorkflowMutation.ExecutionState.RunId, map[string]any{"range_id": request.RangeID, "db_record_version": request.UpdateWorkflowMutation.DBRecordVersion, "error": speculatrace.Error(err)})
++	return err
+ }
+ 
+ func (m *sqlExecutionStore) updateWorkflowExecutionTx(
+diff --git a/service/history/hsm/nexusoperations/completion.go b/service/history/hsm/nexusoperations/completion.go
+index fb56c6c53..228c4f8c8 100644
+--- a/service/history/hsm/nexusoperations/completion.go
++++ b/service/history/hsm/nexusoperations/completion.go
+@@ -14,6 +14,7 @@ import (
+ 	"go.temporal.io/api/serviceerror"
+ 	"go.temporal.io/server/common/metrics"
+ 	commonnexus "go.temporal.io/server/common/nexus"
++	"go.temporal.io/server/common/speculatrace"
+ 	"go.temporal.io/server/service/history/hsm"
+ 	"google.golang.org/protobuf/types/known/timestamppb"
+ )
+@@ -188,7 +189,10 @@ func (h *CompletionHandler) Handle(
+ 	links []*commonpb.Link,
+ 	result *commonpb.Payload,
+ 	opFailedError *nexus.OperationError,
+-) error {
++) (retErr error) {
++	defer func() {
++		speculaCall("CompletionHandlerReturnBoundary", ref, map[string]any{"request_id": requestID, "error": speculatrace.Error(retErr)})
++	}()
+ 	// The initial version of the completion token did not include a request ID.
+ 	// Only retry Access without a run ID if the request ID is not empty.
+ 	isRetryableNotFoundErr := requestID != ""
+@@ -232,6 +236,7 @@ func (h *CompletionHandler) Handle(
+ 		}
+ 		// fabricatedStart means the executor never emitted schedule-to-start, so we emit it here.
+ 		emitScheduleToStart := fabricatedStart && operation.StartedTime != nil
++		node.SpeculaEmit("CompletionHandlerHandle", map[string]any{"ref": speculatrace.Proto(ref.StateMachineRef), "request_id": requestID, "token": operationToken, "start_time": startTime, "error": speculatrace.Error(opFailedError)})
+ 		emitMetrics = h.deferredCompletionMetric(operation, node.NamespaceName(), node.WorkflowTypeName(), opFailedError, emitScheduleToStart, env.Now())
+ 		return nil
+ 	})
+diff --git a/service/history/hsm/nexusoperations/executors.go b/service/history/hsm/nexusoperations/executors.go
+index 3d2edb4a3..634455cb4 100644
+--- a/service/history/hsm/nexusoperations/executors.go
++++ b/service/history/hsm/nexusoperations/executors.go
+@@ -32,6 +32,7 @@ import (
+ 	commonnexus "go.temporal.io/server/common/nexus"
+ 	"go.temporal.io/server/common/nexus/nexusrpc"
+ 	"go.temporal.io/server/common/resource"
++	"go.temporal.io/server/common/speculatrace"
+ 	"go.temporal.io/server/service/history/consts"
+ 	"go.temporal.io/server/service/history/hsm"
+ 	queueserrors "go.temporal.io/server/service/history/queues/errors"
+@@ -287,6 +288,7 @@ func (e taskExecutor) executeInvocationTask(ctx context.Context, env hsm.Environ
+ 	if callTimeout < e.Config.MinRequestTimeout(ns.Name().String()) {
+ 		startTime = time.Now()
+ 		callErr = &operationTimeoutBelowMinError{timeoutType: timeoutType}
++		speculaCall("executeInvocationTaskBelowMin", ref, map[string]any{"budget_ns": int64(callTimeout), "error": speculatrace.Error(callErr)})
+ 	} else if args.endpointName == commonnexus.SystemEndpoint {
+ 		startTime = time.Now()
+ 		result, callErr = e.startOnHistoryService(callCtx, ns, args, options)
+@@ -308,7 +310,9 @@ func (e taskExecutor) executeInvocationTask(ctx context.Context, env hsm.Environ
+ 			}
+ 		}
+ 		startTime = time.Now()
++		speculaCall("executeInvocationTask", ref, map[string]any{"options": options, "budget_ns": int64(callTimeout), "scheduled_time": args.scheduledTime})
+ 		result, callErr = e.startViaHTTP(callCtx, client, args, options)
++		speculaCall("ReceiveStartResponse", ref, speculaStartResult(result, callErr))
+ 	}
+ 
+ 	if result != nil {
+@@ -403,6 +407,7 @@ func (e taskExecutor) loadOperationArgs(
+ 			},
+ 		})
+ 		args.namespaceFailoverVersion = event.Version
++		node.SpeculaEmit("loadOperationArgs", map[string]any{"ref": speculatrace.Proto(ref.StateMachineRef), "task_id": ref.TaskID, "event": speculatrace.Proto(event), "request_id": args.requestID})
+ 		return nil
+ 	})
+ 	return
+@@ -437,10 +442,12 @@ func (e taskExecutor) saveResult(ctx context.Context, env hsm.Environment, ref h
+ 		if err != nil {
+ 			return err
+ 		}
++		node.SpeculaEmit(speculaStartAction(finalOp, callErr), map[string]any{"ref": speculatrace.Proto(ref.StateMachineRef), "task_id": ref.TaskID, "result": speculaStartResult(result, callErr)})
+ 		emitMetrics = e.deferredOperationMetric(finalOp, callErr, node.NamespaceName(), node.WorkflowTypeName(), env.Now())
+ 		return nil
+ 	})
+ 	if err != nil {
++		speculaCall("StartSaveRejected", ref, map[string]any{"error": speculatrace.Error(err)})
+ 		return err
+ 	}
+ 	if emitMetrics != nil {
+@@ -604,11 +611,15 @@ func handleNonRetryableStartOperationError(node *hsm.Node, operation Operation,
+ }
+ 
+ func (e taskExecutor) executeBackoffTask(env hsm.Environment, node *hsm.Node, task BackoffTask) error {
+-	return hsm.MachineTransition(node, func(op Operation) (hsm.TransitionOutput, error) {
++	err := hsm.MachineTransition(node, func(op Operation) (hsm.TransitionOutput, error) {
+ 		return TransitionRescheduled.Apply(op, EventRescheduled{
+ 			Node: node,
+ 		})
+ 	})
++	if err == nil {
++		node.SpeculaEmit("executeBackoffTask", map[string]any{"type": task.Type(), "deadline": task.Deadline()})
++	}
++	return err
+ }
+ 
+ func (e taskExecutor) executeScheduleToCloseTimeoutTask(env hsm.Environment, node *hsm.Node, task ScheduleToCloseTimeoutTask) error {
+@@ -635,6 +646,7 @@ func (e taskExecutor) executeOperationTimeout(env hsm.Environment, node *hsm.Nod
+ 	if err != nil {
+ 		return err
+ 	}
++	node.SpeculaEmit("executeOperationTimeout", map[string]any{"timeout_type": timeoutType.String()})
+ 	emitOperationTimedOut(e.MetricsHandler, e.metricTagConfig(), op, node.NamespaceName(), node.WorkflowTypeName(), timeoutType.String(), env.Now())
+ 	return nil
+ }
+@@ -747,6 +759,7 @@ func (e taskExecutor) executeCancelationTask(ctx context.Context, env hsm.Enviro
+ 	if callTimeout < e.Config.MinRequestTimeout(ns.Name().String()) {
+ 		startTime = time.Now()
+ 		callErr = &operationTimeoutBelowMinError{timeoutType: timeoutType}
++		speculaCall("executeCancelationTaskBelowMin", ref, map[string]any{"budget_ns": int64(callTimeout), "error": speculatrace.Error(callErr)})
+ 	} else if args.endpointName == commonnexus.SystemEndpoint {
+ 		startTime = time.Now()
+ 		callErr = e.cancelOnHistoryService(callCtx, ns, args)
+@@ -780,7 +793,9 @@ func (e taskExecutor) executeCancelationTask(ctx context.Context, env hsm.Enviro
+ 			header.Set(nexusrpc.HeaderTemporalNexusFailureSupport, "true")
+ 		}
+ 		startTime = time.Now()
++		speculaCall("executeCancelationTask", ref, map[string]any{"token": args.token, "request_id": args.requestID, "budget_ns": int64(callTimeout), "header": header})
+ 		callErr = handle.Cancel(callCtx, nexus.CancelOperationOptions{Header: header})
++		speculaCall("ReceiveCancelResponse", ref, map[string]any{"error": speculatrace.Error(callErr)})
+ 	}
+ 	failureSource := failureSourceFromContext(callCtx)
+ 	methodTag := metrics.NexusMethodTag("CancelOperation")
+@@ -854,6 +869,7 @@ func (e taskExecutor) loadArgsForCancelation(ctx context.Context, env hsm.Enviro
+ 			args.headers = maps.Clone(attrs.GetNexusHeader())
+ 			args.payload = attrs.GetInput()
+ 		}
++		n.SpeculaEmit("loadArgsForCancelation", map[string]any{"ref": speculatrace.Proto(ref.StateMachineRef), "task_id": ref.TaskID, "request_id": args.requestID, "token": args.token})
+ 		return nil
+ 	})
+ 	return
+@@ -862,7 +878,7 @@ func (e taskExecutor) loadArgsForCancelation(ctx context.Context, env hsm.Enviro
+ //nolint:revive // The legacy executor is kept intact while existing HSM operations remain loadable.
+ func (e taskExecutor) saveCancelationResult(ctx context.Context, env hsm.Environment, ref hsm.Ref, callErr error, scheduledEventID int64) error {
+ 	return env.Access(ctx, ref, hsm.AccessWrite, func(n *hsm.Node) error {
+-		return hsm.MachineTransition(n, func(c Cancelation) (hsm.TransitionOutput, error) {
++		err := hsm.MachineTransition(n, func(c Cancelation) (hsm.TransitionOutput, error) {
+ 			if callErr != nil {
+ 				var handlerErr *nexus.HandlerError
+ 				var opTimeoutBelowMinErr *operationTimeoutBelowMinError
+@@ -920,15 +936,23 @@ func (e taskExecutor) saveCancelationResult(ctx context.Context, env hsm.Environ
+ 				Node: n,
+ 			})
+ 		})
++		if err == nil {
++			n.SpeculaEmit(speculaCancelAction(n), map[string]any{"ref": speculatrace.Proto(ref.StateMachineRef), "task_id": ref.TaskID, "error": speculatrace.Error(callErr)})
++		}
++		return err
+ 	})
+ }
+ 
+ func (e taskExecutor) executeCancelationBackoffTask(env hsm.Environment, node *hsm.Node, task CancelationBackoffTask) error {
+-	return hsm.MachineTransition(node, func(c Cancelation) (hsm.TransitionOutput, error) {
++	err := hsm.MachineTransition(node, func(c Cancelation) (hsm.TransitionOutput, error) {
+ 		return TransitionCancelationRescheduled.Apply(c, EventCancelationRescheduled{
+ 			Node: node,
+ 		})
+ 	})
++	if err == nil {
++		node.SpeculaEmit("executeCancelationBackoffTask", map[string]any{"type": task.Type(), "deadline": task.Deadline()})
++	}
++	return err
+ }
+ 
+ // lookupEndpint gets an endpoint from the registry, preferring to look up by ID and falling back to name lookup.
+diff --git a/service/history/hsm/nexusoperations/workflow/commands.go b/service/history/hsm/nexusoperations/workflow/commands.go
+index 92703cf53..486900567 100644
+--- a/service/history/hsm/nexusoperations/workflow/commands.go
++++ b/service/history/hsm/nexusoperations/workflow/commands.go
+@@ -18,6 +18,7 @@ import (
+ 	chasmworkflow "go.temporal.io/server/chasm/lib/workflow"
+ 	commonnexus "go.temporal.io/server/common/nexus"
+ 	"go.temporal.io/server/common/primitives/timestamp"
++	"go.temporal.io/server/common/speculatrace"
+ 	"go.temporal.io/server/service/history/hsm"
+ 	"go.temporal.io/server/service/history/hsm/nexusoperations"
+ 	historyi "go.temporal.io/server/service/history/interfaces"
+@@ -185,6 +186,7 @@ func (ch *commandHandler) HandleScheduleCommand(
+ 	coll := nexusoperations.MachineCollection(root)
+ 	maxPendingOperations := ch.config.MaxConcurrentOperations(nsName)
+ 	if coll.Size() >= ch.config.MaxConcurrentOperations(nsName) {
++		root.SpeculaEmit("HandleScheduleCommandLimit", map[string]any{"capacity": ch.config.MaxConcurrentOperations(nsName), "physical_count": coll.Size()})
+ 		return chasmworkflow.FailWorkflowTaskError{
+ 			Cause:   enumspb.WORKFLOW_TASK_FAILED_CAUSE_PENDING_NEXUS_OPERATIONS_LIMIT_EXCEEDED,
+ 			Message: fmt.Sprintf("workflow has reached the pending nexus operation limit of %d for this namespace", maxPendingOperations),
+@@ -238,7 +240,11 @@ func (ch *commandHandler) HandleScheduleCommand(
+ 		he.EventGroupMarkers = command.EventGroupMarkers
+ 	})
+ 
+-	return nexusoperations.ScheduledEventDefinition{}.Apply(root, event)
++	err := nexusoperations.ScheduledEventDefinition{}.Apply(root, event)
++	if err == nil {
++		root.SpeculaEmit("HandleScheduleCommand", map[string]any{"event": speculatrace.Proto(event), "capacity": ch.config.MaxConcurrentOperations(nsName)})
++	}
++	return err
+ }
+ 
+ func (ch *commandHandler) HandleCancelCommand(
+@@ -308,6 +314,9 @@ func (ch *commandHandler) HandleCancelCommand(
+ 	})
+ 
+ 	err = nexusoperations.CancelRequestedEventDefinition{}.Apply(ms.HSM(), event)
++	if err == nil || errors.Is(err, hsm.ErrStateMachineNotFound) {
++		ms.HSM().SpeculaEmit("HandleCancelCommand", map[string]any{"event": speculatrace.Proto(event), "apply_error": speculatrace.Error(err)})
++	}
+ 
+ 	// Cancel spawns a child Cancelation machine, if that machine already exists we got a duplicate cancelation request.
+ 	if errors.Is(err, hsm.ErrStateMachineAlreadyExists) {
+diff --git a/service/history/hsm/tree.go b/service/history/hsm/tree.go
+index b16a317c6..401f578e8 100644
+--- a/service/history/hsm/tree.go
++++ b/service/history/hsm/tree.go
+@@ -441,6 +441,7 @@ func (n *Node) DeleteChild(key Key) error {
+ 		}
+ 	}
+ 	delete(n.cache.children, key)
++	child.SpeculaEmit("HSMDelete", nil)
+ 	return nil
+ }
+ 
+@@ -631,6 +632,7 @@ func MachineTransition[T any](n *Node, transitionFn func(T) (TransitionOutput, e
+ 		},
+ 	})
+ 
++	n.SpeculaEmit("HSMTransition", map[string]any{"type": n.Key.Type, "transition_tasks": speculaTasks(output.Tasks)})
+ 	return nil
+ }
+ 
+diff --git a/service/history/queues/executable.go b/service/history/queues/executable.go
+index dfab5e70f..74da7950f 100644
+--- a/service/history/queues/executable.go
++++ b/service/history/queues/executable.go
+@@ -31,6 +31,7 @@ import (
+ 	"go.temporal.io/server/common/log/tag"
+ 	"go.temporal.io/server/common/metrics"
+ 	"go.temporal.io/server/common/namespace"
++	"go.temporal.io/server/common/speculatrace"
+ 	ctasks "go.temporal.io/server/common/tasks"
+ 	"go.temporal.io/server/common/telemetry"
+ 	"go.temporal.io/server/common/util"
+@@ -271,6 +272,10 @@ func NewExecutable(
+ }
+ 
+ func (e *executableImpl) Execute() (retErr error) {
++	speculatrace.Emit("QueueExecute", "recovery", e.GetNamespaceID(), e.GetWorkflowID(), e.GetRunID(), map[string]any{"task": e.Task, "task_id": e.GetTaskID(), "reader_id": e.readerID, "attempt": e.attempt.Load()})
++	defer func() {
++		speculatrace.Emit("QueueExecutionResult", "recovery", e.GetNamespaceID(), e.GetWorkflowID(), e.GetRunID(), map[string]any{"task_id": e.GetTaskID(), "error": speculatrace.Error(retErr)})
++	}()
+ 	startTime := e.timeSource.Now()
+ 	e.scheduleLatency = startTime.Sub(e.scheduledTime)
+ 
+@@ -748,6 +753,7 @@ func (e *executableImpl) Ack() {
+ 	}
+ 
+ 	e.state = ctasks.TaskStateAcked
++	speculatrace.Emit("QueueAck", "recovery", e.GetNamespaceID(), e.GetWorkflowID(), e.GetRunID(), map[string]any{"task": e.Task, "task_id": e.GetTaskID(), "invalid": e.invalidTask})
+ 
+ 	if e.invalidTask {
+ 		// do not emit metrics for invalid tasks
+diff --git a/service/history/shard/context_impl.go b/service/history/shard/context_impl.go
+index 74e48d5c3..570456f51 100644
+--- a/service/history/shard/context_impl.go
++++ b/service/history/shard/context_impl.go
+@@ -49,6 +49,7 @@ import (
+ 	"go.temporal.io/server/common/quotas"
+ 	"go.temporal.io/server/common/rpc"
+ 	"go.temporal.io/server/common/searchattribute"
++	"go.temporal.io/server/common/speculatrace"
+ 	"go.temporal.io/server/common/util"
+ 	"go.temporal.io/server/common/wideevents"
+ 	"go.temporal.io/server/service/history/configs"
+@@ -1544,6 +1545,7 @@ func (s *ContextImpl) handleWriteErrorLocked(
+ 		// reliably check the outcome by performing a read. If we fail, we'll shut down the shard.
+ 		// Note that reacquiring the shard will cause the max read level to be updated
+ 		// to the new range (i.e. past newMaxReadLevel).
++		speculatrace.Emit("LoseShard", "recovery", "", "", "", map[string]any{"range_id": requestRangeID, "shard_id": s.GetShardID(), "error": speculatrace.Error(err)})
+ 		_ = s.transition(contextRequestLost{})
+ 		return err
+ 	}
+diff --git a/service/history/statemachine_environment.go b/service/history/statemachine_environment.go
+index 0b516a6ae..bc68275e2 100644
+--- a/service/history/statemachine_environment.go
++++ b/service/history/statemachine_environment.go
+@@ -17,6 +17,7 @@ import (
+ 	"go.temporal.io/server/common/metrics"
+ 	"go.temporal.io/server/common/namespace"
+ 	"go.temporal.io/server/common/persistence/transitionhistory"
++	"go.temporal.io/server/common/speculatrace"
+ 	"go.temporal.io/server/service/history/consts"
+ 	"go.temporal.io/server/service/history/hsm"
+ 	historyi "go.temporal.io/server/service/history/interfaces"
+@@ -381,6 +382,7 @@ func (e *stateMachineEnvironment) Access(ctx context.Context, ref hsm.Ref, acces
+ 	defer func() {
+ 		if accessType == hsm.AccessWrite && accessed {
+ 			release(retErr)
++			speculatrace.Emit("AccessReturn", "persistence", ref.WorkflowKey.NamespaceID, ref.WorkflowKey.WorkflowID, ref.WorkflowKey.RunID, map[string]any{"error": speculatrace.Error(retErr), "ref": speculatrace.Proto(ref.StateMachineRef), "task_id": ref.TaskID})
+ 		} else {
+ 			release(nil)
+ 		}
+@@ -393,6 +395,7 @@ func (e *stateMachineEnvironment) Access(ctx context.Context, ref hsm.Ref, acces
+ 	if err := accessor(node); err != nil {
+ 		return err
+ 	}
++	ms.HSM().SpeculaEmit("AccessMutationBoundary", map[string]any{"access_type": accessType, "task_id": ref.TaskID, "ref": speculatrace.Proto(ref.StateMachineRef)})
+ 	if accessType == hsm.AccessRead {
+ 		return nil
+ 	}
+diff --git a/service/history/timer_queue_task_executor_base.go b/service/history/timer_queue_task_executor_base.go
+index 4d5cae038..8776effbd 100644
+--- a/service/history/timer_queue_task_executor_base.go
++++ b/service/history/timer_queue_task_executor_base.go
+@@ -18,6 +18,7 @@ import (
+ 	"go.temporal.io/server/common/namespace"
+ 	"go.temporal.io/server/common/persistence"
+ 	"go.temporal.io/server/common/resource"
++	"go.temporal.io/server/common/speculatrace"
+ 	"go.temporal.io/server/common/util"
+ 	"go.temporal.io/server/service/history/configs"
+ 	"go.temporal.io/server/service/history/consts"
+@@ -303,6 +304,7 @@ func (t *timerQueueTaskExecutorBase) executeStateMachineTimers(
+ 		return 0, consts.ErrWorkflowZombie
+ 	}
+ 
++	ms.HSM().SpeculaEmit("executeStateMachineTimerTask", map[string]any{"task": task})
+ 	timers := ms.GetExecutionInfo().StateMachineTimers
+ 	processedTimers := 0
+ 
+@@ -333,6 +335,7 @@ func (t *timerQueueTaskExecutorBase) executeStateMachineTimers(
+ 					metrics.OperationTag(queues.GetTimerStateMachineTaskTypeTagValue(timer.GetType(), t.isActive)),
+ 				)
+ 				t.logger.Info("Skipped state machine timer", tag.Error(err))
++				ms.HSM().SpeculaEmit("SkipStaleTimer", map[string]any{"timer": speculatrace.Proto(timer), "deadline": group.Deadline.AsTime(), "error": speculatrace.Error(err)})
+ 			}
+ 		}
+ 		// Remove the processed timer group.
+@@ -344,5 +347,6 @@ func (t *timerQueueTaskExecutorBase) executeStateMachineTimers(
+ 		// Update processed timers.
+ 		ms.GetExecutionInfo().StateMachineTimers = timers
+ 	}
++	ms.HSM().SpeculaEmit("FinishStateMachineTimers", map[string]any{"processed_groups": processedTimers})
+ 	return processedTimers, nil
+ }
+diff --git a/service/history/workflow/context.go b/service/history/workflow/context.go
+index 183e229f6..fc9cda381 100644
+--- a/service/history/workflow/context.go
++++ b/service/history/workflow/context.go
+@@ -28,6 +28,7 @@ import (
+ 	"go.temporal.io/server/common/persistence"
+ 	"go.temporal.io/server/common/primitives"
+ 	"go.temporal.io/server/common/softassert"
++	"go.temporal.io/server/common/speculatrace"
+ 	"go.temporal.io/server/common/testing/testhooks"
+ 	"go.temporal.io/server/service/history/configs"
+ 	"go.temporal.io/server/service/history/consts"
+@@ -172,6 +173,9 @@ func (c *ContextImpl) IsDirty() bool {
+ }
+ 
+ func (c *ContextImpl) Clear() {
++	if c.MutableState != nil {
++		speculatrace.Emit("CacheLoss", "recovery", c.workflowKey.NamespaceID, c.workflowKey.WorkflowID, c.workflowKey.RunID, nil)
++	}
+ 	metrics.WorkflowContextCleared.With(c.metricsHandler).Record(1)
+ 	if c.MutableState != nil {
+ 		c.MutableState.GetQueryRegistry().Clear()
+@@ -443,6 +447,7 @@ func (c *ContextImpl) LoadMutableState(ctx context.Context, shardContext history
+ 		// returned by NewMutableStateFromDB().
+ 		// Thus causing NPE (e.g. when calling c.Clear()) or other unexpected behavior.
+ 		c.MutableState = mutableState
++		mutableState.HSM().SpeculaEmit("LoadMutableState", map[string]any{"range_id": shardContext.GetRangeID(), "shard_id": shardContext.GetShardID()})
+ 	}
+ 
+ 	mutableStateArchetypeID := c.MutableState.ChasmTree().ArchetypeID()
+diff --git a/service/history/workflow/mutable_state_impl.go b/service/history/workflow/mutable_state_impl.go
+index e582d61eb..5f9de2736 100644
+--- a/service/history/workflow/mutable_state_impl.go
++++ b/service/history/workflow/mutable_state_impl.go
+@@ -62,6 +62,7 @@ import (
+ 	"go.temporal.io/server/common/searchattribute/sadefs"
+ 	serviceerrors "go.temporal.io/server/common/serviceerror"
+ 	"go.temporal.io/server/common/softassert"
++	"go.temporal.io/server/common/speculatrace"
+ 	"go.temporal.io/server/common/tasktoken"
+ 	"go.temporal.io/server/common/util"
+ 	"go.temporal.io/server/common/worker_versioning"
+@@ -1384,6 +1385,9 @@ func (ms *MutableStateImpl) AddHistoryEvent(t enumspb.EventType, setAttributes f
+ 		ms.writeEventToCache(event)
+ 	}
+ 	ms.currentTransactionAddedStateMachineEventTypes = append(ms.currentTransactionAddedStateMachineEventTypes, t)
++	if speculatrace.Active(ms.executionInfo.NamespaceId) {
++		speculatrace.Emit("HistoryEvent", "workflow-lock", ms.executionInfo.NamespaceId, ms.executionInfo.WorkflowId, ms.executionState.RunId, speculatrace.Proto(event))
++	}
+ 	return event
+ }
+ 
+@@ -7644,6 +7648,7 @@ func (ms *MutableStateImpl) CloseTransactionAsMutation(
+ 	}
+ 
+ 	ms.checksum = result.checksum
++	ms.SpeculaEmit("CloseTransactionBoundary", map[string]any{"new_buffered_events": result.bufferEvents, "clear_buffered_events": result.clearBuffer, "workflow_events": result.workflowEventsSeq})
+ 	if err := ms.cleanupTransaction(); err != nil {
+ 		return nil, nil, err
+ 	}
+diff --git a/service/history/workflow/task_generator.go b/service/history/workflow/task_generator.go
+index 3e3cf4c4d..3f5193e90 100644
+--- a/service/history/workflow/task_generator.go
++++ b/service/history/workflow/task_generator.go
+@@ -331,7 +331,7 @@ func (r *TaskGeneratorImpl) GenerateDirtySubStateMachineTasks(
+ 	}
+ 
+ 	AddNextStateMachineTimerTask(r.mutableState)
+-
++	r.mutableState.HSM().SpeculaEmit("GenerateDirtySubStateMachineTasks", nil)
+ 	return nil
+ }
+ 
+diff --git a/service/history/workflow/task_refresher.go b/service/history/workflow/task_refresher.go
+index 902e2acfb..bec656a6b 100644
+--- a/service/history/workflow/task_refresher.go
++++ b/service/history/workflow/task_refresher.go
+@@ -89,6 +89,7 @@ func (r *TaskRefresherImpl) Refresh(
+ 		return taskGenerator.GenerateDeleteHistoryEventTask(closeTime)
+ 	}
+ 
++	mutableState.HSM().SpeculaEmit("RefreshWorkflowTasks", nil)
+ 	return nil
+ }
+ 
+diff --git a/service/history/workflow/transaction_impl.go b/service/history/workflow/transaction_impl.go
+index bd7a7c35f..ca31c04d8 100644
+--- a/service/history/workflow/transaction_impl.go
++++ b/service/history/workflow/transaction_impl.go
+@@ -16,6 +16,7 @@ import (
+ 	"go.temporal.io/server/common/namespace"
+ 	"go.temporal.io/server/common/persistence"
+ 	"go.temporal.io/server/common/persistence/transitionhistory"
++	"go.temporal.io/server/common/speculatrace"
+ 	"go.temporal.io/server/service/history/events"
+ 	historyi "go.temporal.io/server/service/history/interfaces"
+ 	"go.temporal.io/server/service/history/notification"
+@@ -198,6 +199,7 @@ func (t *TransactionImpl) UpdateWorkflowExecution(
+ 		},
+ 		isWorkflow,
+ 	)
++	speculatrace.Emit("NotifyOnExecutionMutation", "persistence", currentWorkflowMutation.ExecutionInfo.NamespaceId, currentWorkflowMutation.ExecutionInfo.WorkflowId, currentWorkflowMutation.ExecutionState.RunId, map[string]any{"error": speculatrace.Error(err), "possibly_succeeded": persistence.OperationPossiblySucceeded(err), "db_record_version": currentWorkflowMutation.DBRecordVersion})
+ 	if persistence.OperationPossiblySucceeded(err) {
+ 		NotifyOnExecutionMutation(engine, archetypeID, currentWorkflowMutation)
+ 		NotifyOnExecutionSnapshot(engine, archetypeID, newWorkflowSnapshot)
+diff --git a/service/history/workflow/workflow_task_state_machine.go b/service/history/workflow/workflow_task_state_machine.go
+index 72123c71b..ef61c0ce6 100644
+--- a/service/history/workflow/workflow_task_state_machine.go
++++ b/service/history/workflow/workflow_task_state_machine.go
+@@ -633,6 +633,7 @@ func (m *workflowTaskStateMachine) AddWorkflowTaskStartedEvent(
+ 		return nil, nil, err
+ 	}
+ 
++	m.ms.SpeculaEmit("StartWorkflowTask", nil)
+ 	return startedEvent, workflowTask, nil
+ }
+ 
+@@ -886,6 +887,7 @@ func (m *workflowTaskStateMachine) AddWorkflowTaskCompletedEvent(
+ 		}
+ 	}
+ 
++	m.ms.SpeculaEmit("CompleteWorkflowTask", nil)
+ 	return event, nil
+ }
+ 
+diff --git a/tests/testcore/test_cluster.go b/tests/testcore/test_cluster.go
+index d5651acfa..1e162761e 100644
+--- a/tests/testcore/test_cluster.go
++++ b/tests/testcore/test_cluster.go
+@@ -38,6 +38,7 @@ import (
+ 	"go.temporal.io/server/common/resolver"
+ 	"go.temporal.io/server/common/rpc/auth"
+ 	"go.temporal.io/server/common/rpc/encryption"
++	"go.temporal.io/server/common/speculatrace"
+ 	"go.temporal.io/server/common/telemetry"
+ 	"go.temporal.io/server/common/testing/freeport"
+ 	"go.temporal.io/server/common/testing/testhooks"
+@@ -125,6 +126,9 @@ func GetPersistenceTestDefaults() persistencetests.TestBaseOptions {
+ func (f *defaultPersistenceTestBaseFactory) NewTestBase(options *persistencetests.TestBaseOptions) *persistencetests.TestBase {
+ 	defaults := GetPersistenceTestDefaults()
+ 	options.ApplyDefaults(&defaults)
++	if speculatrace.Enabled() {
++		options.ConnectAttributes = map[string]string{"mode": "memory", "cache": "shared"}
++	}
+ 
+ 	if cliFlags.enableFaultInjection != "" && options.FaultInjection == nil {
+ 		// If -enableFaultInjection is passed to the test runner, then default fault injection config is added to the persistence options.

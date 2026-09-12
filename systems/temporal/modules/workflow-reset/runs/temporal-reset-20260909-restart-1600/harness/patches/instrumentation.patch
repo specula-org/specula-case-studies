@@ -1,0 +1,596 @@
+diff --git a/common/persistence/history_manager.go b/common/persistence/history_manager.go
+index 9777739be..21a0e193e 100644
+--- a/common/persistence/history_manager.go
++++ b/common/persistence/history_manager.go
+@@ -14,6 +14,7 @@ import (
+ 	"go.temporal.io/server/common"
+ 	"go.temporal.io/server/common/log/tag"
+ 	"go.temporal.io/server/common/primitives/timestamp"
++	"go.temporal.io/server/common/resettrace"
+ 	"go.temporal.io/server/common/softassert"
+ )
+ 
+@@ -207,6 +208,7 @@ findDeleteRanges:
+ 		ShardID:      request.ShardID,
+ 		BranchRanges: deleteRanges,
+ 	}
++	resettrace.ContextEvent(ctx, "GetHistoryTreeContainingBranch", resettrace.Fields{"request": req, "tree": historyTreeResp})
+ 	return m.persistence.DeleteHistoryBranch(ctx, req)
+ }
+ 
+diff --git a/common/persistence/sql/common.go b/common/persistence/sql/common.go
+index 1e65a456a..02a9a5fee 100644
+--- a/common/persistence/sql/common.go
++++ b/common/persistence/sql/common.go
+@@ -15,6 +15,7 @@ import (
+ 	"go.temporal.io/server/common/persistence"
+ 	"go.temporal.io/server/common/persistence/serialization"
+ 	"go.temporal.io/server/common/persistence/sql/sqlplugin"
++	"go.temporal.io/server/common/resettrace"
+ )
+ 
+ // TODO: Rename all SQL Managers to Stores
+@@ -61,6 +62,7 @@ func (m *SqlStore) txExecute(ctx context.Context, operation string, f func(tx sq
+ 			m.logger.Error("transaction rollback error", tag.Error(rollBackErr))
+ 		}
+ 
++		_ = resettrace.Transaction(ctx, operation, err)
+ 		switch err.(type) {
+ 		case *persistence.ConditionFailedError,
+ 			*persistence.CurrentWorkflowConditionFailedError,
+@@ -74,10 +76,11 @@ func (m *SqlStore) txExecute(ctx context.Context, operation string, f func(tx sq
+ 			return serviceerror.NewUnavailablef("%v: %v", operation, err)
+ 		}
+ 	}
++	resettrace.TransactionIssued(ctx, operation)
+ 	if err := tx.Commit(); err != nil {
+ 		return serviceerror.NewUnavailablef("%s operation failed. Failed to commit transaction. Error: %v", operation, err)
+ 	}
+-	return nil
++	return resettrace.Transaction(ctx, operation, nil)
+ }
+ 
+ func gobSerialize(x any) ([]byte, error) {
+diff --git a/common/persistence/sql/execution.go b/common/persistence/sql/execution.go
+index 6b981cf70..9106f39fe 100644
+--- a/common/persistence/sql/execution.go
++++ b/common/persistence/sql/execution.go
+@@ -15,6 +15,7 @@ import (
+ 	"go.temporal.io/server/common/persistence/serialization"
+ 	"go.temporal.io/server/common/persistence/sql/sqlplugin"
+ 	"go.temporal.io/server/common/primitives"
++	"go.temporal.io/server/common/resettrace"
+ )
+ 
+ type sqlExecutionStore struct {
+@@ -61,12 +62,21 @@ func (m *sqlExecutionStore) CreateWorkflowExecution(
+ 	ctx context.Context,
+ 	request *p.InternalCreateWorkflowExecutionRequest,
+ ) (response *p.InternalCreateWorkflowExecutionResponse, err error) {
++	m.traceBind(request.NewWorkflowSnapshot.WorkflowID, request.NewWorkflowSnapshot.NamespaceID, request.ShardID)
++	ctx = resettrace.WithWrite(ctx, request.NewWorkflowSnapshot.WorkflowID, "CreateWorkflowExecution", request)
++	resettrace.Emit(request.NewWorkflowSnapshot.WorkflowID, "IssueCandidateHistory", resettrace.Fields{})
++
+ 	for _, req := range request.NewWorkflowNewEvents {
+ 		if err := m.AppendHistoryNodes(ctx, req); err != nil {
+ 			return nil, err
+ 		}
+ 	}
+ 
++	resettrace.Emit(request.NewWorkflowSnapshot.WorkflowID, "AppendHistoryNodes", resettrace.Fields{"method": "CreateWorkflowExecution", "request": request})
++	if fault := resettrace.BeforeMetadata(ctx); fault != nil {
++		return nil, fault
++	}
++
+ 	err = m.txExecuteShardLocked(ctx,
+ 		"CreateWorkflowExecution",
+ 		request.ShardID,
+@@ -335,12 +345,18 @@ func (m *sqlExecutionStore) UpdateWorkflowExecution(
+ 	ctx context.Context,
+ 	request *p.InternalUpdateWorkflowExecutionRequest,
+ ) error {
++	m.traceBind(request.UpdateWorkflowMutation.WorkflowID, request.UpdateWorkflowMutation.NamespaceID, request.ShardID)
++	ctx = resettrace.WithWrite(ctx, request.UpdateWorkflowMutation.WorkflowID, "UpdateWorkflowExecution", request)
++	resettrace.Emit(request.UpdateWorkflowMutation.WorkflowID, "IssueCurrentHistory", resettrace.Fields{})
++
+ 	// first append history
+ 	for _, req := range request.UpdateWorkflowNewEvents {
+ 		if err := m.AppendHistoryNodes(ctx, req); err != nil {
+ 			return err
+ 		}
+ 	}
++	resettrace.Emit(request.UpdateWorkflowMutation.WorkflowID, "AppendHistoryNodes_Current", resettrace.Fields{"method": "UpdateWorkflowExecution", "request": request})
++	resettrace.Emit(request.UpdateWorkflowMutation.WorkflowID, "IssueCandidateHistory", resettrace.Fields{})
+ 	for _, req := range request.NewWorkflowNewEvents {
+ 		if err := m.AppendHistoryNodes(ctx, req); err != nil {
+ 			return err
+@@ -348,6 +364,11 @@ func (m *sqlExecutionStore) UpdateWorkflowExecution(
+ 	}
+ 
+ 	// then update mutable state
++	resettrace.Emit(request.UpdateWorkflowMutation.WorkflowID, "AppendHistoryNodes", resettrace.Fields{"method": "UpdateWorkflowExecution", "request": request})
++	if fault := resettrace.BeforeMetadata(ctx); fault != nil {
++		return fault
++	}
++
+ 	return m.txExecuteShardLocked(ctx,
+ 		"UpdateWorkflowExecution",
+ 		request.ShardID,
+@@ -447,12 +468,18 @@ func (m *sqlExecutionStore) ConflictResolveWorkflowExecution(
+ 	ctx context.Context,
+ 	request *p.InternalConflictResolveWorkflowExecutionRequest,
+ ) error {
++	m.traceBind(request.ResetWorkflowSnapshot.WorkflowID, request.ResetWorkflowSnapshot.NamespaceID, request.ShardID)
++	ctx = resettrace.WithWrite(ctx, request.ResetWorkflowSnapshot.WorkflowID, "ConflictResolveWorkflowExecution", request)
++	resettrace.Emit(request.ResetWorkflowSnapshot.WorkflowID, "IssueCurrentHistory", resettrace.Fields{})
++
+ 	// first append history
+ 	for _, req := range request.CurrentWorkflowEventsNewEvents {
+ 		if err := m.AppendHistoryNodes(ctx, req); err != nil {
+ 			return err
+ 		}
+ 	}
++	resettrace.Emit(request.ResetWorkflowSnapshot.WorkflowID, "AppendHistoryNodes_Current", resettrace.Fields{"method": "ConflictResolveWorkflowExecution", "request": request})
++	resettrace.Emit(request.ResetWorkflowSnapshot.WorkflowID, "IssueCandidateHistory", resettrace.Fields{})
+ 	for _, req := range request.ResetWorkflowEventsNewEvents {
+ 		if err := m.AppendHistoryNodes(ctx, req); err != nil {
+ 			return err
+@@ -464,6 +491,11 @@ func (m *sqlExecutionStore) ConflictResolveWorkflowExecution(
+ 		}
+ 	}
+ 
++	resettrace.Emit(request.ResetWorkflowSnapshot.WorkflowID, "AppendHistoryNodes", resettrace.Fields{"method": "ConflictResolveWorkflowExecution", "request": request})
++	if fault := resettrace.BeforeMetadata(ctx); fault != nil {
++		return fault
++	}
++
+ 	return m.txExecuteShardLocked(ctx,
+ 		"ConflictResolveWorkflowExecution",
+ 		request.ShardID,
+@@ -691,6 +723,7 @@ func (m *sqlExecutionStore) GetCurrentExecution(
+ 	ctx context.Context,
+ 	request *p.GetCurrentExecutionRequest,
+ ) (*p.InternalGetCurrentExecutionResponse, error) {
++	m.traceBind(request.WorkflowID, request.NamespaceID, request.ShardID)
+ 	row, err := m.DB.SelectFromCurrentExecutions(ctx, sqlplugin.CurrentExecutionsFilter{
+ 		ShardID:     request.ShardID,
+ 		NamespaceID: primitives.MustParseUUID(request.NamespaceID),
+diff --git a/service/history/api/resetworkflow/api.go b/service/history/api/resetworkflow/api.go
+index cead3c3bf..5bbd2e5ef 100644
+--- a/service/history/api/resetworkflow/api.go
++++ b/service/history/api/resetworkflow/api.go
+@@ -18,6 +18,7 @@ import (
+ 	"go.temporal.io/server/common/metrics"
+ 	"go.temporal.io/server/common/namespace"
+ 	"go.temporal.io/server/common/persistence/versionhistory"
++	"go.temporal.io/server/common/resettrace"
+ 	"go.temporal.io/server/common/worker_versioning"
+ 	"go.temporal.io/server/service/history/api"
+ 	"go.temporal.io/server/service/history/consts"
+@@ -42,6 +43,10 @@ func Invoke(
+ 
+ 	request := resetRequest.ResetRequest
+ 	workflowID := request.WorkflowExecution.GetWorkflowId()
++	resettrace.Emit(workflowID, "ResetWorkflowExecution", resettrace.Fields{"request": request})
++	defer func() {
++		resettrace.Emit(workflowID, "ReleaseWorkflowLease", resettrace.Fields{"error": resettrace.Error(retError)})
++	}()
+ 
+ 	if rl := shardContext.BusinessIDReuseRateLimiter(namespaceID, workflowID, chasm.WorkflowArchetypeID); rl != nil && !rl.Allow() {
+ 		archetypeName, _ := shardContext.ChasmRegistry().ArchetypeDisplayName(chasm.WorkflowArchetypeID)
+@@ -71,6 +76,7 @@ func Invoke(
+ 	defer func() { baseWorkflowLease.GetReleaseFn()(retError) }()
+ 
+ 	baseMutableState := baseWorkflowLease.GetMutableState()
++	resettrace.Emit(workflowID, "GetWorkflowLease_Base", resettrace.Fields{"local": resettrace.Snapshot(baseMutableState)})
+ 	if request.GetWorkflowTaskFinishEventId() <= common.FirstEventID ||
+ 		request.GetWorkflowTaskFinishEventId() >= baseMutableState.GetNextEventID() {
+ 		return nil, serviceerror.NewInvalidArgument("Workflow task finish ID must be > 1 && <= workflow last event ID.")
+@@ -90,6 +96,7 @@ func Invoke(
+ 		request.WorkflowExecution.GetWorkflowId(),
+ 		locks.PriorityHigh,
+ 	)
++	resettrace.Emit(workflowID, "GetCurrentWorkflowRunID", resettrace.Fields{"run": currentRunID, "error": resettrace.Error(err)})
+ 	currentExecutionMissing, err := shouldTolerateMissingCurrentExecution(err, baseRunID)
+ 	if err != nil {
+ 		return nil, err
+@@ -121,6 +128,12 @@ func Invoke(
+ 		defer func() { currentWorkflowLease.GetReleaseFn()(retError) }()
+ 	}
+ 
++	var traceCurrent any
++	if currentWorkflowLease != nil {
++		traceCurrent = resettrace.Snapshot(currentWorkflowLease.GetMutableState())
++	}
++	resettrace.Emit(workflowID, "GetWorkflowLease_Current", resettrace.Fields{"local": traceCurrent})
++	resettrace.Emit(workflowID, "Invoke_Deduplicate", resettrace.Fields{"hit": currentWorkflowLease != nil && currentWorkflowLease.GetMutableState().GetExecutionState().CreateRequestId == request.GetRequestId()})
+ 	// dedup by requestID
+ 	if currentWorkflowLease != nil &&
+ 		currentWorkflowLease.GetMutableState().GetExecutionState().CreateRequestId == request.GetRequestId() {
+@@ -128,12 +141,15 @@ func Invoke(
+ 			tag.WorkflowID(workflowID),
+ 			tag.WorkflowRunID(currentRunID),
+ 			tag.WorkflowNamespaceID(namespaceID.String()))
++		resettrace.Emit(workflowID, "Invoke_ReturnSuccess", resettrace.Fields{"run": currentRunID})
+ 		return &historyservice.ResetWorkflowExecutionResponse{
+ 			RunId: currentRunID,
+ 		}, nil
+ 	}
+ 
+ 	resetRunID := uuid.New().String()
++	resettrace.Run(workflowID, resetRunID)
++	resettrace.Emit(workflowID, "Invoke_NewRunID", resettrace.Fields{"run": resetRunID})
+ 	baseRebuildLastEventID := request.GetWorkflowTaskFinishEventId() - 1
+ 	baseVersionHistories := baseMutableState.GetExecutionInfo().GetVersionHistories()
+ 	baseCurrentVersionHistory, err := versionhistory.GetCurrentVersionHistory(baseVersionHistories)
+@@ -210,6 +226,7 @@ func Invoke(
+ 		}
+ 	}
+ 
++	resettrace.Emit(workflowID, "Invoke_ReturnSuccess", resettrace.Fields{"run": resetRunID})
+ 	return &historyservice.ResetWorkflowExecutionResponse{
+ 		RunId: resetRunID,
+ 	}, nil
+diff --git a/service/history/api/startworkflow/api.go b/service/history/api/startworkflow/api.go
+index 6a3886ce1..37783206f 100644
+--- a/service/history/api/startworkflow/api.go
++++ b/service/history/api/startworkflow/api.go
+@@ -21,6 +21,7 @@ import (
+ 	"go.temporal.io/server/common/namespace"
+ 	"go.temporal.io/server/common/persistence"
+ 	"go.temporal.io/server/common/primitives"
++	"go.temporal.io/server/common/resettrace"
+ 	"go.temporal.io/server/common/softassert"
+ 	"go.temporal.io/server/common/tasktoken"
+ 	"go.temporal.io/server/common/worker_versioning"
+@@ -187,6 +188,9 @@ func (s *Starter) Invoke(
+ 	ctx context.Context,
+ ) (resp *historyservice.StartWorkflowExecutionResponse, startOutcome StartOutcome, retError error) {
+ 	request := s.request.StartRequest
++	defer func() {
++		resettrace.Emit(request.WorkflowId, "ReleaseWorkflowLease", resettrace.Fields{"error": resettrace.Error(retError)})
++	}()
+ 	if err := s.prepare(ctx); err != nil {
+ 		return nil, StartErr, err
+ 	}
+@@ -207,6 +211,8 @@ func (s *Starter) Invoke(
+ 		currentExecutionLock(retError)
+ 	}()
+ 
++	resettrace.Run(request.WorkflowId, creationParams.runID)
++	resettrace.Emit(request.WorkflowId, "StartWorkflowExecution", resettrace.Fields{"run": creationParams.runID, "request": request, "events": creationParams.workflowEventBatches})
+ 	err = s.createBrandNew(ctx, creationParams)
+ 	if err != nil {
+ 		var currentWorkflowConditionFailedError *persistence.CurrentWorkflowConditionFailedError
+@@ -233,6 +239,9 @@ func (s *Starter) Invoke(
+ 		creationParams.workflowTaskInfo,
+ 		extractHistoryEvents(creationParams.workflowEventBatches),
+ 	)
++	if err == nil {
++		resettrace.Emit(request.WorkflowId, "Invoke_ReturnSuccess", resettrace.Fields{"run": resp.RunId})
++	}
+ 	return resp, StartNew, err
+ }
+ 
+diff --git a/service/history/ndc/workflow_resetter.go b/service/history/ndc/workflow_resetter.go
+index 1b95952a4..fa1699017 100644
+--- a/service/history/ndc/workflow_resetter.go
++++ b/service/history/ndc/workflow_resetter.go
+@@ -27,6 +27,7 @@ import (
+ 	"go.temporal.io/server/common/log/tag"
+ 	"go.temporal.io/server/common/namespace"
+ 	"go.temporal.io/server/common/persistence"
++	"go.temporal.io/server/common/resettrace"
+ 	"go.temporal.io/server/common/testing/testhooks"
+ 	"go.temporal.io/server/service/history/api/updateworkflowoptions"
+ 	"go.temporal.io/server/service/history/consts"
+@@ -234,6 +235,7 @@ func (r *workflowResetterImpl) ResetWorkflow(
+ 	//
+ 	// Read from the base run's RequestIds map; fall back to CreateRequestId otherwise.
+ 	startRequestID := findStartRequestID(baseWorkflow.GetMutableState().GetExecutionState())
++	resettrace.Emit(workflowID, "ResetWorkflow_UpdateResetRunID", resettrace.Fields{"start": startRequestID, "base": resettrace.Snapshot(baseWorkflow.GetMutableState()), "currentMutation": currentWorkflowMutation, "currentEvents": currentWorkflowEventsSeq})
+ 
+ 	resetWorkflow, err := r.prepareResetWorkflow(
+ 		ctx,
+@@ -270,6 +272,7 @@ func (r *workflowResetterImpl) ResetWorkflow(
+ 		return err
+ 	}
+ 
++	resettrace.Emit(workflowID, "ScheduleWorkflowTask", resettrace.Fields{"local": resettrace.Snapshot(resetMS)})
+ 	if err = r.persistToDB(
+ 		ctx,
+ 		baseWorkflow,
+@@ -362,6 +365,7 @@ func (r *workflowResetterImpl) prepareResetWorkflow(
+ 		return nil, err
+ 	}
+ 
++	resettrace.Emit(workflowID, "Rebuild", resettrace.Fields{"local": resettrace.Snapshot(resetMutableState)})
+ 	return resetWorkflow, nil
+ }
+ 
+@@ -410,6 +414,9 @@ func (r *workflowResetterImpl) persistToDB(
+ 		); err != nil {
+ 			return err
+ 		}
++		if err := resettrace.Fault(baseWorkflow.GetMutableState().GetWorkflowKey().WorkflowID, "between-writes", resettrace.Fields{"candidate": baseWorkflow.GetMutableState().GetExecutionInfo().ResetRunId}); err != nil {
++			return err
++		}
+ 		if _, err := r.transaction.CreateWorkflowExecution(
+ 			ctx,
+ 			persistence.CreateWorkflowModeBrandNew,
+@@ -527,6 +534,9 @@ func (r *workflowResetterImpl) replayResetWorkflow(
+ 		return nil, err
+ 	}
+ 
++	resettrace.Token(workflowID, resetRunID, resetBranchToken)
++	resettrace.Token(workflowID, baseRunID, baseBranchToken)
++	resettrace.Emit(workflowID, "ForkHistoryBranch", resettrace.Fields{"run": resetRunID, "token": resetBranchToken, "originalToken": baseBranchToken, "prefixToken": newBaseBranchToken, "cut": baseRebuildLastEventID})
+ 	resetContext := workflow.NewContext(
+ 		r.shardContext.GetConfig(),
+ 		definition.NewWorkflowKey(
+@@ -810,6 +820,7 @@ func (r *workflowResetterImpl) reapplyContinueAsNewWorkflowEvents(
+ 	// Second, for remaining continue as new workflow, reapply eligible events
+ 	for len(nextRunID) != 0 {
+ 		nextWorkflowNextEventID, nextWorkflowBranchToken, err := getNextEventIDBranchToken(nextRunID)
++		resettrace.Emit(workflowID, "GetNextEventIDBranchToken", resettrace.Fields{"run": nextRunID, "next": nextWorkflowNextEventID, "token": nextWorkflowBranchToken, "error": resettrace.Error(err)})
+ 		if err != nil {
+ 			// A deleted run truncates the chain; other errors must fail the reset so a retry
+ 			// can reapply the full surviving chain, since reset is one-shot.
+@@ -862,6 +873,7 @@ func (r *workflowResetterImpl) reapplyEventsFromBranch(
+ 	//  from visibility for better coverage of events eligible for re-application.
+ 	//  after the above change, this API do not have to return the continue as new run ID
+ 
++	ctx = resettrace.WithWrite(ctx, mutableState.GetWorkflowKey().WorkflowID, "ReadHistoryBranch", nil)
+ 	iter := collection.NewPagingIterator(r.getPaginationFn(
+ 		ctx,
+ 		firstEventID,
+@@ -878,6 +890,7 @@ func (r *workflowResetterImpl) reapplyEventsFromBranch(
+ 			return "", err
+ 		}
+ 		lastEvents = batch.Events
++		resettrace.Emit(mutableState.GetWorkflowKey().WorkflowID, "ReadPage", resettrace.Fields{"events": lastEvents})
+ 		if _, err := r.reapplyEvents(ctx, mutableState, lastEvents, resetReapplyExcludeTypes); err != nil {
+ 			return "", err
+ 		}
+@@ -907,6 +920,7 @@ func (r *workflowResetterImpl) reapplyEventsFromBranch(
+ 			nextRunID = lastEvent.GetWorkflowExecutionContinuedAsNewEventAttributes().GetNewExecutionRunId()
+ 		}
+ 	}
++	resettrace.Emit(mutableState.GetWorkflowKey().WorkflowID, "ReapplyEventsFromBranch_NextRun", resettrace.Fields{"run": nextRunID})
+ 	return nextRunID, nil
+ }
+ 
+@@ -957,7 +971,18 @@ func reapplyEvents(
+ 	_, excludeSignal := resetReapplyExcludeTypes[enumspb.RESET_REAPPLY_EXCLUDE_TYPE_SIGNAL]
+ 	_, excludeUpdate := resetReapplyExcludeTypes[enumspb.RESET_REAPPLY_EXCLUDE_TYPE_UPDATE]
+ 	var reappliedEvents []*historypb.HistoryEvent
++	var tracePrevious *historypb.HistoryEvent
++	var traceBefore int
++	traceObserve := func() {
++		if isReset && tracePrevious != nil {
++			resettrace.Emit(mutableState.GetWorkflowKey().WorkflowID, "ReapplyEvents", resettrace.Fields{"event": tracePrevious, "applied": len(reappliedEvents) > traceBefore, "local": resettrace.Snapshot(mutableState)})
++		}
++	}
++	defer traceObserve()
+ 	for _, event := range events {
++		traceObserve()
++		tracePrevious = event
++		traceBefore = len(reappliedEvents)
+ 		switch event.GetEventType() {
+ 		case enumspb.EVENT_TYPE_WORKFLOW_EXECUTION_SIGNALED:
+ 			if excludeSignal || isDuplicate(event) {
+@@ -1373,6 +1398,7 @@ func (r *workflowResetterImpl) getPaginationFn(
+ 		if err != nil {
+ 			return nil, nil, err
+ 		}
++		resettrace.ContextEvent(ctx, "ReadHistoryBranch", resettrace.Fields{"first": firstEventID, "next": nextEventID, "token": branchToken, "batches": resp.History, "more": len(resp.NextPageToken) > 0, "continuation": len(paginationToken) > 0})
+ 		return resp.History, resp.NextPageToken, nil
+ 	}
+ }
+diff --git a/service/history/shard/context_impl.go b/service/history/shard/context_impl.go
+index 74e48d5c3..0d6ae7779 100644
+--- a/service/history/shard/context_impl.go
++++ b/service/history/shard/context_impl.go
+@@ -47,6 +47,7 @@ import (
+ 	"go.temporal.io/server/common/pingable"
+ 	"go.temporal.io/server/common/primitives/timestamp"
+ 	"go.temporal.io/server/common/quotas"
++	"go.temporal.io/server/common/resettrace"
+ 	"go.temporal.io/server/common/rpc"
+ 	"go.temporal.io/server/common/searchattribute"
+ 	"go.temporal.io/server/common/util"
+@@ -550,7 +551,10 @@ func (s *ContextImpl) CreateWorkflowExecution(
+ 	if err := s.ioSemaphoreAcquire(ctx); err != nil {
+ 		return nil, err
+ 	}
+-	defer s.ioSemaphoreRelease()
++	defer func() {
++		s.ioSemaphoreRelease()
++		resettrace.Emit(request.NewWorkflowSnapshot.ExecutionInfo.WorkflowId, "PersistenceReturn", resettrace.Fields{"method": "CreateWorkflowExecution", "error": resettrace.Error(err)})
++	}()
+ 
+ 	s.wLock()
+ 
+@@ -585,6 +589,14 @@ func (s *ContextImpl) CreateWorkflowExecution(
+ 	request.RangeID = currentRangeID
+ 
+ 	s.wUnlock()
++	traceNew := &request.NewWorkflowSnapshot
++	if traceNew != nil {
++		v := traceNew.ExecutionInfo.GetVersionHistories()
++		if len(v.GetHistories()) > 0 {
++			resettrace.Token(traceNew.ExecutionInfo.WorkflowId, traceNew.ExecutionState.RunId, v.Histories[v.CurrentVersionHistoryIndex].BranchToken)
++		}
++	}
++	resettrace.Emit(request.NewWorkflowSnapshot.ExecutionInfo.WorkflowId, "ShardSubmit", resettrace.Fields{"method": "CreateWorkflowExecution", "request": request})
+ 	resp, err := s.executionManager.CreateWorkflowExecution(ctx, request)
+ 	requestCompletionFn(err)
+ 
+@@ -608,7 +620,10 @@ func (s *ContextImpl) UpdateWorkflowExecution(
+ 	if err := s.ioSemaphoreAcquire(ctx); err != nil {
+ 		return nil, err
+ 	}
+-	defer s.ioSemaphoreRelease()
++	defer func() {
++		s.ioSemaphoreRelease()
++		resettrace.Emit(request.UpdateWorkflowMutation.ExecutionInfo.WorkflowId, "PersistenceReturn", resettrace.Fields{"method": "UpdateWorkflowExecution", "error": resettrace.Error(err)})
++	}()
+ 
+ 	s.wLock()
+ 
+@@ -648,6 +663,14 @@ func (s *ContextImpl) UpdateWorkflowExecution(
+ 	request.RangeID = s.getRangeIDLocked()
+ 	s.wUnlock()
+ 
++	traceNew := request.NewWorkflowSnapshot
++	if traceNew != nil {
++		v := traceNew.ExecutionInfo.GetVersionHistories()
++		if len(v.GetHistories()) > 0 {
++			resettrace.Token(traceNew.ExecutionInfo.WorkflowId, traceNew.ExecutionState.RunId, v.Histories[v.CurrentVersionHistoryIndex].BranchToken)
++		}
++	}
++	resettrace.Emit(request.UpdateWorkflowMutation.ExecutionInfo.WorkflowId, "ShardSubmit", resettrace.Fields{"method": "UpdateWorkflowExecution", "request": request})
+ 	resp, err := s.executionManager.UpdateWorkflowExecution(ctx, request)
+ 	requestCompletionFn(err)
+ 	if err = s.handleWriteError(request.RangeID, err); err != nil {
+@@ -686,7 +709,10 @@ func (s *ContextImpl) ConflictResolveWorkflowExecution(
+ 	if err := s.ioSemaphoreAcquire(ctx); err != nil {
+ 		return nil, err
+ 	}
+-	defer s.ioSemaphoreRelease()
++	defer func() {
++		s.ioSemaphoreRelease()
++		resettrace.Emit(request.ResetWorkflowSnapshot.ExecutionInfo.WorkflowId, "PersistenceReturn", resettrace.Fields{"method": "ConflictResolveWorkflowExecution", "error": resettrace.Error(err)})
++	}()
+ 
+ 	s.wLock()
+ 
+@@ -726,6 +752,14 @@ func (s *ContextImpl) ConflictResolveWorkflowExecution(
+ 	request.RangeID = s.getRangeIDLocked()
+ 	s.wUnlock()
+ 
++	traceNew := request.NewWorkflowSnapshot
++	if traceNew != nil {
++		v := traceNew.ExecutionInfo.GetVersionHistories()
++		if len(v.GetHistories()) > 0 {
++			resettrace.Token(traceNew.ExecutionInfo.WorkflowId, traceNew.ExecutionState.RunId, v.Histories[v.CurrentVersionHistoryIndex].BranchToken)
++		}
++	}
++	resettrace.Emit(request.ResetWorkflowSnapshot.ExecutionInfo.WorkflowId, "ShardSubmit", resettrace.Fields{"method": "ConflictResolveWorkflowExecution", "request": request})
+ 	resp, err := s.executionManager.ConflictResolveWorkflowExecution(ctx, request)
+ 	requestCompletionFn(err)
+ 	if err = s.handleWriteError(request.RangeID, err); err != nil {
+@@ -919,6 +953,8 @@ func (s *ContextImpl) DeleteWorkflowExecution(
+ 	stage *tasks.DeleteWorkflowExecutionStage,
+ 	retentionDelete bool,
+ ) (retErr error) {
++	ctx = resettrace.WithWrite(ctx, key.WorkflowID, "deletion", nil)
++	resettrace.Emit(key.WorkflowID, "DeleteExecutionTask", resettrace.Fields{"run": key.RunID})
+ 	// DeleteWorkflowExecution is a 4 stages process (order is very important and should not be changed):
+ 	// 1. Add visibility delete task, i.e. schedule visibility record delete, and execution replication delete task,
+ 	// 2. Delete current workflow execution pointer,
+@@ -983,6 +1019,7 @@ func (s *ContextImpl) DeleteWorkflowExecution(
+ 				return err
+ 			}
+ 			defer s.ioSemaphoreRelease()
++			resettrace.Emit(key.WorkflowID, "DeleteWorkflowExecution_AcquireIO", resettrace.Fields{"run": key.RunID, "range": s.GetRangeID()})
+ 
+ 			// Stage 1. Add visibility delete task and delete execution replication task.
+ 			if !stage.IsProcessed(tasks.DeleteWorkflowExecutionStageVisibility) {
+@@ -1059,6 +1096,7 @@ func (s *ContextImpl) DeleteWorkflowExecution(
+ 				}
+ 			}
+ 			stage.MarkProcessed(tasks.DeleteWorkflowExecutionStageCurrent)
++			resettrace.Emit(key.WorkflowID, "DeleteCurrentWorkflowExecution", resettrace.Fields{"run": key.RunID})
+ 
+ 			// Stage 3. Delete workflow mutable state.
+ 			if !stage.IsProcessed(tasks.DeleteWorkflowExecutionStageMutableState) {
+@@ -1081,6 +1119,7 @@ func (s *ContextImpl) DeleteWorkflowExecution(
+ 				}
+ 			}
+ 			stage.MarkProcessed(tasks.DeleteWorkflowExecutionStageMutableState)
++			resettrace.Emit(key.WorkflowID, "DeleteWorkflowMutableState", resettrace.Fields{"run": key.RunID})
+ 
+ 			return nil
+ 		}(); err != nil {
+@@ -1100,6 +1139,7 @@ func (s *ContextImpl) DeleteWorkflowExecution(
+ 		}
+ 	}
+ 	stage.MarkProcessed(tasks.DeleteWorkflowExecutionStageHistory)
++	resettrace.Emit(key.WorkflowID, "DeleteHistoryBranch_SQL", resettrace.Fields{"run": key.RunID})
+ 	return nil
+ }
+ 
+@@ -1180,9 +1220,11 @@ func (s *ContextImpl) renewRangeLocked(isStealing bool) error {
+ 	defer cancel()
+ 
+ 	previousRangeID := s.getRangeIDLocked()
+-	err := s.persistenceShardManager.UpdateShard(ctx, &persistence.UpdateShardRequest{
+-		ShardInfo:       updatedShardInfo,
+-		PreviousRangeID: previousRangeID,
++	err := resettrace.ObserveAll("RenewShardRange", resettrace.Fields{"shard": s.shardID, "range": updatedShardInfo.RangeId}, func() error {
++		return s.persistenceShardManager.UpdateShard(ctx, &persistence.UpdateShardRequest{
++			ShardInfo:       updatedShardInfo,
++			PreviousRangeID: previousRangeID,
++		})
+ 	})
+ 	if err != nil {
+ 		// Failure in updating shard to grab new RangeID
+@@ -1718,6 +1760,7 @@ func (s *ContextImpl) transition(request contextRequest) error {
+ 
+ 	setStateAcquiring := func() {
+ 		s.state = contextStateAcquiring
++		resettrace.All("BeginAcquireShard", resettrace.Fields{"shard": s.shardID})
+ 		s.contextTaggedLogger.Info("", tag.LifeCycleStarted, tag.ComponentShardContext)
+ 		go s.acquireShard()
+ 	}
+@@ -1736,6 +1779,7 @@ func (s *ContextImpl) transition(request contextRequest) error {
+ 
+ 	setStateStopped := func() {
+ 		s.state = contextStateStopped
++		resettrace.All("CrashHistoryService", resettrace.Fields{"shard": s.shardID, "scope": "shard-stop-cache-loss"})
+ 		s.contextTaggedLogger.Info("", tag.LifeCycleStopped, tag.ComponentShardContext)
+ 		// Do this again in case we skipped the stopping state, which could happen
+ 		// when calling CloseShardByID or the controller is shutting down.
+@@ -1761,6 +1805,7 @@ func (s *ContextImpl) transition(request contextRequest) error {
+ 			return nil // nothing to do, already acquiring
+ 		case contextRequestAcquired:
+ 			s.state = contextStateAcquired
++			resettrace.All("AcquireShard", resettrace.Fields{"shard": s.shardID, "range": s.getRangeIDLocked()})
+ 			if request.engine != nil {
+ 				// engineFuture.Set should only be called inside stateLock when state is
+ 				// Acquiring, so that other code (i.e. FinishStop) can know that after a state
+diff --git a/service/history/workflow/mutable_state_impl.go b/service/history/workflow/mutable_state_impl.go
+index e582d61eb..770323a1d 100644
+--- a/service/history/workflow/mutable_state_impl.go
++++ b/service/history/workflow/mutable_state_impl.go
+@@ -58,6 +58,7 @@ import (
+ 	"go.temporal.io/server/common/persistence/transitionhistory"
+ 	"go.temporal.io/server/common/persistence/versionhistory"
+ 	"go.temporal.io/server/common/primitives/timestamp"
++	"go.temporal.io/server/common/resettrace"
+ 	"go.temporal.io/server/common/retrypolicy"
+ 	"go.temporal.io/server/common/searchattribute/sadefs"
+ 	serviceerrors "go.temporal.io/server/common/serviceerror"
+@@ -3505,6 +3506,7 @@ func (ms *MutableStateImpl) addCompletionCallbacks(
+ 	requestID string,
+ 	completionCallbacks []*commonpb.Callback,
+ ) error {
++	resettrace.Emit(ms.GetWorkflowKey().WorkflowID, "CallbackSource", resettrace.Fields{"run": ms.GetWorkflowKey().RunID, "request": requestID, "count": len(completionCallbacks)})
+ 	if len(completionCallbacks) == 0 {
+ 		return nil
+ 	}
+diff --git a/tests/testcore/test_cluster.go b/tests/testcore/test_cluster.go
+index d5651acfa..57694ad59 100644
+--- a/tests/testcore/test_cluster.go
++++ b/tests/testcore/test_cluster.go
+@@ -124,6 +124,9 @@ func GetPersistenceTestDefaults() persistencetests.TestBaseOptions {
+ 
+ func (f *defaultPersistenceTestBaseFactory) NewTestBase(options *persistencetests.TestBaseOptions) *persistencetests.TestBase {
+ 	defaults := GetPersistenceTestDefaults()
++	if os.Getenv("RESET_TRACE_SQLITE_FILE") == "1" && defaults.SQLDBPluginName == "sqlite" {
++		defaults = *persistencetests.GetSQLiteFileTestClusterOption()
++	}
+ 	options.ApplyDefaults(&defaults)
+ 
+ 	if cliFlags.enableFaultInjection != "" && options.FaultInjection == nil {

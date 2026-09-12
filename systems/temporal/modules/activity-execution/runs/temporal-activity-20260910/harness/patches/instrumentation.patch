@@ -1,0 +1,953 @@
+diff --git a/client/history/retryable_client_gen.go b/client/history/retryable_client_gen.go
+index 31e486120..dc71f2d9a 100644
+--- a/client/history/retryable_client_gen.go
++++ b/client/history/retryable_client_gen.go
+@@ -5,10 +5,12 @@ package history
+ import (
+ 	"context"
+ 
++	"go.temporal.io/api/serviceerror"
+ 	"go.temporal.io/server/api/historyservice/v1"
+ 	"google.golang.org/grpc"
+ 
+ 	"go.temporal.io/server/common/backoff"
++	"go.temporal.io/server/common/speculatrace"
+ )
+ 
+ func (c *retryableClient) AddTasks(
+@@ -677,9 +679,18 @@ func (c *retryableClient) RecordActivityTaskStarted(
+ 	opts ...grpc.CallOption,
+ ) (*historyservice.RecordActivityTaskStartedResponse, error) {
+ 	var resp *historyservice.RecordActivityTaskStartedResponse
++	attempt := 0
+ 	op := func(ctx context.Context) error {
++		attempt++
++		if attempt > 1 {
++			speculatrace.Emit(request.WorkflowExecution.WorkflowId, "RetryRecordActivityTaskStarted", speculatrace.Fields{"request": speculatrace.Proto(request), "attempt": attempt, "boundary": "live-child-client-retry"})
++		}
+ 		var err error
+ 		resp, err = c.client.RecordActivityTaskStarted(ctx, request, opts...)
++		if err == nil && speculatrace.TakeSpecificFault(request.WorkflowExecution.WorkflowId, "RetryStartResponse") {
++			speculatrace.Emit(request.WorkflowExecution.WorkflowId, "LoseAPIResponse", speculatrace.Fields{"request": speculatrace.Proto(request), "response": speculatrace.Proto(resp), "boundary": "successful-start-reply-lost-inside-client"})
++			return serviceerror.NewUnavailable("specula: lost successful start reply")
++		}
+ 		return err
+ 	}
+ 	err := backoff.ThrottleRetryContext(ctx, op, c.policy, c.isRetryable)
+diff --git a/common/persistence/execution_manager.go b/common/persistence/execution_manager.go
+index 327ae6341..0f6cd6447 100644
+--- a/common/persistence/execution_manager.go
++++ b/common/persistence/execution_manager.go
+@@ -21,6 +21,7 @@ import (
+ 	"go.temporal.io/server/common/persistence/transitionhistory"
+ 	"go.temporal.io/server/common/persistence/versionhistory"
+ 	"go.temporal.io/server/common/softassert"
++	"go.temporal.io/server/common/speculatrace"
+ 	"go.temporal.io/server/service/history/tasks"
+ )
+ 
+@@ -244,6 +245,7 @@ func (m *executionManagerImpl) UpdateWorkflowExecution(
+ 		NewWorkflowNewEvents:    newWorkflowNewEvents,
+ 	}
+ 
++	speculatrace.Emit(updateMutation.ExecutionInfo.WorkflowId, "SubmitWorkflowMutation", speculatrace.Fields{"request": speculatrace.Freeze(newRequest), "mutation": speculatrace.Freeze(updateMutation), "events": speculatrace.Freeze(request.UpdateWorkflowEvents)})
+ 	err = m.persistence.UpdateWorkflowExecution(ctx, newRequest)
+ 	switch err.(type) {
+ 	case nil:
+diff --git a/common/persistence/faultinjection/execution_store_gen.go b/common/persistence/faultinjection/execution_store_gen.go
+index a4eff149d..78d2079b3 100644
+--- a/common/persistence/faultinjection/execution_store_gen.go
++++ b/common/persistence/faultinjection/execution_store_gen.go
+@@ -8,6 +8,8 @@ package faultinjection
+ 
+ import (
+ 	"context"
++	"go.temporal.io/api/serviceerror"
++	"go.temporal.io/server/common/speculatrace"
+ 
+ 	_sourcePersistence "go.temporal.io/server/common/persistence"
+ )
+@@ -249,6 +251,36 @@ func (d faultInjectionExecutionStore) SetWorkflowExecution(ctx context.Context,
+ 
+ // UpdateWorkflowExecution wraps ExecutionStore.UpdateWorkflowExecution.
+ func (d faultInjectionExecutionStore) UpdateWorkflowExecution(ctx context.Context, request *_sourcePersistence.InternalUpdateWorkflowExecutionRequest) (err error) {
++	if injected := speculatrace.TakeFault(request.UpdateWorkflowMutation.WorkflowID); injected != "" {
++		if injected == "CommitThenUnavailable" {
++			err = d.ExecutionStore.UpdateWorkflowExecution(ctx, request)
++			if err != nil {
++				return err
++			}
++			speculatrace.Emit(request.UpdateWorkflowMutation.WorkflowID, "RetryPersistenceAfterUnavailable", speculatrace.Fields{"boundary": "committed-delegate-return-lost", "request": speculatrace.Freeze(request)})
++			return serviceerror.NewUnavailable("specula: lost successful commit response")
++		}
++		if injected == "DelayedTimeout" {
++			go func() {
++				speculatrace.WaitDelayed()
++				detached := context.WithoutCancel(ctx)
++				result := d.ExecutionStore.UpdateWorkflowExecution(detached, request)
++				speculatrace.Emit(request.UpdateWorkflowMutation.WorkflowID, "RejectWorkflowMutationTx", speculatrace.Fields{"boundary": "delayed-delegate-return", "error": speculatrace.Error(result)})
++				speculatrace.MarkDelayedFinished()
++			}()
++			speculatrace.Emit(request.UpdateWorkflowMutation.WorkflowID, "PersistenceResponseTimeout", speculatrace.Fields{"kind": injected, "delegatePending": true, "request": speculatrace.Freeze(request)})
++			return newFault("Timeout", 1, "UpdateWorkflowExecution").err
++		}
++		f := newFault(injected, 1, "UpdateWorkflowExecution")
++		executed := false
++		err = f.inject(func() error { executed = true; return d.ExecutionStore.UpdateWorkflowExecution(ctx, request) })
++		name := "PersistenceTimeoutBeforeWrite"
++		if executed {
++			name = "PersistenceResponseTimeout"
++		}
++		speculatrace.Emit(request.UpdateWorkflowMutation.WorkflowID, name, speculatrace.Fields{"kind": injected, "delegateExecuted": executed, "dbRecordVersion": request.UpdateWorkflowMutation.DBRecordVersion, "error": speculatrace.Error(err)})
++		return err
++	}
+ 	err = d.generator.generate("UpdateWorkflowExecution", request).inject(func() error {
+ 		err = d.ExecutionStore.UpdateWorkflowExecution(ctx, request)
+ 		return err
+diff --git a/common/persistence/sql/execution.go b/common/persistence/sql/execution.go
+index 6b981cf70..86bb69f44 100644
+--- a/common/persistence/sql/execution.go
++++ b/common/persistence/sql/execution.go
+@@ -15,6 +15,7 @@ import (
+ 	"go.temporal.io/server/common/persistence/serialization"
+ 	"go.temporal.io/server/common/persistence/sql/sqlplugin"
+ 	"go.temporal.io/server/common/primitives"
++	"go.temporal.io/server/common/speculatrace"
+ )
+ 
+ type sqlExecutionStore struct {
+@@ -325,6 +326,18 @@ func (m *sqlExecutionStore) GetWorkflowExecution(
+ 		return nil, serviceerror.NewUnavailablef("GetWorkflowExecution: failed to get signals requested. Error: %v", err)
+ 	}
+ 
++	if speculatrace.Active(request.WorkflowID) {
++		tx, readErr := m.DB.BeginTx(ctx)
++		if readErr == nil {
++			snap, captureErr := m.speculaSnapshot(ctx, tx, request.ShardID, request.NamespaceID, request.WorkflowID, request.RunID)
++			speculatrace.CaptureError(request.WorkflowID, captureErr)
++			speculatrace.CaptureError(request.WorkflowID, tx.Rollback())
++			speculatrace.Emit(request.WorkflowID, "ReadWorkflowExecution", speculatrace.Fields{"sqlSnapshot": snap, "returnedVersion": executionsRow.DBRecordVersion, "basis": "independent-sql-read-transaction"})
++		} else {
++			speculatrace.CaptureError(request.WorkflowID, readErr)
++		}
++	}
++
+ 	return &p.InternalGetWorkflowExecutionResponse{
+ 		State:           state,
+ 		DBRecordVersion: executionsRow.DBRecordVersion,
+@@ -347,14 +360,34 @@ func (m *sqlExecutionStore) UpdateWorkflowExecution(
+ 		}
+ 	}
+ 
++	active := speculatrace.Active(request.UpdateWorkflowMutation.WorkflowID)
++	var snapshot speculatrace.Fields
++	if active {
++		speculatrace.Emit(request.UpdateWorkflowMutation.WorkflowID, "AppendHistoryNodes", speculatrace.Fields{"request": speculatrace.Freeze(request)})
++	}
+ 	// then update mutable state
+-	return m.txExecuteShardLocked(ctx,
++	err := m.txExecuteShardLocked(ctx,
+ 		"UpdateWorkflowExecution",
+ 		request.ShardID,
+ 		request.RangeID,
+ 		func(tx sqlplugin.Tx) error {
+-			return m.updateWorkflowExecutionTx(ctx, tx, request)
++			err := m.updateWorkflowExecutionTx(ctx, tx, request)
++			if err == nil && active {
++				w := request.UpdateWorkflowMutation
++				var captureErr error
++				snapshot, captureErr = m.speculaSnapshot(ctx, tx, request.ShardID, w.NamespaceID, w.WorkflowID, w.ExecutionState.RunId)
++				speculatrace.CaptureError(w.WorkflowID, captureErr)
++			}
++			return err
+ 		})
++	if active {
++		event := "ApplyWorkflowMutationTx"
++		if err != nil {
++			event = "RejectWorkflowMutationTx"
++		}
++		speculatrace.Emit(request.UpdateWorkflowMutation.WorkflowID, event, speculatrace.Fields{"sqlSnapshot": snapshot, "request": speculatrace.Freeze(request), "error": speculatrace.Error(err), "commitConfirmed": err == nil})
++	}
++	return err
+ }
+ 
+ func (m *sqlExecutionStore) updateWorkflowExecutionTx(
+diff --git a/common/persistence/sql/execution_tasks.go b/common/persistence/sql/execution_tasks.go
+index 96223259c..814f1b55a 100644
+--- a/common/persistence/sql/execution_tasks.go
++++ b/common/persistence/sql/execution_tasks.go
+@@ -11,6 +11,7 @@ import (
+ 	"go.temporal.io/api/serviceerror"
+ 	p "go.temporal.io/server/common/persistence"
+ 	"go.temporal.io/server/common/persistence/sql/sqlplugin"
++	"go.temporal.io/server/common/speculatrace"
+ 	"go.temporal.io/server/service/history/tasks"
+ )
+ 
+@@ -66,7 +67,10 @@ func (m *sqlExecutionStore) CompleteHistoryTask(
+ func (m *sqlExecutionStore) RangeCompleteHistoryTasks(
+ 	ctx context.Context,
+ 	request *p.RangeCompleteHistoryTasksRequest,
+-) error {
++) (traceErr error) {
++	defer func() {
++		speculatrace.Emit("", "RangeCompleteHistoryTasks", speculatrace.Fields{"request": speculatrace.Freeze(request), "category": request.TaskCategory.Name(), "categoryId": request.TaskCategory.ID(), "error": speculatrace.Error(traceErr)})
++	}()
+ 	switch request.TaskCategory.Type() {
+ 	case tasks.CategoryTypeImmediate:
+ 		return m.rangeCompleteHistoryImmediateTasks(ctx, request)
+diff --git a/common/persistence/sql/shard.go b/common/persistence/sql/shard.go
+index f6af47f6e..7be9be71c 100644
+--- a/common/persistence/sql/shard.go
++++ b/common/persistence/sql/shard.go
+@@ -10,6 +10,7 @@ import (
+ 	"go.temporal.io/server/common/persistence"
+ 	"go.temporal.io/server/common/persistence/serialization"
+ 	"go.temporal.io/server/common/persistence/sql/sqlplugin"
++	"go.temporal.io/server/common/speculatrace"
+ )
+ 
+ type sqlShardStore struct {
+@@ -83,7 +84,7 @@ func (m *sqlShardStore) UpdateShard(
+ 	ctx context.Context,
+ 	request *persistence.InternalUpdateShardRequest,
+ ) error {
+-	return m.txExecute(ctx, "UpdateShard", func(tx sqlplugin.Tx) error {
++	err := m.txExecute(ctx, "UpdateShard", func(tx sqlplugin.Tx) error {
+ 		if err := lockShard(ctx,
+ 			tx,
+ 			request.ShardID,
+@@ -110,6 +111,10 @@ func (m *sqlShardStore) UpdateShard(
+ 		}
+ 		return nil
+ 	})
++	if err == nil {
++		speculatrace.Emit("", "ReacquireShard", speculatrace.Fields{"shardId": request.ShardID, "previousRangeId": request.PreviousRangeID, "rangeId": request.RangeID})
++	}
++	return err
+ }
+ 
+ func (m *sqlShardStore) AssertShardOwnership(
+diff --git a/common/rpc/interceptor/retry.go b/common/rpc/interceptor/retry.go
+index fe2f818b8..c1485718f 100644
+--- a/common/rpc/interceptor/retry.go
++++ b/common/rpc/interceptor/retry.go
+@@ -3,7 +3,10 @@ package interceptor
+ import (
+ 	"context"
+ 
++	"go.temporal.io/server/api/historyservice/v1"
+ 	"go.temporal.io/server/common/backoff"
++	"go.temporal.io/server/common/speculatrace"
++	"go.temporal.io/server/common/tasktoken"
+ 	"google.golang.org/grpc"
+ )
+ 
+@@ -33,7 +36,16 @@ func (i *RetryableInterceptor) Intercept(
+ 	handler grpc.UnaryHandler,
+ ) (any, error) {
+ 	var response any
++	attempt := 0
+ 	op := func(ctx context.Context) error {
++		attempt++
++		if attempt > 1 {
++			if request, ok := req.(*historyservice.RespondActivityTaskCompletedRequest); ok {
++				if token, decodeErr := tasktoken.NewSerializer().Deserialize(request.GetCompleteRequest().GetTaskToken()); decodeErr == nil {
++					speculatrace.Emit(token.WorkflowId, "RetryActivityRequest", speculatrace.Fields{"request": speculatrace.Proto(request), "token": speculatrace.Proto(token), "attempt": attempt, "boundary": "history-server-interceptor-retry"})
++				}
++			}
++		}
+ 		var err error
+ 		response, err = handler(ctx, req)
+ 		return err
+diff --git a/service/history/api/recordactivitytaskheartbeat/api.go b/service/history/api/recordactivitytaskheartbeat/api.go
+index dc71ba427..9733fa0b5 100644
+--- a/service/history/api/recordactivitytaskheartbeat/api.go
++++ b/service/history/api/recordactivitytaskheartbeat/api.go
+@@ -8,10 +8,12 @@ import (
+ 	"go.temporal.io/server/common/definition"
+ 	"go.temporal.io/server/common/metrics"
+ 	"go.temporal.io/server/common/namespace"
++	"go.temporal.io/server/common/speculatrace"
+ 	"go.temporal.io/server/common/tasktoken"
+ 	"go.temporal.io/server/service/history/api"
+ 	"go.temporal.io/server/service/history/consts"
+ 	historyi "go.temporal.io/server/service/history/interfaces"
++	"go.temporal.io/server/service/history/workflow"
+ )
+ 
+ func Invoke(
+@@ -46,8 +48,21 @@ func Invoke(
+ 			token.WorkflowId,
+ 			token.RunId,
+ 		),
+-		func(workflowLease api.WorkflowLease) (*api.UpdateWorkflowAction, error) {
++		func(workflowLease api.WorkflowLease) (tracePost *api.UpdateWorkflowAction, traceErr error) {
+ 			mutableState := workflowLease.GetMutableState()
++			if speculatrace.Active(token.WorkflowId) {
++				before := workflow.SpeculaSnapshot(mutableState)
++				defer func() {
++					name := "RecordActivityTaskHeartbeat"
++					if traceErr != nil {
++						name = "RejectActivityRequest"
++					}
++					workflow.SpeculaObserve(mutableState, name, speculatrace.Fields{
++						"before": before, "token": speculatrace.Proto(token),
++						"request": speculatrace.Proto(request), "postActions": tracePost,
++						"error": speculatrace.Error(traceErr)})
++				}()
++			}
+ 			if !mutableState.IsWorkflowExecutionRunning() {
+ 				return nil, consts.ErrWorkflowCompleted
+ 			}
+diff --git a/service/history/api/recordactivitytaskstarted/api.go b/service/history/api/recordactivitytaskstarted/api.go
+index a40fc1b66..3d466f487 100644
+--- a/service/history/api/recordactivitytaskstarted/api.go
++++ b/service/history/api/recordactivitytaskstarted/api.go
+@@ -18,6 +18,7 @@ import (
+ 	"go.temporal.io/server/common/namespace"
+ 	"go.temporal.io/server/common/priorities"
+ 	serviceerrors "go.temporal.io/server/common/serviceerror"
++	"go.temporal.io/server/common/speculatrace"
+ 	"go.temporal.io/server/common/tqid"
+ 	"go.temporal.io/server/common/worker_versioning"
+ 	"go.temporal.io/server/service/history/api"
+@@ -57,6 +58,20 @@ func Invoke(
+ 		),
+ 		func(workflowLease api.WorkflowLease) (resp *api.UpdateWorkflowAction, retErr error) {
+ 			mutableState := workflowLease.GetMutableState()
++			if speculatrace.Active(request.WorkflowExecution.WorkflowId) {
++				before := workflow.SpeculaSnapshot(mutableState)
++				old, present := mutableState.GetActivityInfo(request.ScheduledEventId)
++				duplicate := present && old.StartedEventId != common.EmptyEventID && old.RequestId == request.RequestId
++				defer func() {
++					name := "RecordActivityTaskStarted"
++					if retErr != nil {
++						name = "RecordActivityTaskStartedRejected"
++					} else if duplicate {
++						name = "RecordActivityTaskStartedDuplicate"
++					}
++					workflow.SpeculaObserve(mutableState, name, speculatrace.Fields{"before": before, "request": speculatrace.Proto(request), "response": speculatrace.Proto(response), "error": speculatrace.Error(retErr)})
++				}()
++			}
+ 			if !mutableState.IsWorkflowExecutionRunning() {
+ 				return nil, consts.ErrWorkflowCompleted
+ 			}
+diff --git a/service/history/api/respondactivitytaskcanceled/api.go b/service/history/api/respondactivitytaskcanceled/api.go
+index 0b4a1b5b8..dd57d13f4 100644
+--- a/service/history/api/respondactivitytaskcanceled/api.go
++++ b/service/history/api/respondactivitytaskcanceled/api.go
+@@ -11,6 +11,7 @@ import (
+ 	"go.temporal.io/server/common/metrics"
+ 	"go.temporal.io/server/common/namespace"
+ 	"go.temporal.io/server/common/primitives/timestamp"
++	"go.temporal.io/server/common/speculatrace"
+ 	"go.temporal.io/server/common/tasktoken"
+ 	"go.temporal.io/server/common/worker_versioning"
+ 	"go.temporal.io/server/service/history/api"
+@@ -54,8 +55,21 @@ func Invoke(
+ 			token.WorkflowId,
+ 			token.RunId,
+ 		),
+-		func(workflowLease api.WorkflowLease) (*api.UpdateWorkflowAction, error) {
++		func(workflowLease api.WorkflowLease) (tracePost *api.UpdateWorkflowAction, traceErr error) {
+ 			mutableState := workflowLease.GetMutableState()
++			if speculatrace.Active(token.WorkflowId) {
++				before := workflow.SpeculaSnapshot(mutableState)
++				defer func() {
++					name := "RespondActivityTaskCanceled"
++					if traceErr != nil {
++						name = "RejectActivityRequest"
++					}
++					workflow.SpeculaObserve(mutableState, name, speculatrace.Fields{
++						"before": before, "token": speculatrace.Proto(token),
++						"request": speculatrace.Proto(request), "postActions": tracePost,
++						"error": speculatrace.Error(traceErr)})
++				}()
++			}
+ 			workflowTypeName = mutableState.GetWorkflowType().GetName()
+ 			if !mutableState.IsWorkflowExecutionRunning() {
+ 				return nil, consts.ErrWorkflowCompleted
+diff --git a/service/history/api/respondactivitytaskcompleted/api.go b/service/history/api/respondactivitytaskcompleted/api.go
+index ab09e6d58..c6e6e1c2a 100644
+--- a/service/history/api/respondactivitytaskcompleted/api.go
++++ b/service/history/api/respondactivitytaskcompleted/api.go
+@@ -11,6 +11,7 @@ import (
+ 	"go.temporal.io/server/common/metrics"
+ 	"go.temporal.io/server/common/namespace"
+ 	"go.temporal.io/server/common/primitives/timestamp"
++	"go.temporal.io/server/common/speculatrace"
+ 	"go.temporal.io/server/common/tasktoken"
+ 	"go.temporal.io/server/common/worker_versioning"
+ 	"go.temporal.io/server/service/history/api"
+@@ -55,8 +56,21 @@ func Invoke(
+ 			token.WorkflowId,
+ 			token.RunId,
+ 		),
+-		func(workflowLease api.WorkflowLease) (*api.UpdateWorkflowAction, error) {
++		func(workflowLease api.WorkflowLease) (tracePost *api.UpdateWorkflowAction, traceErr error) {
+ 			mutableState := workflowLease.GetMutableState()
++			if speculatrace.Active(token.WorkflowId) {
++				before := workflow.SpeculaSnapshot(mutableState)
++				defer func() {
++					name := "RespondActivityTaskCompleted"
++					if traceErr != nil {
++						name = "RejectActivityRequest"
++					}
++					workflow.SpeculaObserve(mutableState, name, speculatrace.Fields{
++						"before": before, "token": speculatrace.Proto(token),
++						"request": speculatrace.Proto(request), "postActions": tracePost,
++						"error": speculatrace.Error(traceErr)})
++				}()
++			}
+ 			workflowTypeName = mutableState.GetWorkflowType().GetName()
+ 			if !mutableState.IsWorkflowExecutionRunning() {
+ 				return nil, consts.ErrWorkflowCompleted
+diff --git a/service/history/api/respondactivitytaskfailed/api.go b/service/history/api/respondactivitytaskfailed/api.go
+index e65720414..38d684969 100644
+--- a/service/history/api/respondactivitytaskfailed/api.go
++++ b/service/history/api/respondactivitytaskfailed/api.go
+@@ -12,6 +12,7 @@ import (
+ 	"go.temporal.io/server/common/metrics"
+ 	"go.temporal.io/server/common/namespace"
+ 	"go.temporal.io/server/common/primitives/timestamp"
++	"go.temporal.io/server/common/speculatrace"
+ 	"go.temporal.io/server/common/tasktoken"
+ 	"go.temporal.io/server/common/worker_versioning"
+ 	"go.temporal.io/server/service/history/api"
+@@ -56,8 +57,21 @@ func Invoke(
+ 			token.WorkflowId,
+ 			token.RunId,
+ 		),
+-		func(workflowLease api.WorkflowLease) (*api.UpdateWorkflowAction, error) {
++		func(workflowLease api.WorkflowLease) (tracePost *api.UpdateWorkflowAction, traceErr error) {
+ 			mutableState := workflowLease.GetMutableState()
++			if speculatrace.Active(token.WorkflowId) {
++				before := workflow.SpeculaSnapshot(mutableState)
++				defer func() {
++					name := "RespondActivityTaskFailed"
++					if traceErr != nil {
++						name = "RejectActivityRequest"
++					}
++					workflow.SpeculaObserve(mutableState, name, speculatrace.Fields{
++						"before": before, "token": speculatrace.Proto(token),
++						"request": speculatrace.Proto(request), "postActions": tracePost,
++						"error": speculatrace.Error(traceErr)})
++				}()
++			}
+ 			workflowTypeName = mutableState.GetWorkflowType().GetName()
+ 			if !mutableState.IsWorkflowExecutionRunning() {
+ 				return nil, consts.ErrWorkflowCompleted
+diff --git a/service/history/api/respondworkflowtaskcompleted/api.go b/service/history/api/respondworkflowtaskcompleted/api.go
+index d0881ba78..2ac187bfe 100644
+--- a/service/history/api/respondworkflowtaskcompleted/api.go
++++ b/service/history/api/respondworkflowtaskcompleted/api.go
+@@ -33,6 +33,7 @@ import (
+ 	"go.temporal.io/server/common/persistence"
+ 	"go.temporal.io/server/common/persistence/visibility/manager"
+ 	"go.temporal.io/server/common/searchattribute"
++	"go.temporal.io/server/common/speculatrace"
+ 	"go.temporal.io/server/common/tasktoken"
+ 	"go.temporal.io/server/common/testing/testhooks"
+ 	"go.temporal.io/server/common/worker_versioning"
+@@ -649,6 +650,24 @@ func (handler *WorkflowTaskCompletedHandler) Invoke(
+ 		}
+ 	}
+ 
++	if speculatrace.Active(ms.GetExecutionInfo().WorkflowId) {
++		event := "RespondWorkflowTaskCompleted"
++		for _, cmd := range request.Commands {
++			switch cmd.CommandType {
++			case enumspb.COMMAND_TYPE_SCHEDULE_ACTIVITY_TASK:
++				event = "AddActivityTaskScheduledEvent"
++			case enumspb.COMMAND_TYPE_REQUEST_CANCEL_ACTIVITY_TASK:
++				event = "HandleCommandRequestCancelActivity"
++			case enumspb.COMMAND_TYPE_COMPLETE_WORKFLOW_EXECUTION:
++				event = "HandleCommandCompleteWorkflow"
++			default:
++			}
++		}
++		if wtFailedCause != nil && event == "HandleCommandCompleteWorkflow" {
++			event = "FailWorkflowTaskAfterRejectedClose"
++		}
++		workflow.SpeculaObserve(ms, event, speculatrace.Fields{"request": speculatrace.Proto(request), "hasBufferedEventsOrMessages": hasBufferedEventsOrMessages})
++	}
+ 	var updateErr error
+ 	if newMutableState != nil {
+ 		newWorkflowExecutionInfo := newMutableState.GetExecutionInfo()
+@@ -1131,6 +1150,15 @@ func failWorkflowTask(
+ ) (historyi.MutableState, int64, error) {
+ 
+ 	// clear any updates we have accumulated so far
++	if speculatrace.Active(wfContext.GetWorkflowKey().WorkflowID) && wtFailedCause.failedCause == enumspb.WORKFLOW_TASK_FAILED_CAUSE_UNHANDLED_COMMAND {
++		for _, command := range request.Commands {
++			if command.CommandType == enumspb.COMMAND_TYPE_COMPLETE_WORKFLOW_EXECUTION {
++				if impl, ok := wfContext.(*workflow.ContextImpl); ok {
++					speculatrace.MarkRejectedClose(wfContext.GetWorkflowKey().WorkflowID, speculatrace.Fields{"before": workflow.SpeculaSnapshot(impl.MutableState), "request": speculatrace.Proto(request), "cause": wtFailedCause.failedCause.String()})
++				}
++			}
++		}
++	}
+ 	wfContext.Clear()
+ 
+ 	// Reload workflow execution so we can apply the workflow task failure event
+diff --git a/service/history/shard/context_impl.go b/service/history/shard/context_impl.go
+index 74e48d5c3..da5b4a090 100644
+--- a/service/history/shard/context_impl.go
++++ b/service/history/shard/context_impl.go
+@@ -49,6 +49,7 @@ import (
+ 	"go.temporal.io/server/common/quotas"
+ 	"go.temporal.io/server/common/rpc"
+ 	"go.temporal.io/server/common/searchattribute"
++	"go.temporal.io/server/common/speculatrace"
+ 	"go.temporal.io/server/common/util"
+ 	"go.temporal.io/server/common/wideevents"
+ 	"go.temporal.io/server/service/history/configs"
+@@ -174,8 +175,11 @@ type (
+ 	// These are the requests that can be passed to transition to change state:
+ 	contextRequest any
+ 
+-	contextRequestAcquire    struct{}
+-	contextRequestAcquired   struct{ engine historyi.Engine }
++	contextRequestAcquire  struct{}
++	contextRequestAcquired struct {
++		engine        historyi.Engine
++		observedRange int64
++	}
+ 	contextRequestLost       struct{}
+ 	contextRequestStop       struct{ reason stopReason }
+ 	contextRequestFinishStop struct{}
+@@ -646,6 +650,12 @@ func (s *ContextImpl) UpdateWorkflowExecution(
+ 	}
+ 
+ 	request.RangeID = s.getRangeIDLocked()
++	speculatrace.Emit(request.UpdateWorkflowMutation.ExecutionInfo.WorkflowId, "SetAndTrackTaskKeys", speculatrace.Fields{
++		"request":                    speculatrace.Freeze(request),
++		"allocationTime":             s.taskKeyManager.generator.speculaKeyAllocationTime,
++		"minScheduledTime":           s.taskKeyManager.generator.taskMinScheduledTime,
++		"timerProcessorMaxTimeShift": s.config.TimerProcessorMaxTimeShift(),
++	})
+ 	s.wUnlock()
+ 
+ 	resp, err := s.executionManager.UpdateWorkflowExecution(ctx, request)
+@@ -1544,6 +1554,7 @@ func (s *ContextImpl) handleWriteErrorLocked(
+ 		// reliably check the outcome by performing a read. If we fail, we'll shut down the shard.
+ 		// Note that reacquiring the shard will cause the max read level to be updated
+ 		// to the new range (i.e. past newMaxReadLevel).
++		speculatrace.Emit("", "LoseShardContext", speculatrace.Fields{"shardId": s.GetShardID(), "error": speculatrace.Error(err), "kind": "ownership-uncertain-reacquisition-request"})
+ 		_ = s.transition(contextRequestLost{})
+ 		return err
+ 	}
+@@ -1778,6 +1789,7 @@ func (s *ContextImpl) transition(request contextRequest) error {
+ 				return errInvalidTransition
+ 			}
+ 
++			speculatrace.Emit("", "ShardReady", speculatrace.Fields{"rangeId": request.observedRange, "boundary": "contextRequestAcquired"})
+ 			return nil
+ 		case contextRequestLost:
+ 			return nil // nothing to do, already acquiring
+@@ -2076,6 +2088,7 @@ func (s *ContextImpl) acquireShard() {
+ 		// UpdateShard call is the only one in flight.
+ 		s.wLock()
+ 		err = s.renewRangeLocked(true)
++		observedRange := s.getRangeIDLocked()
+ 		s.wUnlock()
+ 		if err != nil {
+ 			return err
+@@ -2094,7 +2107,7 @@ func (s *ContextImpl) acquireShard() {
+ 		// -> namespace handover callback is registered & called before shard is able to serve traffic
+ 		// -> information for handover namespace is recorded before shard can servce traffic
+ 		// -> upon shard reload, no history api or task can go through for ns in handover state
+-		err = s.transition(contextRequestAcquired{engine: engine})
++		err = s.transition(contextRequestAcquired{engine: engine, observedRange: observedRange})
+ 
+ 		if err != nil {
+ 			if engine != nil {
+diff --git a/service/history/shard/task_key_generator.go b/service/history/shard/task_key_generator.go
+index 5a05e574d..3b8132a12 100644
+--- a/service/history/shard/task_key_generator.go
++++ b/service/history/shard/task_key_generator.go
+@@ -23,7 +23,8 @@ type (
+ 		nextTaskID         int64
+ 		exclusiveMaxTaskID int64
+ 
+-		taskMinScheduledTime time.Time
++		taskMinScheduledTime     time.Time
++		speculaKeyAllocationTime time.Time
+ 
+ 		rangeSizeBits uint
+ 		timeSource    clock.TimeSource
+@@ -53,6 +54,7 @@ func (a *taskKeyGenerator) setTaskKeys(
+ 	taskMaps ...map[tasks.Category][]tasks.Task,
+ ) error {
+ 	now := a.timeSource.Now()
++	a.speculaKeyAllocationTime = now
+ 	// TODO: Truncation here is just to make sure task scheduled time has the same precision as the old logic.
+ 	// Remove this truncation once we validate the rest of the code can worker correctly with higher precision.
+ 	a.setTaskMinScheduledTime(now.Truncate(common.ScheduledTaskMinPrecision))
+diff --git a/service/history/timer_queue_active_task_executor.go b/service/history/timer_queue_active_task_executor.go
+index a4ca37bae..6e5ab9214 100644
+--- a/service/history/timer_queue_active_task_executor.go
++++ b/service/history/timer_queue_active_task_executor.go
+@@ -27,6 +27,7 @@ import (
+ 	"go.temporal.io/server/common/priorities"
+ 	"go.temporal.io/server/common/resource"
+ 	"go.temporal.io/server/common/softassert"
++	"go.temporal.io/server/common/speculatrace"
+ 	"go.temporal.io/server/common/testing/testhooks"
+ 	"go.temporal.io/server/service/history/configs"
+ 	"go.temporal.io/server/service/history/consts"
+@@ -231,6 +232,7 @@ func (t *timerQueueActiveTaskExecutor) executeActivityTimeoutTask(
+ 	referenceTime := t.Now()
+ 	updateMutableState := false
+ 	scheduleWorkflowTask := false
++	traceScan := []speculatrace.Fields{}
+ 
+ 	// Need to clear activity heartbeat timer task mask for new activity timer task creation.
+ 	// NOTE: LastHeartbeatTimeoutVisibilityInSeconds is for deduping heartbeat timer creation as it's possible
+@@ -262,7 +264,9 @@ Loop:
+ 			continue Loop
+ 		}
+ 
++		traceBefore := speculatrace.Proto(activityInfo)
+ 		result, err := t.processSingleActivityTimeoutTask(mutableState, timerSequenceID, activityInfo)
++		traceScan = append(traceScan, speculatrace.Fields{"timer": timerSequenceID, "beforeAI": traceBefore, "update": result.shouldUpdateMutableState, "makeWFT": result.shouldScheduleWorkflowTask, "error": speculatrace.Error(err)})
+ 
+ 		if err != nil {
+ 			return err
+@@ -273,11 +277,18 @@ Loop:
+ 
+ 	}
+ 
++	workflow.SpeculaObserve(mutableState, "ExecuteActivityTimeoutTask", speculatrace.Fields{"task": task, "referenceTime": referenceTime, "scan": traceScan, "mutated": updateMutableState, "makeWFT": scheduleWorkflowTask})
+ 	if !updateMutableState {
+ 		release(nil) // so mutable state is not unloaded from cache
+ 		return errNoTimerFired
+ 	}
+-	return t.updateWorkflowExecution(ctx, weContext, mutableState, scheduleWorkflowTask)
++	updateErr := t.updateWorkflowExecution(ctx, weContext, mutableState, scheduleWorkflowTask)
++	if updateErr == nil && speculatrace.TakeSpecificFault(task.WorkflowID, "DuplicateTimerAck") {
++		release(nil)
++		speculatrace.Emit(task.WorkflowID, "RedeliverTask", speculatrace.Fields{"task": task, "boundary": "successful-timeout-execution-ack-lost"})
++		return serviceerror.NewUnavailable("specula: lost timeout task acknowledgement")
++	}
++	return updateErr
+ }
+ 
+ type processingActivityTimeoutResult struct {
+@@ -618,6 +629,7 @@ func (t *timerQueueActiveTaskExecutor) executeActivityRetryTimerTask(
+ 	priority := priorities.Merge(mutableState.GetExecutionInfo().Priority, activityInfo.Priority)
+ 
+ 	// NOTE: do not access anything related mutable state after this lock release
++	workflow.SpeculaObserve(mutableState, "ExecuteActivityRetryTimerTask", speculatrace.Fields{"task": task})
+ 	release(nil) // release earlier as we don't need the lock anymore
+ 
+ 	resp, err := t.matchingRawClient.AddActivityTask(ctx, &matchingservice.AddActivityTaskRequest{
+@@ -634,6 +646,7 @@ func (t *timerQueueActiveTaskExecutor) executeActivityRetryTimerTask(
+ 		Stamp:                  task.Stamp,
+ 		Priority:               priority,
+ 	})
++	speculatrace.Emit(task.WorkflowID, "DeliverAddActivityTaskResponse", speculatrace.Fields{"task": task, "response": speculatrace.Proto(resp), "error": speculatrace.Error(err)})
+ 	if err != nil {
+ 		return err
+ 	}
+diff --git a/service/history/transfer_queue_active_task_executor.go b/service/history/transfer_queue_active_task_executor.go
+index 1cfc694af..31951d091 100644
+--- a/service/history/transfer_queue_active_task_executor.go
++++ b/service/history/transfer_queue_active_task_executor.go
+@@ -37,6 +37,7 @@ import (
+ 	"go.temporal.io/server/common/rpc"
+ 	"go.temporal.io/server/common/sdk"
+ 	serviceerrors "go.temporal.io/server/common/serviceerror"
++	"go.temporal.io/server/common/speculatrace"
+ 	"go.temporal.io/server/common/testing/testhooks"
+ 	"go.temporal.io/server/common/worker_versioning"
+ 	"go.temporal.io/server/service/history/configs"
+@@ -281,6 +282,7 @@ func (t *transferQueueActiveTaskExecutor) processActivityTask(
+ 	// NOTE: do not access anything related mutable state after this lock release
+ 	// release the context lock since we no longer need mutable state and
+ 	// the rest of logic is making RPC call, which takes time.
++	workflow.SpeculaObserve(mutableState, "ProcessActivityTask", speculatrace.Fields{"task": task})
+ 	release(nil)
+ 
+ 	return t.pushActivity(ctx, task, timeout, directive, priority, historyi.TransactionPolicyActive)
+diff --git a/service/history/transfer_queue_task_executor_base.go b/service/history/transfer_queue_task_executor_base.go
+index 989b9d780..89417f860 100644
+--- a/service/history/transfer_queue_task_executor_base.go
++++ b/service/history/transfer_queue_task_executor_base.go
+@@ -21,6 +21,7 @@ import (
+ 	"go.temporal.io/server/common/persistence/visibility/manager"
+ 	"go.temporal.io/server/common/resource"
+ 	"go.temporal.io/server/common/searchattribute"
++	"go.temporal.io/server/common/speculatrace"
+ 	"go.temporal.io/server/service/history/configs"
+ 	"go.temporal.io/server/service/history/consts"
+ 	"go.temporal.io/server/service/history/deletemanager"
+@@ -117,6 +118,7 @@ func (t *transferQueueTaskExecutorBase) pushActivity(
+ 		Stamp:                  task.Stamp,
+ 		Priority:               priority,
+ 	})
++	speculatrace.Emit(task.WorkflowID, "DeliverAddActivityTaskResponse", speculatrace.Fields{"task": task, "response": speculatrace.Proto(resp), "error": speculatrace.Error(err)})
+ 	if _, isNotFound := err.(*serviceerror.NotFound); isNotFound {
+ 		// NotFound error is not expected for AddTasks calls
+ 		// but will be ignored by task error handling logic, so log it here
+diff --git a/service/history/workflow/cache/cache.go b/service/history/workflow/cache/cache.go
+index 7a7d4c146..1e88d86e7 100644
+--- a/service/history/workflow/cache/cache.go
++++ b/service/history/workflow/cache/cache.go
+@@ -378,6 +378,7 @@ func (c *cacheImpl) makeReleaseFunc(
+ 			}()
+ 			if rec := recover(); rec != nil {
+ 				wfContext.Clear()
++				speculaObserveRelease(wfContext, err)
+ 				wfContext.Unlock()
+ 				c.Release(cacheKey)
+ 				panic(rec)
+@@ -385,6 +386,7 @@ func (c *cacheImpl) makeReleaseFunc(
+ 				if err != nil || forceClearContext {
+ 					// TODO see issue #668, there are certain type or errors which can bypass the clear
+ 					wfContext.Clear()
++					speculaObserveRelease(wfContext, err)
+ 					wfContext.Unlock()
+ 					c.Release(cacheKey)
+ 				} else {
+@@ -398,6 +400,7 @@ func (c *cacheImpl) makeReleaseFunc(
+ 							tag.WorkflowRunID(wfContext.GetWorkflowKey().RunID),
+ 						)
+ 					}
++					speculaObserveRelease(wfContext, err)
+ 					wfContext.Unlock()
+ 					c.Release(cacheKey)
+ 					if isDirty {
+diff --git a/service/history/workflow/context.go b/service/history/workflow/context.go
+index 183e229f6..19ba52581 100644
+--- a/service/history/workflow/context.go
++++ b/service/history/workflow/context.go
+@@ -28,6 +28,7 @@ import (
+ 	"go.temporal.io/server/common/persistence"
+ 	"go.temporal.io/server/common/primitives"
+ 	"go.temporal.io/server/common/softassert"
++	"go.temporal.io/server/common/speculatrace"
+ 	"go.temporal.io/server/common/testing/testhooks"
+ 	"go.temporal.io/server/service/history/configs"
+ 	"go.temporal.io/server/service/history/consts"
+@@ -172,6 +173,10 @@ func (c *ContextImpl) IsDirty() bool {
+ }
+ 
+ func (c *ContextImpl) Clear() {
++	defer func() {
++		name, fields := speculatrace.TakeClear(c.workflowKey.WorkflowID)
++		speculatrace.Emit(c.workflowKey.WorkflowID, name, fields)
++	}()
+ 	metrics.WorkflowContextCleared.With(c.metricsHandler).Record(1)
+ 	if c.MutableState != nil {
+ 		c.MutableState.GetQueryRegistry().Clear()
+@@ -443,6 +448,7 @@ func (c *ContextImpl) LoadMutableState(ctx context.Context, shardContext history
+ 		// returned by NewMutableStateFromDB().
+ 		// Thus causing NPE (e.g. when calling c.Clear()) or other unexpected behavior.
+ 		c.MutableState = mutableState
++		SpeculaObserve(c.MutableState, "LoadMutableState", speculatrace.Fields{"databaseVersion": response.DBRecordVersion})
+ 	}
+ 
+ 	mutableStateArchetypeID := c.MutableState.ChasmTree().ArchetypeID()
+@@ -894,6 +900,9 @@ func (c *ContextImpl) updateWorkflowExecutionWithNew(
+ 	updateWorkflowTransactionPolicy historyi.TransactionPolicy,
+ 	newWorkflowTransactionPolicy *historyi.TransactionPolicy,
+ ) (retError error) {
++	defer func() {
++		speculatrace.MarkUpdateReturn(c.workflowKey.WorkflowID, retError)
++	}()
+ 
+ 	defer func() {
+ 		if retError != nil {
+diff --git a/service/history/workflow/mutable_state_impl.go b/service/history/workflow/mutable_state_impl.go
+index e582d61eb..c92075e83 100644
+--- a/service/history/workflow/mutable_state_impl.go
++++ b/service/history/workflow/mutable_state_impl.go
+@@ -62,6 +62,7 @@ import (
+ 	"go.temporal.io/server/common/searchattribute/sadefs"
+ 	serviceerrors "go.temporal.io/server/common/serviceerror"
+ 	"go.temporal.io/server/common/softassert"
++	"go.temporal.io/server/common/speculatrace"
+ 	"go.temporal.io/server/common/tasktoken"
+ 	"go.temporal.io/server/common/util"
+ 	"go.temporal.io/server/common/worker_versioning"
+@@ -6947,8 +6948,10 @@ func (ms *MutableStateImpl) RetryActivity(
+ 	}
+ 
+ 	now := ms.timeSource.Now().In(time.UTC)
++	policyNow := ms.timeSource.Now().In(time.UTC)
++	speculatrace.Emit(ms.executionInfo.WorkflowId, "RetryPolicyTimes", speculatrace.Fields{"scheduledEventId": ai.ScheduledEventId, "attempt": ai.Attempt, "scheduledNow": now, "policyNow": policyNow})
+ 	retryBackoff, retryState := nextBackoffInterval(
+-		ms.timeSource.Now().In(time.UTC),
++		policyNow,
+ 		ai.Attempt,
+ 		ai.RetryMaximumAttempts,
+ 		ai.RetryInitialInterval,
+@@ -7643,6 +7646,7 @@ func (ms *MutableStateImpl) CloseTransactionAsMutation(
+ 		Checksum:        result.checksum,
+ 	}
+ 
++	SpeculaObserve(ms, "CloseTransactionAsMutation", speculatrace.Fields{"mutation": speculatrace.Freeze(workflowMutation), "events": speculatrace.Freeze(result.workflowEventsSeq)})
+ 	ms.checksum = result.checksum
+ 	if err := ms.cleanupTransaction(); err != nil {
+ 		return nil, nil, err
+diff --git a/service/history/workflow/transaction_impl.go b/service/history/workflow/transaction_impl.go
+index bd7a7c35f..c749d382c 100644
+--- a/service/history/workflow/transaction_impl.go
++++ b/service/history/workflow/transaction_impl.go
+@@ -16,6 +16,7 @@ import (
+ 	"go.temporal.io/server/common/namespace"
+ 	"go.temporal.io/server/common/persistence"
+ 	"go.temporal.io/server/common/persistence/transitionhistory"
++	"go.temporal.io/server/common/speculatrace"
+ 	"go.temporal.io/server/service/history/events"
+ 	historyi "go.temporal.io/server/service/history/interfaces"
+ 	"go.temporal.io/server/service/history/notification"
+@@ -198,6 +199,7 @@ func (t *TransactionImpl) UpdateWorkflowExecution(
+ 		},
+ 		isWorkflow,
+ 	)
++	speculatrace.Emit(currentWorkflowMutation.ExecutionInfo.WorkflowId, "ReturnPersistenceResult", speculatrace.Fields{"dbRecordVersion": currentWorkflowMutation.DBRecordVersion, "error": speculatrace.Error(err)})
+ 	if persistence.OperationPossiblySucceeded(err) {
+ 		NotifyOnExecutionMutation(engine, archetypeID, currentWorkflowMutation)
+ 		NotifyOnExecutionSnapshot(engine, archetypeID, newWorkflowSnapshot)
+@@ -614,6 +616,7 @@ func NotifyOnExecutionMutation(
+ 		return
+ 	}
+ 	engine.NotifyNewTasks(workflowMutation.Tasks)
++	speculatrace.Emit(workflowMutation.ExecutionInfo.WorkflowId, "NotifyOnExecutionMutation", speculatrace.Fields{"dbRecordVersion": workflowMutation.DBRecordVersion, "tasks": speculatrace.Freeze(workflowMutation.Tasks)})
+ 	if len(workflowMutation.UpsertChasmNodes) > 0 ||
+ 		len(workflowMutation.DeleteChasmNodes) > 0 {
+ 		engine.NotifyChasmExecution(chasm.ExecutionKey{
+diff --git a/service/history/workflow/workflow_task_state_machine.go b/service/history/workflow/workflow_task_state_machine.go
+index 72123c71b..ea21e4edc 100644
+--- a/service/history/workflow/workflow_task_state_machine.go
++++ b/service/history/workflow/workflow_task_state_machine.go
+@@ -27,6 +27,7 @@ import (
+ 	"go.temporal.io/server/common/log/tag"
+ 	"go.temporal.io/server/common/metrics"
+ 	"go.temporal.io/server/common/primitives/timestamp"
++	"go.temporal.io/server/common/speculatrace"
+ 	"go.temporal.io/server/common/tqid"
+ 	"go.temporal.io/server/common/worker_versioning"
+ 	historyi "go.temporal.io/server/service/history/interfaces"
+@@ -633,6 +634,7 @@ func (m *workflowTaskStateMachine) AddWorkflowTaskStartedEvent(
+ 		return nil, nil, err
+ 	}
+ 
++	SpeculaObserve(m.ms, "RecordWorkflowTaskStarted", speculatrace.Fields{"requestId": requestID, "workflowTask": workflowTask})
+ 	return startedEvent, workflowTask, nil
+ }
+ 
+diff --git a/service/matching/matching_engine.go b/service/matching/matching_engine.go
+index af4595c23..cef2805d2 100644
+--- a/service/matching/matching_engine.go
++++ b/service/matching/matching_engine.go
+@@ -56,6 +56,7 @@ import (
+ 	"go.temporal.io/server/common/searchattribute"
+ 	serviceerrors "go.temporal.io/server/common/serviceerror"
+ 	"go.temporal.io/server/common/softassert"
++	"go.temporal.io/server/common/speculatrace"
+ 	"go.temporal.io/server/common/stream_batcher"
+ 	"go.temporal.io/server/common/taskqueue"
+ 	"go.temporal.io/server/common/tasktoken"
+@@ -687,10 +688,11 @@ func (e *matchingEngineImpl) AddActivityTask(
+ 		span.SetAttributes(attribute.String(telemetry.WorkerTaskIDKey, workerTaskID))
+ 	}
+ 
+-	return pm.AddTask(ctx, addTaskParams{
+-		taskInfo:    taskInfo,
+-		forwardInfo: addRequest.ForwardInfo,
+-	})
++	buildId, syncMatch, err = pm.AddTask(ctx, addTaskParams{taskInfo: taskInfo, forwardInfo: addRequest.ForwardInfo})
++	if !syncMatch {
++		speculatrace.Emit(addRequest.Execution.WorkflowId, "AddActivityTask", speculatrace.Fields{"request": speculatrace.Proto(addRequest), "taskInfo": speculatrace.Proto(taskInfo), "syncMatch": syncMatch, "error": speculatrace.Error(err), "boundary": "AddTask-return"})
++	}
++	return buildId, syncMatch, err
+ }
+ 
+ // PollWorkflowTaskQueue tries to get the workflow task using exponential backoff.
+@@ -3603,7 +3605,17 @@ func (e *matchingEngineImpl) recordActivityTaskStarted(
+ 		ComponentRef:               task.event.Data.GetComponentRef(),
+ 	}
+ 
+-	return e.historyClient.RecordActivityTaskStarted(ctx, recordStartedRequest)
++	if task.isSyncMatchTask() {
++		speculatrace.Emit(recordStartedRequest.WorkflowExecution.WorkflowId, "AddActivityTask", speculatrace.Fields{"request": speculatrace.Proto(recordStartedRequest), "taskInfo": speculatrace.Proto(task.event.Data), "syncMatch": true, "error": nil, "boundary": "sync-receiver-acceptance"})
++	}
++	speculatrace.Emit(recordStartedRequest.WorkflowExecution.WorkflowId, "PollActivityTaskQueue", speculatrace.Fields{"request": speculatrace.Proto(recordStartedRequest), "task": speculatrace.Proto(task.event), "syncMatch": task.isSyncMatchTask()})
++	resp, err := e.historyClient.RecordActivityTaskStarted(ctx, recordStartedRequest)
++	if err == nil && speculatrace.TakeSpecificFault(recordStartedRequest.WorkflowExecution.WorkflowId, "LoseStartResponse") {
++		speculatrace.Emit(recordStartedRequest.WorkflowExecution.WorkflowId, "LoseAPIResponse", speculatrace.Fields{"boundary": "History-to-Matching", "request": speculatrace.Proto(recordStartedRequest), "response": speculatrace.Proto(resp)})
++		return nil, serviceerror.NewUnavailable("specula: lost History start response")
++	}
++	speculatrace.Emit(recordStartedRequest.WorkflowExecution.WorkflowId, "ReceiveRecordActivityTaskStartedResponse", speculatrace.Fields{"request": speculatrace.Proto(recordStartedRequest), "response": speculatrace.Proto(resp), "error": speculatrace.Error(err)})
++	return resp, err
+ }
+ 
+ // newRecordTaskStartedContext creates a context for recording
+diff --git a/service/matching/pri_task_reader.go b/service/matching/pri_task_reader.go
+index ceb643422..7f05b38ee 100644
+--- a/service/matching/pri_task_reader.go
++++ b/service/matching/pri_task_reader.go
+@@ -20,6 +20,7 @@ import (
+ 	"go.temporal.io/server/common/persistence"
+ 	serviceerrors "go.temporal.io/server/common/serviceerror"
+ 	"go.temporal.io/server/common/softassert"
++	"go.temporal.io/server/common/speculatrace"
+ 	"go.temporal.io/server/common/util"
+ 	"golang.org/x/sync/semaphore"
+ )
+@@ -128,6 +129,7 @@ func (tr *priTaskReader) completeTask(task *internalTask, res taskResponse) {
+ 		// trying the same task immediately. maybe also: after a few attempts on the same task,
+ 		// let it get cycled to the end of the queue, in case there's some task/wf-specific
+ 		// thing.
++		speculatrace.Emit(task.event.Data.WorkflowId, "RetryMatchingActivityTask", speculatrace.Fields{"task": speculatrace.Proto(task.event), "error": speculatrace.Error(err), "boundary": "priority-reader-retains-task"})
+ 		tr.addTaskToMatcher(task)
+ 		return
+ 	}
+@@ -252,6 +254,7 @@ func (tr *priTaskReader) processTaskBatch(tasks []*persistencespb.AllocatedTaskI
+ 
+ 		if IsTaskExpired(t) {
+ 			// task expired when we read it
++			speculatrace.Emit(t.Data.WorkflowId, "DropExpiredMatchingTask", speculatrace.Fields{"task": speculatrace.Proto(t), "boundary": "matching-expiry-on-read"})
+ 			recordDroppedTask(tr.backlogMgr.metricsHandler, dropReasonExpiredRead)
+ 			return true
+ 		}
+diff --git a/service/matching/task.go b/service/matching/task.go
+index 9e6fe02a5..c89291d05 100644
+--- a/service/matching/task.go
++++ b/service/matching/task.go
+@@ -13,6 +13,7 @@ import (
+ 	persistencespb "go.temporal.io/server/api/persistence/v1"
+ 	taskqueuespb "go.temporal.io/server/api/taskqueue/v1"
+ 	"go.temporal.io/server/common/namespace"
++	"go.temporal.io/server/common/speculatrace"
+ 	"google.golang.org/protobuf/types/known/timestamppb"
+ )
+ 
+@@ -371,6 +372,9 @@ func (task *internalTask) setEvicted() {
+ // carried on the taskResponse and counted in tasks_dropped by the backlog completion
+ // callback (reader.completeTask).
+ func (task *internalTask) finish(r taskFinishResult) {
++	if task.event != nil && (r.dropReason == dropReasonExpiredMemory || r.dropReason == dropReasonExpiredRead) {
++		speculatrace.Emit(task.event.Data.WorkflowId, "DropExpiredMatchingTask", speculatrace.Fields{"task": speculatrace.Proto(task.event.AllocatedTaskInfo), "boundary": "matching-expiry-disposition"})
++	}
+ 	task.finishInternal(taskResponse{
+ 		startErr:   r.err,
+ 		dropReason: r.dropReason,
+diff --git a/tests/testcore/test_cluster.go b/tests/testcore/test_cluster.go
+index d5651acfa..4961c76e2 100644
+--- a/tests/testcore/test_cluster.go
++++ b/tests/testcore/test_cluster.go
+@@ -119,6 +119,9 @@ type defaultPersistenceTestBaseFactory struct{}
+ // GetPersistenceTestDefaults returns the default persistence options based on CLI flags.
+ // Use this when creating TestClusterConfig to ensure proper database configuration.
+ func GetPersistenceTestDefaults() persistencetests.TestBaseOptions {
++	if os.Getenv("SPECULA_TRACE_ROOT") != "" {
++		return *persistencetests.GetSQLiteFileTestClusterOption()
++	}
+ 	return *persistencetests.GetTestClusterOption(cliFlags.persistenceType, cliFlags.persistenceDriver)
+ }
+ 

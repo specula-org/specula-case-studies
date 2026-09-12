@@ -1,0 +1,84 @@
+{
+  "schema_version": "2",
+  "system": "temporal-update",
+  "generated_by": "consolidate",
+  "findings": [
+    {
+      "id": "CR-1",
+      "title": "A write result, published effect, and caller receipt are different events",
+      "source": "code-review",
+      "scenario": "Scenario 1",
+      "severity": "High",
+      "invariant": null,
+      "config": null,
+      "counterexample": null,
+      "affected_code": [
+        "common/persistence/sql/execution.go:338",
+        "common/persistence/cassandra/execution_store.go:110",
+        "service/history/shard/context_impl.go:1477",
+        "service/history/api/respondworkflowtaskcompleted/api.go:676",
+        "service/history/api/respondworkflowtaskcompleted/api.go:750",
+        "service/history/workflow/mutable_state_impl.go:1544",
+        "service/history/workflow/mutable_state_impl.go:5899"
+      ],
+      "summary": "A durable workflow mutation can commit even when its caller receives an error, and an appended physical History batch can exist without a committed execution mutation. The scenario separates History append, execution and task commit, effect publication or cancellation, response assembly or loss, cache clearing, reload, resubmission, and polling. The hypothesized failure is that a caller could observe a successful Update result that conflicts with durable recovery, or that a stale host event cache could expose the wrong Update's result. Existing one-Update fault tests leave two-Update, delayed-waiter, and later-handler-error combinations unresolved."
+    },
+    {
+      "id": "CR-2",
+      "title": "Old work is fenced by identity, but error cleanup can affect current work",
+      "source": "code-review",
+      "scenario": "Scenario 2",
+      "severity": "High",
+      "invariant": null,
+      "config": null,
+      "counterexample": null,
+      "affected_code": [
+        "service/history/api/respondworkflowtaskcompleted/api.go:174",
+        "service/history/api/respondworkflowtaskcompleted/api.go:189",
+        "service/history/api/respondworkflowtaskcompleted/api.go:231",
+        "service/history/timer_queue_active_task_executor.go:408",
+        "service/history/timer_queue_active_task_executor.go:433"
+      ],
+      "summary": "A stale workflow-task completion or timer can refer to an earlier speculative task while cleanup code operates on the current cached Workflow context. Completion validates the task identity tuple before applying commands, but deferred sticky cleanup still runs on early identity rejection. Timer validation uses different guards for speculative and normal tasks, leaving compositions involving old submitted timers, cache replacement, and converted normal tasks to be checked. The scenario should preserve the distinction between rejecting stale work, clearing stickiness, firing or canceling the specific timer, and retrying admission."
+    },
+    {
+      "id": "CR-3",
+      "title": "Mixed Update outcomes and final Workflow closure share an effect batch",
+      "source": "code-review",
+      "scenario": "Scenario 3",
+      "severity": "High",
+      "invariant": null,
+      "config": null,
+      "counterexample": null,
+      "affected_code": [
+        "common/effect/buffer.go:29",
+        "common/effect/buffer.go:53",
+        "service/history/workflow/update/update.go:259",
+        "service/history/workflow/update/update.go:626",
+        "service/history/api/respondworkflowtaskcompleted/api.go:726",
+        "service/history/workflow/update/abort_reason.go:44",
+        "service/history/workflow/update/registry.go:124"
+      ],
+      "summary": "Acceptance, completion, rejection, and Workflow closure can coexist in one Workflow Task while callers observe independently completed futures. Effect application, rollback cancellation, provisional Update states, terminal publication, and final close aborts must be modeled as ordered but separately observable steps. The scenario includes accepted handler failure with correct durable outcome but misleading response-link metadata, plus forced-termination behavior where a failed close write can leave durable RUNNING and Accepted state. The open question is whether mixed outcomes, uncertain persistence, and unlocked waiter observation can produce unsupported acceptance or incompatible successful outcomes."
+    },
+    {
+      "id": "CR-4",
+      "title": "Volatile deduplication must retain a delivery or retry path",
+      "source": "code-review",
+      "scenario": "Scenario 4",
+      "severity": "High",
+      "invariant": null,
+      "config": null,
+      "counterexample": null,
+      "affected_code": [
+        "service/history/api/updateworkflow/api.go:168",
+        "service/history/api/updateworkflow/api.go:256",
+        "service/history/api/updateworkflow/api.go:317",
+        "service/history/workflow/update/update.go:384",
+        "service/history/workflow/update/update.go:729",
+        "service/history/workflow/update/registry.go:297"
+      ],
+      "summary": "Direct speculative dispatch, its in-memory timer, and cached Update deduplication have different lifetimes. Direct Matching errors are swallowed and rely on speculative schedule-to-start fallback, while duplicate requests can attach callbacks to existing volatile Update objects. Buffered callbacks can make automatic rejection fail, and rejected-unprocessed handling discards that error while successor Workflow Tasks may still provide a recovery path. The scenario asks whether finite dispatch failures, cache loss, retries, timers, and worker capability changes always preserve a path to acceptance or a legitimate terminal outcome."
+    }
+  ]
+}

@@ -1,0 +1,65 @@
+
+func (s *NexusWorkflowTestSuite) TestSpeculaNexusMaxTimeoutOmitted(chasmEnabled bool) {
+	env := s.newTestEnv(chasmEnabled, testcore.WithDedicatedCluster(), testcore.WithDynamicConfig(nexusoperations.MaxOperationScheduleToCloseTimeout, 3*time.Second))
+	ctx := s.Context()
+	taskQueue := testcore.RandomizeStr(s.T().Name())
+	var accepted atomic.Int32
+	endpoint := env.createRandomExternalNexusServer(ctx, s.T(), nexustest.Handler{
+		OnStartOperation: func(_ context.Context, _, _ string, _ *nexus.LazyValue, opts nexus.StartOperationOptions) (nexus.HandlerStartOperationResult[any], error) {
+			accepted.Add(1)
+			s.T().Logf("ENDPOINT_ACCEPT request_id=%s", opts.RequestID)
+			return &nexus.HandlerStartOperationResultAsync{OperationToken: opts.RequestID}, nil
+		},
+	})
+	caller := func(ctx workflow.Context, requested int64) error {
+		return workflow.NewNexusClient(endpoint, "service").ExecuteOperation(ctx, "operation", "input", workflow.NexusOperationOptions{
+			ScheduleToCloseTimeout: time.Duration(requested),
+		}).Get(ctx, nil)
+	}
+	w := worker.New(env.SdkClient(), taskQueue, worker.Options{})
+	w.RegisterWorkflow(caller)
+	s.NoError(w.Start())
+	defer w.Stop()
+	omitted, err := env.SdkClient().ExecuteWorkflow(ctx, client.StartWorkflowOptions{TaskQueue: taskQueue}, caller, int64(0))
+	s.NoError(err)
+	defer func() { _ = env.SdkClient().TerminateWorkflow(context.Background(), omitted.GetID(), omitted.GetRunID(), "probe cleanup") }()
+	control, err := env.SdkClient().ExecuteWorkflow(ctx, client.StartWorkflowOptions{TaskQueue: taskQueue}, caller, int64(time.Minute))
+	s.NoError(err)
+	err = control.Get(ctx, nil)
+	s.Error(err)
+	controlHistory := env.GetHistory(env.Namespace().String(), &commonpb.WorkflowExecution{WorkflowId: control.GetID(), RunId: control.GetRunID()})
+	controlScheduled := s.RequireHistoryEvent(controlHistory, enumspb.EVENT_TYPE_NEXUS_OPERATION_SCHEDULED)
+	s.Equal(3*time.Second, controlScheduled.GetNexusOperationScheduledEventAttributes().GetScheduleToCloseTimeout().AsDuration())
+	s.RequireHistoryEvent(controlHistory, enumspb.EVENT_TYPE_NEXUS_OPERATION_TIMED_OUT)
+	s.T().Log("HEALTHY_CONTROL requested=60s scheduled=3s terminal=TimedOut")
+	env.CloseShard(env.NamespaceID().String(), omitted.GetID())
+	desc, err := env.SdkClient().DescribeWorkflowExecution(ctx, omitted.GetID(), omitted.GetRunID())
+	s.NoError(err)
+	s.Len(desc.PendingNexusOperations, 1)
+	s.Zero(desc.PendingNexusOperations[0].GetScheduleToCloseTimeout().AsDuration())
+	persisted, err := env.AdminClient().DescribeMutableState(ctx, &adminservice.DescribeMutableStateRequest{
+		Namespace: env.Namespace().String(),
+		Execution: &commonpb.WorkflowExecution{WorkflowId: omitted.GetID(), RunId: omitted.GetRunID()},
+		Archetype: chasm.WorkflowArchetype,
+	})
+	s.NoError(err)
+	ms := persisted.DatabaseMutableState
+	s.Zero(ms.GetExecutionInfo().GetWorkflowRunTimeout().AsDuration())
+	nodes := ms.GetExecutionInfo().GetSubStateMachinesByType()[nexusoperations.OperationMachineType].GetMachinesById()
+	s.Len(nodes, 1)
+	for id, node := range nodes {
+		info := &persistencespb.NexusOperationInfo{}
+		s.NoError(proto.Unmarshal(node.Data, info))
+		s.Zero(info.GetScheduleToCloseTimeout().AsDuration())
+		s.NotEmpty(info.GetOperationToken())
+		tasks, err := (nexusoperations.Operation{NexusOperationInfo: info}).RegenerateTasks(nil)
+		s.NoError(err)
+		s.Empty(tasks)
+		s.T().Logf("POST_RELOAD_DB op_id=%s request_id=%s token=%s state=%s schedule_to_close=%s regenerated_tasks=%d buffered=%d", id, info.RequestId, info.OperationToken, info.State, info.ScheduleToCloseTimeout.AsDuration(), len(tasks), len(ms.BufferedEvents))
+	}
+	s.EqualValues(2, accepted.Load())
+	history := env.GetHistory(env.Namespace().String(), &commonpb.WorkflowExecution{WorkflowId: omitted.GetID(), RunId: omitted.GetRunID()})
+	scheduled := s.RequireHistoryEvent(history, enumspb.EVENT_TYPE_NEXUS_OPERATION_SCHEDULED)
+	s.Zero(scheduled.GetNexusOperationScheduledEventAttributes().GetScheduleToCloseTimeout().AsDuration())
+	s.T().Log("OBSERVED omitted=0 configured_max=3s persisted=0 survived_shard_close=true")
+}

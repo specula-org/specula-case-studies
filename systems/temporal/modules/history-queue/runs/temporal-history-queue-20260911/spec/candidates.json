@@ -1,0 +1,104 @@
+{
+  "schema_version": "2",
+  "system": "temporal-history-queue",
+  "generated_by": "consolidate",
+  "findings": [
+    {
+      "id": "CR-1",
+      "title": "Uncertain publication versus read eligibility",
+      "source": "code-review",
+      "scenario": "Scenario 1",
+      "severity": "High",
+      "invariant": null,
+      "config": null,
+      "counterexample": null,
+      "affected_code": [
+        "service/history/shard/task_key_manager.go:45",
+        "service/history/shard/task_key_manager.go:88",
+        "service/history/shard/task_request_tracker.go:36",
+        "service/history/shard/context_impl.go:1501",
+        "service/history/shard/context_impl.go:2030",
+        "common/persistence/sql/execution.go:360"
+      ],
+      "summary": "This scenario asks whether task allocation, SQL commit visibility, pending-write tracking, notification, and shard range reacquisition can advance different frontiers. A delayed or uncertain workflow transaction must not later insert required transfer work below a read boundary that the queue has already retired. The brief reports native SQLite evidence for isolated publication safeguards, but the coupled publication/checkpoint/ownership schedule was not covered by any model-checking finding."
+    },
+    {
+      "id": "CR-2",
+      "title": "Logical scope survives but the live reader cursor disappears",
+      "source": "code-review",
+      "scenario": "Scenario 2",
+      "severity": "High",
+      "invariant": null,
+      "config": null,
+      "counterexample": null,
+      "affected_code": [
+        "service/history/queues/reader.go:350",
+        "service/history/queues/reader.go:454",
+        "service/history/queues/slice.go:307",
+        "service/history/queues/slice.go:366",
+        "service/history/queues/queue_base.go:295",
+        "service/history/queues/tracker.go:58"
+      ],
+      "summary": "This scenario concerns reader slice mutation, ACK-driven shrinkage, movement between readers, and checkpoint/reload. The brief identifies a live-reader cursor stall where an empty slice can be removed without repairing nextReadSlice, leaving durable work recoverable only after reconstruction. It also keeps adjacent split, merge, widening, clear, and duplicate-overlap accounting interactions as candidates because model checking did not emit a covering counterexample."
+    },
+    {
+      "id": "CR-3",
+      "title": "Deletion receipt, volatile checkpoint, and durable checkpoint diverge",
+      "source": "code-review",
+      "scenario": "Scenario 3",
+      "severity": "High",
+      "invariant": null,
+      "config": null,
+      "counterexample": null,
+      "affected_code": [
+        "service/history/queues/queue_base.go:295",
+        "service/history/queues/queue_base.go:340",
+        "service/history/queues/queue_base.go:373",
+        "service/history/queues/queue_base.go:397",
+        "service/history/shard/context_impl.go:1228",
+        "service/history/shard/context_impl.go:1252"
+      ],
+      "summary": "This scenario covers the fact that prefix deletion and queue-state persistence are separate operations. A successful delete, lost reply, memory-only queue-state update, throttled shard snapshot, or updateShardInfo lifecycle failure must not let recovery skip unfinished rows or make completed rows permanently unreachable for cleanup. Native schedules in the brief cover selected safe cases, but the full combination was not represented by a model-checking candidate."
+    },
+    {
+      "id": "CR-4",
+      "title": "An old owner can finish effects after durable ownership changes",
+      "source": "code-review",
+      "scenario": "Scenario 4",
+      "severity": "High",
+      "invariant": null,
+      "config": null,
+      "counterexample": null,
+      "affected_code": [
+        "service/history/queues/executable.go:273",
+        "service/history/queues/executable.go:402",
+        "service/history/queues/executable.go:724",
+        "common/persistence/sql/execution_tasks.go:17",
+        "common/persistence/sql/execution_tasks.go:361",
+        "common/persistence/sql/shard.go:82",
+        "service/history/api/consistency_checker.go:177"
+      ],
+      "summary": "This scenario asks what an old owner can still do after durable shard ownership changes. SQL writes that carry RangeID are fenced, but already-started readers, executions, Matching RPCs, DLQ operations, ACK handling, and immediate prefix deletion have different protection or idempotency contracts. Confirmation must distinguish harmless duplicate effects from stale effects that can invalidate the new owner's recovery boundary, because no MC finding covered this mechanism."
+    },
+    {
+      "id": "CR-5",
+      "title": "ACK discharges a transport obligation under a specific downstream contract",
+      "source": "code-review",
+      "scenario": "Scenario 5",
+      "severity": "High",
+      "invariant": null,
+      "config": null,
+      "counterexample": null,
+      "affected_code": [
+        "service/history/transfer_queue_active_task_executor.go:250",
+        "service/history/queues/executable.go:451",
+        "service/history/queues/dlq_writer.go:63",
+        "common/persistence/sql/queue_v2.go:45",
+        "service/matching/matching_engine.go:810",
+        "service/matching/matching_engine.go:1037",
+        "service/history/tasks/task.go:373"
+      ],
+      "summary": "This scenario separates local ACK from the actual downstream responsibility for workflow progress. Successful Matching dispatch, durable spool acceptance, started execution, obsolete-task drop, terminal discard, retry, rescheduling, and DLQ transfer can all lead to ACK-like local completion but do not mean the same thing. The brief reports healthy Workflow/Activity evidence and DLQ lost-reply behavior, while leaving the coupled responsibility-loss question uncovered by model checking."
+    }
+  ]
+}

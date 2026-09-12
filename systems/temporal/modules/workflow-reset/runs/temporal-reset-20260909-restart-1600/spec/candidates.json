@@ -1,0 +1,122 @@
+{
+  "schema_version": "2",
+  "system": "temporal-reset",
+  "generated_by": "consolidate",
+  "findings": [
+    {
+      "id": "MC-1",
+      "title": "A short scanner age can remove history before execution publication",
+      "source": "model-checking",
+      "scenario": "Scenario 5, explicit non-default scanner-age sensitivity",
+      "severity": "Medium",
+      "invariant": "AcknowledgedResetExists",
+      "config": "MC_hunt_scenario5_short_age_sql.cfg",
+      "counterexample": "spec/output/validation-20260909/hunts-bfs-01/MC_hunt_scenario5_short_age_sql.out",
+      "affected_code": [
+        "service/worker/scanner/history/scavenger.go:206",
+        "service/worker/scanner/history/scavenger.go:252",
+        "service/history/api/create_workflow_util.go:135",
+        "service/history/ndc/workflow_resetter.go:378"
+      ],
+      "summary": "With scanner minimum age shorter than the history-to-metadata publication interval, the scanner can observe no execution and remove its branch before execution metadata commits. The supplied short-age configuration produces a 13-state Start counterexample. Real file-SQLite Start and Reset probes with age zero acknowledge runs with absent or incomplete history after shard reload, while default-60-day controls preserve full history. This is a conditional configuration-sensitive finding, not a demonstrated default-age failure.",
+      "dedup_note": "partially covers code-review Scenario 5 (same history-branch scanner cleanup and publication-window mechanism); the distinct child-completion redirection and branch-reference residual remains CR-5"
+    },
+    {
+      "id": "MC-2",
+      "title": "Identical Reset requests can create another run instead of returning the first result",
+      "source": "model-checking",
+      "scenario": "Scenarios 1 and 2, immediate replay and response-loss recovery; prior T-1 reconfirmation",
+      "severity": "High",
+      "invariant": "ImmediateRetryIdentity",
+      "config": "MC_hunt_scenario1_2_replay_sql.cfg",
+      "counterexample": "spec/output/validation-20260909/hunts-sim-01/MC_hunt_scenario1_2_replay_sql.out",
+      "affected_code": [
+        "service/history/api/resetworkflow/api.go:140",
+        "service/history/ndc/workflow_resetter.go:237",
+        "service/history/ndc/state_rebuilder.go:402",
+        "service/history/workflow/mutable_state_impl.go:2600"
+      ],
+      "summary": "Reset compares the public request ID against current CreateRequestId, but reconstruction persists the original Start ID instead. A lost successful response followed by the identical Reset request therefore creates another run. SQL and Cassandra models produce 74- and 78-state counterexamples; real SQLite replay traces also verify termination when the first Reset run is still running. These are one reconfirmation of prior T-1/CR-1, not separate or newly established backend findings.",
+      "dedup_note": "also covers code-review Scenario 1 (same Reset request ID replaced by Start/callback source identity) and partially covers Scenario 2's response-loss retry identity aspect; the distinct missing-current split-persistence residual remains CR-2"
+    },
+    {
+      "id": "CR-2",
+      "title": "Missing-current Reset split persistence can leave incomplete durable state across retry",
+      "source": "code-review",
+      "scenario": "Scenario 2: A missing current requires an incomplete durable Reset before success",
+      "severity": "High",
+      "invariant": null,
+      "config": null,
+      "counterexample": null,
+      "affected_code": [
+        "service/history/ndc/workflow_resetter.go:368",
+        "common/persistence/sql/execution.go:64",
+        "common/persistence/sql/execution.go:106",
+        "common/persistence/sql/execution.go:375",
+        "common/persistence/cassandra/mutable_state_store.go:388",
+        "common/persistence/cassandra/mutable_state_store.go:888",
+        "service/history/shard/context_impl.go:1501",
+        "service/history/shard/context_impl.go:2030"
+      ],
+      "summary": "Missing-current Reset persists the base reset link through UpdateBypassCurrent separately from CreateBrandNew for the candidate run. The code-review scenario tracks definite rejection, committed-but-unavailable, and delayed-completion outcomes across SQL and Cassandra metadata writes, shard ownership checks, cache loss, and retry. A supported create/delete path can reach missing current; an injected rejected Create left a durable base link without a candidate execution, while a healthy retry in the existing probe recovered in-memory. Confirmation still needs to exercise the uncertain or delayed write schedules and durable readback or restart behavior, so this remains a code-review candidate rather than an MC-covered finding."
+    },
+    {
+      "id": "CR-3",
+      "title": "A stale missing-current decision can race a competing current operation",
+      "source": "code-review",
+      "scenario": "Scenario 3: A stale missing-current decision meets a competing operation",
+      "severity": "High",
+      "invariant": null,
+      "config": null,
+      "counterexample": null,
+      "affected_code": [
+        "service/history/workflow/cache/cache.go:463",
+        "service/history/shard/context_impl.go:552",
+        "service/history/shard/context_impl.go:610",
+        "service/history/shard/context_impl.go:2189",
+        "common/persistence/sql/execution.go:106",
+        "common/persistence/sql/execution.go:375",
+        "common/persistence/sql/execution.go:492",
+        "service/history/handler.go:2291",
+        "common/rpc/interceptor/retry.go:36"
+      ],
+      "summary": "The missing-current decision is based on a short current lookup that can become stale before the Reset's conditional execution writes. The scenario covers a competing Start or Reset that changes current while Reset is between lookup, I/O admission, write error conversion, lease release, and automatic whole-handler retry. With SQL persistence capacity above one, the code-review evidence observed a Start commit during a gate and the retry later terminate that Start through the ordinary Reset path. Confirmation must decide whether the resulting public ordering and replacement behavior are permitted for the same request identity."
+    },
+    {
+      "id": "CR-4",
+      "title": "Reset reapplication can combine Continue-As-New histories with colliding Update IDs",
+      "source": "code-review",
+      "scenario": "Scenario 4: Reapplication combines histories with different identity scopes",
+      "severity": "High",
+      "invariant": null,
+      "config": null,
+      "counterexample": null,
+      "affected_code": [
+        "service/history/ndc/workflow_resetter.go:725",
+        "service/history/ndc/workflow_resetter.go:916",
+        "service/history/workflow/mutable_state_impl.go:5735"
+      ],
+      "summary": "Reset traverses surviving Continue-As-New successors and reapplies eligible events into one rebuilt run. The code-review scenario focuses on Update events whose IDs are valid in separate source runs but collide when the reset run has a single Update-ID map and Reset skips the Update registry and resource dedup path. The cited path includes CAN successor traversal, suffix reapplication, Update admission conversion, and mutable-state rejection of an already-present Update ID. Confirmation must preserve failure outcomes and distinguish intentional work reexecution from duplicate API request handling."
+    },
+    {
+      "id": "CR-5",
+      "title": "Staged deletion and child-completion consumers can follow incomplete Reset state",
+      "source": "code-review",
+      "scenario": "Scenario 5: Registered history branches and deletion outlive execution attempts",
+      "severity": "Medium",
+      "invariant": null,
+      "config": null,
+      "counterexample": null,
+      "affected_code": [
+        "service/history/ndc/workflow_resetter.go:518",
+        "common/persistence/history_manager.go:37",
+        "common/persistence/sql/history_store.go:295",
+        "service/history/shard/context_impl.go:922",
+        "service/history/shard/context_impl.go:1040",
+        "service/history/api/recordchildworkflowcompleted/api.go:28",
+        "service/history/api/recordchildworkflowcompleted/api.go:101"
+      ],
+      "summary": "Scenario 5's scanner and history publication window is represented by MC-1, but the modeling brief also calls out deletion and consumer paths at distinct code sites. The residual code-review concern is that fork metadata, staged deletion, branch-reference computation, and child-completion redirection can observe an incomplete Reset attempt or an intermediate ResetRunId. The cited child-completion path may treat NotFound on the redirected run as the parent being gone, while cleanup paths decide which history branches are still protected. Confirmation must use supported public deletion and pending-child scenarios to determine whether this distinct path loses reachable history or acknowledgements."
+    }
+  ]
+}

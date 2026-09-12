@@ -1,0 +1,63 @@
+--- a/spec/base.tla
++++ b/spec/base.tla
+@@ -571,7 +571,7 @@
+ \* service/history/transfer_queue_active_task_executor.go:339-347,373; S4/S5 RPC interface
+ MatchingLostReply(e) ==
+   /\ s.ex[e].pc = "matchingReply"
+-  /\ s' = [s EXCEPT !.ex[e].pc = "handle", !.ex[e].result = "retry"]
++  /\ s' = [s EXCEPT !.ex[e].pc = "handle", !.ex[e].result = "unexpected"]
+ 
+ \* Q/executable.go:385-389,420-439; Q/dlq_writer.go:63-103; SQL/queue_v2.go:45-104; S5
+ EnqueueTaskCommit(e) ==
+--- a/spec/Trace.tla
++++ b/spec/Trace.tla
+@@ -41,7 +41,7 @@
+   move_threshold |-> MoveThreshold, predicate_limit |-> PredicateLimit,
+   shrink_keys |-> ShrinkKeys, unexpected_limit |-> UnexpectedLimit, dlq_enabled |-> DLQEnabled]
+ DecodeConstants(j) == [j EXCEPT !.groups = SS(@)]
+-Envelope(e) == /\ e.tag = "temporal-history-queue" /\ e.seq \in Nat
++Envelope(e) == /\ e.tag = "trace" /\ e.seq \in Nat
+                 /\ e.schema = 1 /\ e.provenance \in {"implementation","synthetic-spec-test"}
+ \* Mandatory full snapshot equality: no optional-field checks and no TRUE stub.
+ ValidatePostState(e) == /\ Envelope(e) /\ e.seq = l /\ s' = DecodeState(e.post)
+--- a/spec/Trace.cfg
++++ b/spec/Trace.cfg
+@@ -1,10 +1,10 @@
+ SPECIFICATION TraceSpec
+ CONSTANTS
+-  TaskCount = 3
++  TaskCount = 6
+   OwnerCount = 2
+   Groups = {"g1", "g2"}
+-  SliceSlots = 10
+-  ExecSlots = 6
++  SliceSlots = 24
++  ExecSlots = 24
+   SnapshotSlots = 2
+   BatchSize = 1
+   MaxEpoch = 2
+@@ -12,7 +12,7 @@
+   PredicateLimit = 0
+   ShrinkKeys = 2
+   UnexpectedLimit = 2
+-  DLQEnabled = TRUE
++  DLQEnabled = FALSE
+ CHECK_DEADLOCK FALSE
+ INVARIANTS TypeOK ReaderStructure NoPhantomEffect CompletedWasStarted AckDisposition
+ PROPERTIES TraceMatched
+--- a/spec/instrumentation-spec.md
++++ b/spec/instrumentation-spec.md
+@@ -1,10 +1,12 @@
+ # Instrumentation specification
++
++Harness compatibility: the mandatory tag follows the installed harness-generation skill (`trace`). The complete four-scenario implementation adapter and its explicit coverage limits are recorded in `../harness/REPORT.md`. `MatchingLostReply` uses the actual timeout classification (`unexpected`) and retains the measured unexpected-error counter.
+ 
+ Revision `0c010ce5fe8c0180aa7573c72fe8fc87c6df7025`; Category A; SQL/SQLite WAL. Paths abbreviated in `base.tla`: Q=`service/history/queues`, H=`service/history/shard`, SQL=`common/persistence/sql`, M=`service/matching`. This document maps all 65 base actions one-to-one to 65 trace event types. Init and Endpoint are trace-control records. It describes the next harness phase; no implementation trace is claimed to have been collected by spec generation.
+ 
+ ## 1. Trace event schema
+ 
+-One NDJSON object per modeled transition, globally serialized by a **controlled test schedule at the stated hook boundaries**, with mandatory `tag: "temporal-history-queue"`, `schema: 1`, contiguous `seq` starting at 1, `provenance: "implementation"`, `event`, `args` and full `post`. `Trace.tla` accepts explicitly labelled `synthetic-spec-test` fixtures only to test the adapter; those are not implementation evidence. Unknown events and missing fields fail; there is no tag filter or silent repair.
++One NDJSON object per modeled transition, globally serialized by a **controlled test schedule at the stated hook boundaries**, with mandatory `tag: "trace"`, `schema: 1`, contiguous `seq` starting at 1, `provenance: "implementation"`, `event`, `args` and full `post`. `Trace.tla` accepts explicitly labelled `synthetic-spec-test` fixtures only to test the adapter; those are not implementation evidence. Unknown events and missing fields fail; there is no tag filter or silent repair.
+ 
+ The first record is `Init`, with revision, `backend: "sqlite-wal"`, actual mapped constants and a complete independently observed initial state. Constants keys are exactly `task_count, owner_count, groups, slice_slots, exec_slots, snapshot_slots, batch_size, max_epoch, move_threshold, predicate_limit, shrink_keys, unexpected_limit, dlq_enabled`. Groups are stable namespace-group strings. Final `Endpoint` has `complete: true`, `independent_readback: true`, full `post`, and `readback` containing `range, owner, rows, workflow, matching, started, obsolete, dlq, completed, queue`. These assertions require actual independent readback evidence in the harness report; labels alone do not establish provenance.
+ 

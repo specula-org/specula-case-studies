@@ -1,0 +1,11 @@
+# Conditional progress experiments
+
+The first counterexamples in both progress configurations stalled at phase=Result with notification pending. The persistence fairness group omitted the mandatory NotifyOnExecutionMutation action. That omission is corrected and retained as Case B evidence. The original three-tick clock configuration is rerun after this fix; a finite clock horizon is a separate concern, not the cause inferred for the first counterexample.
+
+MC_progress_healthy.cfg keeps the identical EligibleWorkEventuallyResolves property and fairness on persistence, timer, recovery and WFT service. Its clock advances fairly to the next logical deadline, physical cue, pending task/write visibility or Matching expiry, without consuming an artificial finite clock budget. Arbitrary stuttering between those advances remains allowed. This is an event-boundary abstraction for a specified healthy suffix, not a proof for every clock/input schedule.
+
+Bounds and assumptions: one Activity, two attempts/workers, no worker result/heartbeat inputs or injected faults; STS=1000 ms, STC=2000 ms, SCT=4000 ms, HB=1000 ms; retry interval 1000 ms, maximum 2000 ms; full 1000 ms reader shift at allocation; Matching creation at acceptance; no initial held WFT. These explicit timing assumptions are separate from the broader bounded safety and hunting configurations, whose limits are unchanged. There is no future-time safety quotient in this temporal run.
+
+A finite SCT permits resolution by timeout even without an Activity result. Fair WFT service is necessary for terminal consumption. Deliberate pause, permanent storage failure, arbitrary fault prefixes, process/database restart and indefinite queue parking are outside this experiment. Results and limitations are reported separately from the original incomplete progress model.
+
+After notification fairness was fixed, the original finite-clock run independently failed at now=4 with a physical STS cue due at 6. The event-boundary healthy run then ran 30 minutes without a violation but did not finish; repeated partial-graph temporal checks consumed substantial runtime. An additional 30-minute run uses the same model/parameters and `-lncheck final`, changing checking strategy rather than bounds. Both results are retained.
