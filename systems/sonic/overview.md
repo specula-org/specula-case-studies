@@ -4,23 +4,9 @@
 
 Specula analyzed and tested SONiC's DPU active-standby HA manager, FDB and bridge-port orchestration, ICCP and MCLAG synchronization, Dual-ToR mux control, and warm-reboot orchestration, including failover, MAC and FDB learning and aging, peer-state synchronization, mux transitions, and multi-component state restoration.
 
-The August 2026 additions are backed by the reviewed [DASH HA run](modules/dash-ha/runs/sonic-dash-ha-vm-codex-gpt56-sol-max-20260801/review/independent-review.md), [ICCPD run](modules/iccpd/runs/sonic-iccpd-vm-codex-gpt56-sol-max-20260801/review/independent-review.md), [warm reboot run](modules/warmreboot/runs/sonic-warmreboot-vm9-codex-gpt56-sol-high-20260803/review/independent-review.md), the curated [`effort_EXP` ledger](modules/effort-exp/runs/sonic-effort-exp-codex-gpt56-sol-20260811/review/independent-review.md), and the focused [LinkMgrD e2e guidance review](modules/linkmgrd/runs/sonic-linkmgrd-e2e-guidance-codex-gpt56-sol-xhigh-20260811/review/independent-review.md).
-
-## Reviewed `effort_EXP` ledger
-
-The reviewed `effort_EXP` batch contributes 52 recordable SONiC bugs across DASH HA, FDB, ICCPD, LinkMgrD, and warm reboot: 43 `New` bugs and 9 `Known` bugs, with 28 `Critical`, 21 `High`, and 3 `Medium` severity classifications.
-
-This ledger includes warm reboot `high/MC-2`: `sonic-package-manager install --enable` is treated as a supported management surface, and no current ordering or exclusion guard prevents it from interleaving with warm-restart finalization. Warm reboot `high/MC-5` remains deferred pending direct validation; findings classified as `MASKED`, `ENV_LIMITED`, `FALSE POSITIVE`, or `DROPPED` are excluded.
-
-## Focused LinkMgrD e2e guidance review
-
-Four focused LinkMgrD e2e guidance replicas ran against `sonic-net/sonic-linkmgrd` snapshot `298adcd23a95eae918ab53c9697527e5c53a8cf8`. The raw Phase 4 reports contain 35 disposition entries; after deduplication against the existing SONiC records, 8 additional reproduced `New` LinkMgrD bugs are promoted: 3 `Critical`, 4 `High`, and 1 `Medium`.
-
-The raw outputs remain in `/home/ubuntu/specula-linkmgrd-e2e-runner-20260810/runs`; the curated case-study record is [modules/linkmgrd/runs/sonic-linkmgrd-e2e-guidance-codex-gpt56-sol-xhigh-20260811](modules/linkmgrd/runs/sonic-linkmgrd-e2e-guidance-codex-gpt56-sol-xhigh-20260811/README.md).
-
 ## Bugs
 
-The consolidated system summary below lists 43 new-bug summaries: the existing 35 plus 8 focused LinkMgrD e2e additions.
+Specula's system summary lists 43 new-bug summaries:
 
 - `DefaultRoute::Wait` satisfies the active-switch gate before the default route is confirmed healthy, allowing a premature transition to Active.
 - Active-Active mux control lacks a transition for `(LPWait, MuxError, LinkUp)`, leaving the state machine idle until another heartbeat arrives.
@@ -66,7 +52,7 @@ The consolidated system summary below lists 43 new-bug summaries: the existing 3
 - A crash after peer socket teardown but before disconnect cleanup can permanently skip failover cleanup, leaving State DB and the CLI reporting the dead peer as up.
 - Partial ICCP frames and unsupported APP traffic can block protocol progress in the single scheduler, while mclagsyncd EOF can leave a stale descriptor that suppresses reconnect.
 
-The existing consolidated system summary also lists 9 previously known bugs:
+Specula also recorded 9 previously known bugs:
 
 - **Open:** Peer mux state is not reset across a link Down-to-Up transition, so initialization can treat stale pre-restart state as healthy (Issue #285).
 - **Open:** Local health recovery does not re-evaluate stale peer mux state, allowing asymmetric failure handling to leave both ToRs in Standby (Issues #143 and #285).

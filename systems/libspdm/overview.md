@@ -4,7 +4,7 @@
 
 Specula analyzed and tested libspdm's SPDM requester-responder protocol across opening negotiation, certificate and PSK authentication, key exchange, mutual authentication, measurements and extension logs, event delivery, chunking, secured messages, and session establishment, update, and teardown.
 
-## Findings
+## Bugs
 
 Specula reported 31 new findings: 27 implementation bugs, 2 specification issues,
 1 implementation enhancement, and 1 finding that upstream rejected as not a bug:
@@ -24,12 +24,11 @@ Specula reported 31 new findings: 27 implementation bugs, 2 specification issues
 - Measurement-summary hash sizing ignores `MEL_CAP` when `MEAS_CAP` is absent, preventing a MEL-only responder from binding its log into signed authentication responses.
 - **Approved:** Algorithm negotiation writes selections into connection state before validation and does not roll them back on error, contaminating a retry with failed-attempt values.
 - Algorithm negotiation sets a nonzero base asymmetric algorithm even when no enabled capability requires one, producing an incoherent negotiated state.
-- **Rejected by upstream as not a bug:** Challenge handling marks the connection authenticated before encapsulated authentication finishes and does not roll the state back if that flow fails. The Requester has already authenticated the Responder at this point; a later failure while the Responder authenticates the Requester does not undo that result. See
-  [DMTF/libspdm#3059](https://github.com/DMTF/libspdm/issues/3059).
+- **FP:** A later failure while the Responder authenticates the Requester does not invalidate the Requester's completed authentication of the Responder; see [issue #3059](https://github.com/DMTF/libspdm/issues/3059).
 - **Specification Issue:** MEL exchanges are absent from the signed transcript and carry no signature, nonce, or requester context, leaving a consumed log unbound to the responder or session.
 - `mel_spec` validation is skipped for measurement-only profiles without key-exchange or PSK capability, allowing an unrecognized wire value into negotiated state.
 - An out-of-sequence `CHUNK_SEND_ACK` records an error but still copies the chunk into the reassembly buffer before returning it.
-- **Implementation Enhancement:** The with-context PSK exchange enters `HANDSHAKING` without arming the watchdog used by the without-context path, leaving incomplete sessions dangling. Note that the [SPDM white paper](https://www.dmtf.org/sites/default/files/standards/documents/DSP2058_1.3.0.pdf) states non-normatively that an implementer may impose timeout requirements during the handshake phase.
+- **Implementation Enhancement:** The with-context PSK exchange enters `HANDSHAKING` without arming the watchdog used by the without-context path, leaving incomplete sessions dangling; handshake timeouts are optional in the SPDM white paper.
 - The requester sends `GET_MEASUREMENT_EXTENSION_LOG` without checking for a negotiated nonzero `mel_spec`, provoking an avoidable protocol error.
 - **Approved:** Cross-chunk MEL validation detects only a shrinking total, not same-length content changes or an increased total, so inconsistent multi-chunk logs can pass silently.
 - The requester reads `mel_entries_len` before confirming that the first accumulated MEL chunk contains the complete 16-byte header.

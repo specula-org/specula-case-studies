@@ -6,7 +6,7 @@ Specula analyzed SREGym's benchmark run lifecycle and submission evaluation, inc
 
 ## Bugs
 
-The reviewed [2026-07-27 run](modules/core/runs/sregym-vm-codex-gpt56-sol-max-20260727/review/independent-review.md) records **4 new bugs and 2 previously known bugs**:
+Specula found 4 new bugs and 2 previously known bugs:
 
 - Cleanup can start while submission evaluation is in flight, losing the grade from the published result and reopening mitigation after the application is removed.
 - A delayed diagnosis duplicate can cross the mutable stage boundary and be graded as mitigation, finalizing a false result before the legitimate mitigation is submitted.
