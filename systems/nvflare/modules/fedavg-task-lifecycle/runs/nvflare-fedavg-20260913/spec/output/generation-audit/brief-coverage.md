@@ -1,0 +1,54 @@
+# Brief coverage self-audit
+
+Audit input: pinned modeling-brief §2, §5 and §6.1, actual `MC_hunt_*.cfg` files and `base.tla`/`MC.tla`. `checks/audit_cfgs.py` checks the safety names and scenario cfgs and records the actual enabled invariant lists in `checks/enabled-invariants.json`. **Configuration coverage is not execution coverage.** See `checks/generation-checks.md` for mechanical checks; no implementation trace or local regression is claimed here.
+
+## Brief §2: every Scenario
+
+| Scenario | Actual hunt configuration(s) | Mechanism and assertions |
+|---|---|---|
+| 1 Protected input | `MC_hunt_s1_protected_input.cfg` | First retrieval creates snapshot, headers are separate, aggregation cannot modify its input. `ProtectedBroadcastInput`; all injected fault budgets zero. Retrieval/consumer steps can interleave across clients under real locks. |
+| 2 Identity/retries/history | `MC_hunt_s2_identity_history.cfg` | One lost ACK and its reactive retry; task-check before delayed submission, live receipt/terminal guards, ordered history with capacity **1**, unknown path without a consumer. `AtMostOneConsumer`, `ReceiptAfterDecision`, round provenance. This does not execute the real 10,000-entry limit. |
+| 3 Consumer partial mutation | `MC_hunt_s3_partial_parameters.cfg`, `MC_hunt_s3_metric_failure.cfg` | Separately: active-Cell streamed PyTorch offload failure at a parameter key; ordinary metric allocation failure after parameter history. `CommittedAcceptanceConsistency` checks exposed/saved per-key provenance, helper stats/history and callback count. Success, empty skip, pre-mutation failure and post-mutation failure remain distinct. |
+| 3 conversion/skip control | `MC_hunt_s3_conversion_control.cfg` | Conversion failure has no helper mutation; metrics present/absent/empty and empty parameters are supported. Same acceptance invariant, no parameter/metric failure budget. |
+| 4 Abnormal retirement | `MC_hunt_s4_filter_retirement.cfg`, `MC_hunt_s4_cancel_overlap.cfg`, `MC_hunt_s4_prepare_error.cfg` | Independent filter cancellation, direct mark-only cancellation, before-send ERROR; fault guards require an earlier successful contribution. Queue emptiness remains the ordinary aggregation guard; task status is not added as a transition precondition. `AbnormalTerminationVisible`. |
+| 5 Configured progress | `MC_hunt_s5_progress.cfg`, `MC_hunt_s5_dead_policy.cfg`, `MC_hunt_s5_resilient.cfg` | Fair live monitor and terminating callback progress; separate default dynamic vs explicit resilient error policy. Dead-policy variant has two selected plus one unselected client, min_sites=1 and one dead report, allowing CLIENT_DEAD independently of all-dead panic. Default min_sites=2 may panic before task retirement. |
+
+No scenarios were silently merged. S5 composes the task/round mechanisms of S4 but also has its own explicit temporal and policy configs.
+
+## Brief §5: safety assertions actually enabled
+
+All four named safety invariants are defined in `base.tla` and inherited by `MC.tla` through `EXTENDS base`; `B == INSTANCE base` supplies original action access. `MC.cfg` retains protocol identity and structural checks while the two candidate assertions are commented out. Hunt cfgs contain only core safety and their target assertions.
+
+| Safety invariant | Actual enabled hunt cfgs |
+|---|---|
+| `TypeOK` | `MC_hunt_s1_protected_input.cfg`, `MC_hunt_s2_identity_history.cfg`, `MC_hunt_s3_conversion_control.cfg`, `MC_hunt_s3_metric_failure.cfg`, `MC_hunt_s3_partial_parameters.cfg`, `MC_hunt_s4_cancel_overlap.cfg`, `MC_hunt_s4_filter_retirement.cfg`, `MC_hunt_s4_prepare_error.cfg`, `MC_hunt_s5_dead_policy.cfg`, `MC_hunt_s5_progress.cfg`, `MC_hunt_s5_resilient.cfg` |
+| `CommittedRoundProvenance` | `MC_hunt_s1_protected_input.cfg`, `MC_hunt_s2_identity_history.cfg`, `MC_hunt_s3_conversion_control.cfg`, `MC_hunt_s3_metric_failure.cfg`, `MC_hunt_s3_partial_parameters.cfg`, `MC_hunt_s4_cancel_overlap.cfg`, `MC_hunt_s4_filter_retirement.cfg`, `MC_hunt_s4_prepare_error.cfg`, `MC_hunt_s5_dead_policy.cfg`, `MC_hunt_s5_progress.cfg`, `MC_hunt_s5_resilient.cfg` |
+| `CommittedAcceptanceConsistency` | `MC_hunt_s3_conversion_control.cfg`, `MC_hunt_s3_metric_failure.cfg`, `MC_hunt_s3_partial_parameters.cfg`, `MC_hunt_s5_resilient.cfg` |
+| `AbnormalTerminationVisible` | `MC_hunt_s4_cancel_overlap.cfg`, `MC_hunt_s4_filter_retirement.cfg`, `MC_hunt_s4_prepare_error.cfg`, `MC_hunt_s5_dead_policy.cfg` |
+
+The liveness property `EligibleTaskEventuallyDrains` is defined in base and enabled as `PROPERTY` in `MC_hunt_s5_progress.cfg`, using `MCLiveSpec`, which explicitly assumes `CallbacksTerminate`. That config omits symmetry and counter-free VIEW. Fairness covers admitted internal callback/request completion, monitor admission/steps, round scheduling and time progression. Parameterized monitor reads and admitted request/resend acquisition use strong fairness; other internal stages use weak fairness. It does **not** require clients to produce missing responses. Recovery can invalidate a dead-client condition; the property requires the condition and live-monitor premise to persist. A monitor stopped by policy panic is outside that premise; finalization has its own synchronous drain action.
+
+## Brief §6.1: enabled and reachable mechanisms
+
+| Finding | Targeted configuration and nonzero fault budget | Source-faithful route to the observation |
+|---|---|---|
+| MC-1, parameter window | `MC_hunt_s3_partial_parameters.cfg`: `param=1`, `LazyOffload=TRUE`, all other faults zero | Process a well-formed nonempty result; apply key 1; increment key 2 stats; ordinary lazy materialization of key 2 fails; publish rejected; stamp receipt. Other selected result finishes normally, monitor drains, aggregate/update/save uses retained key provenance. No invariant or guard assumes rejected data was rolled back. |
+| MC-1, parameter-complete window | `MC_hunt_s3_metric_failure.cfg`: `metricPrep=1`, `AllocationFailure=TRUE`, all other faults zero | Complete parameter add and history; metric-filter allocation fails before callback count increment; rejected contribution remains in parameter totals. Same ordinary drain and externally exposed model path. This is a declared ordinary interface failure, not malformed payloads or arbitrary consumer replacement. |
+| MC-2, primary filter path | `MC_hunt_s4_filter_retirement.cfg`: `filter=1`, `OutboundFilter=TRUE`, `FilterAfterContribution=TRUE`; all other faults zero | One nonempty callback succeeds; another selected client's outer filter fails; reacquire runner `wf_lock`, mark whole task CANCELLED; monitor removes it; FedAvg sees empty queue and proceeds to save/next round. Abort remains clear on this path. |
+| MC-2, independent lifecycle variants | S4 direct-cancel/before-send cfgs and `MC_hunt_s5_dead_policy.cfg` | Exercise independent mark-only cancellation, ERROR or policy-permitted CLIENT_DEAD retirement. These are separate attribution paths, not evidence that every cancellation races a callback or every disconnect should abort. |
+
+These are reachability arguments from model actions/configuration, **not executed counterexamples or confirmed product defects**. MC-1 needs actual ordinary interface-failure regression evidence. MC-2 needs independent confirmation that the declared no-partial-round completion policy is the intended product outcome contract. `AllowPartialCompletion` affects only the assertion, never implementation transitions; all supplied hunts set it FALSE.
+
+## User priorities and evidence limits
+
+1. Protected broadcast: modeled at first retrieval, separate from scheduling and outer delivery. The standard path has no arbitrary shared-data mutation; optional successful filters preserve logical model provenance. Quantizer/shared-filter ownership internals remain outside this suite.
+2. Retry/late identity: cooperative task UUID/name/cookie association is preserved by injective normalization; completed history is ordered and bounded. Unknown dispatch never increments aggregation. A successful dispatch ACK does not imply acceptance. The suite does not model forged identity or CR-4 overlapping per-client filters/retraining. ClientCanPoll follows the ordinary fetch/process/send loop and prevents a new task poll before the previous task result submission finishes.
+3. Receipt vs acceptance: conversion, empty skip, per-key stats/value application, helper history, metric work, callback count, published decision, cleanup and receipt are separate actions. The historical consumer-first acceptance fix is retained.
+4. Cancellation and isolation: callback retains communicator and runner locks. Direct cancellation is mark-only. Filter cancellation must reacquire runner `wf_lock`, so it cannot freely interrupt a runner-held result callback. Monitor retains communicator lock through cleanup, while round code can observe queue removal before cleanup. No old admitted callback can cross normal aggregation reset.
+5. Progress/outcomes: all-selected receipt policy, zero timeout/grace, dynamic and resilient error policies, ordered grace/lead thresholds, cached per-client job-policy reads and monitor stop-on-panic are explicit. A permanently missing live response is expected waiting, not a liveness violation.
+
+Parameters are finite proposed exploration bounds, not an exported actual job. Defaults: two selected clients, two rounds, two uniform nonexcluded parameter keys, one positive-weight symbolic metric, FULL updates, no early stopping, successful aggregate-result construction/update/save interface. Configured success paths can reach every ordinary lifecycle stage without faults. Absence/emptiness of metrics is supported by dedicated configs. Selected cohort and key iteration order are fixed per run. Time is sampled on a 30-second grid with saturating task lead (one tick) and dead grace (two ticks), preserving their ordering on that grid but not every real-valued timing.
+
+Transport is an interface: envelope publication, successful delivery/decode, ordinary delivery failure, well-formed decoded result dispatch, ACK loss, and lazy per-key materialization are separate. No universal all-bytes-complete guarantee is assigned to ACK. Stream internals, server process termination on pre-dispatch decode failure, client abort propagation latency, real numerical arithmetic, aggregate/save runtime failures, HA and durable recovery are not explored. Successful aggregate/save operations are the declared observation path for MC-1/MC-2, not evidence of reliability of those interfaces.
+
+The brief's TV-1/2/3 and CR-1/2/3/4/5 remain local regression or code-review work. Unknown-result diagnostic context retention is not treated as aggregation contamination. Mixed FULL/DIFF semantics, wildcard-filter behavior, task-check-period forwarding and custom-aggregator return contracts are not silently converted into model claims.

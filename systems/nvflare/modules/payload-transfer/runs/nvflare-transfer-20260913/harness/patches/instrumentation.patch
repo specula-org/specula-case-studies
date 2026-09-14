@@ -1,0 +1,696 @@
+--- a/nvflare/fuel/f3/streaming/download_service.py
++++ b/nvflare/fuel/f3/streaming/download_service.py
+@@ -11,6 +11,8 @@
+ # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ # See the License for the specific language governing permissions and
+ # limitations under the License.
++from nvflare.fuel.f3.streaming import specula_trace as _trace
++
+ import dataclasses
+ import functools
+ import threading
+@@ -310,8 +312,10 @@
+         # user callbacks run outside the lock. Dedup, pending-guard, pop, record, and
+         # the all-done latch are ONE critical section, so a duplicate serve can never
+         # resurrect a pending entry around a racing finalization.
++        _trace.point("finalizer_select", locals())
+         with self._progress_lock:
+             if to_receiver in self.receiver_statuses:
++                _trace.point("finalizer_reject", locals())
+                 return False
+             if require_pending:
+                 pending = self._pending_confirms.get(to_receiver)
+@@ -323,6 +327,7 @@
+                     self.tx.logger.warning(
+                         f"dropping unsolicited/stale confirmation from {to_receiver} for ref {self.rid}"
+                     )
++                    _trace.point("finalizer_reject", locals())
+                     return False
+             self._pending_confirms.pop(to_receiver, None)
+ 
+@@ -333,6 +338,7 @@
+             all_done = not self._downloaded_to_all_called and self._completion_reached_locked()
+             if all_done:
+                 self._downloaded_to_all_called = True
++            _trace.point("finalizer_commit", locals())
+ 
+         # Guarded like the terminal callbacks in transaction_done: a raising user
+         # callback on the serving path must not lose the EOF reply for this attempt,
+@@ -347,6 +353,7 @@
+             status,
+         )
+ 
++        _trace.point("one_returned", locals())
+         if all_done:
+             # this object is done for all receivers
+             _invoke_cb_safely(
+@@ -354,6 +361,7 @@
+                 f"downloaded_to_all of {type(self.obj)} for ref {self.rid}",
+                 self.obj.downloaded_to_all,
+             )
++            _trace.point("all_returned", locals())
+         return True
+ 
+     def _completion_reached_locked(self) -> bool:
+@@ -392,8 +400,10 @@
+         with self._progress_lock:
+             if to_receiver in self.receiver_statuses:
+                 # already finalized -- a late duplicate serve must not resurrect a provisional
++                _trace.point("served_final", locals())
+                 return None
+             self._pending_confirms[to_receiver] = (status, nonce)
++            _trace.point("served", locals())
+         return nonce
+ 
+     def obj_confirmed(self, to_receiver: str, status: str, nonce: Optional[str]) -> bool:
+@@ -420,6 +430,7 @@
+                 ),
+                 force=True,
+             )
++        _trace.point("finalizer_advance", locals())
+         return accepted
+ 
+     def obj_cancelled(self, to_receiver: str) -> bool:
+@@ -427,11 +438,12 @@
+         accepted = self._finalize_receiver(to_receiver, DownloadStatus.FAILED)
+         if accepted:
+             self.emit_progress(receiver_id=to_receiver, state=TransferProgressState.FAILED, force=True)
++        _trace.point("finalizer_advance", locals())
+         return accepted
+ 
+     def snapshot_receiver_statuses(self) -> dict:
+         with self._progress_lock:
+-            return dict(self.receiver_statuses)
++            return _trace.value("snapshot_ref", dict(self.receiver_statuses), locals())
+ 
+     def snapshot_pending_confirms(self) -> dict:
+         with self._progress_lock:
+@@ -442,12 +454,14 @@
+         now = time.time()
+         with self._progress_lock:
+             self._receiver_activity[receiver] = now
++            _trace.point("ref_active", locals())
+         tx = self.tx
+         with tx._stats_lock:
+             # tx-level activity: budgets judge the whole transaction (see the
+             # _receiver_last_active field comment)
+             tx._acquired_receivers.add(receiver)
+             tx._receiver_last_active[receiver] = now
++            _trace.point("tx_receiver_active", locals())
+ 
+     def snapshot_receiver_activity(self) -> dict:
+         with self._progress_lock:
+@@ -500,18 +514,23 @@
+                             f"idle budget exhausted: {idle:.1f}s since last transaction activity > {idle_timeout}s",
+                         )
+                     )
++        _trace.point("budget_nonfailures", locals())
+         enforced = []
+         for receiver, reason in failures:
++            _trace.point("budget_select", locals())
+             with self.tx._stats_lock:
++                _trace.point("budget_recheck", locals())
+                 if self.tx._receiver_last_active.get(receiver) != tx_last_active.get(receiver):
+                     continue  # activity advanced past the snapshot: not actually idle
+             # _finalize_receiver dedups and pops the pending-confirm entry itself;
+             # a receiver finalized meanwhile (e.g. confirmed) wins -- truth over budget
+             if not self._finalize_receiver(receiver, DownloadStatus.FAILED):
++                _trace.point("budget_advance", locals())
+                 continue
+             self.tx.logger.warning(f"receiver {receiver} failed for ref {self.rid}: {reason}")
+             self.emit_progress(receiver_id=receiver, state=TransferProgressState.FAILED, force=True)
+             enforced.append((receiver, reason))
++            _trace.point("budget_advance", locals())
+         return enforced
+ 
+     def emit_progress(
+@@ -526,6 +545,7 @@
+         if not self.tx.progress_cb:
+             return
+ 
++        _trace.point("progress_request", locals())
+         now = time.time()
+         with self._progress_lock:
+             event = self._make_progress_event_locked(
+@@ -536,6 +556,7 @@
+                 force=force,
+                 timestamp=now,
+             )
++            _trace.point("progress_made", locals())
+         if not event:
+             return
+ 
+@@ -558,6 +579,7 @@
+                 )
+                 for receiver_id in receiver_ids
+             ]
++            _trace.point("terminal_batch", locals())
+ 
+         for event in events:
+             if event:
+@@ -649,10 +671,14 @@
+     monitor or the receiver-confirm handler). A propagating exception would skip
+     outcome recording and source release and, on the monitor path, kill the monitor.
+     """
++    _trace.point("callback_enter", locals())
+     try:
+         cb(*args, **kwargs)
+     except Exception as ex:
++        _trace.point("callback_exception", locals())
+         logger.warning(f"{what} failed: {secure_format_exception(ex)}")
++    else:
++        _trace.point("callback_return", locals())
+ 
+ 
+ class _FinishedRef:
+@@ -772,7 +798,9 @@
+         self._receiver_last_active = {}
+ 
+     def mark_active(self):
+-        self.last_active_time = time.time()
++        with _trace.atomic():
++            self.last_active_time = time.time()
++            _trace.point("mark_active", locals())
+ 
+     def add_total_bytes(self, byte_count: int):
+         if byte_count <= 0:
+@@ -830,11 +858,13 @@
+             if self._ops_closed:
+                 return False
+             self._active_ops += 1
++            _trace.point("op_begin", locals())
+             return True
+ 
+     def end_op(self):
+         with self._ops_cond:
+             self._active_ops -= 1
++            _trace.point("op_end", locals())
+             if self._active_ops <= 0:
+                 self._ops_cond.notify_all()
+ 
+@@ -843,11 +873,14 @@
+         deadline = time.time() + timeout
+         with self._ops_cond:
+             self._ops_closed = True
++            _trace.point("drain_begin", locals())
+             while self._active_ops > 0:
+                 remaining = deadline - time.time()
+                 if remaining <= 0:
++                    _trace.point("drain_expired", locals())
+                     return False
+                 self._ops_cond.wait(remaining)
++            _trace.point("drain_empty", locals())
+         return True
+ 
+     @property
+@@ -861,6 +894,7 @@
+         with self._stats_lock:
+             tx_acquired = set(self._acquired_receivers)
+             tx_last_active = dict(self._receiver_last_active)
++            _trace.point("budget_snapshot", locals())
+         for ref in self.snapshot_refs():
+             assert isinstance(ref, _Ref)
+             ref.enforce_budgets(
+@@ -889,6 +923,7 @@
+             assert isinstance(ref, _Ref)
+             with ref._progress_lock:
+                 if not ref._completion_reached_locked():
++                    _trace.point("finish_scan_missing", locals())
+                     return False
+         return True
+ 
+@@ -932,11 +967,13 @@
+                 # like any verdict (the callback contract holds even on this path)
+                 outcome = self._fail_closed_outcome(status)
+ 
++            _trace.point("computed", locals())
+             progress_state = self._progress_state_for_transaction_status(status)
+             if progress_state:
+                 for ref in refs:
+                     ref.emit_terminal_progress_for_started_receivers(progress_state)
+ 
++            _trace.point("settlement_progress_returned", locals())
+             elapsed = time.time() - self.start_time
+             total_bytes = self.get_total_bytes()
+             size_mb = total_bytes / (1024 * 1024)
+@@ -950,11 +987,13 @@
+             # (CacheableObject.clear_cache()); the source object itself is released
+             # via obj.release() AFTER the callback so the callback can still
+             # observe it (e.g. for memory-GC notifications).
+-            base_objs = [ref.obj.base_obj for ref in refs]
++            base_objs = [_trace.base_object(ref) for ref in refs]
++            _trace.point("objects_begin", locals())
+ 
+             for ref in refs:
+                 obj = ref.obj
+                 assert isinstance(obj, Downloadable)
++                _trace.point("object_callback", locals())
+                 _invoke_cb_safely(
+                     self.logger,
+                     f"transaction_done of {type(obj)} for tx {self.tid}",
+@@ -962,8 +1001,10 @@
+                     self.tid,
+                     status,
+                 )
++                _trace.point("object_returned", locals())
+ 
+             if self.transaction_done_cb:
++                _trace.point("tx_callback", locals())
+                 _invoke_cb_safely(
+                     self.logger,
+                     f"transaction done callback for tx {self.tid}",
+@@ -975,6 +1016,7 @@
+                 )
+ 
+             if outcome is not None and self.outcome_cb:
++                _trace.point("outcome_callback", locals())
+                 _invoke_cb_safely(self.logger, f"transfer outcome callback for tx {self.tid}", self.outcome_cb, outcome)
+         except Exception as ex:
+             # the ceremony must never raise: a propagating exception would escape the
+@@ -985,8 +1027,12 @@
+             # PHASE: source release -- independent of everything above, so no failure
+             # in the verdict or the callbacks can pin the sources in memory; each
+             # release is guarded so one raising release() cannot skip its siblings
++            _trace.point("release_begin", locals())
+             for ref in refs:
++                _trace.point("release_callback", locals())
+                 _invoke_cb_safely(self.logger, f"release of {type(ref.obj)} for tx {self.tid}", ref.obj.release)
++                _trace.point("release_returned", locals())
++            _trace.point("record_ready", locals())
+ 
+             # PHASE: recording -- runs last and cannot raise: the fallback is direct
+             # dataclass construction (never the computation that may just have failed),
+@@ -997,7 +1043,11 @@
+                 outcome = self._fail_closed_outcome(status)
+             if on_outcome and outcome is not None:
+                 _invoke_cb_safely(self.logger, f"outcome recording for tx {self.tid}", on_outcome, outcome)
+-            self._settlement_complete = True
++            if not on_outcome:
++                _trace.point("record_skipped", locals())
++            with _trace.atomic():
++                self._settlement_complete = True
++                _trace.point("settlement_complete", locals())
+ 
+         return outcome
+ 
+@@ -1005,6 +1055,7 @@
+         if not self.progress_cb:
+             return
+ 
++        _trace.point("progress_callback", locals())
+         try:
+             self.progress_cb(**event)
+         except Exception as ex:
+@@ -1012,6 +1063,8 @@
+                 f"download source progress callback failed for ref={event.get('ref_id')}: "
+                 f"{secure_format_exception(ex)}"
+             )
++        finally:
++            _trace.point("progress_returned", locals())
+ 
+     @staticmethod
+     def _progress_state_for_transaction_status(status: str) -> Optional[str]:
+@@ -1402,6 +1455,7 @@
+             tx = cls._tx_table.get(transaction_id)
+             if tx:
+                 cls._delete_tx(tx)
++                _trace.point("delete", locals())
+ 
+         if tx:
+             tx.transaction_done(TransactionDoneStatus.DELETED, on_outcome=functools.partial(cls._record_outcome, tx=tx))
+@@ -1419,8 +1473,10 @@
+         """
+         with cls._tx_lock:
+             if cls._tx_table.get(tx.tid) is not tx or not tx.is_finished():
++                _trace.point("finish_missing", locals())
+                 return False
+             cls._delete_tx(tx, tombstone_finished_refs=True)
++            _trace.point("finish", locals())
+ 
+         cls._submit_finished_settlement(tx)
+         return True
+@@ -1434,7 +1490,9 @@
+         """
+         try:
+             future = callback_thread_pool.submit(cls._settle_finished_transaction, tx)
++            _trace.point("submit_return", locals())
+         except RuntimeError:
++            _trace.point("submit_exception", locals())
+             # The shared executor can race its process-wide shutdown between the
+             # stopped check and ThreadPoolExecutor.submit(). Complete cleanup rather
+             # than strand this transaction's source and termination marker.
+@@ -1443,6 +1501,7 @@
+             # CheckedExecutor deliberately ignores submissions after shutdown. This
+             # edge is already in process teardown, where preserving cleanup is more
+             # important than keeping the request callback asynchronous.
++            _trace.point("submit_fallback", locals())
+             cls._settle_finished_transaction(tx)
+ 
+     @classmethod
+@@ -1479,6 +1538,7 @@
+                     for waiter in waiters:
+                         waiter._resolve(None)
+                 cls._tx_waiters.clear()
++                _trace.point("shutdown", locals())
+ 
+         with cls._init_lock:
+             # Shutdown resets callback-registration state even when a cell is still
+@@ -1503,11 +1563,13 @@
+         sustain it while a drain-leaked operation is still in flight."""
+         with tx._ops_cond:
+             leaked = tx._active_ops > 0
++            _trace.point("marker_read", locals())
+         with cls._tx_lock:
+             if leaked or not tx._settlement_complete:
+                 cls._terminating_txs[tx.tid] = tx
+             elif cls._terminating_txs.get(tx.tid) is tx:
+                 cls._terminating_txs.pop(tx.tid, None)
++            _trace.point("marker_write", locals())
+ 
+     @classmethod
+     def _reap_termination_markers(cls):
+@@ -1520,6 +1582,7 @@
+                     released.append(tid)
+             for tid in released:
+                 cls._terminating_txs.pop(tid, None)
++                _trace.point("marker_reap", locals())
+ 
+     @classmethod
+     def _delete_tx(cls, tx: _Transaction, tombstone_finished_refs: bool = False):
+@@ -1555,13 +1618,16 @@
+             if existing is not None:
+                 # resolve even from an expired record: it is still the recorded truth
+                 waiter._resolve(existing)
++                _trace.point("late_waiter", locals())
+                 return waiter
+             if transaction_id not in cls._outcome_owners:
+                 # unknown/expired/shut-down: nothing will ever record for this id --
+                 # resolve None now (waiters never hang); race-free under this lock
+                 waiter._resolve(None)
++                _trace.point("late_waiter", locals())
+                 return waiter
+             cls._tx_waiters.setdefault(transaction_id, []).append(waiter)
++            _trace.point("late_waiter", locals())
+         return waiter
+ 
+     @classmethod
+@@ -1582,6 +1648,7 @@
+         with cls._outcome_lock:
+             if cls._outcome_owners.get(outcome.tx_id) is not tx:
+                 # ownership consumed (prior record) or cleared (shutdown): stale, drop
++                _trace.point("record_drop", locals())
+                 return
+             cls._outcome_owners.pop(outcome.tx_id, None)
+             # re-stamp at recording time: the TTL retention window starts when the
+@@ -1593,6 +1660,7 @@
+             # runs in _resolve), so setting them under the lock is safe and race-free
+             for waiter in cls._tx_waiters.pop(outcome.tx_id, ()):
+                 waiter._resolve(outcome)
++            _trace.point("record", locals())
+ 
+     @classmethod
+     def get_transaction_outcome(cls, transaction_id: str) -> Optional[TransferOutcome]:
+@@ -1617,6 +1685,7 @@
+             expired = [tid for tid, outcome in cls._tx_outcomes.items() if outcome.expired(now, cls.TX_OUTCOME_TTL)]
+             for tid in expired:
+                 cls._tx_outcomes.pop(tid, None)
++                _trace.point("expire", locals())
+ 
+     @classmethod
+     def _expire_finished_refs(cls, now: float):
+@@ -1668,7 +1737,7 @@
+         rid = payload.get(_PropKey.REF_ID)
+         if not rid:
+             cls._logger.error(f"missing {_PropKey.REF_ID} in request from {requester}")
+-            return make_reply(ReturnCode.INVALID_REQUEST)
++            return _trace.value("producer_reply", make_reply(ReturnCode.INVALID_REQUEST), locals())
+ 
+         confirm_status = payload.get(_PropKey.CONFIRM)
+         if confirm_status is not None:
+@@ -1688,13 +1757,13 @@
+                 finished_status = cls._get_finished_ref_status(rid, requester)
+                 if finished_status == DownloadStatus.SUCCESS:
+                     cls._logger.debug(f"finished ref {rid} from {requester} retried - returning EOF")
+-                    return make_reply(ReturnCode.OK, body={_PropKey.STATUS: ProduceRC.EOF})
++                    return _trace.value("producer_reply", make_reply(ReturnCode.OK, body={_PropKey.STATUS: ProduceRC.EOF}), locals())
+                 elif finished_status == DownloadStatus.FAILED:
+                     cls._logger.debug(f"finished ref {rid} from {requester} retried - returning ERROR")
+-                    return make_reply(ReturnCode.OK, body={_PropKey.STATUS: ProduceRC.ERROR})
++                    return _trace.value("producer_reply", make_reply(ReturnCode.OK, body={_PropKey.STATUS: ProduceRC.ERROR}), locals())
+ 
+                 cls._logger.error(f"no ref found for {rid} from {requester}")
+-                return make_reply(ReturnCode.INVALID_REQUEST)
++                return _trace.value("producer_reply", make_reply(ReturnCode.INVALID_REQUEST), locals())
+ 
+         try:
+             assert isinstance(ref, _Ref)
+@@ -1714,12 +1783,14 @@
+             # a download failure for this requester.
+             try:
+                 rc, data, new_state = ref.obj.produce(current_state, requester)
++                _trace.point("produce", locals())
+             except Exception as ex:
++                _trace.point("produce_exception", locals())
+                 ref.emit_progress(receiver_id=requester, state=TransferProgressState.FAILED, force=True)
+                 cls._logger.error(
+                     f"Object {type(ref.obj)} encountered exception when produce: {secure_format_exception(ex)}"
+                 )
+-                return make_reply(ReturnCode.PROCESS_EXCEPTION)
++                return _trace.value("producer_reply", make_reply(ReturnCode.PROCESS_EXCEPTION), locals())
+ 
+             if rc != ProduceRC.OK:
+                 # already done -- for a confirm-capable receiver this record is PROVISIONAL and the
+@@ -1747,7 +1818,7 @@
+                         force=True,
+                     )
+                     body = {_PropKey.STATUS: rc}
+-                return make_reply(ReturnCode.OK, body=body)
++                return _trace.value("producer_reply", make_reply(ReturnCode.OK, body=body), locals())
+             else:
+                 # continue — accumulate bytes for timing summary in transaction_done()
+                 # CacheableObject returns a list of byte-chunks; FileDownloader returns raw bytes.
+@@ -1765,7 +1836,7 @@
+                 # no CONFIRM_EXPECTED on data chunks: the receiver only consumes it from the
+                 # terminal reply (confirms are sent only after terminal serves), so advertising
+                 # per chunk would be dead weight on the hottest wire message
+-                return make_reply(
++                return _trace.value("producer_reply", make_reply(
+                     ReturnCode.OK,
+                     body={
+                         _PropKey.STATUS: rc,
+@@ -1773,7 +1844,7 @@
+                         _PropKey.DATA: data,
+                         _PropKey.CANCEL_CAPABLE: True,
+                     },
+-                )
++                ), locals())
+ 
+         finally:
+             ref.tx.end_op()
+@@ -1787,6 +1858,7 @@
+                 # confirm can no longer influence it and must not emit against the tx
+                 ref = None
+         if ref is None:
++            _trace.point("confirm_late", locals())
+             # the transaction already terminated/cleaned up: its outcome was computed from what
+             # was known then (fail-closed for unconfirmed receivers); a late confirm is dropped
+             cls._logger.debug(f"late confirmation for unknown ref {rid} from {requester} dropped")
+@@ -1799,6 +1871,8 @@
+             accepted = ref.obj_confirmed(requester, status, nonce)
+             if accepted:
+                 ref.mark_active()
++            else:
++                _trace.point("confirm_inactive", locals())
+         finally:
+             ref.tx.end_op()
+ 
+@@ -1818,6 +1892,7 @@
+             if ref is not None and not ref.tx.begin_op():
+                 ref = None
+         if ref is None:
++            _trace.point("cancel_late", locals())
+             cls._logger.debug(f"late cancellation for unknown ref {rid} from {requester} dropped")
+             return make_reply(ReturnCode.OK)
+ 
+@@ -1827,6 +1902,7 @@
+             tx = ref.tx
+             with tx._stats_lock:
+                 acquired = requester in tx._acquired_receivers
++                _trace.point("cancel_acquired", locals())
+             if not acquired:
+                 # In count-only transactions, accepting an unsolicited identity could
+                 # satisfy the receiver count and retire source data it never acquired.
+@@ -1837,6 +1913,7 @@
+             # whole transaction so untouched sibling refs cannot retain the source.
+             for tx_ref in tx.snapshot_refs():
+                 accepted = tx_ref.obj_cancelled(requester) or accepted
++            _trace.point("cancel_loop_done", locals())
+         finally:
+             ref.tx.end_op()
+ 
+@@ -1848,6 +1925,7 @@
+     def _monitor_tx(cls):
+         while True:
+             now = time.time()
++            _trace.point("monitor_begin", locals())
+ 
+             # Per-receiver budget enforcement runs OUTSIDE _tx_lock: finalizing a
+             # budget-failed receiver fires user callbacks (downloaded_to_one/all), which must
+@@ -1855,10 +1933,13 @@
+             # is_finished() so the classification pass below resolves the tx immediately.
+             with cls._tx_lock:
+                 budget_txs = [tx for tx in cls._tx_table.values() if tx.has_receiver_budgets]
++                _trace.point("monitor_no_budgets", locals())
+             for tx in budget_txs:
+                 with cls._tx_lock:
+                     # dead or settling tx: skip (begin_op makes the table check binding)
+                     live = cls._tx_table.get(tx.tid) is tx and tx.begin_op()
++                    if not live:
++                        _trace.point("monitor_admission_failed", locals())
+                 if not live:
+                     continue
+                 try:
+@@ -1885,10 +1966,13 @@
+                 for tx in expired_tx:
+                     assert isinstance(tx, _Transaction)
+                     cls._delete_tx(tx)
++                    _trace.point("monitor_timeout", locals())
+ 
+                 for tx in finished_tx:
+                     cls._delete_tx(tx, tombstone_finished_refs=True)
+-
++                    _trace.point("monitor_finished", locals())
++
++                _trace.point("monitor_not_retired", locals())
+                 cls._expire_finished_refs(now)
+ 
+             cls._expire_outcomes(now)
+@@ -2082,6 +2166,7 @@
+         # (EOF/ERROR) -- the producer accepts a confirm only against its pending provisional
+         # serve, so mid-stream failure exits do not confirm (budgets/TTL handle those)
+         if not (confirm_enabled and producer_expects_confirm):
++            _trace.point("confirm_skip", locals())
+             return
+         try:
+             # fire-and-forget by design: a lost confirmation is backstopped producer-side by
+@@ -2090,18 +2175,19 @@
+                 channel=OBJ_DOWNLOADER_CHANNEL,
+                 topic=OBJ_DOWNLOADER_TOPIC,
+                 targets=from_fqcn,
+-                message=new_cell_message(
++                message=_trace.value("control_message", new_cell_message(
+                     headers={},
+                     payload={
+                         _PropKey.REF_ID: ref_id,
+                         _PropKey.CONFIRM: receiver_truth,
+                         _PropKey.CONFIRM_NONCE: confirm_nonce,
+                     },
+-                ),
++                ), locals()),
+                 secure=secure,
+                 optional=optional,
+             )
+         except Exception as ex:
++            _trace.point("confirm_lost", locals())
+             logger.warning(f"failed to send download confirmation for ref={ref_id}: {secure_format_exception(ex)}")
+ 
+     def _send_cancel():
+@@ -2112,7 +2198,7 @@
+                 channel=OBJ_DOWNLOADER_CHANNEL,
+                 topic=OBJ_DOWNLOADER_TOPIC,
+                 targets=from_fqcn,
+-                message=new_cell_message(headers={}, payload={_PropKey.REF_ID: ref_id, _PropKey.CANCEL: True}),
++                message=_trace.value("control_message", new_cell_message(headers={}, payload={_PropKey.REF_ID: ref_id, _PropKey.CANCEL: True}), locals()),
+                 secure=secure,
+                 optional=optional,
+             )
+@@ -2165,6 +2251,7 @@
+ 
+     # Build and fire one DownloadService request (no retry logic here).
+     def _do_request(req_state):
++        _trace.point("request_start", locals())
+         req_payload = {_PropKey.REF_ID: ref_id}
+         if confirm_enabled:
+             req_payload[_PropKey.CONFIRM_CAPABLE] = True
+@@ -2244,6 +2331,7 @@
+                         f"[DOWNLOAD_FAILED] Max retries ({max_retries}) exhausted for {from_fqcn}, "
+                         f"ref={ref_id}. Giving up."
+                     )
++            _trace.point("consumer_request_error", locals())
+             _send_cancel()
+             consumer.download_failed(ref_id, f"error requesting data from {from_fqcn} after {duration} secs: {rc}")
+             _emit_progress("failed", force=True)
+@@ -2264,6 +2352,7 @@
+             confirm_nonce = payload.get(_PropKey.CONFIRM_NONCE)
+         status = payload.get(_PropKey.STATUS)
+         if status == ProduceRC.EOF:
++            _trace.point("consumer_eof", locals())
+             elapsed = time.time() - download_start
+             size_mb = total_bytes / (1024 * 1024)
+             logger.info(
+@@ -2272,7 +2361,9 @@
+             )
+             try:
+                 consumer.download_completed(ref_id)
++                _trace.point("consumer_completed", locals())
+             except Exception:
++                _trace.point("consumer_completed_exception", locals())
+                 # receiver-side finalization failed AFTER the last chunk (e.g. disk-offload
+                 # finalize): exactly what receiver-confirmed completion exists to surface --
+                 # the producer must not certify this receiver on its served EOF
+@@ -2283,6 +2374,7 @@
+             _emit_progress("completed", force=True)
+             return
+         elif status == ProduceRC.ERROR:
++            _trace.point("consumer_producer_error", locals())
+             _send_confirm(DownloadStatus.FAILED)
+             consumer.download_failed(ref_id, f"producer error after {duration} secs")
+             _emit_progress("failed", force=True)
+@@ -2296,12 +2388,14 @@
+             if isinstance(data, list):
+                 total_items = (total_items or 0) + len(data)
+         state = payload.get(_PropKey.STATE)
++        _trace.point("consumer_data", locals())
+ 
+         if pipeline_enabled:
+             # Snapshot the request state so a contract-violating in-place
+             # mutation cannot race request serialization or hide the change.
+             request_state = dict(state)
+             current_state = request_state
++            _trace.point("pipeline_submit", locals())
+             pending_future = download_request_thread_pool.submit(_do_request, request_state)
+         else:
+             request_state = None
+@@ -2311,6 +2405,7 @@
+         except Exception as ex:
+             if pending_future:
+                 pending_future.cancel()
++            _trace.point("consumer_consume_exception", locals())
+             _send_cancel()
+             consumer.download_failed(ref_id, f"exception when consuming data: {secure_format_exception(ex)}")
+             _emit_progress("failed", force=True)
+@@ -2344,4 +2439,5 @@
+         else:
+             current_state = new_state
+ 
++        _trace.point("consumer_consume_return", locals())
+         _emit_progress("active")
+--- a/nvflare/client/cell/api.py
++++ b/nvflare/client/cell/api.py
+@@ -18,6 +18,8 @@
+ keeps the trainer available until all downstream result transfers settle; other ranks are
+ passive and rely on their training framework's collectives.
+ """
++
++from nvflare.fuel.f3.streaming import specula_trace as _trace
+ 
+ import copy
+ import math
+@@ -621,6 +623,7 @@
+             f"result-source settlement was not acknowledged after {_RESULT_SOURCE_SETTLED_ATTEMPTS} attempts"
+         )
+ 
++    @_trace.caller_observed
+     def _wait_for_result_transfers(self, result_waiters) -> None:
+         """Wait for strict terminal success of every result DownloadService transaction."""
+         for waiter in result_waiters:
