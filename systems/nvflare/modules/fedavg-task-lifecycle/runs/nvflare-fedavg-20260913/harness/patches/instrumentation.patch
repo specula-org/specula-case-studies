@@ -1,0 +1,643 @@
+--- a/nvflare/app_common/workflows/fedavg.py
++++ b/nvflare/app_common/workflows/fedavg.py
+@@ -11,6 +11,8 @@
+ # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ # See the License for the specific language governing permissions and
+ # limitations under the License.
++
++from nvflare import _specula_trace as _st
+ 
+ import os
+ import time
+@@ -193,6 +195,7 @@
+                         AppConstants.CURRENT_ROUND, self.current_round, private=True, sticky=False
+                     )
+                 self.event(AppEventType.ROUND_STARTED)
++                _st.hook("FedAvgRoundStarted", locals())
+ 
+                 clients = self.sample_clients(self.num_clients)
+ 
+@@ -210,6 +213,7 @@
+                 self._expected_count = len(clients)
+                 self._params_type = None
+                 self._site_metric_weights = {}
++                _st.hook("FedAvgResetAggregation", locals())
+ 
+                 # Non-blocking send with callback for streaming aggregation
+                 set_fedprox_metadata(model, self.fedprox_mu)
+@@ -220,12 +224,14 @@
+                     callback=self._aggregate_one_result,
+                 )
+ 
++                _st.pause("round_wait", locals())
+                 # Wait for all results to be processed
+-                while self.get_num_standing_tasks():
+-                    if self.abort_signal.triggered:
++                while _st.poll_standing(self, self.get_num_standing_tasks()):
++                    if _st.poll_abort(self, self.abort_signal.triggered):
+                         self.info("Abort signal triggered. Finishing FedAvg.")
+                         return
+                     time.sleep(self._task_check_period)
++                    _st.hook("poll_sleep", locals())
+ 
+                 self.event(AppEventType.BEFORE_AGGREGATION)
+ 
+@@ -236,6 +242,7 @@
+                 )
+ 
+                 model = self.update_model(model, aggregate_results)
++                _st.hook("BaseFedAvgUpdateModel", locals())
+ 
+                 # Early stopping: check if current model is better
+                 if self.stop_condition:
+@@ -257,9 +264,11 @@
+                 else:
+                     # No early stopping: save model every round
+                     self.save_model(model)
++                    _st.hook("FedAvgSaveModel", locals())
+ 
+                 # Memory cleanup at end of round (if configured)
+                 self._maybe_cleanup_memory()
++                _st.hook("FedAvgAdvanceRound", locals())
+ 
+             self.info(center_message("Finished FedAvg."))
+         finally:
+@@ -270,6 +279,7 @@
+         if not result.params:
+             client_name = _get_client_name(result)
+             self.warning(f"Empty result from client {client_name}, skipping.")
++            _st.hook("FedAvgAggregateOneResult", locals())
+             return False
+ 
+         # Store only params_type from first result (not the full model)
+@@ -296,6 +306,7 @@
+                 "weight_key": "effective_fedavg_metric_weight",
+             }
+ 
++            _st.hook("FedAvgAggregateOneResult", locals())
+             self._aggr_helper.add(
+                 data=result.params,
+                 weight=weight,
+@@ -312,11 +323,13 @@
+             if self._all_metrics and result.metrics:
+                 # Non-empty metric dicts are treated as "present"; unsupported values are
+                 # filtered per key while allowing other aggregatable keys to contribute.
++                _st.fault("metric_preparation", locals())
+                 aggregatable = filter_aggregatable_metrics(
+                     result.metrics,
+                     warn_skipped=lambda k, tn: self.warning(f"Metric '{k}' ({tn}) skipped for aggregation."),
+                     warned_metric_keys=self._warned_metric_keys,
+                 )
++                _st.hook("FedAvgProcessMetrics", locals())
+                 if aggregatable:
+                     self._aggr_metrics_helper.add(
+                         data=aggregatable,
+@@ -324,6 +337,9 @@
+                         contributor_name=client_name,
+                         contribution_round=self.current_round,
+                     )
++
++            if not (self._all_metrics and result.metrics):
++                _st.hook("FedAvgProcessMetrics", locals())
+ 
+         self._received_count += 1
+         self.info(f"Aggregated {self._received_count}/{self._expected_count} results")
+@@ -344,15 +360,18 @@
+         else:
+             # Use built-in InTime aggregation
+             aggr_stats = self._aggr_helper.get_aggregation_stats()
++            _st.hook("FedAvgGetAggregationStats", locals())
+             aggr_stats[AggregationStatsKey.ROUND] = self.current_round
+             if self.fl_ctx:
+                 self.fl_ctx.set_prop(AppConstants.AGGREGATION_STATS, aggr_stats, private=True, sticky=False)
+ 
+             aggr_params = self._aggr_helper.get_result()
++            _st.hook("WeightedGetParamResult", locals())
+             aggr_metrics = self._aggr_metrics_helper.get_result() if self._all_metrics else None
++            _st.hook("WeightedGetMetricResult", locals())
+             aggr_metrics = aggr_metrics or None
+ 
+-            return FLModel(
++            _st_result = FLModel(
+                 params=aggr_params,
+                 params_type=self._params_type,
+                 metrics=aggr_metrics,
+@@ -363,6 +382,9 @@
+                     AppConstants.METRICS_AGGREGATION_INFO: self._make_metrics_aggregation_info(),
+                 },
+             )
++
++            _st.hook("FedAvgBuildAggregateResult", locals())
++            return _st_result
+ 
+     def _make_metrics_aggregation_info(self) -> Dict[str, Any]:
+         key_metric_info = self._make_key_metric_info()
+--- a/nvflare/app_common/workflows/base_model_controller.py
++++ b/nvflare/app_common/workflows/base_model_controller.py
+@@ -11,6 +11,8 @@
+ # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ # See the License for the specific language governing permissions and
+ # limitations under the License.
++
++from nvflare import _specula_trace as _st
+ 
+ import random
+ from abc import ABC, abstractmethod
+@@ -223,9 +225,11 @@
+         return task
+ 
+     def _prepare_task_data(self, client_task: ClientTask, fl_ctx: FLContext) -> None:
++        _st.fault("before_send", locals())
+         self.fire_event_with_data(
+             AppEventType.BEFORE_TRAIN_TASK, fl_ctx, AppConstants.TRAIN_SHAREABLE, client_task.task.data
+         )
++        _st.hook("BasePrepareTaskData", locals())
+ 
+     @staticmethod
+     def _set_ctx_prop_preserving_attrs(
+@@ -268,13 +272,17 @@
+         try:
+             self.event(AppEventType.BEFORE_CONTRIBUTION_ACCEPT)
+             preliminarily_accepted = self._accept_train_result(client_name=client_name, result=result, fl_ctx=fl_ctx)
++            _st.hook("BaseAcceptTrainResult", locals())
+             if preliminarily_accepted:
+                 try:
++                    _st.fault("conversion", locals())
+                     result_model = FLModelUtils.from_shareable(result)
+                     result_model.meta["props"] = client_task.task.props[AppConstants.META_DATA]
+                     result_model.meta["client_name"] = client_name
++                    _st.hook("BaseConvertResult", locals())
+                 except Exception as e:
+                     self.warning(f"Failed to convert result from {client_name} to FLModel: {e}")
++                    _st.hook("BaseConvertResultFailure", locals())
+                 else:
+                     callback = client_task.task.get_prop(AppConstants.TASK_PROP_CALLBACK)
+                     if callback:
+@@ -282,16 +290,20 @@
+                             # Callbacks may return False to report that a valid result was
+                             # deliberately skipped (FedAvg does this for empty parameters).
+                             accepted = callback(result_model) is not False
++                            _st.hook("consumer_return", locals())
+                         except Exception as e:
+                             self.error(f"Unsuccessful callback {callback} for task {client_task.task.name}: {e}")
++                            _st.hook("consumer_failure", locals())
+                     else:
+                         self._results.append(result_model)
+                         accepted = True
+             self._set_ctx_prop_preserving_attrs(fl_ctx, AppConstants.AGGREGATION_ACCEPTED, accepted)
+             self.event(AppEventType.AFTER_CONTRIBUTION_ACCEPT)
++            _st.hook("BasePublishAcceptance", locals())
+         finally:
+             self._clear_training_result(fl_ctx)
+             client_task.result = None
++            _st.hook("BaseClearTrainingResult", locals())
+         # Note: Memory cleanup (gc.collect + malloc_trim) is handled by subclasses
+         # via _maybe_cleanup_memory() based on memory_gc_rounds setting
+ 
+@@ -304,6 +316,7 @@
+             )
+             if accepted:
+                 self.info(f"Result of unknown task {task_name} sent to aggregator.")
++            _st.hook("BaseProcessUnknownResult", locals())
+         else:
+             self.error("Ignoring result from unknown task.")
+ 
+@@ -376,6 +389,7 @@
+     def control_flow(self, abort_signal: Signal, fl_ctx: FLContext) -> None:
+         self.fl_ctx = fl_ctx
+         self.abort_signal = abort_signal
++        _st.hook("bootstrap", locals())
+         try:
+             self.info("Beginning model controller run.")
+             self.event(AppEventType.TRAINING_STARTED)
+--- a/nvflare/app_common/aggregators/weighted_aggregation_helper.py
++++ b/nvflare/app_common/aggregators/weighted_aggregation_helper.py
+@@ -11,6 +11,8 @@
+ # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ # See the License for the specific language governing permissions and
+ # limitations under the License.
++
++from nvflare import _specula_trace as _st
+ 
+ import re
+ import threading
+@@ -166,10 +168,12 @@
+                     continue
+ 
+                 self.key_contribution_counts[k] = self.key_contribution_counts.get(k, 0) + 1
++                _st.hook("helper_stats", locals())
+ 
+                 # Disk-streamed payloads may pass lazy refs
+                 # instead of in-memory tensors. If present, materialize() loads
+                 # the tensor from disk before weighted aggregation math.
++                _st.fault("helper_value", locals())
+                 materialize_fn = getattr(v, "materialize", None)
+                 if callable(materialize_fn):
+                     v = materialize_fn()
+@@ -214,6 +218,7 @@
+                         else:
+                             self.total[k] = current_total + v
+                     self.counts[k] = self.counts[k] + weight
++                _st.hook("helper_value", locals())
+ 
+             self.history.append(
+                 {
+@@ -222,6 +227,8 @@
+                     "weight": weight,
+                 }
+             )
++
++        _st.hook("helper_history", locals())
+ 
+     def get_result(self):
+         """Divide weighted sum by sum of weights."""
+--- a/nvflare/apis/impl/wf_comm_server.py
++++ b/nvflare/apis/impl/wf_comm_server.py
+@@ -11,6 +11,8 @@
+ # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ # See the License for the specific language governing permissions and
+ # limitations under the License.
++from nvflare import _specula_trace as _st
++
+ import threading
+ import time
+ from collections import OrderedDict
+@@ -184,6 +186,7 @@
+             if not self._dead_clients.get(client_name):
+                 self.log_warning(fl_ctx, f"client {client_name} is placed on dead client watch list")
+                 self._dead_clients[client_name] = _DeadClientStatus()
++                _st.hook("WFCommReportDeadClient", locals())
+             else:
+                 self.log_warning(fl_ctx, f"discarded dead client report {client_name=}: already on watch list")
+ 
+@@ -275,6 +278,7 @@
+         can_send_task = True
+         task = client_task_to_send.task
+         with task.cb_lock:
++            _st.hook("request_selected", locals())
+             # Note: must guarantee the after_task_sent_cb is always called
+             # regardless whether the task is sent successfully.
+             # This is so that the app could clear up things in after_task_sent_cb.
+@@ -293,6 +297,7 @@
+                     task.exception = e
+ 
+             self.logger.debug("before_task_sent_cb done on client_task_to_send: {}".format(client_task_to_send))
++            _st.hook("BasePrepareTaskDataFailure", locals())
+             self.logger.debug(f"task completion status is {task.completion_status}")
+ 
+             if task.completion_status is not None:
+@@ -311,6 +316,7 @@
+                     import copy
+ 
+                     try:
++                        _st.fault("protect", locals())
+                         task._broadcast_data = copy.deepcopy(task.data)
+                     except Exception as e:
+                         self.log_error(
+@@ -322,6 +328,7 @@
+                         task.exception = e
+                         can_send_task = False
+             task_data = getattr(task, "_broadcast_data", task.data)
++            _st.hook("protect", locals())
+             operator = task.operator
+ 
+             if task.after_task_sent_cb is not None:
+@@ -341,6 +348,7 @@
+                 # NOTE: the CB could cancel the task
+                 can_send_task = False
+ 
++            _st.hook("WFCommCheckCanSend", locals())
+             if not can_send_task:
+                 return self._try_again()
+ 
+@@ -432,6 +440,7 @@
+             ValueError: task_name is not found in the client_task
+         """
+         with self._controller_lock:
++            _st.hook("WFCommAcquireSubmission", locals())
+             self._do_process_submission(client, task_name, task_id, result, fl_ctx)
+ 
+     def _do_process_submission(
+@@ -452,6 +461,7 @@
+             self.log_debug(fl_ctx, "Get submission from client task={} id={}".format(client_task, task_id))
+ 
+         if client_task is None:
++            _st.hook("dispatch_missing", locals())
+             if (
+                 completed_client_task
+                 and completed_client_task.client_name == client.name
+@@ -485,6 +495,7 @@
+             if task.name != task_name:
+                 raise ValueError("client specified task name {} doesn't match {}".format(task_name, task.name))
+ 
++            _st.hook("dispatch_live", locals())
+             if task.completion_status is not None:
+                 # the task is already finished - drop the result
+                 self.log_info(fl_ctx, "task is already finished - submission dropped")
+@@ -519,6 +530,7 @@
+                 self.log_debug(fl_ctx, "no result_received_cb")
+ 
+             client_task.result_received_time = time.time()
++            _st.hook("receipt_observed", locals())
+ 
+     def _schedule_task(
+         self,
+@@ -572,6 +584,7 @@
+ 
+         with self._task_lock:
+             self._tasks.append(task)
++            _st.hook("WFCommScheduleTask", locals())
+             self.log_info(fl_ctx, "scheduled task {}".format(task.name))
+ 
+     def broadcast(
+@@ -810,6 +823,7 @@
+             fl_ctx (Optional[FLContext], optional): FLContext associated with this cancellation. Defaults to None.
+         """
+         task.completion_status = completion_status
++        _st.hook("WFCommCancelTask", locals())
+ 
+     def cancel_all_tasks(self, completion_status=TaskCompletionStatus.CANCELLED, fl_ctx: Optional[FLContext] = None):
+         """Cancel all standing tasks in this controller.
+@@ -893,6 +907,7 @@
+             self._cleanup_inflight_tensor_downloads(fl_ctx)
+             self._clear_standing_tasks(fl_ctx=fl_ctx)
+             self._all_done = True
++            _st.hook("WFCommFinalizeRun", locals())
+ 
+     def relay(
+         self,
+@@ -1022,12 +1037,15 @@
+         self.wait_for_task(task, abort_signal)
+ 
+     def _check_dead_clients(self):
++        _st.hook("monitor_begin", locals())
+         if not self._dead_clients:
++            _st.hook("monitor_dead_end", locals())
+             return
+ 
+         now = time.time()
+         with self._dead_clients_lock:
+             for client_name, status in self._dead_clients.items():
++                _st.hook("dead_next", locals())
+                 if status.disconnect_time:
+                     # already disconnected
+                     continue
+@@ -1043,29 +1061,39 @@
+                     fl_ctx.set_prop(FLContextKey.DISCONNECTED_CLIENT_NAME, client_name)
+                     self.fire_event(EventType.CLIENT_DISCONNECTED, fl_ctx)
+ 
++        _st.hook("monitor_dead_end", locals())
++
+     def _monitor_tasks(self):
+         while not self._all_done:
++            _st.pause("monitor", locals())
++            if self._all_done:
++                return
+             # determine clients are still active or not
+             self._check_dead_clients()
+ 
+             should_abort_job = self._job_policy_violated()
++            _st.hook("policy_result", locals())
+             if not should_abort_job:
+                 self.check_tasks()
+             else:
+                 with self._engine.new_context() as fl_ctx:
+                     self.system_panic("Aborting job due to deployment policy violation", fl_ctx)
++                    _st.hook("WFCommJobPolicyDecision", locals())
+                 return
+             time.sleep(self._task_check_period)
+ 
+     def check_tasks(self):
+         with self._controller_lock:
+             self._do_check_tasks()
++        _st.hook("monitor_return", locals())
+ 
+     def _do_check_tasks(self):
+         exit_tasks = []
+         with self._task_lock:
++            _st.hook("WFCommMonitorAcquire", locals())
+             for task in self._tasks:
+                 if task.completion_status is not None:
++                    _st.hook("monitor_terminal_selected", locals())
+                     exit_tasks.append(task)
+                     continue
+ 
+@@ -1077,9 +1105,11 @@
+                             "manager in task must be an instance of TaskManager, but got {}".format(manager)
+                         )
+                     should_exit, exit_status = manager.check_task_exit(task)
++                    _st.hook("WFCommMonitorSelect", locals())
+                     self.logger.debug("should_exit: {}, exit_status: {}".format(should_exit, exit_status))
+                     if should_exit:
+                         task.completion_status = exit_status
++                        _st.hook("WFCommMonitorMarkTerminal", locals())
+                         exit_tasks.append(task)
+                         continue
+ 
+@@ -1091,9 +1121,11 @@
+ 
+                 # check whether clients that the task is waiting are all dead
+                 dead_clients = self._get_task_dead_clients(task)
++                _st.hook("WFCommTaskDeadCheckDone", locals())
+                 if dead_clients:
+                     self.logger.info(f"client {dead_clients} is dead - set task {task.name} to TIMEOUT")
+                     task.completion_status = TaskCompletionStatus.CLIENT_DEAD
++                    _st.hook("WFCommMonitorMarkTerminal", locals())
+                     exit_tasks.append(task)
+                     continue
+ 
+@@ -1107,6 +1139,7 @@
+                     self.logger.debug("Removing client_task with id={}".format(client_task.id))
+                     self._remember_completed_client_task(client_task)
+                     self._client_task_map.pop(client_task.id)
++                _st.hook("WFCommMonitorRemove", locals())
+ 
+         # do the task exit processing outside the lock to minimize the locking time
+         # and to avoid potential deadlock since the CB could schedule another task
+@@ -1176,7 +1209,9 @@
+ 
+             # either we have not sent the task to this client or we have not received response
+             # is the client already dead?
+-            if self.get_client_disconnect_time(target):
++            _st_dead_time = self.get_client_disconnect_time(target)
++            _st.hook("WFCommReadTaskDeadClient", locals())
++            if _st_dead_time:
+                 # this client is dead - remember it
+                 dead_clients.append(target)
+             else:
+@@ -1221,7 +1256,9 @@
+             dead_clients = []
+ 
+             for client in clients:
+-                if self.get_client_disconnect_time(client.name):
++                _st_dead_time = self.get_client_disconnect_time(client.name)
++                _st.hook("WFCommReadPolicyClient", locals())
++                if _st_dead_time:
+                     dead_clients.append(client.name)
+                 else:
+                     alive_clients.append(client.name)
+--- a/nvflare/private/fed/server/server_runner.py
++++ b/nvflare/private/fed/server/server_runner.py
+@@ -11,6 +11,8 @@
+ # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ # See the License for the specific language governing permissions and
+ # limitations under the License.
++
++from nvflare import _specula_trace as _st
+ 
+ import threading
+ import time
+@@ -164,6 +166,7 @@
+                         # Note: WF finalization may take time since it needs to wait for
+                         # the job monitor to join.
+                         self.current_wf = None
++                        _st.hook("ServerRunnerCloseWorkflow", locals())
+ 
+                     self.log_info(fl_ctx, f"Workflow: {wf.id} finalizing ...")
+                     try:
+@@ -296,6 +299,7 @@
+             return self._task_try_again()
+ 
+         self._report_client_active("getTask", fl_ctx)
++        _st.hook("ServerRunnerTaskRequestActive", locals())
+ 
+         peer_job_id = peer_ctx.get_job_id()
+         if not peer_job_id or peer_job_id != self.job_id:
+@@ -320,7 +324,9 @@
+                 fl_ctx,
+             )
+             if not task_name or task_name == SpecialTaskName.TRY_AGAIN:
++                _st.hook("request_return_empty", locals())
+                 return self._task_try_again()
++            _st.hook("WFCommPublishClientTask", locals())
+ 
+             # Mark this task as being processed to prevent duplicate assignments
+             with self._processing_tasks_lock:
+@@ -342,6 +348,7 @@
+                     abort_signal=self.abort_signal,
+                 )
+             except Exception as e:
++                _st.hook("ServerRunnerFilterFailure", locals())
+                 self.log_exception(
+                     fl_ctx,
+                     "processing error in task data filter {}; "
+@@ -350,6 +357,7 @@
+                 with self.wf_lock:
+                     if self.current_wf:
+                         self.current_wf.controller.communicator.handle_exception(task_id, fl_ctx)
++                _st.hook("WFCommHandleException", locals())
+                 # Remove task from processing tracker since filtering failed
+                 with self._processing_tasks_lock:
+                     self._processing_tasks.pop(client.name, None)
+@@ -368,6 +376,7 @@
+             with self._processing_tasks_lock:
+                 self._processing_tasks.pop(client.name, None)
+ 
++            _st.hook("ServerRunnerFilterTask", locals())
+             return task_name, task_id, task_data
+         except Exception as e:
+             self.log_exception(
+@@ -383,6 +392,7 @@
+         start = time.time()
+         while True:
+             with self.wf_lock:
++                _st.hook("ServerRunnerAcquireTaskRequest", locals())
+                 if self.current_wf is None:
+                     self.log_debug(fl_ctx, "no current workflow - asked client to try again later")
+                     return "", "", None
+@@ -461,18 +471,22 @@
+         # after END_RUN. Keep the admission decision and all downstream state
+         # access under the same lock used to close the workflow.
+         with self.wf_lock:
++            _st.hook("ServerRunnerProcessSubmission", locals())
+             if self.status != "started" or self.current_wf is None:
+                 self.log_info(
+                     fl_ctx,
+                     f"ignored result submission since server runner status is {self.status} "
+                     f"and current workflow is {self.current_wf}",
+                 )
++                _st.hook("ServerRunnerDropClosedSubmission", locals())
+                 return
+-            return self._process_submission(client, task_name, task_id, result, fl_ctx)
++            self._process_submission(client, task_name, task_id, result, fl_ctx)
++        _st.hook("submission_return", locals())
+ 
+     def _process_submission(self, client: Client, task_name: str, task_id: str, result: Shareable, fl_ctx: FLContext):
+         self.log_info(fl_ctx, f"got result from client {client.name} for task: name={task_name}, id={task_id}")
+         self._report_client_active("submitTaskResult", fl_ctx)
++        _st.hook("ServerRunnerSubmissionActive", locals())
+ 
+         if not isinstance(result, Shareable):
+             self.log_error(fl_ctx, "invalid result submission: must be Shareable but got {}".format(type(result)))
+@@ -580,10 +594,12 @@
+     def _handle_job_heartbeat(self, topic: str, request: Shareable, fl_ctx: FLContext) -> Shareable:
+         self.log_debug(fl_ctx, "received client job_heartbeat")
+         self._report_client_active("jobHeartbeat", fl_ctx)
++        _st.hook("WFCommClientIsActive", locals())
+         return make_reply(ReturnCode.OK)
+ 
+     def _handle_task_check(self, topic: str, request: Shareable, fl_ctx: FLContext) -> Shareable:
+         self._report_client_active("taskCheck", fl_ctx)
++        _st.hook("ServerRunnerCheckTaskActive", locals())
+         task_id = request.get_header(ReservedHeaderKey.TASK_ID)
+         if not task_id:
+             self.log_error(fl_ctx, f"missing {ReservedHeaderKey.TASK_ID} in task_check request")
+@@ -599,10 +615,12 @@
+             task = self.current_wf.controller.communicator.process_task_check(task_id=task_id, fl_ctx=fl_ctx)
+             if task:
+                 self.log_debug(fl_ctx, f"task {task_id} is still good")
+-                return make_reply(ReturnCode.OK)
++                _st_check_reply = make_reply(ReturnCode.OK)
+             else:
+                 self.log_info(fl_ctx, f"task {task_id} is not found")
+-                return make_reply(ReturnCode.TASK_UNKNOWN)
++                _st_check_reply = make_reply(ReturnCode.TASK_UNKNOWN)
++        _st.hook("ClientCheckTask", locals())
++        return _st_check_reply
+ 
+     def abort(self, fl_ctx: FLContext, turn_to_cold: bool = False):
+         self.status = "done"
+--- a/nvflare/private/fed/client/client_runner.py
++++ b/nvflare/private/fed/client/client_runner.py
+@@ -11,6 +11,8 @@
+ # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ # See the License for the specific language governing permissions and
+ # limitations under the License.
++from nvflare import _specula_trace as _st
++
+ import fnmatch
+ import threading
+ import time
+@@ -223,6 +225,7 @@
+         return reply
+ 
+     def _process_task(self, task: TaskAssignment, fl_ctx: FLContext) -> Shareable:
++        _st.hook("ClientReceiveTask", locals())
+         reply = self._do_process_task(task, fl_ctx)
+ 
+         cookie_jar = task.data.get_cookie_jar()
+@@ -231,6 +234,7 @@
+ 
+         reply.set_header(ReservedHeaderKey.TASK_NAME, task.name)
+         reply.set_header(ReservedHeaderKey.TASK_ID, task.task_id)
++        _st.hook("client_processed", locals())
+         return reply
+ 
+     def _do_process_task(self, task: TaskAssignment, fl_ctx: FLContext) -> Shareable:
+@@ -590,6 +594,8 @@
+     def _send_task_result(self, result: Shareable, task_id: str, fl_ctx: FLContext):
+         try_count = 1
+         while True:
++            if try_count > 1:
++                _st.hook("ClientRetryResult", locals())
+             self.log_debug(fl_ctx, f"try #{try_count}: sending task result to server")
+ 
+             if self.run_abort_signal.triggered:
+@@ -628,6 +634,7 @@
+         # try to send the result
+         self.log_info(fl_ctx, f"start to send task result to {self.parent_target}")
+         reply_sent = self.engine.send_task_result(result, fl_ctx, timeout=self.submit_task_result_timeout)
++        _st.hook("dispatch_ack", locals())
+         if reply_sent:
+             self.log_info(fl_ctx, f"task result sent to {self.parent_target}")
+             delete_msg_root(msg_root_id)

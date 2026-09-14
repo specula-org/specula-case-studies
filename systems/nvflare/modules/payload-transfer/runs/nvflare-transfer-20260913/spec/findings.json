@@ -1,0 +1,44 @@
+{
+  "schema_version": "2",
+  "system": "nvflare-transfer",
+  "generated_by": "validation-workflow",
+  "findings": [
+    {
+      "id": "MC-1",
+      "title": "Post-enqueue submission failure duplicates settlement effects and permits callbacks after receipt",
+      "source": "model-checking",
+      "scenario": "S3 and S5: settlement submission, callback/source/waiter ordering",
+      "severity": "Medium",
+      "invariant": "SingleSettlementEffects",
+      "config": "MC_hunt_s3_settlement.cfg",
+      "counterexample": "spec/output/MC_hunt_s3_settlement_bfs.out",
+      "affected_code": [
+        "nvflare/fuel/f3/streaming/stream_utils.py:60",
+        "nvflare/fuel/f3/streaming/download_service.py:1429",
+        "nvflare/fuel/f3/streaming/download_service.py:1449",
+        "nvflare/fuel/f3/streaming/download_service.py:895",
+        "nvflare/fuel/f3/streaming/download_service.py:1579"
+      ],
+      "summary": "A non-shutdown RuntimeError can follow ThreadPoolExecutor queue publication; CheckedExecutor preserves that error and DownloadService responds by settling inline while the queued or already-running worker remains eligible. Transaction retirement has one winner but transaction_done has no entry latch, so both invocations execute object, transaction and outcome callbacks and source release attempts. Receipt ownership only guards the final stored outcome after those effects. A 77-state counterexample violates SingleSettlementEffects; a separate 94-state counterexample in MC_hunt_s3_after_receipt_bfs.out violates NoSettlementEffectsAfterReceipt. The provenance-checked existing local trace supports this mechanism under a controlled submit-failure injection, without establishing a natural production trigger or independent Phase 4 reproduction."
+    },
+    {
+      "id": "MC-2",
+      "title": "A pipelined EOF can publish COMPLETED progress after cancellation finalized FAILED",
+      "source": "model-checking",
+      "scenario": "S1: receiver truth versus terminal source progress",
+      "severity": "Medium",
+      "invariant": "CompletedProgressHasReceiverSuccess",
+      "config": "MC_hunt_s1_progress.cfg",
+      "counterexample": "spec/output/MC_hunt_s1_progress_bfs.out",
+      "affected_code": [
+        "nvflare/fuel/f3/streaming/download_service.py:313",
+        "nvflare/fuel/f3/streaming/download_service.py:392",
+        "nvflare/fuel/f3/streaming/download_service.py:425",
+        "nvflare/fuel/f3/streaming/download_service.py:587",
+        "nvflare/fuel/f3/streaming/download_service.py:1728",
+        "nvflare/fuel/f3/streaming/download_service.py:2300"
+      ],
+      "summary": "A supported Consumer pipeline admits its next request before consume fails and sends acquired-receiver cancellation. Cancellation commits final FAILED under the ref lock, then performs callbacks and FAILED progress outside that lock. An admitted EOF in this gap sees the already-final receiver, receives no serve nonce, and the terminal handler incorrectly selects COMPLETED progress from EOF even though confirmation is enabled. The first-terminal latch suppresses the later FAILED correction, as shown by a source-mapped 35-state TLC counterexample. The exact contradictory-progress schedule has not been independently reproduced at runtime, and neither a false successful strict receipt nor false trainer-send success is established."
+    }
+  ]
+}

@@ -1,0 +1,112 @@
+{
+  "schema_version": "2",
+  "system": "nvflare-fedavg",
+  "generated_by": "consolidate",
+  "findings": [
+    {
+      "id": "MC-1",
+      "title": "Rejected contributions retain aggregation values or statistics after consumer failure",
+      "source": "model-checking",
+      "scenario": "S3 - Consumer failure after partial aggregation mutation",
+      "severity": "Medium",
+      "invariant": "CommittedAcceptanceConsistency",
+      "config": "MC_hunt_s3_metric_failure.cfg",
+      "counterexample": "spec/output/hunt-bfs/MC_hunt_s3_metric_failure/tlc.out",
+      "affected_code": [
+        "nvflare/app_common/workflows/base_model_controller.py:263",
+        "nvflare/app_common/workflows/fedavg.py:299",
+        "nvflare/app_common/workflows/fedavg.py:346",
+        "nvflare/app_common/aggregators/weighted_aggregation_helper.py:162",
+        "nvflare/app_opt/pt/lazy_tensor_dict.py:77"
+      ],
+      "summary": "FedAvg updates parameter helpers before metric processing and increments its received count only after the consumer succeeds. BaseModelController catches consumer exceptions and publishes accepted=False without undoing earlier parameter or statistic mutations. TLC reaches a global-model update that retains rejected values or inconsistent contribution statistics, through metric-preparation allocation failure or per-key lazy materialization failure. Existing scalar allocation-failure implementation traces separately reach actual file saves; streamed PyTorch with active Cell and disk offload remains untested.",
+      "dedup_note": "also covers code-review Scenario 3 (same consumer-failure after partial aggregation mutation mechanism at BaseModelController, FedAvg, weighted aggregation helper, and lazy tensor materialization sites)"
+    },
+    {
+      "id": "CR-1",
+      "title": "Protected broadcast input and outbound ownership boundaries",
+      "source": "code-review",
+      "scenario": "Scenario 1: Protected broadcast input and outbound ownership",
+      "severity": "Low",
+      "invariant": null,
+      "config": null,
+      "counterexample": null,
+      "affected_code": [
+        "nvflare/apis/impl/wf_comm_server.py:277",
+        "nvflare/apis/impl/wf_comm_server.py:590",
+        "nvflare/apis/shareable.py:157",
+        "nvflare/app_common/workflows/fedavg.py:224",
+        "nvflare/private/fed/server/server_runner.py:329",
+        "nvflare/app_opt/pt/quantization/quantizer.py:235"
+      ],
+      "summary": "The brief separates the source model, frozen broadcast payload, and per-client envelope ownership boundaries. Current source performs the first before-send callback before one protected deep copy, then reuses that protected payload while per-client headers are separately copied. Outbound filtering happens after communicator return, and subset-specific filters must own their copies if they mutate data. The S1 protected-input hunt completed cleanly, but this code-review Scenario remains a candidate for confirmation because the consolidator only removes scenarios already represented by an MC counterexample."
+    },
+    {
+      "id": "CR-2",
+      "title": "Task identity, retry receipt, and finite completed history",
+      "source": "code-review",
+      "scenario": "Scenario 2: Task identity, retry receipt and finite completed history",
+      "severity": "Low",
+      "invariant": null,
+      "config": null,
+      "counterexample": null,
+      "affected_code": [
+        "nvflare/apis/impl/wf_comm_server.py:44",
+        "nvflare/apis/impl/wf_comm_server.py:397",
+        "nvflare/apis/impl/wf_comm_server.py:448",
+        "nvflare/apis/impl/wf_comm_server.py:870",
+        "nvflare/apis/impl/wf_comm_server.py:1106",
+        "nvflare/private/fed/client/client_runner.py:225",
+        "nvflare/private/fed/server/server_commands.py:232",
+        "nvflare/private/fed/server/server_command_agent.py:96",
+        "nvflare/app_common/workflows/base_model_controller.py:298"
+      ],
+      "summary": "The brief treats live-task receipt, retired-task deduplication, unknown-task dispatch, and transport acknowledgement as separate decisions. Current source checks assignment, task name, terminal status, and prior receipt for known submissions, then stamps receipt only after callback processing. Completed history is bounded and finalized separately, while unknown successful train results can reach BaseModelController context handling without the known-path aggregation callback. The S2 identity/history hunt completed cleanly, but the mechanism is not covered by MC-1's consumer-mutation counterexample."
+    },
+    {
+      "id": "CR-4",
+      "title": "Abnormal task retirement versus ordinary round commit",
+      "source": "code-review",
+      "scenario": "Scenario 4: Abnormal task retirement versus ordinary round commit",
+      "severity": "High",
+      "invariant": null,
+      "config": null,
+      "counterexample": null,
+      "affected_code": [
+        "nvflare/private/fed/server/server_runner.py:143",
+        "nvflare/private/fed/server/server_runner.py:333",
+        "nvflare/apis/impl/wf_comm_server.py:281",
+        "nvflare/apis/impl/wf_comm_server.py:372",
+        "nvflare/apis/impl/wf_comm_server.py:434",
+        "nvflare/apis/impl/wf_comm_server.py:786",
+        "nvflare/apis/impl/wf_comm_server.py:794",
+        "nvflare/apis/impl/wf_comm_server.py:882",
+        "nvflare/apis/impl/wf_comm_server.py:1060",
+        "nvflare/apis/impl/wf_comm_server.py:1067",
+        "nvflare/app_common/workflows/fedavg.py:223"
+      ],
+      "summary": "The brief identifies a cross-layer mechanism where FedAvg observes only that no standing task remains, without consuming the task's terminal status or termination reason. Optional outbound filter failure and before-send errors can mark a task CANCELLED or ERROR, and the monitor can remove terminal tasks while FedAvg proceeds after queue emptiness. Model checking found abnormal-retirement paths under a proposed no-partial-round oracle, but those were classified Case A because the stricter product policy was not established; revised lifecycle checks completed cleanly. Because there is no MC Case C finding for this mechanism, it remains a code-review candidate for confirmation rather than being deduplicated into MC-1."
+    },
+    {
+      "id": "CR-5",
+      "title": "Configured progress and distinct completion meanings",
+      "source": "code-review",
+      "scenario": "Scenario 5: Configured progress and distinct completion meanings",
+      "severity": "Medium",
+      "invariant": null,
+      "config": null,
+      "counterexample": null,
+      "affected_code": [
+        "nvflare/apis/impl/bcast_manager.py:42",
+        "nvflare/app_common/workflows/fedavg.py:268",
+        "nvflare/app_common/workflows/base_model_controller.py:150",
+        "nvflare/app_common/workflows/base_model_controller.py:329",
+        "nvflare/app_common/utils/error_handling_utils.py:51",
+        "nvflare/apis/impl/wf_comm_server.py:129",
+        "nvflare/apis/impl/wf_comm_server.py:1024",
+        "nvflare/apis/impl/wf_comm_server.py:1157"
+      ],
+      "summary": "The brief separates received responses, accepted contributions, terminal task status, callback cleanup, and run abort policies. BcastTaskManager drains on receipt markers rather than accepted contributions, while default FedAvg waits for all selected clients with task timeout disabled and handles empty, non-OK, dead-client, and resilient-error cases through distinct paths. S5 model checking produced a Case A correction for the unconditional no-partial-round oracle, a budget-limited progress run with no reported violation, and a finite clean resilient-control run. This progress/policy mechanism is related to but not the same code site or root cause as MC-1's partial aggregation mutation."
+    }
+  ]
+}

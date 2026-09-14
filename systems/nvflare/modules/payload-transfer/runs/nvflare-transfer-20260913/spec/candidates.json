@@ -1,0 +1,105 @@
+{
+  "schema_version": "2",
+  "system": "nvflare-transfer",
+  "generated_by": "consolidate",
+  "findings": [
+    {
+      "id": "MC-1",
+      "title": "Post-enqueue submission failure duplicates settlement effects and permits callbacks after receipt",
+      "source": "model-checking",
+      "scenario": "S3 and S5: settlement submission, callback/source/waiter ordering",
+      "severity": "Medium",
+      "invariant": "SingleSettlementEffects",
+      "config": "MC_hunt_s3_settlement.cfg",
+      "counterexample": "spec/output/MC_hunt_s3_settlement_bfs.out",
+      "affected_code": [
+        "nvflare/fuel/f3/streaming/stream_utils.py:60",
+        "nvflare/fuel/f3/streaming/download_service.py:1429",
+        "nvflare/fuel/f3/streaming/download_service.py:1449",
+        "nvflare/fuel/f3/streaming/download_service.py:895",
+        "nvflare/fuel/f3/streaming/download_service.py:1579"
+      ],
+      "summary": "A non-shutdown RuntimeError can follow ThreadPoolExecutor queue publication; CheckedExecutor preserves that error and DownloadService responds by settling inline while the queued or already-running worker remains eligible. Transaction retirement has one winner but transaction_done has no entry latch, so both invocations execute object, transaction and outcome callbacks and source release attempts. Receipt ownership only guards the final stored outcome after those effects. A 77-state counterexample violates SingleSettlementEffects; a separate 94-state counterexample in MC_hunt_s3_after_receipt_bfs.out violates NoSettlementEffectsAfterReceipt. The provenance-checked existing local trace supports this mechanism under a controlled submit-failure injection, without establishing a natural production trigger or independent Phase 4 reproduction.",
+      "dedup_note": "also covers code-review Scenario 3 and the callback/source/waiter-ordering portion of Scenario 5 (same post-enqueue settlement duplication mechanism)"
+    },
+    {
+      "id": "MC-2",
+      "title": "A pipelined EOF can publish COMPLETED progress after cancellation finalized FAILED",
+      "source": "model-checking",
+      "scenario": "S1: receiver truth versus terminal source progress",
+      "severity": "Medium",
+      "invariant": "CompletedProgressHasReceiverSuccess",
+      "config": "MC_hunt_s1_progress.cfg",
+      "counterexample": "spec/output/MC_hunt_s1_progress_bfs.out",
+      "affected_code": [
+        "nvflare/fuel/f3/streaming/download_service.py:313",
+        "nvflare/fuel/f3/streaming/download_service.py:392",
+        "nvflare/fuel/f3/streaming/download_service.py:425",
+        "nvflare/fuel/f3/streaming/download_service.py:587",
+        "nvflare/fuel/f3/streaming/download_service.py:1728",
+        "nvflare/fuel/f3/streaming/download_service.py:2300"
+      ],
+      "summary": "A supported Consumer pipeline admits its next request before consume fails and sends acquired-receiver cancellation. Cancellation commits final FAILED under the ref lock, then performs callbacks and FAILED progress outside that lock. An admitted EOF in this gap sees the already-final receiver, receives no serve nonce, and the terminal handler incorrectly selects COMPLETED progress from EOF even though confirmation is enabled. The first-terminal latch suppresses the later FAILED correction, as shown by a source-mapped 35-state TLC counterexample. The exact contradictory-progress schedule has not been independently reproduced at runtime, and neither a false successful strict receipt nor false trainer-send success is established.",
+      "dedup_note": "also covers code-review Scenario 1 (same final-status/progress split mechanism)"
+    },
+    {
+      "id": "CR-2",
+      "title": "Caller receiver declarations can diverge from complete-payload outcome semantics",
+      "source": "code-review",
+      "scenario": "Scenario 2: Complete-payload receiver sets and caller fanout declarations",
+      "severity": "High",
+      "invariant": null,
+      "config": null,
+      "counterexample": null,
+      "affected_code": [
+        "nvflare/fuel/f3/streaming/transfer_outcome.py:156",
+        "nvflare/fuel/f3/streaming/transfer_outcome.py:197",
+        "nvflare/fuel/f3/cellnet/cell.py:303",
+        "nvflare/fuel/f3/cellnet/cell.py:344",
+        "nvflare/fuel/utils/fobs/decomposers/via_downloader.py:779"
+      ],
+      "summary": "Scenario 2 asks whether transaction completion, success and quorum are interpreted against the receiver declaration actually supplied by the caller across every registered reference. The MC findings do not cover this mechanism: explicit identity mode is modeled as base semantics and no MC violation was emitted for aggregation itself. The brief preserves a caller-side regression hypothesis where multi-target Cell._fire_and_forget omits receiver metadata when encoding once, causing ViaDownloader to default to count 1 while non-pass-through broadcast paths provide count and identities. Confirmation should decide whether this underdeclared fanout can retire source lifetime or report outcomes inconsistently in a supported path."
+    },
+    {
+      "id": "CR-4",
+      "title": "Receiver budget diagnostics and activity clocks remain review-only",
+      "source": "code-review",
+      "scenario": "Scenario 4: Receiver budgets and transaction inactivity are different clocks",
+      "severity": "Medium",
+      "invariant": null,
+      "config": null,
+      "counterexample": null,
+      "affected_code": [
+        "nvflare/fuel/f3/streaming/download_service.py:441",
+        "nvflare/fuel/f3/streaming/download_service.py:736",
+        "nvflare/fuel/f3/streaming/download_service.py:767",
+        "nvflare/fuel/f3/streaming/download_service.py:857",
+        "nvflare/fuel/f3/streaming/download_service.py:1880",
+        "nvflare/fuel/f3/streaming/transfer_progress.py:199"
+      ],
+      "summary": "Scenario 4 separates per-receiver acquisition and idle budgets from transaction-wide inactivity, which is refreshed by any receiver. The MC run explored S4 budget behavior without emitting a violation, so no MC candidate carries this scenario as a concrete counterexample. The remaining code-review candidate is the diagnostic and semantics hypothesis that the warning for a receiver budget greater than or equal to the global inactivity timeout incorrectly says enforcement is disabled even though the sliding inactivity clock still allows receiver-budget enforcement. Confirmation should preserve the distinct transaction, receiver and progress clocks and decide whether the review-only diagnostic or any unmodeled schedule is actionable."
+    },
+    {
+      "id": "CR-5",
+      "title": "Receipt retention, acquired-receiver visibility and source-lifetime documentation residuals",
+      "source": "code-review",
+      "scenario": "Scenario 5: Source release, receipt retention, and waiter observations",
+      "severity": "High",
+      "invariant": null,
+      "config": null,
+      "counterexample": null,
+      "affected_code": [
+        "nvflare/fuel/f3/streaming/download_service.py:841",
+        "nvflare/fuel/f3/streaming/download_service.py:905",
+        "nvflare/fuel/f3/streaming/download_service.py:1463",
+        "nvflare/fuel/f3/streaming/download_service.py:1544",
+        "nvflare/fuel/f3/streaming/download_service.py:1568",
+        "nvflare/fuel/f3/streaming/download_service.py:1604",
+        "nvflare/fuel/f3/streaming/cacheable.py:99",
+        "nvflare/fuel/f3/streaming/cacheable.py:133",
+        "nvflare/client/cell/api.py:624"
+      ],
+      "summary": "Scenario 5 spans final receiver information, callback completion, source release attempts, receipt recording, waiter resolution, shutdown and caller observations. MC-1 covers the distinct post-enqueue duplicate-settlement part of this scenario, but it does not cover the separate review items at the receipt-retention, acquired-receiver-query and source-lifetime documentation sites. The brief calls out unswept expired receipts that can resolve new waiters while outcome query expires them, acquired_receivers() returning empty after retirement, and a stale CacheableObject comment about source release and produce overlap. Confirmation should evaluate those residual mechanisms separately from MC-1 because they cite different code sites and have no model-checking counterexample here."
+    }
+  ]
+}
