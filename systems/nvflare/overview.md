@@ -6,10 +6,10 @@ Specula analyzed and tested NVFlare's training coordination, model-data delivery
 
 ## Bugs
 
-Specula found 10 new bugs and reproduced 1 previously discussed bug:
+Specula found 11 new bugs:
 
 - **Fixed:** A lazy tensor materialization failure can leave partial aggregation from a rejected contribution in the global model; see [PR #5295](https://github.com/NVIDIA/NVFlare/pull/5295).
-- **Known:** A duplicate result arriving after completed-task cache eviction remains retained in controller context until context replacement, even though it is not aggregated again; the unknown-task cleanup gap was previously discussed in [PR #4520](https://github.com/NVIDIA/NVFlare/pull/4520#issuecomment-4383038805).
+- A duplicate result arriving after completed-task cache eviction remains retained in controller context until context replacement, even though it is not aggregated again; related unknown-task cleanup behavior is discussed in [PR #4520](https://github.com/NVIDIA/NVFlare/pull/4520#issuecomment-4383038805).
 - **Fixed:** An executor submission failure after enqueueing can cause inline fallback and a later worker to repeat settlement callbacks and source-release attempts; see [PR #5296](https://github.com/NVIDIA/NVFlare/pull/5296).
 - Pipelined EOF can publish completed source progress after receiver cancellation, while receiver status and the final transfer outcome remain failed.
 - **Fixed:** Multi-target stream sends omit the expected receiver count, allowing the first receiver's completion to retire the source before later targets download it; see [PR #5297](https://github.com/NVIDIA/NVFlare/pull/5297).
