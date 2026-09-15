@@ -1,0 +1,26 @@
+# Round 2: receiver guards, missing outcomes, return-code distinction, normal cleanup.
+header=header.replace('serverWaiter |-> FALSE, serverFailed |-> FALSE,','serverWaiter |-> FALSE, serverFailed |-> FALSE, serverAborted |-> FALSE,')
+header=header.replace('"Stop","OutcomeOK","OutcomeFailed","HeartbeatStop"','"Stop","OutcomeOK","OutcomeFailed","OutcomeAborted","HeartbeatStop"')
+invariants=invariants.replace('exitCode \\in {"ok","failed"}', 'exitCode \\in {"ok","failed","aborted"}')
+byname['ServerEngineReceiveOutcome']['guards'].append('s \\in jobs[t[1]].pending')
+byname['ServerEngineReceiveOutcome']['source']=src('fed:938-956;runner:114-120')
+byname['ServerEngineReceiveFailureOutcome']['guards'].append('s \\in jobs[t[1]].pending')
+byname['ServerEngineReceiveFailureOutcome']['updates']['jobs']=J('t[1]',('.pending','IF jobs[t[1]].serverRegistered \\/ jobs[t[1]].running THEN {} ELSE @ \\ {s}'),('.outcomeKey','IF jobs[t[1]].serverRegistered \\/ jobs[t[1]].running THEN FALSE ELSE @'),('.serverFailed','@ \\/ jobs[t[1]].serverRegistered \\/ jobs[t[1]].running'),('.serverAborted','IF jobs[t[1]].serverRegistered \\/ jobs[t[1]].running THEN FALSE ELSE @'),('.serverStop','@ \\/ jobs[t[1]].serverRegistered'))
+byname['ServerEngineReceiveFailureOutcome']['source']=src('fed:938-956;runner:114-120;runner:813-843')
+action('ServerEngineReceiveAbortedOutcome',['s','t'],[msg('OutcomeAborted')+r' \in network',r's \in jobs[t[1]].pending'],{'network':r'(network \ {Msg("OutcomeAborted",s,t)}) \cup (IF jobs[t[1]].serverRegistered THEN {Msg("Stop",v,t) : v \in jobs[t[1]].deployed} ELSE {})','jobs':J('t[1]',('.pending','IF jobs[t[1]].serverRegistered \\/ jobs[t[1]].running THEN {} ELSE @ \\ {s}'),('.outcomeKey','IF jobs[t[1]].serverRegistered \\/ jobs[t[1]].running THEN FALSE ELSE @'),('.serverFailed','@ \\/ jobs[t[1]].serverRegistered \\/ jobs[t[1]].running'),('.serverAborted','IF (jobs[t[1]].serverRegistered \\/ jobs[t[1]].running) /\\ ~jobs[t[1]].serverFailed THEN TRUE ELSE @'),('.serverStop','@ \\/ jobs[t[1]].serverRegistered'))},'fed:938-956;runner:813-843','3,4',note='Accepted ABORTED code sets an exception classification only for an active job and does not overwrite an existing stronger code.')
+action('ServerEngineIgnoreOutcome',['s','t'],[r's \notin jobs[t[1]].pending',r'\E k \in {"OutcomeOK","OutcomeFailed","OutcomeAborted"} : Msg(k,s,t) \in network'],{'network':r'network \ {Msg(k,s,t) : k \in {"OutcomeOK","OutcomeFailed","OutcomeAborted"}}'},'fed:938-940','4',note='An untracked job/site receives an OK acknowledgement without touching status, pending outcomes or stop state; one terminal report per site/attempt in this slice.')
+action('ServerEngineResolveMissingOutcome',['s','t'],['~jobs[t[1]].serverRegistered',r's \in jobs[t[1]].pending','~RegisteredAtSite(s,t[1])','t[2]=scheduler.issued[t[1]]'],{'jobs':J('t[1]',('.pending','IF jobs[t[1]].running /\\ ~jobs[t[1]].serverFailed THEN {} ELSE @ \\ {s}'),('.outcomeKey','IF jobs[t[1]].running /\\ ~jobs[t[1]].serverFailed THEN FALSE ELSE @'),('.serverFailed','@ \\/ jobs[t[1]].running'),('.serverAborted','IF jobs[t[1]].running /\\ ~jobs[t[1]].serverFailed THEN FALSE ELSE @'))},'fed:1045-1094;runner:813-843;runner:114-120','4',note='Heartbeat observes the job absent at this site after server registry removal. It resolves the pending site without an Outcome envelope; active running-map membership gates fail_run. Delayed heartbeat snapshots remain an explicit projection boundary.')
+byname['FederatedServerHeartbeatCleanup']['fault']=None
+byname['FederatedServerHeartbeatCleanup']['note']+=' Normal periodic response; not an injected, exhaustible fault.'
+# Preserve client outcome classes. Classification follows physical exit observation.
+action('JobExecutorClassifyAbortedExit',['s','t'],['~client[s][t].alive','client[s][t].cleanup="wait"','client[s][t].exitCode="ok"','client[s][t].abortRequested'],{'client':C(('.exitCode','"aborted"'))},'executor:630-647','4',note='Returned ABORTED code after a supported stop; independent of physical exit observation.')
+byname['JobExecutorReportOutcome']['updates']['network']=r'network \cup {Msg(CASE client[s][t].exitCode="ok" -> "OutcomeOK" [] client[s][t].exitCode="aborted" -> "OutcomeAborted" [] OTHER -> "OutcomeFailed",s,t)}'
+byname['JobExecutorOutcomeReportReturned']['guards'].append(r'Msg("OutcomeAborted",s,t) \notin network')
+byname['JobRunnerClassifyCompletion']['updates']['jobs']=J('j',('.finishStatus','IF jobs[j].runAborted \\/ jobs[j].serverAborted THEN "ABORTED" ELSE IF jobs[j].serverFailed THEN "FAILED" ELSE "COMPLETED"'),('.completion','"archive"'))
+for name in ['JobRunnerSelectCompletion','JobRunnerOutcomesResolved']:
+ a=byname[name]
+ a['guards']=[v.replace('jobs[j].serverFailed','(jobs[j].serverFailed /\\ ~jobs[j].serverAborted)') for v in a['guards']]
+ a['updates']={k:v.replace('jobs[j].serverFailed','(jobs[j].serverFailed /\\ ~jobs[j].serverAborted)') for k,v in a['updates'].items()}
+# Server cleanup's unconditional pop is idempotent, including early waiter removal.
+byname['ServerEngineRemoveAfterTerminate']['guards']=['jobs[j].serverTerminated']
+byname['ServerEngineRemoveAfterTerminate']['note']+=' The final pop(job_id,None) may be a no-op after the exit waiter removed it.'

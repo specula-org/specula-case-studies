@@ -1,0 +1,112 @@
+commit eaf1b5ba2446193148fdcc11d46611b046df0137
+Author:     Yuhong Wen <yh_wen@hotmail.com>
+AuthorDate: Fri Apr 29 14:59:43 2022 -0400
+Commit:     GitHub <noreply@github.com>
+CommitDate: Fri Apr 29 14:59:43 2022 -0400
+
+    Fixed the missing min_sites and required_sites for Job. (#461)
+    
+    * Fixed the missing min_sites and required_sites for Job.
+    
+    * Removed the duplicate constant.
+    
+    * fixed codestyle.
+    
+    * fixed typo, also enhanced default value.
+---
+ nvflare/private/fed/client/client_engine.py  |  8 +++++++
+ nvflare/private/fed/client/scheduler_cmds.py | 34 +++++++++++++++-------------
+ 2 files changed, 26 insertions(+), 16 deletions(-)
+
+diff --git a/nvflare/private/fed/client/client_engine.py b/nvflare/private/fed/client/client_engine.py
+index d814b5ba..cd7c9477 100644
+--- a/nvflare/private/fed/client/client_engine.py
++++ b/nvflare/private/fed/client/client_engine.py
+@@ -22,6 +22,7 @@ import traceback
+ from concurrent.futures import ThreadPoolExecutor
+ 
+ from nvflare.apis.fl_constant import MachineStatus, WorkspaceConstants
++from nvflare.apis.fl_context import FLContext, FLContextManager
+ from nvflare.apis.shareable import Shareable
+ from nvflare.apis.utils.common_utils import get_open_ports
+ from nvflare.private.admin_defs import Message
+@@ -56,6 +57,10 @@ class ClientEngine(ClientEngineInternalSpec):
+         self.client.process = None
+         self.client_executor = ProcessExecutor(client.client_name, os.path.join(args.workspace, "startup"))
+ 
++        self.fl_ctx_mgr = FLContextManager(
++            engine=self, identity_name=client_name, run_num="", public_stickers={}, private_stickers={}
++        )
++
+         self.status = MachineStatus.STOPPED
+ 
+         assert workers >= 1, "workers must >= 1"
+@@ -74,6 +79,9 @@ class ClientEngine(ClientEngineInternalSpec):
+ 
+         return "validate process started."
+ 
++    def new_context(self) -> FLContext:
++        return self.fl_ctx_mgr.new_context()
++
+     def get_component(self, component_id: str) -> object:
+         return self.client.components.get(component_id)
+ 
+diff --git a/nvflare/private/fed/client/scheduler_cmds.py b/nvflare/private/fed/client/scheduler_cmds.py
+index d9ae177b..d6d96fed 100644
+--- a/nvflare/private/fed/client/scheduler_cmds.py
++++ b/nvflare/private/fed/client/scheduler_cmds.py
+@@ -16,7 +16,6 @@ import pickle
+ from typing import List
+ 
+ from nvflare.apis.fl_constant import ReturnCode, SystemComponents
+-from nvflare.apis.fl_context import FLContext
+ from nvflare.apis.resource_manager_spec import ResourceConsumerSpec, ResourceManagerSpec
+ from nvflare.apis.shareable import Shareable
+ from nvflare.private.admin_defs import Message
+@@ -40,15 +39,17 @@ class CheckResourceProcessor(RequestProcessor):
+             raise RuntimeError(
+                 f"resource_manager should be of type ResourceManagerSpec, but got {type(resource_manager)}."
+             )
+-        fl_ctx = FLContext()
+-        result = Shareable()
+-        try:
+-            resource_spec = pickle.loads(req.body)
+-            check_result, token = resource_manager.check_resources(resource_requirement=resource_spec, fl_ctx=fl_ctx)
+-            result.set_header(ShareableHeader.CHECK_RESOURCE_RESULT, check_result)
+-            result.set_header(ShareableHeader.RESOURCE_RESERVE_TOKEN, token)
+-        except Exception:
+-            result.set_return_code(ReturnCode.EXECUTION_EXCEPTION)
++        with engine.new_context() as fl_ctx:
++            result = Shareable()
++            try:
++                resource_spec = pickle.loads(req.body)
++                check_result, token = resource_manager.check_resources(
++                    resource_requirement=resource_spec, fl_ctx=fl_ctx
++                )
++                result.set_header(ShareableHeader.CHECK_RESOURCE_RESULT, check_result)
++                result.set_header(ShareableHeader.RESOURCE_RESERVE_TOKEN, token)
++            except Exception:
++                result.set_return_code(ReturnCode.EXECUTION_EXCEPTION)
+ 
+         if not result:
+             result = "OK"
+@@ -75,12 +76,13 @@ class StartJobProcessor(RequestProcessor):
+                 f"resource_consumer should be of type ResourceConsumerSpec, but got {type(resource_consumer)}."
+             )
+ 
+-        resource_spec = pickle.loads(req.body)
+-        run_number = req.get_header(RequestHeader.RUN_NUM)
+-        token = req.get_header(ShareableHeader.RESOURCE_RESERVE_TOKEN)
+-        allocated_resources = resource_manager.allocate_resources(
+-            resource_requirement=resource_spec, token=token, fl_ctx=FLContext()
+-        )
++        with engine.new_context() as fl_ctx:
++            resource_spec = pickle.loads(req.body)
++            run_number = req.get_header(RequestHeader.RUN_NUM)
++            token = req.get_header(ShareableHeader.RESOURCE_RESERVE_TOKEN)
++            allocated_resources = resource_manager.allocate_resources(
++                resource_requirement=resource_spec, token=token, fl_ctx=fl_ctx
++            )
+         result = engine.start_app(
+             run_number,
+             allocated_resource=allocated_resources,

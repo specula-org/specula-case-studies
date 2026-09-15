@@ -1,0 +1,126 @@
+commit c8536f6be21b253139dde36ac1c36a828292e229
+Author:     Yan Cheng <58191769+yanchengnv@users.noreply.github.com>
+AuthorDate: Mon Mar 3 12:31:12 2025 -0500
+Commit:     GitHub <noreply@github.com>
+CommitDate: Tue Mar 4 01:31:12 2025 +0800
+
+    Get job participating clients from Job Meta (#3270)
+    
+    Fixes # .
+    
+    ### Description
+    
+    At the start of a job, the CJ sends a sync message to the server to get
+    information about the job's participating clients. This mechanism has a
+    few issues:
+    
+    - CJs are started at about the same time. If there are many clients
+    (e.g. there could be thousands of clients for handling edge devices),
+    the SP will be under a lot of pressure to process so many messages at
+    the same time.
+    
+    - In case of Simulator, if the number of subprocesses is smaller than
+    the number of clients, then some clients will be swapped in and out.
+    Each time a client is swapped in, it needs to send the sync message
+    again. But if this happens after the job is already done, it will fail,
+    as reported by QA.
+    
+    This PR gets rid of the sync mechanism from CJs. Once the SP starts to
+    run a job, it already knows what clients will participate in the job. SP
+    then includes such info in the job's metadata in the message to CPs to
+    start the job. Once started, the CJ no longer needs to send the sync
+    message to SP to get participating clients since it can get this info
+    from the job's metadata.
+    
+    This PR also cleans up some log messages by changing their log level to
+    DEBUG.
+    
+    NOTE: this PR does not change SJ's logic to get job clients from SP via
+    the sync message, due to the large scope of changes. Since there is
+    always only a single SJ for each job, it won't cost much for the SP to
+    process one message from the SJ.
+    
+    ### Types of changes
+    <!--- Put an `x` in all the boxes that apply, and remove the not
+    applicable items -->
+    - [x] Non-breaking change (fix or new feature that would not break
+    existing functionality).
+    - [ ] Breaking change (fix or new feature that would cause existing
+    functionality to change).
+    - [ ] New tests added to cover the changes.
+    - [ ] Quick tests passed locally by running `./runtest.sh`.
+    - [ ] In-line docstrings updated.
+    - [ ] Documentation updated.
+---
+ nvflare/private/fed/client/client_executor.py | 12 ++++++++++--
+ nvflare/private/fed/server/job_runner.py      |  5 +++++
+ nvflare/private/fed/server/server_engine.py   |  3 ++-
+ 3 files changed, 17 insertions(+), 3 deletions(-)
+
+diff --git a/nvflare/private/fed/client/client_executor.py b/nvflare/private/fed/client/client_executor.py
+index cd8d0c10..cbdba744 100644
+--- a/nvflare/private/fed/client/client_executor.py
++++ b/nvflare/private/fed/client/client_executor.py
+@@ -11,7 +11,7 @@
+ # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ # See the License for the specific language governing permissions and
+ # limitations under the License.
+-
++import json
+ import threading
+ import time
+ from abc import ABC, abstractmethod
+@@ -163,6 +163,14 @@ class JobExecutor(ClientExecutor):
+             fl_ctx: FLContext
+         """
+ 
++        # update the job meta
++        workspace = Workspace(args.workspace, site_name=client.client_name)
++        meta_file = workspace.get_job_meta_path(job_id)
++
++        # rewrite the meta file with the received meta
++        with open(meta_file, "w") as f:
++            json.dump(job_meta, f, indent=4)
++
+         job_launcher: JobLauncherSpec = get_job_launcher(job_meta, fl_ctx)
+ 
+         # prepare command args for the job process
+@@ -528,7 +536,7 @@ class JobExecutor(ClientExecutor):
+         fl_ctx.set_prop(FLContextKey.CURRENT_JOB_ID, job_id, private=True, sticky=False)
+         fl_ctx.set_prop(FLContextKey.CLIENT_NAME, client.client_name, private=True, sticky=False)
+         engine.fire_event(EventType.JOB_COMPLETED, fl_ctx)
+-        self.logger.info(f"Fired event JOB_COMPLETED {EventType.JOB_COMPLETED}")
++        self.logger.debug(f"Fired event JOB_COMPLETED {EventType.JOB_COMPLETED}")
+ 
+     def get_status(self, job_id):
+         process_status = self.run_processes.get(job_id, {}).get(RunProcessKey.STATUS, ClientStatus.STOPPED)
+diff --git a/nvflare/private/fed/server/job_runner.py b/nvflare/private/fed/server/job_runner.py
+index 579982eb..3d82271b 100644
+--- a/nvflare/private/fed/server/job_runner.py
++++ b/nvflare/private/fed/server/job_runner.py
+@@ -246,6 +246,11 @@ class JobRunner(FLComponent):
+         """
+         engine = fl_ctx.get_engine()
+         job_clients = engine.get_job_clients(client_sites)
++
++        # job_clients is a dict of: token => Client
++        assert isinstance(job_clients, dict)
++        participating_clients = [c.to_dict() for c in job_clients.values()]
++        job.meta[JobMetaKey.JOB_CLIENTS] = participating_clients
+         err = engine.start_app_on_server(fl_ctx, job=job, job_clients=job_clients)
+         if err:
+             raise RuntimeError(f"Could not start the server App for job: {job_id}.")
+diff --git a/nvflare/private/fed/server/server_engine.py b/nvflare/private/fed/server/server_engine.py
+index 5643384d..b293b5e9 100644
+--- a/nvflare/private/fed/server/server_engine.py
++++ b/nvflare/private/fed/server/server_engine.py
+@@ -506,7 +506,8 @@ class ServerEngine(ServerEngineInternalSpec, StreamableEngine):
+             return self.run_manager.new_context()
+         else:
+             # this call should never be made before the run_manager is created!
+-            raise RuntimeError("no run_manager in Server Engine.")
++            self.logger.warning("no run_manager in Server Engine.")
++            return FLContext()
+ 
+     def add_component(self, component_id: str, component):
+         self.server.runner_config.add_component(component_id, component)

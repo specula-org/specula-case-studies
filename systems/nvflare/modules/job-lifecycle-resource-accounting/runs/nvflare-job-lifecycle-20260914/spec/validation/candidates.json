@@ -1,0 +1,62 @@
+[
+  {
+    "id": "MC-2",
+    "classification": "C",
+    "title": "Startup rollback frees a resource while the spawned child is still live",
+    "config": "MC_hunt_s2_cleanup_handoff.cfg",
+    "invariant": "NoFreeWhileInUse",
+    "counterexample": "spec/output/MC_hunt_s2_cleanup_handoff-bfs.out",
+    "states": 36,
+    "severity": "Medium",
+    "source_references": [
+      "nvflare/private/fed/client/client_executor.py:299",
+      "nvflare/private/fed/client/client_executor.py:318",
+      "nvflare/private/fed/client/client_executor.py:330",
+      "nvflare/private/fed/client/scheduler_cmds.py:129",
+      "nvflare/app_common/resource_managers/auto_clean_resource_manager.py:166"
+    ],
+    "trace_summary": "State 27 allocates unit 0 at required site s1; 32 spawns a live child; 33 attaches the handle; 34 returns from production AFTER_JOB_LAUNCH dispatch; 35 fails cleanup-waiter installation before any waiter executes; 36 rolls back, changing free=[1] to [0,1] while alive remains true, binding=[0], waiter=false.",
+    "evidence_boundary": "Model counterexample and pinned-source control flow. The existing passing implementation traces do not inject cleanup-thread installation failure. No double-free or permanent process survival is claimed.",
+    "recommendation": "Make post-spawn cleanup ownership explicit. On waiter-install failure retain ownership or terminate and observe exit before returning the resource; ensure a single effective cleanup owner."
+  },
+  {
+    "id": "MC-3",
+    "classification": "C",
+    "title": "A stale deployment write can undo an acknowledged pre-run abort",
+    "config": "MC_hunt_s3_abort_status.cfg",
+    "invariant": "AcceptedPreRunAbortPersists",
+    "counterexample": "spec/output/MC_hunt_s3_abort_status-bfs.out",
+    "states": 22,
+    "severity": "Medium",
+    "source_references": [
+      "nvflare/private/fed/server/job_runner.py:661",
+      "nvflare/private/fed/server/job_runner.py:669",
+      "nvflare/private/fed/server/job_cmds.py:1059",
+      "nvflare/private/fed/server/job_cmds.py:1062",
+      "nvflare/apis/impl/job_def_manager.py:459"
+    ],
+    "trace_summary": "State 12 saves a successful SUBMITTED status check; 13 admin reads SUBMITTED; deployment proceeds; 18 admin stores ABORTED; 21 runner unconditionally stores DISPATCHED; 22 admin constructs a success response from its saved pre-run branch while current status is DISPATCHED.",
+    "evidence_boundary": "Model counterexample and pinned-source control flow. The 22-state trace ends before any child spawn. Subsequent startup is a source-permitted continuation, not an executed public-API reproduction in this phase. The modeled acknowledgment is server-side CLI success-response construction; reply transport is outside this trace projection. Client-visible success assumes ordinary delivery.",
+    "recommendation": "Serialize abort with status transitions or use expected-state updates so stale deployment/start writes cannot overwrite a terminal abort."
+  },
+  {
+    "id": "MC-4",
+    "classification": "C",
+    "title": "A delayed startup write can restore RUNNING after terminal publication",
+    "config": "MC_hunt_s3_terminal_status.cfg",
+    "invariant": "NoTerminalResurrection",
+    "counterexample": "spec/output/MC_hunt_s3_terminal_status-bfs.out",
+    "states": 61,
+    "severity": "Medium",
+    "source_references": [
+      "nvflare/private/fed/server/job_runner.py:709",
+      "nvflare/private/fed/server/job_runner.py:711",
+      "nvflare/private/fed/server/job_runner.py:524",
+      "nvflare/private/fed/server/job_runner.py:531",
+      "nvflare/apis/impl/job_def_manager.py:459"
+    ],
+    "trace_summary": "The server exits and is removed; heartbeat recovery resolves pending outcomes before runner registration. Both starts return and the runner publishes its running-map entry at state 56, then pauses before the RUNNING store. Completion selects/classifies/archives the job and stores COMPLETED at state 60. The startup thread stores RUNNING at 61, after terminal publication.",
+    "evidence_boundary": "Pinned-source locking/store order supports Case C. The saved 61-state trace has completion=remove and running=true: final map deletion has not yet occurred. Source lines 531-538 can subsequently remove bookkeeping without republishing status; a permanently stale RUNNING record is a continuation consequence, not an executed production result. The early-exit/heartbeat setup is within the model child-exit abstraction; no end-to-end reproduction of this interleaving was run.",
+    "recommendation": "Coordinate running-map publication, RUNNING persistence and terminal publication using a shared lifecycle synchronization boundary or expected-state store updates."
+  }
+]

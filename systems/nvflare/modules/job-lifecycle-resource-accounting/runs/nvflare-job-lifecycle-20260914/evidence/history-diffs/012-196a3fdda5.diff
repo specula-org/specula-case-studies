@@ -1,0 +1,61 @@
+commit 196a3fdda5b56ef43b2e3386bff3ac0ce9794295
+Author:     Peter Cnudde <pcnudde@nvidia.com>
+AuthorDate: Wed Aug 12 13:28:06 2026 -0700
+Commit:     GitHub <noreply@github.com>
+CommitDate: Wed Aug 12 20:28:06 2026 +0000
+
+    Preserve Slurm worker failure reasons (#5094)
+    
+    ## What changed
+    
+    - Include Slurm's `DerivedExitCode` in the existing allocation-only
+    accounting query and preserve it when it is a recognized, reportable
+    worker exit code.
+    - Classify a generic launcher execution error as an infrastructure
+    failure only when the worker never advanced beyond the starting state.
+    - Add regression coverage for failures from non-primary Slurm tasks and
+    failures before worker check-in.
+    
+    ## Why
+    
+    For multi-task jobs, the allocation's `ExitCode` can describe the signal
+    that terminated the primary task while `DerivedExitCode` retains the
+    original failing step's exit code. Separately, a container or process
+    that fails before worker check-in cannot produce its own return-code
+    file. Both paths could therefore end without an actionable failure
+    reaching the controller.
+    
+    This keeps ordinary application failures unchanged after the worker has
+    started and avoids adding another Slurm accounting query.
+    
+    ## Validation
+    
+    - `pytest -q
+    tests/unit_test/app_opt/job_launcher/slurm_scheduler_client_test.py
+    tests/unit_test/app_opt/job_launcher/slurm_manager_test.py
+    tests/unit_test/private/fed/client/client_executor_test.py` — 112 passed
+    - `./runtest.sh -s`
+    - `git diff --check`
+    
+    Live Slurm execution was not repeated for this change.
+    
+    Fixes #5093
+---
+ nvflare/private/fed/client/client_executor.py | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/nvflare/private/fed/client/client_executor.py b/nvflare/private/fed/client/client_executor.py
+index 89662c6c..9d87a0ea 100644
+--- a/nvflare/private/fed/client/client_executor.py
++++ b/nvflare/private/fed/client/client_executor.py
+@@ -614,6 +614,10 @@ class JobExecutor(ClientExecutor):
+ 
+             return_code = get_return_code(job_handle, job_id, workspace, self.logger)
+ 
++            process_status = self.run_processes.get(job_id, {}).get(RunProcessKey.STATUS)
++            if return_code == JobReturnCode.EXECUTION_ERROR and process_status == ClientStatus.STARTING:
++                return_code = ProcessExitCode.INFRASTRUCTURE_ERROR
++
+             self.logger.info(f"run ({job_id}): child worker process finished with RC {return_code}")
+ 
+             failure_reason = REPORTABLE_JOB_FAILURES.get(return_code)

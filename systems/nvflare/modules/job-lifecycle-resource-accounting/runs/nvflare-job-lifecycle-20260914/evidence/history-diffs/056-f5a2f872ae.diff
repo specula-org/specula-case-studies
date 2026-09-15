@@ -1,0 +1,132 @@
+commit f5a2f872aef62446913f0417112b463171d7afa5
+Author:     Yan Cheng <58191769+yanchengnv@users.noreply.github.com>
+AuthorDate: Tue Mar 18 16:52:10 2025 -0400
+Commit:     GitHub <noreply@github.com>
+CommitDate: Tue Mar 18 16:52:10 2025 -0400
+
+    Refactor edge training framework (#3301)
+    
+    Fixes # .
+    
+    ### Description
+    
+    A few sentences describing the changes proposed in this pull request.
+    
+    ### Types of changes
+    <!--- Put an `x` in all the boxes that apply, and remove the not
+    applicable items -->
+    - [x] Non-breaking change (fix or new feature that would not break
+    existing functionality).
+    - [ ] Breaking change (fix or new feature that would cause existing
+    functionality to change).
+    - [ ] New tests added to cover the changes.
+    - [ ] Quick tests passed locally by running `./runtest.sh`.
+    - [ ] In-line docstrings updated.
+    - [ ] Documentation updated.
+    
+    ---------
+    
+    Co-authored-by: Zhihong Zhang <100308595+nvidianz@users.noreply.github.com>
+    Co-authored-by: Ziyue Xu <ziyuex@nvidia.com>
+---
+ nvflare/private/fed/client/client_engine.py   | 13 +++++++++++--
+ nvflare/private/fed/client/client_executor.py | 13 +++++++++++--
+ nvflare/private/fed/server/server_engine.py   |  4 ++--
+ 3 files changed, 24 insertions(+), 6 deletions(-)
+
+diff --git a/nvflare/private/fed/client/client_engine.py b/nvflare/private/fed/client/client_engine.py
+index aed568e0..dbf078c8 100644
+--- a/nvflare/private/fed/client/client_engine.py
++++ b/nvflare/private/fed/client/client_engine.py
+@@ -395,7 +395,15 @@ class ClientEngine(ClientEngineInternalSpec, StreamableEngine):
+ 
+         return "Abort signal has been sent to the client App."
+ 
+-    def send_to_job(self, job_id, channel: str, topic: str, msg: CellMessage, timeout: float) -> CellMessage:
++    def send_to_job(
++        self,
++        job_id,
++        channel: str,
++        topic: str,
++        msg: CellMessage,
++        timeout: float,
++        optional=False,
++    ) -> CellMessage:
+         """Send a message to CJ
+ 
+         Args:
+@@ -404,11 +412,12 @@ class ClientEngine(ClientEngineInternalSpec, StreamableEngine):
+             topic: message topic
+             msg: the message to be sent
+             timeout: how long to wait for reply
++            optional: whether the message is optional
+ 
+         Returns: reply from CJ
+ 
+         """
+-        return self.client_executor.send_to_job(job_id, channel, topic, msg, timeout)
++        return self.client_executor.send_to_job(job_id, channel, topic, msg, timeout, optional=optional)
+ 
+     def abort_task(self, job_id: str) -> str:
+         status = self.client_executor.get_status(job_id)
+diff --git a/nvflare/private/fed/client/client_executor.py b/nvflare/private/fed/client/client_executor.py
+index cbdba744..010755a2 100644
+--- a/nvflare/private/fed/client/client_executor.py
++++ b/nvflare/private/fed/client/client_executor.py
+@@ -432,7 +432,15 @@ class JobExecutor(ClientExecutor):
+ 
+         self.logger.info("Client worker process is terminated.")
+ 
+-    def send_to_job(self, job_id, channel: str, topic: str, msg: CellMessage, timeout: float) -> CellMessage:
++    def send_to_job(
++        self,
++        job_id,
++        channel: str,
++        topic: str,
++        msg: CellMessage,
++        timeout: float,
++        optional=False,
++    ) -> CellMessage:
+         """Send a message to CJ
+ 
+         Args:
+@@ -441,6 +449,7 @@ class JobExecutor(ClientExecutor):
+             topic: message topic
+             msg: the message to be sent
+             timeout: how long to wait for reply
++            optional: whether the message is optional
+ 
+         Returns: reply from CJ
+ 
+@@ -451,8 +460,8 @@ class JobExecutor(ClientExecutor):
+             channel=channel,
+             topic=topic,
+             request=msg,
+-            optional=False,
+             timeout=timeout,
++            optional=optional,
+         )
+ 
+     def _terminate_job(self, job_handle, job_id):
+diff --git a/nvflare/private/fed/server/server_engine.py b/nvflare/private/fed/server/server_engine.py
+index 376a0169..49f1c20f 100644
+--- a/nvflare/private/fed/server/server_engine.py
++++ b/nvflare/private/fed/server/server_engine.py
+@@ -720,7 +720,7 @@ class ServerEngine(ServerEngineInternalSpec, StreamableEngine):
+             self.logger.debug("didn't receive clients info - retry in 1 second")
+             time.sleep(1.0)
+ 
+-    def _get_participating_clients(self):
++    def get_participating_clients(self):
+         # called from server's job cell
+         return self.client_manager.clients
+ 
+@@ -832,7 +832,7 @@ class ServerEngine(ServerEngineInternalSpec, StreamableEngine):
+ 
+             job_info = fl_ctx.get_prop(FLContextKey.JOB_INFO)
+             if not job_info:
+-                job_clients = self._get_participating_clients()
++                job_clients = self.get_participating_clients()
+                 fl_ctx.set_prop(FLContextKey.JOB_INFO, (job_id, job_clients))
+             else:
+                 (job_id, job_clients) = job_info

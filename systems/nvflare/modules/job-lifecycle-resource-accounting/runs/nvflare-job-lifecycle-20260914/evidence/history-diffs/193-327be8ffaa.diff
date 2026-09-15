@@ -1,0 +1,316 @@
+commit 327be8ffaad0c319ab3d76b223d7050f630aaee9
+Author:     Yuan-Ting Hsieh (謝沅廷) <yuantinghsieh@gmail.com>
+AuthorDate: Thu May 26 16:35:32 2022 -0700
+Commit:     GitHub <noreply@github.com>
+CommitDate: Thu May 26 16:35:32 2022 -0700
+
+    Fix resource manager (#604)
+---
+ .../resource_managers/list_resource_manager.py     | 35 +++++++++++++++-------
+ nvflare/private/fed/client/client_engine.py        | 35 +++++++++++++---------
+ nvflare/private/fed/client/client_executor.py      | 21 ++++++-------
+ nvflare/private/fed/server/server_engine.py        |  7 ++---
+ 4 files changed, 59 insertions(+), 39 deletions(-)
+
+diff --git a/nvflare/app_common/resource_managers/list_resource_manager.py b/nvflare/app_common/resource_managers/list_resource_manager.py
+index 427bae54..cb8fcb27 100644
+--- a/nvflare/app_common/resource_managers/list_resource_manager.py
++++ b/nvflare/app_common/resource_managers/list_resource_manager.py
+@@ -35,7 +35,7 @@ class ListResourceManager(ResourceManagerSpec, FLComponent):
+ 
+     """
+ 
+-    def __init__(self, resources: Dict[str, List], expiration_period: int = 600):
++    def __init__(self, resources: Dict[str, List], expiration_period: int = 30):
+         """Constructor
+ 
+         Args:
+@@ -64,6 +64,15 @@ class ListResourceManager(ResourceManagerSpec, FLComponent):
+         self.stop_event = Event()
+         self.cleanup_thread = Thread(target=self._check_expired)
+ 
++    def handle_event(self, event_type: str, fl_ctx: FLContext):
++        if event_type == EventType.SYSTEM_START:
++            self.cleanup_thread.start()
++        elif event_type == EventType.SYSTEM_END:
++            self.stop_event.set()
++            if self.cleanup_thread:
++                self.cleanup_thread.join()
++                self.cleanup_thread = None
++
+     def _check_expired(self):
+         while not self.stop_event.is_set():
+             time.sleep(1)
+@@ -81,15 +90,7 @@ class ListResourceManager(ResourceManagerSpec, FLComponent):
+                     for k in reserved_resources:
+                         for i in reserved_resources[k]:
+                             self.resources[k].append(i)
+-
+-    def handle_event(self, event_type: str, fl_ctx: FLContext):
+-        if event_type == EventType.SYSTEM_START:
+-            self.cleanup_thread.start()
+-        elif event_type == EventType.SYSTEM_END:
+-            self.stop_event.set()
+-            if self.cleanup_thread:
+-                self.cleanup_thread.join()
+-                self.cleanup_thread = None
++                self.logger.debug(f"current resources: {self.resources}, reserved_resources {self.reserved_resources}.")
+ 
+     def _check_all_required_resource_available(self, resource_requirement: dict, fl_ctx: FLContext) -> bool:
+         check_result = True
+@@ -127,6 +128,9 @@ class ListResourceManager(ResourceManagerSpec, FLComponent):
+                 self.log_debug(
+                     fl_ctx, f"reserving resources: {reserved_resources} for requirements {resource_requirement}."
+                 )
++                self.log_debug(
++                    fl_ctx, f"current resources: {self.resources}, reserved_resources {self.reserved_resources}."
++                )
+         return check_result, token
+ 
+     def cancel_resources(self, resource_requirement: dict, token: str, fl_ctx: FLContext):
+@@ -137,6 +141,9 @@ class ListResourceManager(ResourceManagerSpec, FLComponent):
+                     for i in reserved_resources[k]:
+                         self.resources[k].appendleft(i)
+                 self.log_debug(fl_ctx, f"cancelling resources: {reserved_resources}.")
++                self.log_debug(
++                    fl_ctx, f"current resources: {self.resources}, reserved_resources {self.reserved_resources}."
++                )
+             else:
+                 self.log_debug(fl_ctx, f"Token {token} is not related to any reserved resources.")
+         return None
+@@ -147,13 +154,19 @@ class ListResourceManager(ResourceManagerSpec, FLComponent):
+             if token and token in self.reserved_resources:
+                 result, _ = self.reserved_resources.pop(token)
+                 self.log_debug(fl_ctx, f"allocating resources: {result} for requirements: {resource_requirement}.")
++                self.log_debug(
++                    fl_ctx, f"current resources: {self.resources}, reserved_resources {self.reserved_resources}."
++                )
+             else:
+                 raise RuntimeError(f"allocate_resources: No reserved resources for token {token}.")
+         return result
+ 
+     def free_resources(self, resources: dict, token: str, fl_ctx: FLContext):
+-        self.log_debug(fl_ctx, f"freeing resources: {resources}.")
+         with self.lock:
++            self.log_debug(fl_ctx, f"freeing resources: {resources}.")
++            self.log_debug(
++                fl_ctx, f"current resources: {self.resources}, reserved_resources {self.reserved_resources}."
++            )
+             for k in resources:
+                 for i in resources[k]:
+                     self.resources[k].append(i)
+diff --git a/nvflare/private/fed/client/client_engine.py b/nvflare/private/fed/client/client_engine.py
+index 6725899a..5180fcde 100644
+--- a/nvflare/private/fed/client/client_engine.py
++++ b/nvflare/private/fed/client/client_engine.py
+@@ -21,12 +21,15 @@ import time
+ import traceback
+ from concurrent.futures import ThreadPoolExecutor
+ 
++from nvflare.apis.event_type import EventType
++from nvflare.apis.fl_component import FLComponent
+ from nvflare.apis.fl_constant import MachineStatus, WorkspaceConstants
+ from nvflare.apis.fl_context import FLContext, FLContextManager
+ from nvflare.apis.shareable import Shareable
+ from nvflare.apis.utils.common_utils import get_open_ports
+ from nvflare.private.admin_defs import Message
+ from nvflare.private.defs import ClientStatusKey, EngineConstant
++from nvflare.private.event import fire_event
+ from nvflare.private.fed.utils.fed_utils import deploy_app
+ 
+ from .client_engine_internal_spec import ClientEngineInternalSpec
+@@ -49,6 +52,7 @@ class ClientEngine(ClientEngineInternalSpec):
+             rank: local process rank
+             workers: number of workers
+         """
++        super().__init__()
+         self.client = client
+         self.client_name = client_name
+         self.sender = sender
+@@ -63,19 +67,21 @@ class ClientEngine(ClientEngineInternalSpec):
+ 
+         self.status = MachineStatus.STOPPED
+ 
+-        assert workers >= 1, "workers must >= 1"
++        if workers < 1:
++            raise ValueError("workers must >= 1")
+         self.executor = ThreadPoolExecutor(max_workers=workers)
+-
+         self.logger = logging.getLogger(self.__class__.__name__)
++        self.fl_components = [x for x in self.client.components if isinstance(x, FLComponent)]
++
++    def fire_event(self, event_type: str, fl_ctx: FLContext):
++        fire_event(event=event_type, handlers=self.fl_components, ctx=fl_ctx)
+ 
+     def set_agent(self, admin_agent):
+         self.admin_agent = admin_agent
+ 
+     def do_validate(self, req: Message):
+         self.logger.info("starting cross site validation.")
+-        future = self.executor.submit(lambda p: _do_validate(*p), [self.sender, req])
+-        # thread = threading.Thread(target=_do_validate, args=(self.sender, req))
+-        # thread.start()
++        _ = self.executor.submit(lambda p: _do_validate(*p), [self.sender, req])
+ 
+         return "validate process started."
+ 
+@@ -213,7 +219,8 @@ class ClientEngine(ClientEngineInternalSpec):
+         self.logger.info("Client shutdown...")
+         touch_file = os.path.join(self.args.workspace, "shutdown.fl")
+         self.client_executor.close()
+-        future = self.executor.submit(lambda p: _shutdown_client(*p), [self.client, self.admin_agent, touch_file])
++        self.fire_event(EventType.SYSTEM_END, self.new_context())
++        _ = self.executor.submit(lambda p: _shutdown_client(*p), [self.client, self.admin_agent, touch_file])
+ 
+         return "Shutdown the client..."
+ 
+@@ -221,7 +228,8 @@ class ClientEngine(ClientEngineInternalSpec):
+         self.logger.info("Client shutdown...")
+         touch_file = os.path.join(self.args.workspace, "restart.fl")
+         self.client_executor.close()
+-        future = self.executor.submit(lambda p: _shutdown_client(*p), [self.client, self.admin_agent, touch_file])
++        self.fire_event(EventType.SYSTEM_END, self.new_context())
++        _ = self.executor.submit(lambda p: _shutdown_client(*p), [self.client, self.admin_agent, touch_file])
+ 
+         return "Restart the client..."
+ 
+@@ -264,21 +272,20 @@ def _do_validate(sender, message):
+     pass
+ 
+ 
+-def _shutdown_client(client, admin_agent, touch_file):
++def _shutdown_client(federated_client, admin_agent, touch_file):
+     with open(touch_file, "a"):
+         os.utime(touch_file, None)
+ 
+     try:
+         print("About to shutdown the client...")
+-        client.communicator.heartbeat_done = True
++        federated_client.communicator.heartbeat_done = True
+         time.sleep(3)
+-        client.close()
++        federated_client.close()
+ 
+-        if client.process:
+-            client.process.terminate()
++        if federated_client.process:
++            federated_client.process.terminate()
+ 
+         admin_agent.shutdown()
+     except BaseException as e:
+         traceback.print_exc()
+-        print("FL client execution exception: " + str(e))
+-        # client.status = ClientStatus.TRAINING_EXCEPTION
++        print("Failed to shutdown client: " + str(e))
+diff --git a/nvflare/private/fed/client/client_executor.py b/nvflare/private/fed/client/client_executor.py
+index 18292298..cfdb14f7 100644
+--- a/nvflare/private/fed/client/client_executor.py
++++ b/nvflare/private/fed/client/client_executor.py
+@@ -22,7 +22,7 @@ import time
+ from multiprocessing.connection import Client
+ 
+ from nvflare.apis.fl_constant import AdminCommandNames, ReturnCode, RunProcessKey
+-from nvflare.apis.fl_context import FLContext
++from nvflare.apis.resource_manager_spec import ResourceConsumerSpec, ResourceManagerSpec
+ from nvflare.apis.shareable import Shareable, make_reply
+ from nvflare.fuel.utils.pipe.file_pipe import FilePipe
+ 
+@@ -183,8 +183,8 @@ class ProcessExecutor(ClientExecutor):
+         listen_port,
+         allocated_resource,
+         token,
+-        resource_consumer,
+-        resource_manager,
++        resource_consumer: ResourceConsumerSpec,
++        resource_manager: ResourceManagerSpec,
+     ):
+         if allocated_resource:
+             resource_consumer.consume(allocated_resource)
+@@ -306,14 +306,13 @@ class ProcessExecutor(ClientExecutor):
+             if process_status == ClientStatus.STARTED:
+                 try:
+                     child_process = self.run_processes[run_number][RunProcessKey.CHILD_PROCESS]
+-                    # kill the sub-process group directly
+                     conn_client = self.get_conn_client(run_number)
+                     if conn_client:
+                         data = {"command": AdminCommandNames.ABORT, "data": {}}
+                         conn_client.send(data)
+                         self.logger.debug("abort sent")
+ 
+-                    threading.Thread(target=self._terminate_process, args=[child_process]).start()
++                    threading.Thread(target=self._terminate_process, args=[child_process, run_number]).start()
+                 except Exception as e:
+                     self.logger.error(f"abort_train execution exception: {e}.", exc_info=True)
+                 finally:
+@@ -324,7 +323,7 @@ class ProcessExecutor(ClientExecutor):
+ 
+         self.logger.info("Client training was terminated.")
+ 
+-    def _terminate_process(self, child_process):
++    def _terminate_process(self, child_process, run_number):
+         # wait for client to handle abort
+         time.sleep(10.0)
+         # kill the sub-process group directly
+@@ -334,7 +333,7 @@ class ProcessExecutor(ClientExecutor):
+         except Exception:
+             pass
+         child_process.terminate()
+-        self.logger.debug("terminated")
++        self.logger.info(f"run ({run_number}): child worker process terminated")
+ 
+     def abort_task(self, client, run_number):
+         with self.lock:
+@@ -360,16 +359,18 @@ class ProcessExecutor(ClientExecutor):
+             if time.time() - start > 15:
+                 break
+ 
+-        self.logger.info("waiting for process to finish.")
++        self.logger.info(f"run ({run_number}): waiting for child worker process to finish.")
+         with self.lock:
+             child_process = self.run_processes.get(run_number, {}).get(RunProcessKey.CHILD_PROCESS)
+         if child_process:
+             child_process.wait()
+             return_code = child_process.returncode
+-            self.logger.info(f"process finished with execution code: {return_code}")
++            self.logger.info(f"run ({run_number}): child worker process finished with execution code: {return_code}")
+ 
+         if allocated_resource:
+-            resource_manager.free_resources(resources=allocated_resource, token=token, fl_ctx=FLContext())
++            resource_manager.free_resources(
++                resources=allocated_resource, token=token, fl_ctx=client.engine.new_context()
++            )
+ 
+         with self.lock:
+             conn_client = self.get_conn_client(run_number)
+diff --git a/nvflare/private/fed/server/server_engine.py b/nvflare/private/fed/server/server_engine.py
+index 3c27fde9..16d6cbd7 100644
+--- a/nvflare/private/fed/server/server_engine.py
++++ b/nvflare/private/fed/server/server_engine.py
+@@ -695,8 +695,8 @@ class ServerEngine(ServerEngineInternalSpec):
+ 
+         return stats
+ 
+-    def _send_admin_requests(self, requests) -> List[ClientReply]:
+-        return self.server.admin_server.send_requests(requests, timeout_secs=self.server.admin_server.timeout)
++    def _send_admin_requests(self, requests, timeout_secs=10) -> List[ClientReply]:
++        return self.server.admin_server.send_requests(requests, timeout_secs=timeout_secs)
+ 
+     def check_client_resources(self, resource_reqs) -> Dict[str, Tuple[bool, str]]:
+         requests = {}
+@@ -710,7 +710,7 @@ class ServerEngine(ServerEngineInternalSpec):
+                 requests.update({client.token: request})
+         replies = []
+         if requests:
+-            replies = self._send_admin_requests(requests)
++            replies = self._send_admin_requests(requests, 15)
+         result = {}
+         for r in replies:
+             site_name = self.get_client_name_from_token(r.client_token)
+@@ -734,7 +734,6 @@ class ServerEngine(ServerEngineInternalSpec):
+                 resource_requirements = resource_reqs[site_name]
+                 request = Message(topic=TrainingTopic.CANCEL_RESOURCE, body=pickle.dumps(resource_requirements))
+                 request.set_header(ShareableHeader.RESOURCE_RESERVE_TOKEN, token)
+-                # request.set_header(ShareableHeader.RESOURCE_SPEC, resource_requirements)
+                 client = self.get_client_from_name(site_name)
+                 if client:
+                     requests.update({client.token: request})

@@ -1,0 +1,205 @@
+author:	chesterxgchen
+association:	collaborator
+edited:	false
+status:	none
+--
+the model persister is on the server side, the client runner is on the client-side, so not sure they are related. can you share the client config files ?  there is a flag launch_once should set to True, to avoid each round to re-start  the process. 
+--
+author:	YuanTingHsieh
+association:	collaborator
+edited:	false
+status:	none
+--
+@falibabaei  thanks for the report!
+
+Can you provide more information?
+Your job's config_fed_server / config_fed_client / and meta.json / custom client code ... etc.
+
+Thanks!
+--
+author:	falibabaei
+association:	contributor
+edited:	true
+status:	none
+--
+Hi,
+Thank you for your reply. I use the flag launch_once=true in my config_fed_client.conf, but I still have that issue. I am in the first step of converting my code using decorators to the nvflare version and for debug purposes I am using the nvflare simulator to run the code. Unfortunately, since the custom code is not in the public repository, I cannot share the repository, but my train function is
+```python 
+   @flare.train
+    def train(input_model=None):
+        """
+        Train UNet model with training images (X_train) and masks (y_train)
+        and user-defined parameters.
+        Use test dataset only to visualise performance before final evaluation.
+        X data can be 3 channel or of different dimension (UNet will automatically be adapted).
+
+        :param X_train: train images
+        :param y_train_onehot: corresponding onehot encoded train masks
+        :param X_test: test images
+        :param y_test_onehot: corresponding onehot encoded test masks
+        :param model_path: (Path) path to which model will be saved
+        :return: model saved to provided path
+        """
+        start = time.time()
+        # Check that provided path can be used for saving model
+        assert (
+            type(model_path) == PosixPath
+            and model_path.suffix == ".h5py"
+        ), f"Provided model path '{model_path}' is not a Path ending in '.h5py'!"
+
+        # (5) loads model from NVFlare
+        for k, v in input_model.params.items():
+            model.get_layer(k).set_weights(v)
+        cfg["epochs"] = 1
+        _logger.info("Training model...")
+        history = model.fit(
+            X_train,
+            y_train_onehot,
+            batch_size=cfg["batch_size"],
+            verbose=2,
+            epochs=cfg["epochs"],
+            validation_data=(X_test, y_test_onehot),
+            callbacks=[CustomEpochLogger()],
+        )
+
+        # print('history is ', history.history)
+        metrics = {
+            metric: values[-1]
+            for metric, values in history.history.items()
+        }
+
+        mlflow_writer.log_metrics(
+            metrics=metrics, step=input_model.current_round
+        )
+        duration = time.time() - start
+        _logger.info(
+            f"Elapsed time during model training:\t{round(duration / 60, 2)} min"
+        )
+
+        # Save trained Model
+        # model.save_weights(model_path)
+        model.save(model_dir)
+        _logger.info(f"Model saved to '{model_path}'.")
+        save_model_info(model=model, model_dir=model_dir)
+
+        # save json config to model directory
+        # cp_conf(model_dir)
+        _logger.info(
+            f"Saved configuration of training run to {model_dir}"
+        )
+
+        # (3) send back the model to nvflare server
+        output_model = flare.FLModel(
+            params={
+                layer.name: layer.get_weights()
+                for layer in model.layers
+            },
+            metrics=history.history,
+        )
+
+        return output_model
+while flare.is_running():
+        input_model = flare.receive()
+        input_model.current_round
+        print(f"current_round={input_model.current_round}")
+
+        # (optional) print system info
+        system_info = flare.system_info()
+        print(f"NVFlare system info: {system_info}")
+
+        train(input_model=input_model)
+
+``` 
+and my configuration for the client and server are attached.
+[config_fed_client.txt](https://github.com/NVIDIA/NVFlare/files/14094744/config_fed_client.txt)
+[config_fed_server.txt](https://github.com/NVIDIA/NVFlare/files/14094746/config_fed_server.txt)
+
+--
+author:	falibabaei
+association:	contributor
+edited:	false
+status:	none
+--
+@ [chesterxgchen](https://github.com/chesterxgchen) I noticed that even with the flag launch_once= ture, if I use the simulator with the flag -t 1, the process restarts every round.
+--
+author:	chesterxgchen
+association:	collaborator
+edited:	false
+status:	none
+--
+The issue is  "-t 1". That means only 1 process to simulate more than one client. The simulator has swap in and out different client sites in the process.
+
+try use
+
+-n N -t N
+
+to make sure N is the same as number of clients
+________________________________
+From: falibabaei ***@***.***>
+Sent: Tuesday, January 30, 2024 1:01 AM
+To: NVIDIA/NVFlare ***@***.***>
+Cc: Chester Chen ***@***.***>; Assign ***@***.***>
+Subject: Re: [NVIDIA/NVFlare] client runner keeps restarting and closing the connection until my model is saved in the mlflow instance (Issue #2326)
+
+
+@ chesterxgchen<https://github.com/chesterxgchen> I noticed that even with the flag launch_once= ture, if I use the simulator with the flag -t 1, the process restarts every round.
+
+—
+Reply to this email directly, view it on GitHub<https://github.com/NVIDIA/NVFlare/issues/2326#issuecomment-1916365344>, or unsubscribe<https://github.com/notifications/unsubscribe-auth/AAD5FQ43Q3NMOH2IZLYHFWTYRCZFVAVCNFSM6AAAAABCPZXZ6CVHI2DSMVQWIX3LMV43OSLTON2WKQ3PNVWWK3TUHMYTSMJWGM3DKMZUGQ>.
+You are receiving this because you were assigned.Message ID: ***@***.***>
+
+--
+author:	falibabaei
+association:	contributor
+edited:	true
+status:	none
+--
+@chesterxgchen  I did what you asked but I do not know why I got this message after the first round
+  File "custom/train_UNet.py", line 436, in main
+    print(f"Currently in round {current_round} out of a total of {total_rounds} rounds")
+ValueError: I/O operation on closed file.
+the print comes from here 
+```python
+while flare.is_running():
+       input_model = flare.receive()
+       current_round = input_model.current_round
+        total_rounds = input_model.total_rounds
+         print(f"Currently in round {current_round} out of a total of {total_rounds} rounds")
+```
+[log.txt](https://github.com/NVIDIA/NVFlare/files/14110996/log.txt)
+
+--
+author:	chesterxgchen
+association:	collaborator
+edited:	false
+status:	none
+--
+Strange, I haven't seen this before. @YuanTingHsieh  can you help ? 
+@falibabaei  if you don't mind, you can email me your code, we can check for you to see if we can re-produce the problem. It shouldn't matter what data correct ? 
+
+--
+author:	falibabaei
+association:	contributor
+edited:	false
+status:	none
+--
+@chesterxgchen Thank you. I have added you and  @YuanTingHsieh to the repository. There are some data in the [dataset](https://github.com/falibabaei/murnong_sem-segm-nvflare/tree/main/dataset) to test the code.
+--
+author:	YuanTingHsieh
+association:	collaborator
+edited:	true
+status:	none
+--
+This specific issue after communication, is actually because the system does not have enough resource.
+Thus it got killed by the OS, this `ValueError: I/O operation on closed file.` is coming from running inside the Google Colab environment.
+
+Closing as that is figured out.
+
+We do find an issue regarding Pipe + PipeHandler:
+
+When sending heartbeats in PipeHandler (Line 323), we use timeout = None, which will be translated to use the default_request_timeout set to 5 seconds. This causes a problem where this send_to_peer(msg) can block the entire _try_read thread for up to 5 seconds. It is supposed to be a fast-checking loop.
+
+When the loop is blocked, it also slows down the follow-up checking/sending heartbeat logic, making the system more prone to timeouts.
+
+I will submit PR to fix it.
+--

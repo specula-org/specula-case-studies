@@ -1,0 +1,349 @@
+commit 2d2b065e3b3b22e06d8fc309572ab2020b6add05
+Author:     Yuhong Wen <yuhongw@nvidia.com>
+AuthorDate: Wed Sep 27 16:26:43 2023 -0400
+Commit:     GitHub <noreply@github.com>
+CommitDate: Wed Sep 27 13:26:43 2023 -0700
+
+    Site-specific Authorization (#1858)
+    
+    * WIP: site_authentication.
+    
+    * Added BEFORE_CLIENT_REGISTER, CLIENT_REGISTERED and SYSTEM_BOOTSTRAP events.
+    
+    * Enabled the site-specific authentication and authorization check.
+    
+    * _set_security_data for SiteSecurityFilter.
+    
+    * Simplify the Security, no need to make it a FlComponent.
+    
+    * optimize the Security API.
+    
+    * made Security abstract.
+    
+    * made Security abstract.
+    
+    * factoried the site security and check_resources using check_security.
+    
+    * removed security_handler. Let the customer code directly handle the AUTHORIZE_COMMAND_CHECK event.
+    
+    * code style fixes.
+    
+    * codestyle.
+    
+    * removed no use import.
+    
+    * fixed TestDefaultJobScheduler .
+    
+    * Added extra client register data.
+    
+    * Made the CLIENT_REGISTER_DATA to the server when registering the client.
+    
+    * removed not used get_components().
+    
+    * refactories.
+    
+    * added contains_commmand() in InternalCommands.
+    
+    * Added peer_ctx for the client registration.
+    
+    * Added peer context data to the admin server sending command.
+    
+    * Added more docstrings.
+    
+    * Fixed the missing peer_ctx in the SiteSecurityFilter.authorization_check().
+    
+    * added BEFORE_SEND_ADMIN_COMMAND event.
+    
+    * Added AFTER_CHECK_CLIENT_RESOURCES event.
+    
+    * Fixed cancel_client_resources() requires resource spec for each client issue.
+    
+    * Added more deployment events, and optimized.
+    
+    * codestyle fix.
+    
+    * Removed no used import.
+    
+    * changed the license header year.
+    
+    * codestyle fix.
+    
+    * changed back the pre-command() only return bool.
+    
+    * Removed not used import.
+    
+    * Rrefactoried.
+    
+    * Removed no use codes.
+    
+    * Addressed the PR reviews.
+    
+    ---------
+    
+    Co-authored-by: Yuan-Ting Hsieh (謝沅廷) <yuantingh@nvidia.com>
+    Co-authored-by: Chester Chen <512707+chesterxgchen@users.noreply.github.com>
+---
+ nvflare/app_common/job_schedulers/job_scheduler.py | 19 ++++++++++------
+ nvflare/private/fed/client/client_engine.py        |  8 +++----
+ nvflare/private/fed/server/job_runner.py           | 18 +++++----------
+ nvflare/private/fed/server/server_engine.py        | 26 +++++++++++++++-------
+ 4 files changed, 40 insertions(+), 31 deletions(-)
+
+diff --git a/nvflare/app_common/job_schedulers/job_scheduler.py b/nvflare/app_common/job_schedulers/job_scheduler.py
+index b8a60d00..2619b98d 100644
+--- a/nvflare/app_common/job_schedulers/job_scheduler.py
++++ b/nvflare/app_common/job_schedulers/job_scheduler.py
+@@ -56,7 +56,7 @@ class DefaultJobScheduler(JobSchedulerSpec, FLComponent):
+         self.lock = threading.Lock()
+ 
+     def _check_client_resources(
+-        self, job_id: str, resource_reqs: Dict[str, dict], fl_ctx: FLContext
++        self, job: Job, resource_reqs: Dict[str, dict], fl_ctx: FLContext
+     ) -> Dict[str, Tuple[bool, str]]:
+         """Checks resources on each site.
+ 
+@@ -73,7 +73,7 @@ class DefaultJobScheduler(JobSchedulerSpec, FLComponent):
+         if not isinstance(engine, ServerEngineSpec):
+             raise RuntimeError(f"engine inside fl_ctx should be of type ServerEngineSpec, but got {type(engine)}.")
+ 
+-        result = engine.check_client_resources(job_id, resource_reqs)
++        result = engine.check_client_resources(job, resource_reqs, fl_ctx)
+         self.log_debug(fl_ctx, f"check client resources result: {result}")
+ 
+         return result
+@@ -155,6 +155,7 @@ class DefaultJobScheduler(JobSchedulerSpec, FLComponent):
+         fl_ctx.set_prop(FLContextKey.CURRENT_JOB_ID, job.job_id, private=True)
+         fl_ctx.set_prop(FLContextKey.CLIENT_RESOURCE_SPECS, resource_reqs, private=True, sticky=False)
+         fl_ctx.set_prop(FLContextKey.JOB_PARTICIPANTS, job_participants, private=True, sticky=False)
++        fl_ctx.set_prop(FLContextKey.JOB_META, job.meta, private=True, sticky=False)
+         self.fire_event(EventType.BEFORE_CHECK_CLIENT_RESOURCES, fl_ctx)
+ 
+         block_reason = fl_ctx.get_prop(FLContextKey.JOB_BLOCK_REASON)
+@@ -163,9 +164,8 @@ class DefaultJobScheduler(JobSchedulerSpec, FLComponent):
+             self.log_info(fl_ctx, f"Job {job.job_id} can't be scheduled: {block_reason}")
+             return SCHEDULE_RESULT_NO_RESOURCE, None, block_reason
+ 
+-        resource_check_results = self._check_client_resources(
+-            job_id=job.job_id, resource_reqs=resource_reqs, fl_ctx=fl_ctx
+-        )
++        resource_check_results = self._check_client_resources(job=job, resource_reqs=resource_reqs, fl_ctx=fl_ctx)
++        self.fire_event(EventType.AFTER_CHECK_CLIENT_RESOURCES, fl_ctx)
+ 
+         if not resource_check_results:
+             self.log_debug(fl_ctx, f"Job {job.job_id} can't be scheduled: resource check results is None or empty.")
+@@ -174,6 +174,7 @@ class DefaultJobScheduler(JobSchedulerSpec, FLComponent):
+         required_sites_not_enough_resource = list(required_sites)
+         num_sites_ok = 0
+         sites_dispatch_info = {}
++        no_resource_message = ""
+         for site_name, check_result in resource_check_results.items():
+             is_resource_enough, token = check_result
+             if is_resource_enough:
+@@ -185,6 +186,9 @@ class DefaultJobScheduler(JobSchedulerSpec, FLComponent):
+                 num_sites_ok += 1
+                 if site_name in required_sites:
+                     required_sites_not_enough_resource.remove(site_name)
++            else:
++                if site_name in required_sites:
++                    no_resource_message += site_name + ":" + token + ";"
+ 
+         if num_sites_ok < job.min_sites:
+             self.log_debug(fl_ctx, f"Job {job.job_id} can't be scheduled: not enough sites have enough resources.")
+@@ -194,7 +198,7 @@ class DefaultJobScheduler(JobSchedulerSpec, FLComponent):
+             return (
+                 SCHEDULE_RESULT_NO_RESOURCE,
+                 None,
+-                f"not enough sites have enough resources (ok sites {num_sites_ok} < min sites {job.min_sites}",
++                f"not enough sites have enough resources (ok sites {num_sites_ok} < min sites {job.min_sites})",
+             )
+ 
+         if required_sites_not_enough_resource:
+@@ -210,7 +214,8 @@ class DefaultJobScheduler(JobSchedulerSpec, FLComponent):
+             return (
+                 SCHEDULE_RESULT_NO_RESOURCE,
+                 None,
+-                f"required sites: {required_sites_not_enough_resource} don't have enough resources",
++                f"required sites: {required_sites_not_enough_resource} don't have enough resources. "
++                f"Details: {no_resource_message}",
+             )
+ 
+         # add server dispatch info
+diff --git a/nvflare/private/fed/client/client_engine.py b/nvflare/private/fed/client/client_engine.py
+index 9a04f2c5..7d622b40 100644
+--- a/nvflare/private/fed/client/client_engine.py
++++ b/nvflare/private/fed/client/client_engine.py
+@@ -36,6 +36,7 @@ from .client_engine_internal_spec import ClientEngineInternalSpec
+ from .client_executor import ProcessExecutor
+ from .client_run_manager import ClientRunInfo
+ from .client_status import ClientStatus
++from .fed_client import FederatedClient
+ 
+ 
+ def _remove_custom_path():
+@@ -48,19 +49,18 @@ def _remove_custom_path():
+ class ClientEngine(ClientEngineInternalSpec):
+     """ClientEngine runs in the client parent process."""
+ 
+-    def __init__(self, client, client_name, args, rank, workers=5):
++    def __init__(self, client: FederatedClient, args, rank, workers=5):
+         """To init the ClientEngine.
+ 
+         Args:
+             client: FL client object
+-            client_name: client name
+             args: command args
+             rank: local process rank
+             workers: number of workers
+         """
+         super().__init__()
+         self.client = client
+-        self.client_name = client_name
++        self.client_name = client.client_name
+         self.args = args
+         self.rank = rank
+         self.client_executor = ProcessExecutor(client, os.path.join(args.workspace, "startup"))
+@@ -68,7 +68,7 @@ class ClientEngine(ClientEngineInternalSpec):
+ 
+         self.fl_ctx_mgr = FLContextManager(
+             engine=self,
+-            identity_name=client_name,
++            identity_name=self.client_name,
+             job_id="",
+             public_stickers={},
+             private_stickers={
+diff --git a/nvflare/private/fed/server/job_runner.py b/nvflare/private/fed/server/job_runner.py
+index 74a5bbad..48154cad 100644
+--- a/nvflare/private/fed/server/job_runner.py
++++ b/nvflare/private/fed/server/job_runner.py
+@@ -12,7 +12,6 @@
+ # See the License for the specific language governing permissions and
+ # limitations under the License.
+ 
+-import json
+ import os
+ import shutil
+ import tempfile
+@@ -36,6 +35,7 @@ from nvflare.private.defs import RequestHeader, TrainingTopic
+ from nvflare.private.fed.server.admin import check_client_replies
+ from nvflare.private.fed.server.server_state import HotState
+ from nvflare.private.fed.utils.app_deployer import AppDeployer
++from nvflare.private.fed.utils.fed_utils import set_message_security_data
+ from nvflare.security.logging import secure_format_exception
+ 
+ 
+@@ -93,7 +93,7 @@ class JobRunner(FLComponent):
+             self.stop()
+ 
+     @staticmethod
+-    def _make_deploy_message(job: Job, app_data, app_name):
++    def _make_deploy_message(job: Job, app_data, app_name, fl_ctx):
+         message = Message(topic=TrainingTopic.DEPLOY, body=app_data)
+         message.set_header(RequestHeader.REQUIRE_AUTHZ, "true")
+ 
+@@ -101,15 +101,7 @@ class JobRunner(FLComponent):
+         message.set_header(RequestHeader.JOB_ID, job.job_id)
+         message.set_header(RequestHeader.APP_NAME, app_name)
+ 
+-        message.set_header(RequestHeader.SUBMITTER_NAME, job.meta.get(JobMetaKey.SUBMITTER_NAME))
+-        message.set_header(RequestHeader.SUBMITTER_ORG, job.meta.get(JobMetaKey.SUBMITTER_ORG))
+-        message.set_header(RequestHeader.SUBMITTER_ROLE, job.meta.get(JobMetaKey.SUBMITTER_ROLE))
+-
+-        message.set_header(RequestHeader.USER_NAME, job.meta.get(JobMetaKey.SUBMITTER_NAME))
+-        message.set_header(RequestHeader.USER_ORG, job.meta.get(JobMetaKey.SUBMITTER_ORG))
+-        message.set_header(RequestHeader.USER_ROLE, job.meta.get(JobMetaKey.SUBMITTER_ROLE))
+-
+-        message.set_header(RequestHeader.JOB_META, json.dumps(job.meta))
++        set_message_security_data(message, job, fl_ctx)
+         return message
+ 
+     def _deploy_job(self, job: Job, sites: dict, fl_ctx: FLContext) -> Tuple[str, list]:
+@@ -146,6 +138,7 @@ class JobRunner(FLComponent):
+             client_sites = []
+             for p in participants:
+                 if p == "server":
++                    self.fire_event(EventType.DEPLOY_JOB_TO_SERVER, fl_ctx)
+                     app_deployer = AppDeployer()
+                     err = app_deployer.deploy(
+                         app_name=app_name,
+@@ -179,7 +172,8 @@ class JobRunner(FLComponent):
+                         client_sites.append(p)
+ 
+             if client_sites:
+-                message = self._make_deploy_message(job, app_data, app_name)
++                self.fire_event(EventType.DEPLOY_JOB_TO_CLIENT, fl_ctx)
++                message = self._make_deploy_message(job, app_data, app_name, fl_ctx)
+                 clients, invalid_inputs = engine.validate_targets(client_sites)
+ 
+                 if invalid_inputs:
+diff --git a/nvflare/private/fed/server/server_engine.py b/nvflare/private/fed/server/server_engine.py
+index 1d238532..73fc51d9 100644
+--- a/nvflare/private/fed/server/server_engine.py
++++ b/nvflare/private/fed/server/server_engine.py
+@@ -56,7 +56,7 @@ from nvflare.private.admin_defs import Message, MsgHeader
+ from nvflare.private.defs import CellChannel, CellMessageHeaderKeys, RequestHeader, TrainingTopic, new_cell_message
+ from nvflare.private.fed.server.server_json_config import ServerJsonConfigurator
+ from nvflare.private.fed.server.server_state import ServerState
+-from nvflare.private.fed.utils.fed_utils import security_close
++from nvflare.private.fed.utils.fed_utils import security_close, set_message_security_data
+ from nvflare.private.scheduler_constants import ShareableHeader
+ from nvflare.security.logging import secure_format_exception
+ from nvflare.widgets.info_collector import InfoCollector
+@@ -720,14 +720,14 @@ class ServerEngine(ServerEngineInternalSpec):
+     def _send_admin_requests(self, requests, timeout_secs=10) -> List[ClientReply]:
+         return self.server.admin_server.send_requests(requests, timeout_secs=timeout_secs)
+ 
+-    def check_client_resources(self, job_id: str, resource_reqs) -> Dict[str, Tuple[bool, str]]:
++    def check_client_resources(self, job: Job, resource_reqs, fl_ctx: FLContext) -> Dict[str, Tuple[bool, str]]:
+         requests = {}
+         for site_name, resource_requirements in resource_reqs.items():
+             # assume server resource is unlimited
+             if site_name == "server":
+                 continue
+-            request = Message(topic=TrainingTopic.CHECK_RESOURCE, body=resource_requirements)
+-            request.set_header(RequestHeader.JOB_ID, job_id)
++            request = self._make_message_for_check_resource(job, resource_requirements, fl_ctx)
++
+             client = self.get_client_from_name(site_name)
+             if client:
+                 requests.update({client.token: request})
+@@ -739,11 +739,12 @@ class ServerEngine(ServerEngineInternalSpec):
+             site_name = r.client_name
+             if r.reply:
+                 error_code = r.reply.get_header(MsgHeader.RETURN_CODE, ReturnCode.OK)
++                message = r.reply.body
+                 if error_code != ReturnCode.OK:
+-                    self.logger.error(f"Client reply error: {r.reply.body}")
+-                    result[site_name] = (False, "")
++                    self.logger.error(f"Client reply error: {message}")
++                    result[site_name] = (False, message)
+                 else:
+-                    resp = r.reply.body
++                    resp = message
+                     result[site_name] = (
+                         resp.get_header(ShareableHeader.IS_RESOURCE_ENOUGH, False),
+                         resp.get_header(ShareableHeader.RESOURCE_RESERVE_TOKEN, ""),
+@@ -752,6 +753,15 @@ class ServerEngine(ServerEngineInternalSpec):
+                 result[site_name] = (False, "")
+         return result
+ 
++    def _make_message_for_check_resource(self, job, resource_requirements, fl_ctx):
++        request = Message(topic=TrainingTopic.CHECK_RESOURCE, body=resource_requirements)
++        request.set_header(RequestHeader.JOB_ID, job.job_id)
++        request.set_header(RequestHeader.REQUIRE_AUTHZ, "true")
++        request.set_header(RequestHeader.ADMIN_COMMAND, AdminCommandNames.CHECK_RESOURCES)
++
++        set_message_security_data(request, job, fl_ctx)
++        return request
++
+     def cancel_client_resources(
+         self, resource_check_results: Dict[str, Tuple[bool, str]], resource_reqs: Dict[str, dict]
+     ):
+@@ -759,7 +769,7 @@ class ServerEngine(ServerEngineInternalSpec):
+         for site_name, result in resource_check_results.items():
+             is_resource_enough, token = result
+             if is_resource_enough and token:
+-                resource_requirements = resource_reqs[site_name]
++                resource_requirements = resource_reqs.get(site_name, {})
+                 request = Message(topic=TrainingTopic.CANCEL_RESOURCE, body=resource_requirements)
+                 request.set_header(ShareableHeader.RESOURCE_RESERVE_TOKEN, token)
+                 client = self.get_client_from_name(site_name)

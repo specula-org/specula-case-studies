@@ -1,0 +1,97 @@
+commit 30fbc3b0f8128ad2b7a777b4db5439d880cee3b7
+Author:     Yan Cheng <58191769+yanchengnv@users.noreply.github.com>
+AuthorDate: Tue Mar 21 16:59:42 2023 -0400
+Commit:     GitHub <noreply@github.com>
+CommitDate: Tue Mar 21 16:59:42 2023 -0400
+
+    Fix cell timing (#1558)
+    
+    * fix cell setup timing
+    
+    * fix cell setup timing
+    
+    * fixed list job
+    
+    * make client_cmd channel messages optional
+    
+    * fix invalid client error
+    
+    ---------
+    
+    Co-authored-by: Chester Chen <512707+chesterxgchen@users.noreply.github.com>
+---
+ nvflare/private/fed/client/client_executor.py | 10 +++++++++-
+ nvflare/private/fed/server/job_runner.py      |  4 ++--
+ 2 files changed, 11 insertions(+), 3 deletions(-)
+
+diff --git a/nvflare/private/fed/client/client_executor.py b/nvflare/private/fed/client/client_executor.py
+index 4bdca932..b7c44269 100644
+--- a/nvflare/private/fed/client/client_executor.py
++++ b/nvflare/private/fed/client/client_executor.py
+@@ -227,6 +227,7 @@ class ProcessExecutor(ClientExecutor):
+                     channel=CellChannel.CLIENT_COMMAND,
+                     topic=AdminCommandNames.CHECK_STATUS,
+                     request=request,
++                    optional=True,
+                 )
+                 return_code = return_data.get_header(MessageHeaderKey.RETURN_CODE)
+                 if return_code == ReturnCode.OK:
+@@ -256,7 +257,11 @@ class ProcessExecutor(ClientExecutor):
+                 fqcn = FQCN.join([self.client.client_name, job_id])
+                 request = new_cell_message({}, fobs.dumps(data))
+                 return_data = self.client.cell.send_request(
+-                    target=fqcn, channel=CellChannel.CLIENT_COMMAND, topic=AdminCommandNames.SHOW_STATS, request=request
++                    target=fqcn,
++                    channel=CellChannel.CLIENT_COMMAND,
++                    topic=AdminCommandNames.SHOW_STATS,
++                    request=request,
++                    optional=True,
+                 )
+                 return_code = return_data.get_header(MessageHeaderKey.RETURN_CODE)
+                 if return_code == ReturnCode.OK:
+@@ -288,6 +293,7 @@ class ProcessExecutor(ClientExecutor):
+                     channel=CellChannel.CLIENT_COMMAND,
+                     topic=AdminCommandNames.SHOW_ERRORS,
+                     request=request,
++                    optional=True,
+                 )
+                 return_code = return_data.get_header(MessageHeaderKey.RETURN_CODE)
+                 if return_code == ReturnCode.OK:
+@@ -316,6 +322,7 @@ class ProcessExecutor(ClientExecutor):
+                     channel=CellChannel.CLIENT_COMMAND,
+                     topic=AdminCommandNames.RESET_ERRORS,
+                     message=request,
++                    optional=True,
+                 )
+ 
+         except Exception as e:
+@@ -412,6 +419,7 @@ class ProcessExecutor(ClientExecutor):
+                     channel=CellChannel.CLIENT_COMMAND,
+                     topic=AdminCommandNames.ABORT_TASK,
+                     message=request,
++                    optional=True,
+                 )
+                 self.logger.debug("abort_task sent")
+ 
+diff --git a/nvflare/private/fed/server/job_runner.py b/nvflare/private/fed/server/job_runner.py
+index b1b77fa6..379144af 100644
+--- a/nvflare/private/fed/server/job_runner.py
++++ b/nvflare/private/fed/server/job_runner.py
+@@ -39,7 +39,7 @@ from nvflare.security.logging import secure_format_exception
+ def _send_to_clients(admin_server, client_sites: List[str], engine, message, timeout=None, optional=False):
+     clients, invalid_inputs = engine.validate_targets(client_sites)
+     if invalid_inputs:
+-        raise RuntimeError(f"invalid clients: {invalid_inputs}.")
++        raise RuntimeError(f"unknown clients: {invalid_inputs}.")
+     requests = {}
+     for c in clients:
+         requests.update({c.token: message})
+@@ -153,7 +153,7 @@ class JobRunner(FLComponent):
+ 
+                 if invalid_inputs:
+                     deploy_detail.append("invalid_clients: {}".format(",".join(invalid_inputs)))
+-                    raise RuntimeError(f"invalid clients: {invalid_inputs}.")
++                    raise RuntimeError(f"unknown clients: {invalid_inputs}.")
+ 
+                 for c in clients:
+                     assert isinstance(c, Client)

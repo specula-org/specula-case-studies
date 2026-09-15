@@ -1,0 +1,517 @@
+commit d8fb57941e9c0bc11d995581c73790890ffd901c
+Author:     Chester Chen <512707+chesterxgchen@users.noreply.github.com>
+AuthorDate: Fri May 1 07:35:42 2026 -0700
+Commit:     GitHub <noreply@github.com>
+CommitDate: Fri May 1 07:35:42 2026 -0700
+
+    Enhance CLI agent readiness workflows (#4500)
+    
+    ## Summary
+    
+    This PR expands the NVFlare CLI for agent-friendly and
+    automation-friendly workflows. It adds stable JSON contracts, scoped
+    startup-kit selection, retry-safe job submission, bounded and
+    study-aware job operations, blocking job wait, JSONL job monitor
+    streaming, POC readiness/endpoint metadata, study submit-preflight
+    metadata, recipe metadata discovery, durable client disable/enable
+    workflows, and system lifecycle commands with structured output.
+    
+    Current scope: **94 files changed**: **14 docs/design/user-guide
+    files**, **34 implementation files**, and **46 test files**.
+    
+    ## Key Design Decisions
+    
+    - **Per-command identity selection is optional and non-mutating.**
+    Online commands use the active startup kit by default. If `--kit-id` or
+    `--startup-kit` is provided, it overrides the active startup kit for
+    that command only and does not change the human default startup kit.
+    - **Submit retry safety is token based.** `--submit-token` is scoped by
+    `study + submitter + token`; it is not an auth credential and does not
+    grant access.
+    - **No special `study=all` behavior.** Study selection is either omitted
+    for default behavior or set to an explicit study name.
+    - **Streaming output uses JSONL, not multi-object JSON.** `job monitor
+    --format jsonl` emits one complete JSON event per line; regular
+    `--format json` remains a single-envelope contract.
+    - **Startup-kit registry commands are flattened under `nvflare
+    config`.** The canonical commands are `nvflare config
+    add/use/inspect/list/remove`; no nested `config kit` command is
+    documented for this PR.
+    - **`config inspect` is read-only and human-readable.** It uses the same
+    table shape as `config list` for the active startup kit, plus the config
+    file path. JSON mode keeps the structured automation payload.
+    - **Human and machine output are separated.** Commands enhanced in this
+    PR keep JSON stdout as a single envelope and avoid leaking raw dict/list
+    output into human mode.
+    - **POC operations are local workspace operations.** `poc add-site` and
+    `poc add-user` do not require an active project-admin startup kit
+    because POC models local deployment setup, not production authorization.
+    - **POC port preflight is best effort.** It checks loopback availability
+    only and reports `scope: "loopback"` plus a note instead of binding
+    wildcard interfaces.
+    - **Recipe discovery is local installed-package discovery.** `recipe
+    list/show` do not connect to a FLARE server. Human mode prints a short
+    loading message before local import/inspection; JSON mode remains clean.
+    - **Recipe metadata is descriptive, not an absolute compatibility
+    contract.** `privacy` means a privacy feature is enabled/declared by
+    that recipe entry; lack of privacy metadata does not mean the underlying
+    algorithm cannot be combined with PETs. `state_exchange` text identifies
+    default transfer behavior when a recipe supports configurable transfer
+    types.
+    - **Client disable/enable is durable policy; `remove-client` is not
+    supported in the new `nvflare system` CLI surface.** `disable-client`
+    persists a disabled-client flag and rejects future heartbeats;
+    `enable-client` clears that flag so the client can rejoin.
+    - **`--schema` stays backward compatible.** Existing argparse-derived
+    schema data remains, with added behavioral metadata for agent-facing
+    commands.
+    
+    ## CLI Feature Changes
+    
+    ### Startup Kit / Identity Selection
+    
+    Adds optional per-command selectors for online commands:
+    
+    ```bash
+    nvflare job list --kit-id <id>
+    nvflare job submit -j <job_folder> --startup-kit <path>
+    nvflare study list --kit-id <id>
+    nvflare system status --startup-kit <path>
+    ```
+    
+    `--kit-id` and `--startup-kit` are not required. If neither is provided,
+    the command uses normal startup-kit resolution, ending with the
+    configured active startup kit. If either selector is provided, it takes
+    precedence for that one command and does not mutate
+    `startup_kits.active` in `~/.nvflare/config.conf`.
+    
+    `nvflare config list --format json` and `nvflare config inspect --format
+    json` provide stable startup-kit metadata for automation, including
+    identity, role/org/project when available, certificate expiration
+    status, and non-fatal findings for stale/unreadable kits.
+    
+    `nvflare config inspect` human output uses the same table columns as
+    `config list`, scoped to the active startup kit:
+    
+    ```text
+    active  id                status  identity          cert_role      path
+    --------------------------------------------------------------------------------------------------------------------------------
+    *       admin@nvidia.com  ok      admin@nvidia.com  project_admin  /private/tmp/nvflare/poc/example_project/prod_00/admin@nvidia.com
+    
+    config_file: /Users/chesterc/.nvflare/config.conf
+    ```
+    
+    `nvflare config use` remains a human-facing convenience command that
+    mutates global CLI state. JSON mode returns a structured `startup_kit`
+    and `identity` payload plus a finding that automation should prefer
+    `--kit-id` or `--startup-kit`.
+    
+    Startup-kit registry commands are:
+    
+    ```bash
+    nvflare config add <id> <startup-kit-dir>
+    nvflare config use <id>
+    nvflare config inspect
+    nvflare config list
+    nvflare config remove <id>
+    ```
+    
+    ### Job Submit / Retry Recovery
+    
+    Adds optional retry-safe submit-token recovery:
+    
+    ```bash
+    nvflare job submit -j <job_folder> [--study <name>] [--submit-token <token>] --format json
+    nvflare job list --study <name> --submit-token <token> --format json
+    ```
+    
+    `--submit-token` is caller-generated and optional. If it is omitted,
+    NVFlare does not auto-create a token: submit behavior remains unchanged,
+    each submit creates a new job as before, and the server still tracks the
+    accepted job through the normal job store/job history. No retry-safe
+    submit-token record is created, so `job list --submit-token` recovery is
+    available only when the original submit used a caller-provided token.
+    
+    If a token is provided, submit-token records are scoped by `study +
+    submitter + token`, persisted with job state, and checked against the
+    canonical submitted job content. A retry with the same token and same
+    content returns the existing accepted job; a retry with the same token
+    and different content is rejected.
+    
+    ### Job Wait / Monitor
+    
+    Adds blocking wait:
+    
+    ```bash
+    nvflare job wait <job_id> [--study <name>] [--timeout N] [--interval N] --format json
+    ```
+    
+    This blocks until terminal job state or timeout and returns one final
+    structured envelope. Human mode now prints periodic status context,
+    including the selected study, instead of only printing the initial
+    connection line.
+    
+    Adds newline-delimited streaming monitor output:
+    
+    ```bash
+    nvflare job monitor <job_id> [--study <name>] [--timeout N] [--interval N] --format jsonl
+    ```
+    
+    - Each stdout line is a complete JSON object and is flushed immediately
+    for pipe consumers.
+    - Progress events use `terminal: false`.
+    - Final events use `event: "terminal"` and `terminal: true`.
+    - Timeout emits `status: "TIMEOUT"` and exits with code 3.
+    - Successful raw statuses such as `FINISHED_OK` normalize to `status:
+    "COMPLETED"` while preserving the raw value as `job_status`.
+    - JSONL is scoped to `job monitor`; non-streaming commands reject it.
+    
+    ### Job Metadata / Download / Logs
+    
+    `job meta` is study-aware and has improved human output. Human mode now
+    renders grouped job details instead of raw key/value dumps, including
+    identity, status, execution, deployment, schedule attempts, and storage
+    details. JSON mode remains structured.
+    
+    Job lookup failures for study-aware commands report the searched study
+    and hint to retry with `--study <study_name>` when appropriate, instead
+    of only saying the job does not exist.
+    
+    `job download --format json` reports local artifact discovery under the
+    JSON `data` object. Human output remains concise and prints the final
+    download path. `--force` replaces an existing local download directory.
+    
+    ```json
+    {
+      "data": {
+        "download_path": "...",
+        "path": "...",
+        "artifact_discovery": "completed",
+        "artifacts": {},
+        "missing_artifacts": []
+      }
+    }
+    ```
+    
+    `job logs` supports named studies and bounded output for automation:
+    
+    ```bash
+    nvflare job logs <job_id> [--study <name>] --site server|<client>|all --tail N --since <timestamp> --max-bytes N
+    ```
+    
+    `--study` defaults to `default`. For named-study jobs, callers must pass
+    the same study used for submit/list; otherwise `JOB_NOT_FOUND` reports
+    the searched study and hints to rerun with `--study <study_name>`.
+    
+    Log retrieval now selects a single preferred log representation instead
+    of returning duplicate formats:
+    
+    - `--format json` requests `log.json` first and falls back to `log.txt`
+    only when the JSON log is unavailable.
+    - Human mode requests `log.txt` first and falls back to `log.json`;
+    JSON-log fallback is rendered as text for display.
+    - Bounds (`--tail`, `--since`, `--max-bytes`) are applied by the CLI
+    after retrieval.
+    
+    The log bounds are CLI-side bounds over server-side stored logs; the
+    command does not execute shell commands on client machines.
+    
+    ### POC Prepare / Start / Stop / Add
+    
+    `poc prepare` reports startup-kit transition metadata and port-preflight
+    diagnostics in JSON mode without dumping agent diagnostics into human
+    output.
+    
+    `poc start` waits for readiness by default and reports actual endpoint
+    metadata. Human output is concise and explains that the admin console is
+    optional.
+    
+    `poc stop` has an explicit automation contract: by default it waits for
+    coordinated server shutdown and returns `status: stopped`; with
+    `--no-wait`, it returns after requesting shutdown with `status:
+    shutdown_initiated`.
+    
+    `poc add-site` and `poc add-user` are explicit local workspace
+    modification commands. They replace the overloaded `poc add` shape for
+    the new CLI UX and do not require an active project-admin startup kit.
+    Adding a second POC project-admin user is rejected because the generated
+    POC workspace has a single project admin.
+    
+    `poc start` endpoint metadata:
+    
+    ```json
+    {
+      "server_address": "localhost:8002",
+      "admin_address": "localhost:8003",
+      "ready_timeout": 30,
+      "port_conflict": false,
+      "port_preflight": {},
+      "warnings": [],
+      "ready": true
+    }
+    ```
+    
+    `server_address` and `admin_address` are the source of truth for
+    follow-on automation.
+    
+    ### Study List
+    
+    `study list --format json` returns startup-kit metadata plus
+    authenticated identity/study details from the server, including
+    role/capability fields such as `can_submit_job`.
+    
+    `can_submit_job` is derived from the server authorization service
+    instead of hard-coded role checks in the CLI. Human output is rendered
+    as readable identity/startup-kit text plus a study table instead of raw
+    Python dict/list formatting.
+    
+    Example response shape:
+    
+    ```json
+    {
+      "startup_kit": {"source": "active", "id": "...", "path": "..."},
+      "identity": {"name": "...", "org": "...", "role": "..."},
+      "studies": ["..."],
+      "study_details": [
+        {
+          "name": "...",
+          "role": "...",
+          "capabilities": {"submit_job": true},
+          "can_submit_job": true
+        }
+      ]
+    }
+    ```
+    
+    This is membership-level submit preflight. Hidden or unmapped studies
+    are omitted; full future policy introspection remains out of scope.
+    
+    ### Recipe Discovery
+    
+    Adds filterable/queryable recipe metadata:
+    
+    ```bash
+    nvflare recipe list [--framework <framework>] [--filter key=value] --format json
+    nvflare recipe show <name> --format json
+    ```
+    
+    Supported filter keys are `framework`, `privacy`, `algorithm`,
+    `aggregation`, and `state_exchange`. The user guide and design doc now
+    list the available values for each metadata key, show which frameworks
+    each value applies to, and include examples for common combinations.
+    
+    Human mode now prints progress while local recipe metadata is loaded:
+    
+    ```text
+    Loading installed recipe catalog...
+    Loading installed recipe metadata for 'fedavg'...
+    ```
+    
+    The `recipe show` human summary distinguishes enabled privacy features
+    from metadata declarations and clarifies default/configurable state
+    exchange. For example:
+    
+    ```text
+    state_exchange: full_model (default; params_transfer_type=FULL, supports FULL or DIFF)
+    privacy: none enabled by default
+    privacy compatibility: not declared in recipe metadata
+    parameters: 28 available; run 'nvflare recipe show fedavg --format json'
+    ```
+    
+    JSON output remains the full structured metadata contract, including
+    algorithm, aggregation, state exchange, framework support, privacy
+    compatibility, constructor parameters, optional dependencies, and
+    template references.
+    
+    ### CLI Schema Contract Metadata
+    
+    Agent-facing commands add behavior metadata to `--schema` output:
+    
+    ```json
+    {
+      "output_modes": ["json"],
+      "streaming": false,
+      "mutating": false,
+      "idempotent": true,
+      "retry_token": {"supported": false}
+    }
+    ```
+    
+    Initial coverage includes `job
+    submit/list/meta/wait/monitor/download/logs`, `config use/inspect/list`,
+    `recipe list/show`, and `study list`.
+    
+    For retry-safe submit commands:
+    
+    ```json
+    {
+      "retry_token": {
+        "supported": true,
+        "flag": "--submit-token",
+        "scope": "study + submitter + token",
+        "retry_safe_when_present": true,
+        "effect": "Deduplicates retries for identical submitted job content in the same study by the same submitter; different content with the same token is rejected."
+      }
+    }
+    ```
+    
+    For streaming monitor:
+    
+    ```json
+    {
+      "output_modes": ["json", "jsonl"],
+      "streaming": true,
+      "mutating": false,
+      "idempotent": true
+    }
+    ```
+    
+    ### System Lifecycle
+    
+    Adds structured lifecycle behavior:
+    
+    ```bash
+    nvflare system shutdown <server|client|all> [--no-wait] --format json
+    nvflare system restart <server|client|all> [--no-wait] --format json
+    nvflare system disable-client <client_name> --format json
+    nvflare system enable-client <client_name> --format json
+    ```
+    
+    `shutdown` and `restart` support wait/no-wait behavior for automation.
+    No-wait machine statuses use underscore values: `shutdown_initiated` and
+    `restart_initiated`.
+    
+    `disable-client` persists a disabled-client flag and rejects future
+    heartbeats until `enable-client` clears it. `enable-client` removes the
+    disabled flag so the client can rejoin on its next heartbeat/session
+    attempt. `remove-client` is intentionally not exposed as a supported
+    `nvflare system` CLI command; durable exclusion should use
+    `disable-client`.
+    
+    ## Major Bug Fixes and Hardening
+    
+    This section lists fixes relative to the previous PR/baseline. It
+    intentionally does not enumerate review-round fixes for features
+    introduced inside this PR.
+    
+    - Fixed `job monitor` not being study-aware; it now supports `--study`
+    and uses the selected study session.
+    - Fixed `job logs` not being study-aware; it now supports `--study` and
+    reports the searched study on `JOB_NOT_FOUND`.
+    - Replaced the misleading non-durable `system remove-client` workflow in
+    the new CLI surface with durable `disable-client` / `enable-client`
+    semantics.
+    - Fixed user-submitted jobs being able to carry `from_hub_site`
+    metadata. User submissions now strip `from_hub_site`, so only the
+    server-side `HubAppDeployer` can mark HUB-created jobs and trigger
+    HUB-specific signature-verification behavior.
+    - Hardened cert request and signed-zip validation to reject private key
+    material embedded in zip members, including PEM content hidden in `.pem`
+    files.
+    - Hardened certificate generation helpers to reject duplicate or
+    reserved X.509 extensions and validate CA `not_valid_before` in addition
+    to expiration.
+    - Fixed invalid CLI connection-timeout values to fall back to the
+    default with a warning instead of failing unexpectedly.
+    
+    ## Docs / Tests
+    
+    Docs updated for:
+    
+    - `nvflare config` flattened commands and startup-kit discovery.
+    - `nvflare config inspect` naming and table-style human output.
+    - Job submit tokens, job wait, job monitor JSONL, job metadata, job
+    download artifacts, bounded/study-aware logs, and study-aware command
+    errors.
+    - POC readiness, endpoint metadata, shutdown behavior, and explicit `poc
+    add-site` / `poc add-user` commands.
+    - Recipe list/show metadata, filter keys/values, framework
+    applicability, privacy metadata semantics, loading messages, and
+    state-exchange defaults.
+    - System shutdown/restart and disable/enable-client semantics.
+    - CLI schema metadata and the remaining agent-readiness backlog.
+    
+    Recent focused checks during review rounds include:
+    
+    ```bash
+    pytest tests/unit_test/tool/recipe_cli_test.py
+    pytest tests/unit_test/tool/system/system_shutdown_test.py tests/unit_test/tool/system/system_restart_test.py
+    python -m nvflare.cli recipe list --format json
+    python -m py_compile nvflare/tool/recipe/recipe_cli.py tests/unit_test/tool/recipe_cli_test.py
+    black --check nvflare/tool/recipe/recipe_cli.py tests/unit_test/tool/recipe_cli_test.py
+    black --check nvflare/tool/poc/poc_commands.py
+    git diff --check
+    ```
+    
+    Earlier implementation/review rounds also ran focused suites for job,
+    POC, study, config, system, CLI output/session/schema, startup-kit,
+    cert/package, and submit-token paths.
+    
+    ---------
+    
+    Co-authored-by: Claude Sonnet 4.6 <noreply@anthropic.com>
+---
+ nvflare/private/fed/server/server_engine.py | 50 +++++++++++++++++++++++++++++
+ 1 file changed, 50 insertions(+)
+
+diff --git a/nvflare/private/fed/server/server_engine.py b/nvflare/private/fed/server/server_engine.py
+index 1e12023c..58d4fb1e 100644
+--- a/nvflare/private/fed/server/server_engine.py
++++ b/nvflare/private/fed/server/server_engine.py
+@@ -567,6 +567,56 @@ class ServerEngine(ServerEngineInternalSpec, StreamableEngine):
+             self._remove_dead_client(client)
+         return ""
+ 
++    @staticmethod
++    def _client_operation_error(client_name: str, e: Exception) -> dict:
++        return {"client_name": client_name, "state": "error", "error": str(e)}
++
++    def disable_clients(self, client_names: List[str]) -> dict:
++        results = []
++        for client_name in client_names:
++            try:
++                already_disabled = self.server.client_manager.is_client_disabled(client_name)
++                removed_tokens = self.server.client_manager.disable_client(client_name)
++                for token in removed_tokens:
++                    self.server.remove_client_data(token)
++                    if self.server.admin_server:
++                        self.server.admin_server.client_dead(token)
++                results.append(
++                    {
++                        "client_name": client_name,
++                        "state": "disabled",
++                        "already_disabled": already_disabled,
++                        "active_session_removed": bool(removed_tokens),
++                        "credential_revoked": False,
++                        "rejoin_allowed": False,
++                    }
++                )
++            except Exception as e:
++                if len(client_names) == 1:
++                    raise
++                results.append(self._client_operation_error(client_name, e))
++        return {"clients": results}
++
++    def enable_clients(self, client_names: List[str]) -> dict:
++        results = []
++        for client_name in client_names:
++            try:
++                was_disabled = self.server.client_manager.enable_client(client_name)
++                results.append(
++                    {
++                        "client_name": client_name,
++                        "state": "enabled",
++                        "was_disabled": was_disabled,
++                        "credential_revoked": False,
++                        "rejoin_allowed": True,
++                    }
++                )
++            except Exception as e:
++                if len(client_names) == 1:
++                    raise
++                results.append(self._client_operation_error(client_name, e))
++        return {"clients": results}
++
+     def _remove_dead_client(self, token):
+         _ = self.server.client_manager.remove_client(token)
+         self.server.remove_client_data(token)

@@ -1,0 +1,66 @@
+commit 5e2283fb61ef1c9cbc3b179d5c17d189537e25ed
+Author:     Peter Cnudde <pcnudde@nvidia.com>
+AuthorDate: Mon Aug 17 15:44:30 2026 -0700
+Commit:     GitHub <noreply@github.com>
+CommitDate: Mon Aug 17 15:44:30 2026 -0700
+
+    Keep resource manager exceptions site-local (#5148)
+    
+    ## Description
+    
+    Follow-up to #5143.
+    
+    The resource-check exception path returned `secure_format_exception(e)`
+    to the server. Unless secure logging was enabled at the client, that
+    included `str(e)`, allowing site-local exception details to enter
+    scheduling history and job metadata.
+    
+    This change keeps the formatted exception in the site-local log and
+    returns the fixed, bounded diagnostic `resource manager raised an
+    exception; see site log` across the site boundary. It also uses a module
+    logger instead of relying on an undeclared `engine.logger` attribute.
+    
+    Resource admission and scheduling behavior are otherwise unchanged.
+    
+    ## Validation
+    
+    - 22 focused scheduler and resource-check tests passed
+    - `./runtest.sh -s` passed
+    - `git diff --check` passed
+---
+ nvflare/private/fed/client/scheduler_cmds.py | 8 +++++---
+ 1 file changed, 5 insertions(+), 3 deletions(-)
+
+diff --git a/nvflare/private/fed/client/scheduler_cmds.py b/nvflare/private/fed/client/scheduler_cmds.py
+index 67bc5993..ad8d4ead 100644
+--- a/nvflare/private/fed/client/scheduler_cmds.py
++++ b/nvflare/private/fed/client/scheduler_cmds.py
+@@ -13,6 +13,7 @@
+ # limitations under the License.
+ 
+ import json
++import logging
+ from typing import List
+ 
+ from nvflare.apis.event_type import EventType
+@@ -26,6 +27,8 @@ from nvflare.private.fed.client.client_engine_internal_spec import ClientEngineI
+ from nvflare.private.scheduler_constants import ShareableHeader
+ from nvflare.security.logging import secure_format_exception
+ 
++logger = logging.getLogger(__name__)
++
+ 
+ def _get_resource_manager(engine: ClientEngineInternalSpec):
+     if not isinstance(engine, ClientEngineInternalSpec):
+@@ -81,9 +84,8 @@ class CheckResourceProcessor(RequestProcessor):
+                         resource_requirement=resource_spec, fl_ctx=fl_ctx
+                     )
+             except Exception as e:
+-                reason = f"resource check failed: {secure_format_exception(e)}"
+-                engine.logger.error(f"Job {job_id}: {reason}")
+-                token = reason
++                logger.error(f"Job {job_id}: resource check failed: {secure_format_exception(e)}")
++                token = "resource manager raised an exception; see site log"
+                 result.set_return_code(ReturnCode.EXECUTION_EXCEPTION)
+ 
+         result.set_header(ShareableHeader.IS_RESOURCE_ENOUGH, is_resource_enough)

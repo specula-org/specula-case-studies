@@ -1,0 +1,223 @@
+commit 1e8e2ad5ed27634d1b2245deaeec89dbd0106407
+Author:     Yan Cheng <58191769+yanchengnv@users.noreply.github.com>
+AuthorDate: Thu Oct 17 15:40:33 2024 -0400
+Commit:     GitHub <noreply@github.com>
+CommitDate: Thu Oct 17 12:40:33 2024 -0700
+
+    Enhance comm scalability Part 1 (#3047)
+    
+    * support net bridge
+    
+    * add app command handler signature
+    
+    * update mock to conform to RM
+    
+    * show client fqcn in check_status cmd
+    
+    * change to use parent fqcn for cj2cp messages
+    
+    * revert docs/quickstart.rst
+    
+    * sync with main
+    
+    * removed unused imports
+    
+    * update docstring
+    
+    * sync with main
+    
+    * support old startup kits
+---
+ nvflare/private/fed/client/client_executor.py | 18 ++++----
+ nvflare/private/fed/server/server_engine.py   | 65 ++++++++++++++++++++++-----
+ 2 files changed, 61 insertions(+), 22 deletions(-)
+
+diff --git a/nvflare/private/fed/client/client_executor.py b/nvflare/private/fed/client/client_executor.py
+index b93aaf63..e2e8f515 100644
+--- a/nvflare/private/fed/client/client_executor.py
++++ b/nvflare/private/fed/client/client_executor.py
+@@ -219,6 +219,9 @@ class ProcessExecutor(ClientExecutor):
+         if run_process:
+             run_process[RunProcessKey.STATUS] = job_status
+ 
++    def _job_fqcn(self, job_id: str):
++        return FQCN.join([self.client.cell.get_fqcn(), job_id])
++
+     def check_status(self, job_id):
+         """Checks the status of the running client.
+ 
+@@ -247,10 +250,9 @@ class ProcessExecutor(ClientExecutor):
+         """
+         try:
+             data = {}
+-            fqcn = FQCN.join([self.client.client_name, job_id])
+             request = new_cell_message({}, data)
+             return_data = self.client.cell.send_request(
+-                target=fqcn,
++                target=self._job_fqcn(job_id),
+                 channel=CellChannel.CLIENT_COMMAND,
+                 topic=AdminCommandNames.SHOW_STATS,
+                 request=request,
+@@ -279,10 +281,9 @@ class ProcessExecutor(ClientExecutor):
+         """
+         try:
+             data = {"command": AdminCommandNames.SHOW_ERRORS, "data": {}}
+-            fqcn = FQCN.join([self.client.client_name, job_id])
+             request = new_cell_message({}, data)
+             return_data = self.client.cell.send_request(
+-                target=fqcn,
++                target=self._job_fqcn(job_id),
+                 channel=CellChannel.CLIENT_COMMAND,
+                 topic=AdminCommandNames.SHOW_ERRORS,
+                 request=request,
+@@ -308,10 +309,9 @@ class ProcessExecutor(ClientExecutor):
+         """
+         try:
+             data = {"command": AdminCommandNames.RESET_ERRORS, "data": {}}
+-            fqcn = FQCN.join([self.client.client_name, job_id])
+             request = new_cell_message({}, data)
+             self.client.cell.fire_and_forget(
+-                targets=fqcn,
++                targets=self._job_fqcn(job_id),
+                 channel=CellChannel.CLIENT_COMMAND,
+                 topic=AdminCommandNames.RESET_ERRORS,
+                 message=request,
+@@ -338,10 +338,9 @@ class ProcessExecutor(ClientExecutor):
+                     with self.lock:
+                         child_process = self.run_processes[job_id][RunProcessKey.CHILD_PROCESS]
+                     data = {}
+-                    fqcn = FQCN.join([self.client.client_name, job_id])
+                     request = new_cell_message({}, data)
+                     self.client.cell.fire_and_forget(
+-                        targets=fqcn,
++                        targets=self._job_fqcn(job_id),
+                         channel=CellChannel.CLIENT_COMMAND,
+                         topic=AdminCommandNames.ABORT,
+                         message=request,
+@@ -404,10 +403,9 @@ class ProcessExecutor(ClientExecutor):
+         process_status = self.run_processes.get(job_id, {}).get(RunProcessKey.STATUS, ClientStatus.NOT_STARTED)
+         if process_status == ClientStatus.STARTED:
+             data = {"command": AdminCommandNames.ABORT_TASK, "data": {}}
+-            fqcn = FQCN.join([self.client.client_name, job_id])
+             request = new_cell_message({}, data)
+             self.client.cell.fire_and_forget(
+-                targets=fqcn,
++                targets=self._job_fqcn(job_id),
+                 channel=CellChannel.CLIENT_COMMAND,
+                 topic=AdminCommandNames.ABORT_TASK,
+                 message=request,
+diff --git a/nvflare/private/fed/server/server_engine.py b/nvflare/private/fed/server/server_engine.py
+index d59128cd..1bf8f415 100644
+--- a/nvflare/private/fed/server/server_engine.py
++++ b/nvflare/private/fed/server/server_engine.py
+@@ -52,6 +52,7 @@ from nvflare.fuel.f3.cellnet.defs import ReturnCode as CellMsgReturnCode
+ from nvflare.fuel.utils.argument_utils import parse_vars
+ from nvflare.fuel.utils.zip_utils import zip_directory_to_bytes
+ from nvflare.private.admin_defs import Message, MsgHeader
++from nvflare.private.aux_runner import AuxMsgTarget
+ from nvflare.private.defs import CellChannel, CellMessageHeaderKeys, RequestHeader, TrainingTopic, new_cell_message
+ from nvflare.private.fed.server.server_json_config import ServerJsonConfigurator
+ from nvflare.private.fed.server.server_state import ServerState
+@@ -536,23 +537,63 @@ class ServerEngine(ServerEngineInternalSpec):
+         optional: bool = False,
+         secure: bool = False,
+     ) -> dict:
++        if not target_requests:
++            return {}
++
++        aux_target_reqs = []
++        for name, req in target_requests.items():
++            amt = self._get_aux_msg_target(name)
++            if not amt:
++                self.logger.error(f"unknown AuxMessage target {name}")
++            else:
++                aux_target_reqs.append((amt, req))
++
++        if not aux_target_reqs:
++            return {}
++
+         return self.run_manager.aux_runner.multicast_aux_requests(
+             topic=topic,
+-            target_requests=target_requests,
++            target_requests=aux_target_reqs,
+             timeout=timeout,
+             fl_ctx=fl_ctx,
+             optional=optional,
+             secure=secure,
+         )
+ 
++    def _get_aux_msg_target(self, name: str):
++        if name.lower() == "server":
++            return AuxMsgTarget.server_target()
++
++        c = self.get_client_from_name(name)
++        if c:
++            return AuxMsgTarget.client_target(c)
++        else:
++            return None
++
+     def send_aux_to_targets(self, targets, topic, request, timeout, fl_ctx, optional, secure):
++        msg_targets = []
+         if not targets:
+-            targets = []
+-            for t in self.get_clients():
+-                targets.append(t.name)
+-        if targets:
++            # all clients
++            for c in self.get_clients():
++                msg_targets.append(AuxMsgTarget.client_target(c))
++        elif not isinstance(targets, list):
++            raise TypeError(f"invalid targets type {type(targets)}")
++        else:
++            # this is a list of targets: check targets
++            for t in targets:
++                if not isinstance(t, str):
++                    raise TypeError(f"target name must be str but got {type(t)}")
++
++                amt = self._get_aux_msg_target(t)
++                if not amt:
++                    self.logger.error(f"invalid target {t}")
++                    return {}
++                else:
++                    msg_targets.append(amt)
++
++        if msg_targets:
+             return self.run_manager.aux_runner.send_aux_request(
+-                targets=targets,
++                targets=msg_targets,
+                 topic=topic,
+                 request=request,
+                 timeout=timeout,
+@@ -736,8 +777,8 @@ class ServerEngine(ServerEngineInternalSpec):
+                 command_name=ServerCommandNames.SHOW_STATS,
+                 command_data={},
+             )
+-        except Exception:
+-            self.logger.error(f"Failed to show_stats for JOB: {job_id}")
++        except Exception as ex:
++            self.logger.error(f"Failed to show_stats for JOB: {job_id}: {secure_format_exception(ex)}")
+ 
+         if stats is None:
+             stats = {}
+@@ -751,8 +792,8 @@ class ServerEngine(ServerEngineInternalSpec):
+                 command_name=ServerCommandNames.GET_ERRORS,
+                 command_data={},
+             )
+-        except Exception:
+-            self.logger.error(f"Failed to get_errors for JOB: {job_id}")
++        except Exception as ex:
++            self.logger.error(f"Failed to get_errors for JOB: {job_id}: {secure_format_exception(ex)}")
+ 
+         if errors is None:
+             errors = {}
+@@ -766,8 +807,8 @@ class ServerEngine(ServerEngineInternalSpec):
+                 command_name=ServerCommandNames.RESET_ERRORS,
+                 command_data={},
+             )
+-        except Exception:
+-            self.logger.error(f"Failed to reset_errors for JOB: {job_id}")
++        except Exception as ex:
++            self.logger.error(f"Failed to reset_errors for JOB: {job_id}: {secure_format_exception(ex)}")
+ 
+         return f"reset the server error stats for job: {job_id}"
+ 

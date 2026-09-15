@@ -1,0 +1,87 @@
+commit 57152d3ab6ee1123d5ee448cb28d4b4b67b4e2a0
+Author:     Yuhong Wen <yuhongw@nvidia.com>
+AuthorDate: Fri Jan 21 17:51:14 2022 -0500
+Commit:     GitHub <noreply@github.com>
+CommitDate: Fri Jan 21 14:51:14 2022 -0800
+
+    Removed the use of tmp folders for the server and client. (#133)
+    
+    * Removed the use of tmp folders for the server and client.
+    
+    * renamed back one of the variable name.
+    
+    * Removed no used import.
+    
+    * Removed the no longer needed sleep().
+    
+    * Removed the no used import.
+---
+ nvflare/private/fed/client/client_engine.py   |  2 +-
+ nvflare/private/fed/client/client_executor.py | 10 ++++++----
+ nvflare/private/fed/server/server_engine.py   |  4 ----
+ 3 files changed, 7 insertions(+), 9 deletions(-)
+
+diff --git a/nvflare/private/fed/client/client_engine.py b/nvflare/private/fed/client/client_engine.py
+index 71dbf5fb..1a69c983 100644
+--- a/nvflare/private/fed/client/client_engine.py
++++ b/nvflare/private/fed/client/client_engine.py
+@@ -45,7 +45,7 @@ class ClientEngine(ClientEngineInternalSpec):
+         self.args = args
+         self.rank = rank
+         self.client.process = None
+-        self.client_executor = ProcessExecutor(client.client_name)
++        self.client_executor = ProcessExecutor(client.client_name, os.path.join(args.workspace, "startup"))
+ 
+         self.run_number = -1
+         self.status = MachineStatus.STOPPED
+diff --git a/nvflare/private/fed/client/client_executor.py b/nvflare/private/fed/client/client_executor.py
+index 6a79d11c..8f0a9fd4 100644
+--- a/nvflare/private/fed/client/client_executor.py
++++ b/nvflare/private/fed/client/client_executor.py
+@@ -29,8 +29,8 @@ from .client_status import ClientStatus, get_status_message
+ 
+ 
+ class ClientExecutor(object):
+-    def __init__(self, uid) -> None:
+-        pipe_path = "/tmp/fl/" + uid + "/comm"
++    def __init__(self, uid, startup) -> None:
++        pipe_path = startup + "/comm"
+         if not os.path.exists(pipe_path):
+             os.makedirs(pipe_path)
+ 
+@@ -123,9 +123,10 @@ class ProcessExecutor(ClientExecutor):
+     Run the Client executor in a child process.
+     """
+ 
+-    def __init__(self, uid):
+-        ClientExecutor.__init__(self, uid)
++    def __init__(self, uid, startup):
++        ClientExecutor.__init__(self, uid, startup)
+         # self.client = client
++        self.startup = startup
+ 
+         self.conn_client = None
+         # self.pool = None
+@@ -171,6 +172,7 @@ class ProcessExecutor(ClientExecutor):
+         command = (
+             f"{sys.executable} -m nvflare.private.fed.app.client.worker_process -m "
+             + args.workspace
++            + " -w " + self.startup
+             + " -s fed_client.json "
+             " --set" + command_options + " print_conf=True"
+         )
+diff --git a/nvflare/private/fed/server/server_engine.py b/nvflare/private/fed/server/server_engine.py
+index 4e2406cd..5809cc00 100644
+--- a/nvflare/private/fed/server/server_engine.py
++++ b/nvflare/private/fed/server/server_engine.py
+@@ -399,10 +399,6 @@ def start_server_training(server, args, app_root, run_number):
+     if os.path.exists(restart_file):
+         os.remove(restart_file)
+ 
+-    if os.path.exists(os.path.join(app_root, args.env)):
+-        env_config = args.env
+-    else:
+-        env_config = "/tmp/fl_server/environment.json"
+     try:
+         server_config_file_name = os.path.join(app_root, args.server_config)
+ 

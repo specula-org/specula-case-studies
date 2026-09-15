@@ -1,0 +1,63 @@
+commit 8826132ea74fe417aea05001250e6bf184f415fa
+Author:     Peter Cnudde <pcnudde@nvidia.com>
+AuthorDate: Mon Jun 22 14:27:54 2026 -0700
+Commit:     GitHub <noreply@github.com>
+CommitDate: Mon Jun 22 17:27:54 2026 -0400
+
+    Compute BYOC locally before allow-list bypass (#4820)
+    
+    ## Summary
+    
+    Fix the client-side BYOC trust boundary so server-provided job metadata
+    cannot independently disable the non-BYOC component class allow-list.
+    
+    The client already validates extracted app contents for BYOC
+    authorization. This change makes the client persist and preserve
+    `job_meta["byoc"]` from that local validation result instead of trusting
+    the server-provided value.
+    
+    ## Why
+    
+    `ComponentPathAuthorizer` skips the non-BYOC class allow-list when
+    `job_meta["byoc"]` is true. Before this change, that metadata could be
+    supplied by the server even when the extracted app did not contain local
+    BYOC content. That made BYOC authorization and allow-list behavior
+    depend on different sources.
+    
+    ## What Changed
+    
+    - Split app validation from app authorization so deploy can reuse the
+    same local `app_info` for both authorization and metadata.
+    - In `AppDeployer`, validate extracted app contents before writing final
+    job metadata, then derive `byoc` from local validation.
+    - In `JobExecutor.start_app`, preserve the locally detected BYOC value
+    when refreshing server-supplied metadata before launch.
+    - Added regression coverage for forged server BYOC metadata, local
+    `custom/` BYOC detection, and launch-time metadata refresh.
+---
+ nvflare/private/fed/client/client_executor.py | 5 +++++
+ 1 file changed, 5 insertions(+)
+
+diff --git a/nvflare/private/fed/client/client_executor.py b/nvflare/private/fed/client/client_executor.py
+index c246dc3d..4cc57213 100644
+--- a/nvflare/private/fed/client/client_executor.py
++++ b/nvflare/private/fed/client/client_executor.py
+@@ -18,6 +18,7 @@ import threading
+ import time
+ from abc import ABC, abstractmethod
+ 
++from nvflare.apis.app_validation import AppValidationKey
+ from nvflare.apis.event_type import EventType
+ from nvflare.apis.fl_constant import AdminCommandNames, ConnPropKey, FLContextKey, RunProcessKey, SystemConfigs
+ from nvflare.apis.fl_context import FLContext
+@@ -194,6 +195,10 @@ class JobExecutor(ClientExecutor):
+                 raise RuntimeError(f"START_JOB metadata differs from deployed job metadata for '{meta_key}'")
+             if meta_key in deployed_job_meta:
+                 job_meta[meta_key] = copy.deepcopy(deployed_value)
++        if deployed_job_meta.get(AppValidationKey.BYOC, False):
++            job_meta[AppValidationKey.BYOC] = True
++        else:
++            job_meta.pop(AppValidationKey.BYOC, None)
+ 
+         # Preserve deploy-time launch metadata while recording scheduler-maintained start metadata.
+         with open(meta_file, "w") as f:

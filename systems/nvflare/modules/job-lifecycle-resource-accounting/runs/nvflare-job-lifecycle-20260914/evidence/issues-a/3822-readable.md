@@ -1,0 +1,204 @@
+# 3822: [Potential Bug?] Aborting flare jobs that use flower
+
+State: CLOSED
+
+Hey there,
+
+I am using NVFlare together with Flower (as described [here)](https://nvflare.readthedocs.io/en/2.5/user_guide/flower_integration/flower_run_as_flare_job.html) in my FL setup. When I abort a running job (in production mode) via the admin console, the flare job stops but some of the Flower subprocesses related to the job keep running as if the job was not stopped. 
+
+I was wondering if there is some kind of way that I have to handle the abort signal when using Flower with FLARE for this to work properly or if there is a missing handler for the EventType.ABORT_TASK in the `handle_event()` function of the `TieExecutor` in `app_common/tie/executor.py`.
+
+
+
+## Comment 3487634466 https://github.com/NVIDIA/NVFlare/issues/3822#issuecomment-3487634466
+
+@SlamanigG thanks for your question!
+
+Could you share a bit more details about your setup?
+
+What is your python version?
+What is your NVFlare version?
+What is the flower version you are using?
+Can you share (if not code) the flare job configs (config_fed_server/config_fed_client) you are using?
+
+Thank you!
+
+## Comment 3489606545 https://github.com/NVIDIA/NVFlare/issues/3822#issuecomment-3489606545
+
+@YuanTingHsieh thanks for the reply! My setup looks like this:
+- python 3.11
+- flwr 1.11.0rc0
+- nvflare-nightly 2.5.2+22.ge69c9c85 ([this commit](https://github.com/NVIDIA/NVFlare/commit/e69c9c85d4540e89d22f014cb9f09b38182a3b43))
+
+**Server config:**
+```
+{
+    "format_version": 2,
+    "workflows": [
+        {
+            "id": "controller",
+            "path": "nvflare.app_opt.flower.controller.FlowerController",
+            "args": {}
+        }
+    ],
+    "components": [
+        {
+            "id": "analytics_receiver",
+            "path": "nvflare.app_opt.tracking.tb.tb_receiver.TBAnalyticsReceiver",
+            "args": {
+                "events": [
+                    "fed.analytix_log_stats"
+                ]
+            }
+        }
+    ],
+    "task_data_filters": [],
+    "task_result_filters": []
+}
+```
+
+**Client config:**
+```
+{
+    "format_version": 2,
+    "executors": [
+        {
+            "tasks": [
+                "*"
+            ],
+            "executor": {
+                "path": "nvflare.app_opt.flower.executor.FlowerExecutor",
+                "args": {
+                    "extra_env": {
+                        "CLIENT_API_TYPE": "EX_PROCESS_API"
+                    }
+                }
+            }
+        }
+    ],
+    "components": [
+        {
+            "id": "metrics_pipe",
+            "path": "nvflare.fuel.utils.pipe.cell_pipe.CellPipe",
+            "args": {
+                "mode": "PASSIVE",
+                "site_name": "{SITE_NAME}",
+                "token": "{JOB_ID}",
+                "root_url": "{ROOT_URL}",
+                "secure_mode": "{SECURE_MODE}",
+                "workspace_dir": "{WORKSPACE}"
+            }
+        },
+        {
+            "id": "metric_relay",
+            "path": "nvflare.app_common.widgets.metric_relay.MetricRelay",
+            "args": {
+                "pipe_id": "metrics_pipe",
+                "heartbeat_timeout": 0,
+                "event_type": "fed.analytix_log_stats"
+            }
+        },
+        {
+            "id": "client_api_config_preparer",
+            "path": "nvflare.app_common.widgets.external_configurator.ExternalConfigurator",
+            "args": {
+                "component_ids": [
+                    "metric_relay"
+                ]
+            }
+        }
+    ],
+    "task_data_filters": [],
+    "task_result_filters": []
+}
+```
+
+Note that i don't create these config myself but use `job = FlowerPyTorchJob(..)` together with `job.export_job(..)` which results in these files.
+
+I also noticed that this behaviour happens in POC mode as well.
+
+## Comment 3510620984 https://github.com/NVIDIA/NVFlare/issues/3822#issuecomment-3510620984
+
+I investigated this some more using the hello-flower example from [here](https://github.com/NVIDIA/NVFlare/blob/2.5/examples/hello-world/hello-flower/job.py) in POC mode and this is what i got:
+
+1. Sometimes clients are not exited correctly and leave behind zombie processes, even if I do not abort the job.
+
+For a run wich does not leave zombie processes the run exits with:
+```
+WARNING - Flower server has stopped with RC TASK_ABORTED
+```
+which allows all clients to shut down before the server.
+
+For a run wich does leave  zombie processes, the server stops with:
+```
+WARNING - Flower server has stopped with RC SERVICE_UNAVAILABLE
+```
+before the clients can exit correctly.
+
+
+2. If the job is aborted, most of the time there is no warning (like `server has stopped with RC..`) on the client side. The server prints:
+```
+ServerEngine - INFO - Abort the server app run.
+ServerEngine - INFO - Abort server status: None
+JobRunner - INFO - Stop the job run: b506946a-83c0-4bef-a9e5-9f9a5bb3dd91
+WARNING - Receiving unknown req_id='011a6f51-55da-45ad-8b21-b3283f4f35ce', discarded: '011a6f51-55da-45ad-8b21-b3283f4f35ce'
+WARNING -  server: no waiter for req 3f1d8372-8815-41af-bb67-6eb24e0a35e7 - the reply is too late
+WARNING - server: no waiter for req 3f1d8372-8815-41af-bb67-6eb24e0a35e7 - the reply is too late
+WARNING - server: no waiter for req 3f1d8372-8815-41af-bb67-6eb24e0a35e7 - the reply is too late
+NFO - Connection [CN00085 Not Connected] is closed PID: 24612
+```
+Even if a site receives a `WARNING - Flower server has stopped with RC TASK_ABORTED`, which sometimes happens and previously indicated correct exit behaviour in (1.), the client process still exists after the abort.
+
+## Comment 3523610761 https://github.com/NVIDIA/NVFlare/issues/3822#issuecomment-3523610761
+
+Thanks for report this issue @SlamanigG. Can you see which flwr process is still running? Supernode or superlink? 
+
+## Comment 3526185413 https://github.com/NVIDIA/NVFlare/issues/3822#issuecomment-3526185413
+
+@holgerroth Thanks fr the reply! Seems to be supernode. After some testing I do not think that this issue is too big of a deal since the left-over processes do not use any resources (and might be cleaned up by the OS at some point anyway). 
+
+I have opened another Issue related to abort behaviour in #3830, which I think is much more relevant when using this setup.
+
+## Comment 3528733026 https://github.com/NVIDIA/NVFlare/issues/3822#issuecomment-3528733026
+
+Thanks. Flower is at version [1.23.0](https://pypi.org/project/flwr/) now. Would the same issue persist in that latest version?
+
+## Comment 3531449377 https://github.com/NVIDIA/NVFlare/issues/3822#issuecomment-3531449377
+
+@holgerroth It seems like upgrading flower to 1.23.0 causes a lot of other issues when used together with nvflare. Also from the nvidia [docs](https://nvflare.readthedocs.io/en/2.5/user_guide/flower_integration/flower_run_as_flare_job.html) I read that only `flwr==1.11.0rc0`is supported. Is this up-to-date?
+
+## Comment 3544393726 https://github.com/NVIDIA/NVFlare/issues/3822#issuecomment-3544393726
+
+Hi @SlamanigG
+
+I observed the same behavior using NVFLARE 2.5 with Flower 1.11.0.
+
+The newer NVFLARE versions (2.6 and 2.7) are designed to work with Flower 1.23.0.
+
+For NVFLARE 2.5, we needed to add the following lines:
+
+```
+diff --git a/nvflare/app_common/tie/executor.py b/nvflare/app_common/tie/executor.py
+index f40bca989..d86ebc4f9 100644
+--- a/nvflare/app_common/tie/executor.py
++++ b/nvflare/app_common/tie/executor.py
+@@ -138,6 +138,9 @@ class TieExecutor(Executor):
+             self._notify_client_done(Constant.EXIT_CODE_FATAL_ERROR, fl_ctx)
+         elif event_type == EventType.END_RUN:
+             self.abort_signal.trigger(True)
++            if self.connector:
++                self.logger.info(f"stopping connector {type(self.connector)}")
++                self.connector.stop(fl_ctx)
+ 
+     def execute(self, task_name: str, shareable: Shareable, fl_ctx: FLContext, abort_signal: Signal) -> Shareable:
+         if task_name == self.configure_task_name:
+```
+
+This fix is already included in NVFLARE 2.6 and later.
+
+We recommend trying the newer versions if possible. Otherwise, you can manually apply this change to 2.5.
+
+## Comment 3546097043 https://github.com/NVIDIA/NVFlare/issues/3822#issuecomment-3546097043
+
+@YuanTingHsieh Thanks for the help! (: 
+

@@ -1,0 +1,94 @@
+commit ef93a5cfce3411b23b1c1eba45af64c4e86da780
+Author:     Yan Cheng <58191769+yanchengnv@users.noreply.github.com>
+AuthorDate: Wed Jul 10 15:59:18 2024 -0400
+Commit:     GitHub <noreply@github.com>
+CommitDate: Wed Jul 10 15:59:18 2024 -0400
+
+    [2.5] Support app commands through admin (#2647)
+    
+    * develop app command support
+    
+    * support app command
+    
+    * reformat
+    
+    * fix unused imports
+    
+    * make cell wait timeout configurable
+    
+    * removed unused import
+---
+ nvflare/private/fed/server/server_engine.py | 39 +++++++++++++++++++++++++++++
+ 1 file changed, 39 insertions(+)
+
+diff --git a/nvflare/private/fed/server/server_engine.py b/nvflare/private/fed/server/server_engine.py
+index 96663dd1..f9f3d4cb 100644
+--- a/nvflare/private/fed/server/server_engine.py
++++ b/nvflare/private/fed/server/server_engine.py
+@@ -67,6 +67,7 @@ from .job_runner import JobRunner
+ from .message_send import ClientReply
+ from .run_info import RunInfo
+ from .run_manager import RunManager
++from .server_commands import ServerCommands
+ from .server_engine_internal_spec import EngineInfo, ServerEngineInternalSpec
+ from .server_status import ServerStatus
+ 
+@@ -419,6 +420,22 @@ class ServerEngine(ServerEngineInternalSpec):
+             self.logger.error(f"Failed to get_app_run_info for run: {job_id}")
+         return run_info
+ 
++    def send_app_command(self, job_id: str, topic: str, cmd_data, timeout: float) -> Shareable:
++        cmd = Shareable()
++        cmd[ServerCommandKey.TOPIC] = topic
++        cmd[ServerCommandKey.DATA] = cmd_data
++        try:
++            result = self.send_command_to_child_runner_process(
++                job_id=job_id,
++                command_name=ServerCommandNames.APP_COMMAND,
++                command_data=cmd,
++                timeout=timeout,
++            )
++        except Exception as ex:
++            self.logger.error(f"Exception sending app command to SJ {job_id}: {secure_format_exception(ex)}")
++            return make_reply(ReturnCode.EXECUTION_EXCEPTION)
++        return result
++
+     def set_run_manager(self, run_manager: RunManager):
+         self.run_manager = run_manager
+         for _, widget in self.widgets.items():
+@@ -512,6 +529,24 @@ class ServerEngine(ServerEngineInternalSpec):
+         except Exception as e:
+             self.logger.error(f"Failed to send the aux_message: {topic} with exception: {secure_format_exception(e)}.")
+ 
++    def multicast_aux_requests(
++        self,
++        topic: str,
++        target_requests: Dict[str, Shareable],
++        timeout: float,
++        fl_ctx: FLContext,
++        optional: bool = False,
++        secure: bool = False,
++    ) -> dict:
++        return self.run_manager.aux_runner.multicast_aux_requests(
++            topic=topic,
++            target_requests=target_requests,
++            timeout=timeout,
++            fl_ctx=fl_ctx,
++            optional=optional,
++            secure=secure,
++        )
++
+     def send_aux_to_targets(self, targets, topic, request, timeout, fl_ctx, optional, secure):
+         if not targets:
+             targets = []
+@@ -815,6 +850,10 @@ class ServerEngine(ServerEngineInternalSpec):
+             replies = self._send_admin_requests(requests, fl_ctx, timeout_secs=20)
+         return replies
+ 
++    def register_app_command(self, topic: str, cmd_func, *args, **kwargs):
++        self.logger.debug(f"registering app command {topic}")
++        ServerCommands.register_app_command(topic, cmd_func, *args, *kwargs)
++
+     def stop_all_jobs(self):
+         fl_ctx = self.new_context()
+         self.job_runner.stop_all_runs(fl_ctx)

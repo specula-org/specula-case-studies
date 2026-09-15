@@ -1,0 +1,210 @@
+commit 425c1dae6b0c09610eec3d7ff1dad558922159a9
+Author:     Yuan-Ting Hsieh (謝沅廷) <yuantinghsieh@gmail.com>
+AuthorDate: Wed Apr 27 10:39:51 2022 -0700
+Commit:     GitHub <noreply@github.com>
+CommitDate: Wed Apr 27 10:39:51 2022 -0700
+
+    Clean up job scheduler, resource manager, and resource consumers (#436)
+    
+    * Clean up job scheduler, resource manager, and resource consumers
+    
+    * Use path instead of name for components
+    
+    * Fix typo
+---
+ .../resource_managers/list_resource_manager.py     | 77 ++++++++++++++++++++++
+ nvflare/private/fed/client/scheduler_cmds.py       |  2 +-
+ nvflare/private/fed/server/server_engine.py        | 33 +++++++---
+ 3 files changed, 102 insertions(+), 10 deletions(-)
+
+diff --git a/nvflare/app_common/resource_managers/list_resource_manager.py b/nvflare/app_common/resource_managers/list_resource_manager.py
+new file mode 100644
+index 00000000..8bee9d25
+--- /dev/null
++++ b/nvflare/app_common/resource_managers/list_resource_manager.py
+@@ -0,0 +1,77 @@
++# Copyright (c) 2021-2022, NVIDIA CORPORATION.  All rights reserved.
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++import uuid
++from typing import Dict, List, Optional
++
++from nvflare.apis.fl_context import FLContext
++from nvflare.apis.resource_manager_spec import ResourceManagerSpec
++
++
++class ListResourceManager(ResourceManagerSpec):
++    """Manage a list of resource units.
++
++    For example:
++
++        - require 2, resource is [0, 1, 2, 3, 4, 5] -> check if things in list is available => return [0,1]
++        - require 3 => return [2, 3, 4]
++        - free 2, require 3 => return [0, 1, 5]
++
++    """
++
++    def __init__(self, resources: Dict[str, List]):
++        """Constructor
++
++        Args:
++            resources (dict): Specify the list of resources unit
++        """
++        super().__init__()
++        if not isinstance(resources, dict):
++            raise TypeError(f"resources should be of type dict, but got {type(resources)}.")
++        self.resources = {}
++        for k in resources:
++            if not isinstance(resources[k], list):
++                raise TypeError(f"item in resources should be of type list, but got {type(resources[k])}.")
++            self.resources[k] = set(resources[k])
++
++    def check_resources(self, resource_requirement: dict, fl_ctx: FLContext) -> (bool, Optional[str]):
++        if not isinstance(resource_requirement, dict):
++            raise TypeError(f"resource_requirement should be of type dict, but got {type(resource_requirement)}.")
++        check_result = True
++        for k in resource_requirement:
++            if k in self.resources:
++                if len(self.resources[k]) < resource_requirement[k]:
++                    check_result = False
++                    break
++        return check_result, str(uuid.uuid4())
++
++    def cancel_resources(self, resource_requirement: dict, token: str, fl_ctx: FLContext):
++        return None
++
++    def allocate_resources(self, resource_requirement: dict, token: str, fl_ctx: FLContext) -> dict:
++        result = {}
++        for k in resource_requirement:
++            if k in self.resources:
++                result[k] = []
++                if len(self.resources[k]) < resource_requirement[k]:
++                    raise RuntimeError("Not enough resources.")
++                for i in range(resource_requirement[k]):
++                    result[k].append(self.resources[k].pop())
++        return result
++
++    def free_resources(self, resources: dict, token: str, fl_ctx: FLContext):
++        for k in resources:
++            if k not in self.resources:
++                raise RuntimeError(f"Key {k} is not in resource manager's resources.")
++            self.resources[k].update(resources[k])
+diff --git a/nvflare/private/fed/client/scheduler_cmds.py b/nvflare/private/fed/client/scheduler_cmds.py
+index d7f1b1ed..d9ae177b 100644
+--- a/nvflare/private/fed/client/scheduler_cmds.py
++++ b/nvflare/private/fed/client/scheduler_cmds.py
+@@ -18,12 +18,12 @@ from typing import List
+ from nvflare.apis.fl_constant import ReturnCode, SystemComponents
+ from nvflare.apis.fl_context import FLContext
+ from nvflare.apis.resource_manager_spec import ResourceConsumerSpec, ResourceManagerSpec
+-from nvflare.apis.scheduler_constants import ShareableHeader
+ from nvflare.apis.shareable import Shareable
+ from nvflare.private.admin_defs import Message
+ from nvflare.private.defs import RequestHeader, TrainingTopic
+ from nvflare.private.fed.client.admin import RequestProcessor
+ from nvflare.private.fed.client.client_engine_internal_spec import ClientEngineInternalSpec
++from nvflare.private.scheduler_constants import ShareableHeader
+ 
+ 
+ class CheckResourceProcessor(RequestProcessor):
+diff --git a/nvflare/private/fed/server/server_engine.py b/nvflare/private/fed/server/server_engine.py
+index 019abafd..ee4c32aa 100644
+--- a/nvflare/private/fed/server/server_engine.py
++++ b/nvflare/private/fed/server/server_engine.py
+@@ -28,7 +28,7 @@ from concurrent.futures import ThreadPoolExecutor
+ from multiprocessing.connection import Client as CommandClient
+ from multiprocessing.connection import Listener
+ from threading import Lock
+-from typing import List, Tuple
++from typing import Dict, List, Tuple
+ 
+ from nvflare.apis.client import Client
+ from nvflare.apis.fl_constant import (
+@@ -46,7 +46,6 @@ from nvflare.apis.fl_constant import (
+ from nvflare.apis.fl_context import FLContext, FLContextManager
+ from nvflare.apis.fl_snapshot import FLSnapshot, RunSnapshot
+ from nvflare.apis.impl.job_def_manager import JobDefManagerSpec
+-from nvflare.apis.scheduler_constants import ShareableHeader
+ from nvflare.apis.shareable import Shareable, make_reply
+ from nvflare.apis.utils.common_utils import get_open_ports
+ from nvflare.apis.utils.fl_context_utils import get_serializable_data
+@@ -55,9 +54,11 @@ from nvflare.fuel.hci.zip_utils import zip_directory_to_bytes
+ from nvflare.private.admin_defs import Message
+ from nvflare.private.defs import RequestHeader, TrainingTopic
+ from nvflare.private.fed.server.server_json_config import ServerJsonConfigurator
++from nvflare.private.scheduler_constants import ShareableHeader
+ from nvflare.widgets.info_collector import InfoCollector
+ from nvflare.widgets.widget import Widget, WidgetID
+ 
++from .admin import ClientReply
+ from .client_manager import ClientManager
+ from .job_runner import JobRunner
+ from .run_manager import RunManager
+@@ -692,27 +693,41 @@ class ServerEngine(ServerEngineInternalSpec):
+ 
+         return stats
+ 
+-    def _send_admin_requests(self, requests):
++    def _send_admin_requests(self, requests) -> List[ClientReply]:
+         return self.server.admin_server.send_requests(requests, timeout_secs=self.server.admin_server.timeout)
+ 
+-    def check_client_resources(self, resource_reqs):
++    def check_client_resources(self, resource_reqs) -> List[ClientReply]:
++        """To send the check_client_resources requests to the clients
++
++        Args:
++            resource_reqs: resource_reqs for the job
++
++        Returns:
++            A list of ClientReply.
++        """
+         requests = {}
+-        result = {}
+         for site_name, resource_requirements in resource_reqs.items():
+             # assume server resource is unlimited
+             if site_name == "server":
+                 continue
+             request = Message(topic=TrainingTopic.CHECK_RESOURCE, body=pickle.dumps(resource_requirements))
+-            # request.set_header(ShareableHeader.RESOURCE_SPEC, resource_requirements)
+             client = self.get_client_from_name(site_name)
+             if client:
+                 requests.update({client.token: request})
+         replies = []
+         if requests:
+             replies = self._send_admin_requests(requests)
+-        return replies, result
++        return replies
+ 
+-    def cancel_client_resources(self, resource_check_results, resource_reqs):
++    def cancel_client_resources(
++        self, resource_check_results: Dict[str, Tuple[bool, str]], resource_reqs: Dict[str, dict]
++    ):
++        """To cancel the request resources for the job
++
++        Args:
++            resource_check_results: reserved resources
++            resource_reqs: resource_reqs for the job
++        """
+         requests = {}
+         for site_name, result in resource_check_results.items():
+             check_result, token = result
+@@ -725,7 +740,7 @@ class ServerEngine(ServerEngineInternalSpec):
+                 if client:
+                     requests.update({client.token: request})
+         if requests:
+-            replies = self._send_admin_requests(requests)
++            _ = self._send_admin_requests(requests)
+ 
+     def start_client_job(self, run_number, client_sites):
+         requests = {}

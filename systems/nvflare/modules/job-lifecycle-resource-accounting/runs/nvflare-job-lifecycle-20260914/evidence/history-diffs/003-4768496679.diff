@@ -1,0 +1,81 @@
+commit 4768496679306cd528bcde6bff5d351b4bb9a4c7
+Author:     Yuan-Ting Hsieh (謝沅廷) <yuantingh@nvidia.com>
+AuthorDate: Thu Aug 20 14:57:20 2026 -0700
+Commit:     GitHub <noreply@github.com>
+CommitDate: Thu Aug 20 14:57:20 2026 -0700
+
+    Treat duplicate mandatory clients as one required site (#5161)
+    
+    ## Summary
+    
+    - deduplicate mandatory clients before scheduler admission while
+    preserving their first-seen order
+    - allow harmless duplicate entries to schedule when the required site is
+    connected and has sufficient resources
+    - block non-string mandatory-client entries before study-enrollment
+    membership checks
+    - add regression coverage for duplicate and malformed mandatory-client
+    entries
+    
+    ## Root cause
+    
+    `DefaultJobScheduler._try_job()` copied `job.required_sites` into a list
+    of sites still needing resources. A successful resource check removed
+    only one matching entry, so a duplicate remained and incorrectly
+    triggered the required-site no-resource path.
+    
+    Malformed non-string entries also exposed hash-based failure paths
+    during deduplication and study-enrollment lookup, which could interrupt
+    a scheduling pass before later valid candidates were considered.
+    
+    ## Impact
+    
+    Mandatory-client membership now has set semantics during scheduling.
+    Invalid entries are blocked as job-definition errors without starving
+    later candidates. Existing required-site diagnostics retain list
+    formatting and deterministic order, and the resource cancellation and
+    retry paths are unchanged.
+    
+    This is pre-existing behavior discovered while reviewing #5149; that PR
+    did not introduce the bug.
+    
+    ## Validation
+    
+    - `python -m pytest
+    tests/unit_test/app_common/job_schedulers/job_scheduler_test.py -v` — 23
+    passed
+    - scoped `black --check`, `isort --check`, and `flake8` for both changed
+    files
+    - `git diff --check`
+---
+ nvflare/app_common/job_schedulers/job_scheduler.py | 17 ++++++++++++++++-
+ 1 file changed, 16 insertions(+), 1 deletion(-)
+
+diff --git a/nvflare/app_common/job_schedulers/job_scheduler.py b/nvflare/app_common/job_schedulers/job_scheduler.py
+index 2aee620d..c381625c 100644
+--- a/nvflare/app_common/job_schedulers/job_scheduler.py
++++ b/nvflare/app_common/job_schedulers/job_scheduler.py
+@@ -135,7 +135,22 @@ class DefaultJobScheduler(JobSchedulerSpec, FLComponent):
+                     sites_to_app[SERVER_SITE_NAME] = app_name
+         self.log_debug(fl_ctx, f"Job {job.job_id} is checking against applicable sites: {applicable_sites}")
+ 
+-        required_sites = job.required_sites if job.required_sites else []
++        raw_required_sites = job.required_sites
++        if raw_required_sites is None:
++            raw_required_sites = []
++        elif not isinstance(raw_required_sites, list):
++            self.log_error(fl_ctx, f"Job {job.job_id} has invalid required sites '{raw_required_sites}'")
++            return SCHEDULE_RESULT_BLOCK, None, "required sites must be a list"
++
++        required_sites = []
++        seen = set()
++        for site_name in raw_required_sites:
++            if not isinstance(site_name, str):
++                self.log_error(fl_ctx, f"Job {job.job_id} has invalid required site '{site_name}'")
++                return SCHEDULE_RESULT_BLOCK, None, f"invalid required site '{site_name}'"
++            if site_name not in seen:
++                seen.add(site_name)
++                required_sites.append(site_name)
+         if enrolled_sites is not None:
+             for site_name in required_sites:
+                 if site_name not in enrolled_sites:

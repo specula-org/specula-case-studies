@@ -1,0 +1,112 @@
+author:	taleinat
+association:	contributor
+edited:	false
+status:	none
+--
+For another data-point, we downgraded the code to v2.2.5, re-ran the model training, and it ran through to the end successfully. This strengthens my hypothesis that the previous failure was due to a bug in v2.3.5.
+--
+author:	YuanTingHsieh
+association:	collaborator
+edited:	false
+status:	none
+--
+@taleinat thanks for the report.
+
+Can you share these informations:
+
+1. What built-in components are they using on the client / server side?
+2. When this memory steep climb happens, you say "no iteration had ended", what does that mean?
+Does that mean, each client site is still in training phase BUT no model weights (or weight differences) have been submitted to the server? So server memory usage began its steep climb BEFORE receiving any weights?
+3. Can you share the setup like how many clients they are using?
+4. Can you share the approximate size of the model? We just want to mock a similar size and see if we can reproduce this.
+
+@yanchengnv @chesterxgchen  we need to investigate on this issue, tagging in case I forgot to mention this later.
+--
+author:	yanchengnv
+association:	contributor
+edited:	true
+status:	none
+--
+Tal, a few more questions:
+- Which server process has this memory problem? There are two server processes: one is the root server process that is started when the system is started; another is for the training job that is started only when the job is deployed.
+- What type of aggregator did you use? 
+- Does this problem happen to all training jobs, or only to this particular job?
+Thanks.
+--
+author:	yanchengnv
+association:	contributor
+edited:	true
+status:	none
+--
+After staring at the graph for a while, I noticed a few things:
+- The training has been going on for over 13 hours. Since each round took a few hours, some aggregation should have happened, but we don't see any memory usage surge in the first 13 hours. This seems to indicate that the training was going fine.
+- Then the surge happened. A surge is usually the effect of multiple things added up. If there is a systematic memory leak, the curve should be steadily going up, but not a surge. Is it possible that somehow multiple clients started submitting their model weights to the server at the same time period?
+- Another possibility has to do with network speed/stability. Did you see any timeout errors in the client's log? If the client fails to get a task due to timeout, it will send the getTask request again to the server. So if the timeout parameter is too short, it could cause cascading effect: the server keeps trying to send the same task (with model weights) to the clients again and again. This will cause memory surge. 
+- Did you try to re-run the same job with NVFLARE 2.3.5? If the surge was caused by accidental multiple weight submissions, the chance of that happening again should be low.
+--
+author:	taleinat
+association:	contributor
+edited:	false
+status:	none
+--
+Hi, I'll provide as many details as I can, but first let me respond quickly to @yanchengnv:
+
+> The training has been going on for over 13 hours. Since each round took a few hours, some aggregation should have happened, but we don't see any memory usage surge in the first 13 hours. This seems to indicate that the training was going fine.
+
+Indeed, I agree.
+
+> Is it possible that somehow multiple clients started submitting their model weights to the server at the same time period?
+
+That's not possible, since this training was being run with a single FL client.
+
+> Did you see any timeout errors in the client's log?
+
+No, I did not see anything of the sort.
+
+> Did you try to re-run the same job with NVFLARE 2.3.5?
+
+Not yet.
+--
+author:	yanchengnv
+association:	contributor
+edited:	false
+status:	none
+--
+It looks that the sudden memory surge was not caused by the training process. Accidentally we just found an issue with job meta data processing that could cause memory exhaustion on the server, which seems to match your experience here. We are working on a fix to patch all releases.
+
+In the meanwhile, could you re-run this job on 2.3.5? If the surge is not training related, you should be able to run it through.
+--
+author:	chesterxgchen
+association:	collaborator
+edited:	true
+status:	none
+--
+@taleinat not sure we alway hit the bug Yan pointed out. cc: @IsaacYangSLA 
+Here is our recent test to simulate your use case: 1 client, 500MB (model), 3000 rounds, 15 hr. training. We don't see memory spike. This is server side Job Process (SJ) memory 
+
+![image](https://github.com/NVIDIA/NVFlare/assets/512707/1e0a9c99-322c-4371-8c61-130a557e20de)
+
+
+
+--
+author:	taleinat
+association:	contributor
+edited:	false
+status:	none
+--
+I've run this again with NVFLARE v2.3.5 and it did run to completion successfully without any memory spike.
+--
+author:	yanchengnv
+association:	contributor
+edited:	false
+status:	none
+--
+This proves our theory that this is unrelated to training. We are working on a fix of the memory exhaustion issue and will provide a patch soon.
+--
+author:	yanchengnv
+association:	contributor
+edited:	false
+status:	none
+--
+BTW, the fix has been released. Please check out v2.3.9.
+--

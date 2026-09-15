@@ -1,0 +1,152 @@
+commit efc47d470b688f0ab5578ff99be3d9c7269db291
+Author:     Yuan-Ting Hsieh (謝沅廷) <yuantingh@nvidia.com>
+AuthorDate: Thu Aug 13 11:41:51 2026 -0700
+Commit:     GitHub <noreply@github.com>
+CommitDate: Thu Aug 13 11:41:51 2026 -0700
+
+    Preserve workspace sources during archival (#5111)
+    
+    ## Summary
+    
+    - build multi-source workspace archives directly from their source files
+    instead of moving those files into a temporary directory
+    - include final archive publication in the storage error-handling
+    boundary so failed publishes clean up their temporary archive
+    - publish with `os.replace()`, matching NVFlare's atomic-replacement
+    pattern
+    - add regression coverage for archive layout, ZIP-write failure, retry
+    completeness, final-publication failure, source preservation, and
+    diagnostics
+    
+    ## Root cause
+    
+    `FilesystemStorage._write_multi` moved workspace contents into a
+    `TemporaryDirectory` before creating the ZIP. If ZIP creation failed—for
+    example because the job store was full, read-only, or returned an I/O
+    error—the context manager deleted that temporary directory and therefore
+    deleted the only copies of the workspace artifacts.
+    
+    The retry then saw the original source directories still present but
+    empty, created an empty ZIP, and could publish the job as completed with
+    no trained model.
+    
+    This is a follow-up to #5091. That fix prevents a cleanup retry from
+    overwriting an archive after `save_workspace` returns, but cannot cover
+    a failure inside `save_workspace` before its success latch is set.
+    
+    ## Impact
+    
+    Packaging now treats list-based workspace sources as read-only. A failed
+    ZIP write or failed final publication leaves the source artifacts intact
+    for a complete retry, while a successful save is still followed by the
+    existing explicit JobRunner cleanup. This avoids both data loss and the
+    disk/RAM duplication that copying all sources into another staging
+    directory would introduce.
+    
+    The existing documented `mv_file=True` behavior for single string-path
+    inputs is intentionally unchanged and outside this PR's scope.
+    
+    ## Validation
+    
+    Authoritative validation used a fresh isolated checkout of the exact
+    signed PR head:
+    
+    - head `be96c4082633bbab2fa5f4d61b8d01e7bdaef5b4`
+    - tree `4aee7b1e0e3f65daefed2f553004e1e44d12a5c5`
+    - parent `c3008e2e12e2db89730f1d953ec65671872f07c7`
+    - base `de7177fc6b98b71c1fdf931facd0d836879be7af`
+    - base..HEAD binary diff SHA-256
+    `9fddffb4db890faf5b14eca112c69a1878add71fcbd7b4d8b0ba78a88285427f`
+    - review-only parent..HEAD diff SHA-256
+    `c423e01447503c4c261f05eb5e553eac48ed0a89450aa583223ece53692c638e`
+    - Good EDDSA signature, clean source and unchanged QA, exact runtime
+    imports
+    
+    Checks:
+    
+    - `storage_test.py`: 32 passed, RC 0
+    - repository-wide Black, isort, flake8, agent-skill lint, and `git diff
+    --check`: passed
+    - GitHub CI: all unit-test matrices, coverage, style, CodeQL, wheel
+    build, compatibility, link, license, and review checks passed
+    - unchanged DLQASH MR !199 primary: 1 passed, RC 0
+    - persistent and transient companion selectors: 2 passed, RC 0
+    - supplemental overwrite/same-device `os.replace` diagnostic: passed
+    
+    Primary Colossus job `941cb3c6-c5c3-45ed-a17e-535af71725a1`:
+    
+    - job store locked for 25 seconds; 17 packaging writes failed while the
+    sources remained intact
+    - repaired retry reached `FINISHED:COMPLETED` in 25.004361 seconds
+    - final downloads: metadata 895 bytes, job archive 20,024 bytes,
+    workspace archive 101,234 bytes
+    - extracted workspace: 19 files / 98,208 bytes
+    - original 164-byte trained model survived with SHA-256
+    `ecb50e4ceb5147bc97cb674067d6e23bce6d6533ef18d8f5a05d29b8b6f59a25`
+    - no temporary archives, job-store entries, processes, listeners, or
+    CLOSE-WAIT sockets remained
+    
+    Controls:
+    
+    - persistent job-store failure: 60 expected failures, exact 60-second
+    bounded-grace message, source residue preserved, then completed after
+    permissions were restored
+    - transient failure: recovered after 2 expected failures in 10.968770
+    seconds; `ARCHIVAL_ABANDONED=no`; complete archive downloaded
+    successfully
+    - temporary host configuration was restored byte-for-byte after testing
+    
+    ## Review disposition
+    
+    The duplicate-member compatibility question is closed as benign. When
+    two source roots contain the same relative member name, the new archive
+    contains both physical members; Python ZIP name lookup and extraction
+    select the later member, preserving the previous implementation's
+    effective last-wins result, while directory-name collisions no longer
+    destroy either source. No dedup prepass is included in this focused
+    data-loss fix. A separate hardening change could emit only the last
+    member if duplicate-member warnings or archive-scanner compatibility
+    become a requirement.
+    
+    Review feedback on atomic replacement and diagnostics is addressed in
+    `be96c408`:
+    
+    - final publication uses `os.replace()`
+    - unsupported content errors list `bytes`, `str`, and `list`
+    - invalid list entries report the offending path
+    - regression tests cover all three behaviors
+    
+    Two pre-existing storage atomicity defects remain intentionally outside
+    this focused PR:
+    
+    - for string content with `mv_file=True`, the source has already moved
+    to `tmp_path` when final publication runs; on publication failure,
+    cleanup now removes that only copy instead of leaving a manually
+    salvageable UUID temporary file. A dedicated follow-up should restore
+    `tmp_path` to the original source path, or deliberately preserve it, and
+    cover both recovery and destination preservation with failure injection.
+    - metadata publication failure during `create_object(...,
+    overwrite_existing=True)` can remove data and invalidate the previous
+    object.
+    
+    These should be handled independently with dedicated failure-injection
+    coverage.
+---
+ nvflare/private/fed/server/job_runner.py | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/nvflare/private/fed/server/job_runner.py b/nvflare/private/fed/server/job_runner.py
+index 0f883695..2ebace10 100644
+--- a/nvflare/private/fed/server/job_runner.py
++++ b/nvflare/private/fed/server/job_runner.py
+@@ -592,8 +592,8 @@ class JobRunner(FLComponent):
+             job_manager = engine.get_component(SystemComponents.JOB_MANAGER)
+             location = job_manager.save_workspace(job_id, ws_dirs, fl_ctx)
+             if finished_state:
+-                # save_workspace moves source contents. Record that irreversible step before cleanup so a cleanup retry
+-                # cannot replace the complete archive with one built from the now-empty sources.
++                # Latch the successful archive publication before cleanup so a cleanup retry cannot rewrite it from
++                # sources that an earlier cleanup attempt may have partially removed.
+                 finished_state.workspace_archive_written = True
+                 finished_state.workspace_archive_sources = tuple(ws_dirs)
+             self.log_debug(fl_ctx, f"Workspace {ws_dirs} saved to {location}")

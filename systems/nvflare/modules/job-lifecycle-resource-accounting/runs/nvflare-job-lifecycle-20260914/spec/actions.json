@@ -1,0 +1,2122 @@
+[
+  {
+    "name": "DefaultJobSchedulerBeginPass",
+    "params": [],
+    "guards": [
+      "scheduler.pc = \"idle\"",
+      "Cardinality(scheduler.scheduled) < MaxJobs"
+    ],
+    "updates": {
+      "scheduler": "[scheduler EXCEPT !.pc = \"scan\", !.candidates = SelectSeq(JobOrder,LAMBDA j : jobs[j].status = \"SUBMITTED\")]"
+    },
+    "source": "nvflare/app_common/job_schedulers/job_scheduler.py:339-346; nvflare/private/fed/server/job_runner.py:641-658",
+    "scenario": "5",
+    "fault": null,
+    "note": ""
+  },
+  {
+    "name": "DefaultJobSchedulerEndPass",
+    "params": [],
+    "guards": [
+      "scheduler.pc = \"scan\"",
+      "scheduler.candidates = <<>>"
+    ],
+    "updates": {
+      "scheduler": "[scheduler EXCEPT !.pc = \"persistFailed\", !.returnTo = \"idle\"]"
+    },
+    "source": "nvflare/app_common/job_schedulers/job_scheduler.py:377-378",
+    "scenario": "5",
+    "fault": null,
+    "note": ""
+  },
+  {
+    "name": "DefaultJobSchedulerSkipBackoff",
+    "params": [],
+    "guards": [
+      "scheduler.pc = \"scan\"",
+      "scheduler.candidates # <<>>",
+      "scheduler.cooldown[Head(scheduler.candidates)]",
+      "scheduler.count[Head(scheduler.candidates)] < MaxScheduleCount"
+    ],
+    "updates": {
+      "scheduler": "[scheduler EXCEPT !.candidates = Tail(scheduler.candidates)]"
+    },
+    "source": "nvflare/app_common/job_schedulers/job_scheduler.py:356-362",
+    "scenario": "5",
+    "fault": null,
+    "note": ""
+  },
+  {
+    "name": "DefaultJobSchedulerBackoffElapsed",
+    "params": [
+      "j"
+    ],
+    "guards": [
+      "scheduler.cooldown[j]"
+    ],
+    "updates": {
+      "scheduler": "[scheduler EXCEPT !.cooldown[j] = FALSE]"
+    },
+    "source": "nvflare/app_common/job_schedulers/job_scheduler.py:356-362",
+    "scenario": "5",
+    "fault": null,
+    "note": "Deadline crossing; elapsed seconds must be >= Backoff(j); no normal retry counter bound."
+  },
+  {
+    "name": "DefaultJobSchedulerExhausted",
+    "params": [],
+    "guards": [
+      "scheduler.pc = \"scan\"",
+      "scheduler.candidates # <<>>",
+      "scheduler.count[Head(scheduler.candidates)] >= MaxScheduleCount"
+    ],
+    "updates": {
+      "scheduler": "[scheduler EXCEPT !.count[Head(scheduler.candidates)] = @+1, !.history[Head(scheduler.candidates)] = Append(@,\"exceeded\"), !.cooldown[Head(scheduler.candidates)] = TRUE, !.blockedPending = @ \\cup {Head(scheduler.candidates)}, !.candidates = Tail(@)]"
+    },
+    "source": "nvflare/app_common/job_schedulers/job_scheduler.py:298-310; nvflare/app_common/job_schedulers/job_scheduler.py:347-354",
+    "scenario": "5",
+    "fault": null,
+    "note": "The exhausted-candidate metadata write succeeds in this slice."
+  },
+  {
+    "name": "DefaultJobSchedulerTryJob",
+    "params": [],
+    "guards": [
+      "scheduler.pc = \"scan\"",
+      "scheduler.candidates # <<>>",
+      "~scheduler.cooldown[Head(scheduler.candidates)]",
+      "scheduler.count[Head(scheduler.candidates)] < MaxScheduleCount",
+      "scheduler.issued[Head(scheduler.candidates)] < AttemptSlots"
+    ],
+    "updates": {
+      "scheduler": "[scheduler EXCEPT !.current = Head(scheduler.candidates), !.issued[Head(scheduler.candidates)] = @+1, !.considered[Head(scheduler.candidates)] = @+1, !.pc = \"sendCheck\"]"
+    },
+    "source": "nvflare/app_common/job_schedulers/job_scheduler.py:104-199; nvflare/app_common/job_schedulers/job_scheduler.py:347-365",
+    "scenario": "1-5",
+    "fault": null,
+    "note": "Connected valid selected sites pass applicability checks. AttemptSlots is a finite fresh-token universe, not retry policy."
+  },
+  {
+    "name": "ServerEngineCheckClientResources",
+    "params": [],
+    "guards": [
+      "scheduler.pc = \"sendCheck\""
+    ],
+    "updates": {
+      "network": "network \\cup {Msg(\"Check\",s,CurrentToken) : s \\in Sites}",
+      "rpc": "[s \\in Sites |-> [rpc[s] EXCEPT ![CurrentToken].check = \"waiting\"]]",
+      "scheduler": "[scheduler EXCEPT !.pc = \"checkWait\"]"
+    },
+    "source": "nvflare/private/fed/server/server_engine.py:1010-1024",
+    "scenario": "1-5",
+    "fault": null,
+    "note": ""
+  },
+  {
+    "name": "CheckResourceProcessorReserve",
+    "params": [
+      "s",
+      "t"
+    ],
+    "guards": [
+      "ResourceManagerUnlocked(s)",
+      "Msg(\"Check\", s, t) \\in network",
+      "rm[s].free # <<>>"
+    ],
+    "updates": {
+      "rm": "[rm EXCEPT ![s].free = Tail(@), ![s].reserved[t] = <<Head(rm[s].free)>>, ![s].ttl[t] = ReservationTTL]",
+      "network": "(network \\ {Msg(\"Check\", s, t)}) \\cup {Msg(\"CheckOK\", s, t)}"
+    },
+    "source": "nvflare/private/fed/client/scheduler_cmds.py:67-93; nvflare/app_common/resource_managers/auto_clean_resource_manager.py:123-138; nvflare/app_common/resource_managers/list_resource_manager.py:57-75",
+    "scenario": "1,2,4,5",
+    "fault": null,
+    "note": ""
+  },
+  {
+    "name": "CheckResourceProcessorUnavailable",
+    "params": [
+      "s",
+      "t"
+    ],
+    "guards": [
+      "ResourceManagerUnlocked(s)",
+      "Msg(\"Check\", s, t) \\in network",
+      "rm[s].free = <<>>"
+    ],
+    "updates": {
+      "network": "(network \\ {Msg(\"Check\", s, t)}) \\cup {Msg(\"CheckNo\", s, t)}"
+    },
+    "source": "nvflare/private/fed/client/scheduler_cmds.py:83-93; nvflare/app_common/resource_managers/auto_clean_resource_manager.py:123-138; nvflare/app_common/resource_managers/list_resource_manager.py:57-67",
+    "scenario": "1,4,5",
+    "fault": null,
+    "note": ""
+  },
+  {
+    "name": "ServerEngineReceiveCheckOK",
+    "params": [
+      "s",
+      "t"
+    ],
+    "guards": [
+      "Msg(\"CheckOK\", s, t) \\in network"
+    ],
+    "updates": {
+      "network": "network \\ {Msg(\"CheckOK\", s, t)}",
+      "rpc": "[rpc EXCEPT ![s][t].check = IF rpc[s][t].check = \"waiting\" THEN \"ok\" ELSE rpc[s][t].check]"
+    },
+    "source": "nvflare/private/fed/server/server_engine.py:1025-1041; nvflare/private/fed/server/server_engine.py:1065-1083; nvflare/private/fed/server/admin.py:286-339",
+    "scenario": "1,4,5",
+    "fault": null,
+    "note": "Closed waiters discard late replies; no mutation of another token or lifecycle status."
+  },
+  {
+    "name": "ServerEngineReceiveCheckNo",
+    "params": [
+      "s",
+      "t"
+    ],
+    "guards": [
+      "Msg(\"CheckNo\", s, t) \\in network"
+    ],
+    "updates": {
+      "network": "network \\ {Msg(\"CheckNo\", s, t)}",
+      "rpc": "[rpc EXCEPT ![s][t].check = IF rpc[s][t].check = \"waiting\" THEN \"no\" ELSE rpc[s][t].check]"
+    },
+    "source": "nvflare/private/fed/server/server_engine.py:1025-1041; nvflare/private/fed/server/server_engine.py:1065-1083; nvflare/private/fed/server/admin.py:286-339",
+    "scenario": "1,4,5",
+    "fault": null,
+    "note": "Closed waiters discard late replies; no mutation of another token or lifecycle status."
+  },
+  {
+    "name": "AdminCheckTimeout",
+    "params": [
+      "t"
+    ],
+    "guards": [
+      "\\E s \\in Sites : rpc[s][t].check = \"waiting\""
+    ],
+    "updates": {
+      "rpc": "[s \\in Sites |-> [rpc[s] EXCEPT ![t].check = IF @ = \"waiting\" THEN \"timeout\" ELSE @]]"
+    },
+    "source": "nvflare/private/fed/server/server_engine.py:1023-1040; nvflare/private/fed/server/server_engine.py:1065-1083; nvflare/private/fed/server/admin.py:307-339",
+    "scenario": "1,4,5",
+    "fault": "checkTimeout",
+    "note": "Actual RPC deadline crossing; commands already sent remain executable."
+  },
+  {
+    "name": "ServerEngineReceiveDeployOK",
+    "params": [
+      "s",
+      "t"
+    ],
+    "guards": [
+      "Msg(\"DeployOK\", s, t) \\in network"
+    ],
+    "updates": {
+      "network": "network \\ {Msg(\"DeployOK\", s, t)}",
+      "rpc": "[rpc EXCEPT ![s][t].deploy = IF rpc[s][t].deploy = \"waiting\" THEN \"ok\" ELSE rpc[s][t].deploy]"
+    },
+    "source": "nvflare/private/fed/server/server_engine.py:1025-1041; nvflare/private/fed/server/server_engine.py:1065-1083; nvflare/private/fed/server/admin.py:286-339",
+    "scenario": "1,4,5",
+    "fault": null,
+    "note": "Closed waiters discard late replies; no mutation of another token or lifecycle status."
+  },
+  {
+    "name": "ServerEngineReceiveDeployNo",
+    "params": [
+      "s",
+      "t"
+    ],
+    "guards": [
+      "Msg(\"DeployNo\", s, t) \\in network"
+    ],
+    "updates": {
+      "network": "network \\ {Msg(\"DeployNo\", s, t)}",
+      "rpc": "[rpc EXCEPT ![s][t].deploy = IF rpc[s][t].deploy = \"waiting\" THEN \"no\" ELSE rpc[s][t].deploy]"
+    },
+    "source": "nvflare/private/fed/server/server_engine.py:1025-1041; nvflare/private/fed/server/server_engine.py:1065-1083; nvflare/private/fed/server/admin.py:286-339",
+    "scenario": "1,4,5",
+    "fault": null,
+    "note": "Closed waiters discard late replies; no mutation of another token or lifecycle status."
+  },
+  {
+    "name": "AdminDeployTimeout",
+    "params": [
+      "t"
+    ],
+    "guards": [
+      "\\E s \\in Sites : rpc[s][t].deploy = \"waiting\""
+    ],
+    "updates": {
+      "rpc": "[s \\in Sites |-> [rpc[s] EXCEPT ![t].deploy = IF @ = \"waiting\" THEN \"timeout\" ELSE @]]"
+    },
+    "source": "nvflare/private/fed/server/server_engine.py:1023-1040; nvflare/private/fed/server/server_engine.py:1065-1083; nvflare/private/fed/server/admin.py:307-339",
+    "scenario": "1,4,5",
+    "fault": "deployTimeout",
+    "note": "Actual RPC deadline crossing; commands already sent remain executable."
+  },
+  {
+    "name": "ServerEngineReceiveStartOK",
+    "params": [
+      "s",
+      "t"
+    ],
+    "guards": [
+      "Msg(\"StartOK\", s, t) \\in network"
+    ],
+    "updates": {
+      "network": "network \\ {Msg(\"StartOK\", s, t)}",
+      "rpc": "[rpc EXCEPT ![s][t].start = IF rpc[s][t].start = \"waiting\" THEN \"ok\" ELSE rpc[s][t].start]"
+    },
+    "source": "nvflare/private/fed/server/server_engine.py:1025-1041; nvflare/private/fed/server/server_engine.py:1065-1083; nvflare/private/fed/server/admin.py:286-339",
+    "scenario": "1,4,5",
+    "fault": null,
+    "note": "Closed waiters discard late replies; no mutation of another token or lifecycle status."
+  },
+  {
+    "name": "ServerEngineReceiveStartNo",
+    "params": [
+      "s",
+      "t"
+    ],
+    "guards": [
+      "Msg(\"StartNo\", s, t) \\in network"
+    ],
+    "updates": {
+      "network": "network \\ {Msg(\"StartNo\", s, t)}",
+      "rpc": "[rpc EXCEPT ![s][t].start = IF rpc[s][t].start = \"waiting\" THEN \"no\" ELSE rpc[s][t].start]"
+    },
+    "source": "nvflare/private/fed/server/server_engine.py:1025-1041; nvflare/private/fed/server/server_engine.py:1065-1083; nvflare/private/fed/server/admin.py:286-339",
+    "scenario": "1,4,5",
+    "fault": null,
+    "note": "Closed waiters discard late replies; no mutation of another token or lifecycle status."
+  },
+  {
+    "name": "AdminStartTimeout",
+    "params": [
+      "t"
+    ],
+    "guards": [
+      "\\E s \\in Sites : rpc[s][t].start = \"waiting\""
+    ],
+    "updates": {
+      "rpc": "[s \\in Sites |-> [rpc[s] EXCEPT ![t].start = IF @ = \"waiting\" THEN \"timeout\" ELSE @]]"
+    },
+    "source": "nvflare/private/fed/server/server_engine.py:1023-1040; nvflare/private/fed/server/server_engine.py:1065-1083; nvflare/private/fed/server/admin.py:307-339",
+    "scenario": "1,4,5",
+    "fault": "startTimeout",
+    "note": "Actual RPC deadline crossing; commands already sent remain executable."
+  },
+  {
+    "name": "ServerEngineReceiveCancelAck",
+    "params": [
+      "s",
+      "t"
+    ],
+    "guards": [
+      "Msg(\"CancelAck\", s, t) \\in network"
+    ],
+    "updates": {
+      "network": "network \\ {Msg(\"CancelAck\", s, t)}",
+      "rpc": "[rpc EXCEPT ![s][t].cancel = IF rpc[s][t].cancel = \"waiting\" THEN \"ok\" ELSE rpc[s][t].cancel]"
+    },
+    "source": "nvflare/private/fed/server/server_engine.py:1025-1041; nvflare/private/fed/server/server_engine.py:1065-1083; nvflare/private/fed/server/admin.py:286-339",
+    "scenario": "1,4,5",
+    "fault": null,
+    "note": "Closed waiters discard late replies; no mutation of another token or lifecycle status."
+  },
+  {
+    "name": "AdminCancelTimeout",
+    "params": [
+      "t"
+    ],
+    "guards": [
+      "\\E s \\in Sites : rpc[s][t].cancel = \"waiting\""
+    ],
+    "updates": {
+      "rpc": "[s \\in Sites |-> [rpc[s] EXCEPT ![t].cancel = IF @ = \"waiting\" THEN \"timeout\" ELSE @]]"
+    },
+    "source": "nvflare/private/fed/server/server_engine.py:1023-1040; nvflare/private/fed/server/server_engine.py:1065-1083; nvflare/private/fed/server/admin.py:307-339",
+    "scenario": "1,4,5",
+    "fault": "cancelTimeout",
+    "note": "Actual RPC deadline crossing; commands already sent remain executable."
+  },
+  {
+    "name": "DefaultJobSchedulerEvaluateResources",
+    "params": [],
+    "guards": [
+      "scheduler.pc = \"checkWait\"",
+      "WaitDone(CurrentToken,\"check\",Sites)"
+    ],
+    "updates": {
+      "scheduler": "[scheduler EXCEPT !.pc = IF Policy(ReplySites(CurrentToken,\"check\",\"ok\")) THEN \"history\" ELSE \"cancelSend\", !.result = IF Policy(ReplySites(CurrentToken,\"check\",\"ok\")) THEN \"scheduled\" ELSE \"no_resource\"]",
+      "jobs": "[jobs EXCEPT ![CurrentJob].dispatch = ReplySites(CurrentToken,\"check\",\"ok\")]"
+    },
+    "source": "nvflare/app_common/job_schedulers/job_scheduler.py:203-261",
+    "scenario": "1,2,5",
+    "fault": null,
+    "note": ""
+  },
+  {
+    "name": "ServerEngineCancelClientResources",
+    "params": [],
+    "guards": [
+      "scheduler.pc = \"cancelSend\""
+    ],
+    "updates": {
+      "network": "network \\cup {Msg(\"Cancel\",s,CurrentToken) : s \\in jobs[CurrentJob].dispatch}",
+      "rpc": "[s \\in Sites |-> [rpc[s] EXCEPT ![CurrentToken].cancel = IF s \\in jobs[CurrentJob].dispatch THEN \"waiting\" ELSE @]]",
+      "scheduler": "[scheduler EXCEPT !.pc = \"cancelWait\"]"
+    },
+    "source": "nvflare/app_common/job_schedulers/job_scheduler.py:229-247; nvflare/private/fed/server/server_engine.py:1052-1066",
+    "scenario": "4,5",
+    "fault": null,
+    "note": ""
+  },
+  {
+    "name": "CancelResourceProcessorCancel",
+    "params": [
+      "s",
+      "t"
+    ],
+    "guards": [
+      "ResourceManagerUnlocked(s)",
+      "Msg(\"Cancel\", s, t) \\in network"
+    ],
+    "updates": {
+      "rm": "[rm EXCEPT ![s].free = Reverse(rm[s].reserved[t]) \\o @, ![s].reserved[t] = <<>>, ![s].ttl[t] = 0]",
+      "network": "(network \\ {Msg(\"Cancel\", s, t)}) \\cup {Msg(\"CancelAck\", s, t)}"
+    },
+    "source": "nvflare/private/fed/client/scheduler_cmds.py:149-157; nvflare/app_common/resource_managers/auto_clean_resource_manager.py:140-151; nvflare/app_common/resource_managers/list_resource_manager.py:52-55",
+    "scenario": "4,5",
+    "fault": null,
+    "note": "Only existing reservations are returned. Missing or already allocated tokens are a no-op."
+  },
+  {
+    "name": "DefaultJobSchedulerCancelReturned",
+    "params": [],
+    "guards": [
+      "scheduler.pc = \"cancelWait\"",
+      "WaitDone(CurrentToken,\"cancel\",jobs[CurrentJob].dispatch)"
+    ],
+    "updates": {
+      "scheduler": "[scheduler EXCEPT !.pc = \"history\"]"
+    },
+    "source": "nvflare/private/fed/server/server_engine.py:1065-1066; nvflare/app_common/job_schedulers/job_scheduler.py:229-254",
+    "scenario": "5",
+    "fault": null,
+    "note": "Pinned implementation discards cancellation acknowledgements, including timeout/no reply."
+  },
+  {
+    "name": "DefaultJobSchedulerUpdateHistory",
+    "params": [],
+    "guards": [
+      "scheduler.pc = \"history\""
+    ],
+    "updates": {
+      "scheduler": "[scheduler EXCEPT !.count[CurrentJob] = @+1, !.history[CurrentJob] = Append(@,scheduler.result), !.cooldown[CurrentJob] = TRUE, !.pc = IF scheduler.result=\"scheduled\" THEN \"persistFailed\" ELSE \"scan\", !.returnTo = IF scheduler.result=\"scheduled\" THEN \"checkSubmitted\" ELSE \"idle\", !.failedPending = IF scheduler.result=\"scheduled\" THEN @ ELSE @ \\cup {CurrentJob}, !.candidates = IF scheduler.result=\"scheduled\" THEN @ ELSE Tail(@)]"
+    },
+    "source": "nvflare/app_common/job_schedulers/job_scheduler.py:320-333; nvflare/app_common/job_schedulers/job_scheduler.py:364-375",
+    "scenario": "5",
+    "fault": null,
+    "note": ""
+  },
+  {
+    "name": "DefaultJobSchedulerAdmissionException",
+    "params": [],
+    "guards": [
+      "scheduler.pc \\in {\"checkWait\",\"history\"}"
+    ],
+    "updates": {
+      "scheduler": "[scheduler EXCEPT !.pc = \"persistFailed\", !.returnTo = \"idle\", !.candidates = <<>>]"
+    },
+    "source": "nvflare/app_common/job_schedulers/job_scheduler.py:292-310; nvflare/app_common/job_schedulers/job_scheduler.py:364-369",
+    "scenario": "5",
+    "fault": "admissionError",
+    "note": "Known #5191 context: whole pass exits, no new cancellation/history; TTL remains."
+  },
+  {
+    "name": "AutoCleanResourceManagerTick",
+    "params": [
+      "s"
+    ],
+    "guards": [
+      "ResourceManagerUnlocked(s)",
+      "\\E t \\in Tokens : rm[s].ttl[t] > 0"
+    ],
+    "updates": {
+      "rm": "[rm EXCEPT ![s].ttl = [t \\in Tokens |-> IF rm[s].ttl[t]>0 THEN rm[s].ttl[t]-1 ELSE 0]]"
+    },
+    "source": "nvflare/app_common/resource_managers/auto_clean_resource_manager.py:102-113",
+    "scenario": "1,4,5",
+    "fault": null,
+    "note": "One cleanup scan tick. Expired entries are drained under the same RM lock by FinishExpiry; other RM operations are disabled while an expired entry exists."
+  },
+  {
+    "name": "AutoCleanResourceManagerFinishExpiry",
+    "params": [
+      "s",
+      "t"
+    ],
+    "guards": [
+      "rm[s].reserved[t] # <<>>",
+      "rm[s].ttl[t] = 0"
+    ],
+    "updates": {
+      "rm": "[rm EXCEPT ![s].free = Reverse(rm[s].reserved[t]) \\o @, ![s].reserved[t] = <<>>]"
+    },
+    "source": "nvflare/app_common/resource_managers/auto_clean_resource_manager.py:105-116; nvflare/app_common/resource_managers/list_resource_manager.py:52-55",
+    "scenario": "1,4,5",
+    "fault": null,
+    "note": "Internal lock-held scan continuation, not a release/reacquire window. Drain order over tokens overapproximates insertion order; unit conservation is order-independent."
+  },
+  {
+    "name": "JobRunnerCheckSubmitted",
+    "params": [],
+    "guards": [
+      "scheduler.pc = \"checkSubmitted\""
+    ],
+    "updates": {
+      "jobs": "[jobs EXCEPT ![CurrentJob].checked = jobs[CurrentJob].status]",
+      "scheduler": "[scheduler EXCEPT !.pc = IF jobs[CurrentJob].status = \"SUBMITTED\" THEN \"deploySend\" ELSE \"idle\"]"
+    },
+    "source": "nvflare/private/fed/server/job_runner.py:660-669",
+    "scenario": "3",
+    "fault": null,
+    "note": "Status read and subsequent DISPATCHED publication are separate."
+  },
+  {
+    "name": "JobRunnerDeployJob",
+    "params": [],
+    "guards": [
+      "scheduler.pc = \"deploySend\""
+    ],
+    "updates": {
+      "network": "network \\cup {Msg(\"Deploy\",s,CurrentToken) : s \\in jobs[CurrentJob].dispatch}",
+      "rpc": "[s \\in Sites |-> [rpc[s] EXCEPT ![CurrentToken].deploy = IF s \\in jobs[CurrentJob].dispatch THEN \"waiting\" ELSE @]]",
+      "scheduler": "[scheduler EXCEPT !.pc = \"deployWait\"]"
+    },
+    "source": "nvflare/private/fed/server/job_runner.py:173-248",
+    "scenario": "1-3",
+    "fault": null,
+    "note": "Server deployment succeeds here; DeploymentException models the raised/returned-error path."
+  },
+  {
+    "name": "JobRunnerDeploymentException",
+    "params": [],
+    "guards": [
+      "scheduler.pc \\in {\"deploySend\",\"deployWait\"}"
+    ],
+    "updates": {
+      "scheduler": "[scheduler EXCEPT !.pc = \"failRemove\"]"
+    },
+    "source": "nvflare/private/fed/server/job_runner.py:194-209; nvflare/private/fed/server/job_runner.py:224-226; nvflare/private/fed/server/job_runner.py:713-728",
+    "scenario": "2,5",
+    "fault": "deployError",
+    "note": ""
+  },
+  {
+    "name": "ClientDeploySuccess",
+    "params": [
+      "s",
+      "t"
+    ],
+    "guards": [
+      "Msg(\"Deploy\", s, t) \\in network"
+    ],
+    "updates": {
+      "client": "[client EXCEPT ![s][t].deployed = TRUE]",
+      "network": "(network \\ {Msg(\"Deploy\", s, t)}) \\cup {Msg(\"DeployOK\", s, t)}"
+    },
+    "source": "nvflare/private/fed/client/training_cmds.py:99-140; nvflare/private/fed/client/client_engine.py:462-480; nvflare/private/fed/server/job_runner.py:250-267",
+    "scenario": "2",
+    "fault": null,
+    "note": "Boundary abstraction of successful client deployment; no workspace content modeled."
+  },
+  {
+    "name": "ClientDeployError",
+    "params": [
+      "s",
+      "t"
+    ],
+    "guards": [
+      "Msg(\"Deploy\", s, t) \\in network"
+    ],
+    "updates": {
+      "network": "(network \\ {Msg(\"Deploy\", s, t)}) \\cup {Msg(\"DeployNo\", s, t)}"
+    },
+    "source": "nvflare/private/fed/client/training_cmds.py:99-140; nvflare/private/fed/client/client_engine.py:462-480; nvflare/private/fed/server/job_runner.py:250-267",
+    "scenario": "2",
+    "fault": "deployError",
+    "note": "Client deployment returns non-OK; already successful sites remain deployed."
+  },
+  {
+    "name": "JobRunnerEvaluateDeployment",
+    "params": [],
+    "guards": [
+      "scheduler.pc = \"deployWait\"",
+      "WaitDone(CurrentToken,\"deploy\",jobs[CurrentJob].dispatch)"
+    ],
+    "updates": {
+      "jobs": "[jobs EXCEPT ![CurrentJob].deployed = ReplySites(CurrentToken,\"deploy\",\"ok\")]",
+      "scheduler": "[scheduler EXCEPT !.pc = IF Policy(ReplySites(CurrentToken,\"deploy\",\"ok\")) THEN \"writeDispatched\" ELSE \"failRemove\"]"
+    },
+    "source": "nvflare/private/fed/server/job_runner.py:250-285",
+    "scenario": "2,3",
+    "fault": null,
+    "note": ""
+  },
+  {
+    "name": "JobRunnerWriteDispatched",
+    "params": [],
+    "guards": [
+      "scheduler.pc = \"writeDispatched\""
+    ],
+    "updates": {
+      "jobs": "[jobs EXCEPT ![CurrentJob].status = \"DISPATCHED\"]",
+      "scheduler": "[scheduler EXCEPT !.pc = \"persistDeploy\"]"
+    },
+    "source": "nvflare/private/fed/server/job_runner.py:669-670; nvflare/apis/impl/job_def_manager.py:459-481",
+    "scenario": "3",
+    "fault": null,
+    "note": ""
+  },
+  {
+    "name": "JobRunnerPersistDeploy",
+    "params": [],
+    "guards": [
+      "scheduler.pc = \"persistDeploy\""
+    ],
+    "updates": {
+      "scheduler": "[scheduler EXCEPT !.persisted[CurrentJob] = scheduler.count[CurrentJob], !.pc = \"checkDispatched\"]"
+    },
+    "source": "nvflare/private/fed/server/job_runner.py:672-695",
+    "scenario": "3,5",
+    "fault": null,
+    "note": ""
+  },
+  {
+    "name": "JobRunnerCheckDispatched",
+    "params": [],
+    "guards": [
+      "scheduler.pc = \"checkDispatched\""
+    ],
+    "updates": {
+      "jobs": "[jobs EXCEPT ![CurrentJob].checked = jobs[CurrentJob].status]",
+      "scheduler": "[scheduler EXCEPT !.pc = IF jobs[CurrentJob].status = \"DISPATCHED\" THEN \"serverSpawn\" ELSE \"idle\"]"
+    },
+    "source": "nvflare/private/fed/server/job_runner.py:697-707",
+    "scenario": "3",
+    "fault": null,
+    "note": ""
+  },
+  {
+    "name": "ServerEngineSpawnJob",
+    "params": [],
+    "guards": [
+      "scheduler.pc = \"serverSpawn\"",
+      "~jobs[CurrentJob].serverSpawned"
+    ],
+    "updates": {
+      "jobs": "[jobs EXCEPT ![CurrentJob].serverAlive = TRUE, ![CurrentJob].serverSpawned = TRUE]",
+      "scheduler": "[scheduler EXCEPT !.pc = \"serverRegister\"]"
+    },
+    "source": "nvflare/private/fed/server/server_engine.py:179-195; nvflare/private/fed/server/server_engine.py:314-316",
+    "scenario": "2,3",
+    "fault": null,
+    "note": "Default local server spawn; physical exit remains a separate event."
+  },
+  {
+    "name": "ServerEngineRegisterJob",
+    "params": [],
+    "guards": [
+      "scheduler.pc = \"serverRegister\""
+    ],
+    "updates": {
+      "jobs": "[jobs EXCEPT ![CurrentJob].serverRegistered = TRUE]",
+      "scheduler": "[scheduler EXCEPT !.pc = \"serverWaiter\"]"
+    },
+    "source": "nvflare/private/fed/server/server_engine.py:321-326",
+    "scenario": "2-4",
+    "fault": null,
+    "note": ""
+  },
+  {
+    "name": "ServerEngineInstallWaiter",
+    "params": [],
+    "guards": [
+      "scheduler.pc = \"serverWaiter\""
+    ],
+    "updates": {
+      "jobs": "[jobs EXCEPT ![CurrentJob].serverWaiter = TRUE]",
+      "scheduler": "[scheduler EXCEPT !.pc = \"pendingOutcomes\"]"
+    },
+    "source": "nvflare/private/fed/server/server_engine.py:328-329",
+    "scenario": "2-4",
+    "fault": null,
+    "note": "Server waiter thread creation succeeds in this slice; the targeted installation failure is client-side."
+  },
+  {
+    "name": "JobRunnerSetPendingOutcomes",
+    "params": [],
+    "guards": [
+      "scheduler.pc = \"pendingOutcomes\""
+    ],
+    "updates": {
+      "jobs": "[jobs EXCEPT ![CurrentJob].pending = jobs[CurrentJob].deployed, ![CurrentJob].outcomeKey = TRUE]",
+      "scheduler": "[scheduler EXCEPT !.pc = \"startSend\"]"
+    },
+    "source": "nvflare/private/fed/server/job_runner.py:295-310",
+    "scenario": "1-4",
+    "fault": null,
+    "note": ""
+  },
+  {
+    "name": "ServerEngineStartClientJob",
+    "params": [],
+    "guards": [
+      "scheduler.pc = \"startSend\""
+    ],
+    "updates": {
+      "network": "network \\cup {Msg(\"Start\",s,CurrentToken) : s \\in jobs[CurrentJob].deployed}",
+      "rpc": "[s \\in Sites |-> [rpc[s] EXCEPT ![CurrentToken].start = IF s \\in jobs[CurrentJob].deployed THEN \"waiting\" ELSE @]]",
+      "scheduler": "[scheduler EXCEPT !.pc = \"startWait\"]"
+    },
+    "source": "nvflare/private/fed/server/server_engine.py:1068-1083",
+    "scenario": "1,2",
+    "fault": null,
+    "note": ""
+  },
+  {
+    "name": "JobRunnerEvaluateStartReplies",
+    "params": [],
+    "guards": [
+      "scheduler.pc = \"startWait\"",
+      "WaitDone(CurrentToken,\"start\",jobs[CurrentJob].deployed)"
+    ],
+    "updates": {
+      "jobs": "[jobs EXCEPT ![CurrentJob].active = IF ReplySites(CurrentToken,\"start\",\"no\") # {} \\/ jobs[CurrentJob].deployed = {} \\/ (StrictStart /\\ ~Policy(ReplySites(CurrentToken,\"start\",\"ok\"))) THEN jobs[CurrentJob].deployed ELSE ReplySites(CurrentToken,\"start\",\"ok\")]",
+      "scheduler": "[scheduler EXCEPT !.pc = IF ReplySites(CurrentToken,\"start\",\"no\") # {} \\/ jobs[CurrentJob].deployed = {} \\/ (StrictStart /\\ ~Policy(ReplySites(CurrentToken,\"start\",\"ok\"))) THEN \"failRemove\" ELSE \"filterOutcomes\"]"
+    },
+    "source": "nvflare/private/fed/server/admin.py:101-142; nvflare/private/fed/server/job_runner.py:313-358",
+    "scenario": "1,2",
+    "fault": null,
+    "note": "check_client_replies and strict participant errors raise before filtering the initialized deployed-site list (runner:313-358)."
+  },
+  {
+    "name": "JobRunnerFilterPendingOutcomes",
+    "params": [],
+    "guards": [
+      "scheduler.pc = \"filterOutcomes\"",
+      "jobs[CurrentJob].outcomeKey"
+    ],
+    "updates": {
+      "jobs": "[jobs EXCEPT ![CurrentJob].pending = @ \\cap jobs[CurrentJob].active]",
+      "scheduler": "[scheduler EXCEPT !.pc = \"startedEvent\"]"
+    },
+    "source": "nvflare/private/fed/server/job_runner.py:355-364",
+    "scenario": "1,4",
+    "fault": null,
+    "note": ""
+  },
+  {
+    "name": "DefaultJobSchedulerJobStarted",
+    "params": [],
+    "guards": [
+      "scheduler.pc = \"startedEvent\""
+    ],
+    "updates": {
+      "scheduler": "[scheduler EXCEPT !.scheduled = @ \\cup {CurrentJob}, !.pc = \"registerRunning\"]"
+    },
+    "source": "nvflare/private/fed/server/job_runner.py:364-372; nvflare/app_common/job_schedulers/job_scheduler.py:275-280; nvflare/apis/utils/event.py:54-84",
+    "scenario": "1,3,4",
+    "fault": null,
+    "note": "Synchronous production event dispatch, explicit job ID, set-like idempotent membership; ordinary component exceptions do not propagate."
+  },
+  {
+    "name": "JobRunnerRegisterRunning",
+    "params": [],
+    "guards": [
+      "scheduler.pc = \"registerRunning\""
+    ],
+    "updates": {
+      "jobs": "[jobs EXCEPT ![CurrentJob].running = TRUE]",
+      "scheduler": "[scheduler EXCEPT !.pc = \"writeRunning\"]"
+    },
+    "source": "nvflare/private/fed/server/job_runner.py:709-710",
+    "scenario": "3",
+    "fault": null,
+    "note": ""
+  },
+  {
+    "name": "JobRunnerWriteRunning",
+    "params": [],
+    "guards": [
+      "scheduler.pc = \"writeRunning\""
+    ],
+    "updates": {
+      "jobs": "[jobs EXCEPT ![CurrentJob].status = \"RUNNING\", ![CurrentJob].resurrected = @ \\/ jobs[CurrentJob].terminalPublished]",
+      "scheduler": "[scheduler EXCEPT !.pc = \"idle\"]"
+    },
+    "source": "nvflare/private/fed/server/job_runner.py:711-712; nvflare/apis/impl/job_def_manager.py:459-481",
+    "scenario": "3",
+    "fault": null,
+    "note": "No expected-state guard; terminalPublished is a history observer for this attempt."
+  },
+  {
+    "name": "JobRunnerStartupStoreError",
+    "params": [],
+    "guards": [
+      "scheduler.pc \\in {\"writeDispatched\",\"persistDeploy\",\"writeRunning\"}"
+    ],
+    "updates": {
+      "scheduler": "[scheduler EXCEPT !.pc = \"failRemove\"]"
+    },
+    "source": "nvflare/private/fed/server/job_runner.py:670-689; nvflare/private/fed/server/job_runner.py:711-713",
+    "scenario": "2,3,5",
+    "fault": "storeError",
+    "note": ""
+  },
+  {
+    "name": "ServerEngineStartupError",
+    "params": [],
+    "guards": [
+      "scheduler.pc = \"serverSpawn\""
+    ],
+    "updates": {
+      "scheduler": "[scheduler EXCEPT !.pc = \"failRemove\"]"
+    },
+    "source": "nvflare/private/fed/server/server_engine.py:179-193; nvflare/private/fed/server/job_runner.py:304-306",
+    "scenario": "2",
+    "fault": "preLaunchError",
+    "note": ""
+  },
+  {
+    "name": "JobRunnerFailureRemove",
+    "params": [],
+    "guards": [
+      "scheduler.pc = \"failRemove\""
+    ],
+    "updates": {
+      "jobs": "[jobs EXCEPT ![CurrentJob].running = FALSE, ![CurrentJob].pending = {}, ![CurrentJob].outcomeKey = FALSE]",
+      "scheduler": "[scheduler EXCEPT !.pc = \"failStop\"]"
+    },
+    "source": "nvflare/private/fed/server/job_runner.py:713-719",
+    "scenario": "2,5",
+    "fault": null,
+    "note": ""
+  },
+  {
+    "name": "JobRunnerFailureStop",
+    "params": [],
+    "guards": [
+      "scheduler.pc=\"failStopWait\" \\/ (scheduler.pc=\"failStop\" /\\ ~jobs[CurrentJob].serverRegistered)"
+    ],
+    "updates": {
+      "jobs": "[jobs EXCEPT ![CurrentJob].serverStop = @ \\/ jobs[CurrentJob].serverRegistered]",
+      "scheduler": "[scheduler EXCEPT !.pc = \"failStatus\"]"
+    },
+    "source": "nvflare/private/fed/server/job_runner.py:374-413; nvflare/private/fed/server/job_runner.py:719-720",
+    "scenario": "2,4,5",
+    "fault": null,
+    "note": "Stop is sent only when server run_processes contains the job; it does not reclaim reservations."
+  },
+  {
+    "name": "JobRunnerFailureStatus",
+    "params": [],
+    "guards": [
+      "scheduler.pc = \"failStatus\""
+    ],
+    "updates": {
+      "jobs": "[jobs EXCEPT ![CurrentJob].status = \"FAILED_TO_RUN\"]",
+      "scheduler": "[scheduler EXCEPT !.pc = \"failEvent\"]"
+    },
+    "source": "nvflare/private/fed/server/job_runner.py:720-726",
+    "scenario": "2,5",
+    "fault": null,
+    "note": "Failure-branch store failure is TV-2 first, not injected here."
+  },
+  {
+    "name": "DefaultJobSchedulerJobAbortedOnStartFailure",
+    "params": [],
+    "guards": [
+      "scheduler.pc = \"failEvent\""
+    ],
+    "updates": {
+      "scheduler": "[scheduler EXCEPT !.scheduled = @ \\ {CurrentJob}, !.pc = \"idle\"]"
+    },
+    "source": "nvflare/private/fed/server/job_runner.py:728-731; nvflare/app_common/job_schedulers/job_scheduler.py:281-285; nvflare/apis/utils/event.py:54-84",
+    "scenario": "2,4,5",
+    "fault": null,
+    "note": ""
+  },
+  {
+    "name": "StartJobProcessorAllocate",
+    "params": [
+      "s",
+      "t"
+    ],
+    "guards": [
+      "ResourceManagerUnlocked(s)",
+      "Msg(\"Start\", s, t) \\in network",
+      "rm[s].reserved[t] # <<>>"
+    ],
+    "updates": {
+      "rm": "[rm EXCEPT ![s].allocated[t] = rm[s].reserved[t], ![s].payload[t] = rm[s].reserved[t], ![s].reserved[t] = <<>>, ![s].ttl[t] = 0]",
+      "client": "[client EXCEPT ![s][t].pc = \"allocated\"]",
+      "network": "network \\ {Msg(\"Start\", s, t)}"
+    },
+    "source": "nvflare/private/fed/client/scheduler_cmds.py:114-118; nvflare/app_common/resource_managers/auto_clean_resource_manager.py:153-164",
+    "scenario": "1,2,4",
+    "fault": null,
+    "note": ""
+  },
+  {
+    "name": "StartJobProcessorRejectToken",
+    "params": [
+      "s",
+      "t"
+    ],
+    "guards": [
+      "ResourceManagerUnlocked(s)",
+      "Msg(\"Start\", s, t) \\in network",
+      "rm[s].reserved[t] = <<>>"
+    ],
+    "updates": {
+      "client": "[client EXCEPT ![s][t].pc = \"error\"]",
+      "network": "(network \\ {Msg(\"Start\", s, t)}) \\cup {Msg(\"StartNo\", s, t)}"
+    },
+    "source": "nvflare/app_common/resource_managers/auto_clean_resource_manager.py:156-163; nvflare/private/fed/client/scheduler_cmds.py:129-137",
+    "scenario": "1,4",
+    "fault": null,
+    "note": "Fixed missing-token rejection; no fallback allocation and no rollback when allocation never succeeded."
+  },
+  {
+    "name": "ListResourceConsumerConsume",
+    "params": [
+      "s",
+      "t"
+    ],
+    "guards": [
+      "client[s][t].pc = \"allocated\""
+    ],
+    "updates": {
+      "resourceEnv": "[resourceEnv EXCEPT ![s] = rm[s].payload[t]]",
+      "client": "[client EXCEPT ![s][t].pc = \"consumed\"]"
+    },
+    "source": "nvflare/private/fed/client/scheduler_cmds.py:119-121; nvflare/app_common/resource_consumers/list_resource_consumer.py:31-37; nvflare/app_common/resource_consumers/list_resource_consumer.py:49-52",
+    "scenario": "1",
+    "fault": null,
+    "note": ""
+  },
+  {
+    "name": "ClientEngineStartAppCheck",
+    "params": [
+      "s",
+      "t"
+    ],
+    "guards": [
+      "client[s][t].pc = \"consumed\"",
+      "client[s][t].deployed",
+      "~RegisteredAtSite(s,t[1])"
+    ],
+    "updates": {
+      "client": "[client EXCEPT ![s][t].pc = \"checked\"]"
+    },
+    "source": "nvflare/private/fed/client/client_engine.py:357-379",
+    "scenario": "2",
+    "fault": null,
+    "note": "Valid fresh start after acknowledged deployment; early-return alternative is preserved separately."
+  },
+  {
+    "name": "ClientEngineStartAppReturnedError",
+    "params": [
+      "s",
+      "t"
+    ],
+    "guards": [
+      "client[s][t].pc = \"consumed\"",
+      "~client[s][t].deployed"
+    ],
+    "updates": {
+      "client": "[client EXCEPT ![s][t].pc = \"returnedError\"]",
+      "network": "network \\cup {Msg(\"StartNo\", s, t)}"
+    },
+    "source": "nvflare/private/fed/client/client_engine.py:365-367; nvflare/private/fed/client/scheduler_cmds.py:122-137",
+    "scenario": "2",
+    "fault": null,
+    "note": "CR-1 boundary: cannot be reached by the selected successful-deploy START chain. No arbitrary deletion fault added; returned error does not free allocation."
+  },
+  {
+    "name": "JobExecutorRegisterPendingHandle",
+    "params": [
+      "s",
+      "t"
+    ],
+    "guards": [
+      "client[s][t].pc = \"checked\"",
+      "~RegisteredAtSite(s,t[1])"
+    ],
+    "updates": {
+      "client": "[client EXCEPT ![s][t].pc = \"registered\", ![s][t].handle = \"pending\", ![s][t].logical = \"STARTING\"]"
+    },
+    "source": "nvflare/private/fed/client/client_executor.py:299-307",
+    "scenario": "1,2,4",
+    "fault": null,
+    "note": ""
+  },
+  {
+    "name": "JobExecutorPrepareException",
+    "params": [
+      "s",
+      "t"
+    ],
+    "guards": [
+      "client[s][t].pc \\in {\"allocated\",\"consumed\",\"checked\"}"
+    ],
+    "updates": {
+      "client": "[client EXCEPT ![s][t].pc = \"rollback\"]"
+    },
+    "source": "nvflare/private/fed/client/scheduler_cmds.py:119-133; nvflare/private/fed/client/client_executor.py:224-258",
+    "scenario": "2",
+    "fault": "preLaunchError",
+    "note": "Ordinary preparation/metadata I/O exception before spawn; no fabricated invalid input."
+  },
+  {
+    "name": "ProcessJobLauncherSnapshotEnvironment",
+    "params": [
+      "s",
+      "t"
+    ],
+    "guards": [
+      "client[s][t].pc = \"registered\""
+    ],
+    "updates": {
+      "client": "[client EXCEPT ![s][t].binding = resourceEnv[s], ![s][t].pc = \"snapshotted\"]"
+    },
+    "source": "nvflare/app_common/job_launcher/process_launcher.py:66-78",
+    "scenario": "1",
+    "fault": null,
+    "note": ""
+  },
+  {
+    "name": "ProcessJobLauncherSpawn",
+    "params": [
+      "s",
+      "t"
+    ],
+    "guards": [
+      "client[s][t].pc = \"snapshotted\""
+    ],
+    "updates": {
+      "client": "[client EXCEPT ![s][t].alive = TRUE, ![s][t].spawned = TRUE, ![s][t].pc = \"spawned\"]"
+    },
+    "source": "nvflare/app_common/job_launcher/process_launcher.py:80-83; nvflare/private/fed/client/client_executor.py:309-311",
+    "scenario": "1,2",
+    "fault": null,
+    "note": ""
+  },
+  {
+    "name": "ProcessJobLauncherSpawnException",
+    "params": [
+      "s",
+      "t"
+    ],
+    "guards": [
+      "client[s][t].pc \\in {\"registered\",\"snapshotted\"}"
+    ],
+    "updates": {
+      "client": "[client EXCEPT ![s][t].pc = \"rollback\", ![s][t].handle = \"none\"]"
+    },
+    "source": "nvflare/app_common/job_launcher/process_launcher.py:68-83; nvflare/private/fed/client/client_executor.py:308-316",
+    "scenario": "2",
+    "fault": "spawnError",
+    "note": "Failure before a returned live handle; post-spawn handle-constructor failure is outside this slice."
+  },
+  {
+    "name": "PendingJobHandleAttach",
+    "params": [
+      "s",
+      "t"
+    ],
+    "guards": [
+      "client[s][t].pc = \"spawned\""
+    ],
+    "updates": {
+      "client": "[client EXCEPT ![s][t].pc = IF client[s][t].pendingAbort THEN \"attachedAbort\" ELSE \"attached\", ![s][t].handle = \"attached\", ![s][t].attached = TRUE]"
+    },
+    "source": "nvflare/private/fed/client/client_executor.py:60-63; nvflare/private/fed/client/client_executor.py:318-320",
+    "scenario": "1,2,4",
+    "fault": null,
+    "note": ""
+  },
+  {
+    "name": "JobExecutorApplyPendingAbort",
+    "params": [
+      "s",
+      "t"
+    ],
+    "guards": [
+      "client[s][t].pc = \"attachedAbort\""
+    ],
+    "updates": {
+      "client": "[client EXCEPT ![s][t].terminateRequested = TRUE, ![s][t].pc = \"attached\"]"
+    },
+    "source": "nvflare/private/fed/client/client_executor.py:318-320; nvflare/private/fed/client/client_executor.py:505-512",
+    "scenario": "2,4",
+    "fault": null,
+    "note": ""
+  },
+  {
+    "name": "JobExecutorAfterJobLaunchEvent",
+    "params": [
+      "s",
+      "t"
+    ],
+    "guards": [
+      "client[s][t].pc = \"attached\""
+    ],
+    "updates": {
+      "client": "[client EXCEPT ![s][t].pc = \"afterEvent\"]"
+    },
+    "source": "nvflare/private/fed/client/client_executor.py:324-330; nvflare/apis/utils/event.py:54-84",
+    "scenario": "2",
+    "fault": null,
+    "note": "Real event dispatch catches ordinary handler exceptions; no exceptional rollback edge from such handlers."
+  },
+  {
+    "name": "JobExecutorInstallCleanupWaiter",
+    "params": [
+      "s",
+      "t"
+    ],
+    "guards": [
+      "client[s][t].pc = \"afterEvent\""
+    ],
+    "updates": {
+      "client": "[client EXCEPT ![s][t].pc = \"replyReady\", ![s][t].waiter = TRUE, ![s][t].cleanup = \"wait\"]"
+    },
+    "source": "nvflare/private/fed/client/client_executor.py:330-334",
+    "scenario": "2,4",
+    "fault": null,
+    "note": ""
+  },
+  {
+    "name": "JobExecutorWaiterInstallationException",
+    "params": [
+      "s",
+      "t"
+    ],
+    "guards": [
+      "client[s][t].pc = \"afterEvent\""
+    ],
+    "updates": {
+      "client": "[client EXCEPT ![s][t].pc = \"rollback\"]"
+    },
+    "source": "nvflare/private/fed/client/client_executor.py:330-334; nvflare/private/fed/client/scheduler_cmds.py:129-133",
+    "scenario": "2",
+    "fault": "waiterError",
+    "note": "Ordinary Thread construction/start exception before waiter execution. Live attached handle is retained; no invented double-free thread."
+  },
+  {
+    "name": "StartJobProcessorRollback",
+    "params": [
+      "s",
+      "t"
+    ],
+    "guards": [
+      "ResourceManagerUnlocked(s)",
+      "client[s][t].pc = \"rollback\"",
+      "rm[s].payload[t] # <<>>"
+    ],
+    "updates": {
+      "rm": "[rm EXCEPT ![s].free = Reverse(rm[s].payload[t]) \\o @, ![s].allocated[t] = <<>>, ![s].releases[t] = @+1]",
+      "client": "[client EXCEPT ![s][t].pc = \"error\"]",
+      "network": "network \\cup {Msg(\"StartNo\", s, t)}"
+    },
+    "source": "nvflare/private/fed/client/scheduler_cmds.py:129-137; nvflare/app_common/resource_managers/auto_clean_resource_manager.py:166-172; nvflare/app_common/resource_managers/list_resource_manager.py:52-55",
+    "scenario": "2",
+    "fault": null,
+    "note": "Rollback calls free(payload) regardless of child liveness or handle ownership. No fictitious token guard on free."
+  },
+  {
+    "name": "StartJobProcessorReplySuccess",
+    "params": [
+      "s",
+      "t"
+    ],
+    "guards": [
+      "client[s][t].pc = \"replyReady\""
+    ],
+    "updates": {
+      "client": "[client EXCEPT ![s][t].pc = \"returned\"]",
+      "network": "network \\cup {Msg(\"StartOK\", s, t)}"
+    },
+    "source": "nvflare/private/fed/client/client_engine.py:382; nvflare/private/fed/client/scheduler_cmds.py:135-137",
+    "scenario": "1,2",
+    "fault": null,
+    "note": ""
+  },
+  {
+    "name": "JobExecutorNotifyStarted",
+    "params": [
+      "s",
+      "t"
+    ],
+    "guards": [
+      "client[s][t].alive",
+      "client[s][t].handle # \"none\"",
+      "client[s][t].logical = \"STARTING\""
+    ],
+    "updates": {
+      "client": "[client EXCEPT ![s][t].logical = \"STARTED\"]"
+    },
+    "source": "nvflare/private/fed/client/client_executor.py:347-350",
+    "scenario": "4",
+    "fault": null,
+    "note": ""
+  },
+  {
+    "name": "JobExecutorNotifyStopped",
+    "params": [
+      "s",
+      "t"
+    ],
+    "guards": [
+      "client[s][t].alive",
+      "client[s][t].handle # \"none\"",
+      "client[s][t].logical = \"STARTED\""
+    ],
+    "updates": {
+      "client": "[client EXCEPT ![s][t].logical = \"STOPPED\"]"
+    },
+    "source": "nvflare/private/fed/client/client_executor.py:347-350; nvflare/private/fed/client/client_engine.py:390-404",
+    "scenario": "4",
+    "fault": null,
+    "note": ""
+  },
+  {
+    "name": "ClientChildExit",
+    "params": [
+      "s",
+      "t"
+    ],
+    "guards": [
+      "client[s][t].alive"
+    ],
+    "updates": {
+      "client": "[client EXCEPT ![s][t].alive = FALSE]"
+    },
+    "source": "nvflare/app_common/job_launcher/process_launcher.py:51-58; nvflare/private/fed/client/client_executor.py:625-630",
+    "scenario": "2,4",
+    "fault": null,
+    "note": "Ordinary completion or response to a stop; no guaranteed success under a permanently non-terminating process."
+  },
+  {
+    "name": "ClientChildFailure",
+    "params": [
+      "s",
+      "t"
+    ],
+    "guards": [
+      "client[s][t].alive"
+    ],
+    "updates": {
+      "client": "[client EXCEPT ![s][t].alive = FALSE, ![s][t].exitCode = \"failed\"]"
+    },
+    "source": "nvflare/private/fed/client/client_executor.py:630-647",
+    "scenario": "2,4",
+    "fault": "childError",
+    "note": "Abstract reportable ordinary process failure; generic teardown RC classifications are not expanded."
+  },
+  {
+    "name": "JobExecutorWaitChildExit",
+    "params": [
+      "s",
+      "t"
+    ],
+    "guards": [
+      "client[s][t].cleanup = \"wait\"",
+      "~client[s][t].alive",
+      "client[s][t].spawned",
+      "client[s][t].attached"
+    ],
+    "updates": {
+      "client": "[client EXCEPT ![s][t].exitObserved = TRUE, ![s][t].cleanup = \"report\"]"
+    },
+    "source": "nvflare/private/fed/client/client_executor.py:625-647",
+    "scenario": "2,4",
+    "fault": null,
+    "note": ""
+  },
+  {
+    "name": "JobExecutorReportOutcome",
+    "params": [
+      "s",
+      "t"
+    ],
+    "guards": [
+      "client[s][t].cleanup = \"report\""
+    ],
+    "updates": {
+      "network": "network \\cup {Msg(CASE client[s][t].exitCode=\"ok\" -> \"OutcomeOK\" [] client[s][t].exitCode=\"aborted\" -> \"OutcomeAborted\" [] OTHER -> \"OutcomeFailed\",s,t)}",
+      "client": "[client EXCEPT ![s][t].cleanup = \"reportWait\"]"
+    },
+    "source": "nvflare/private/fed/client/client_executor.py:648-664",
+    "scenario": "4",
+    "fault": null,
+    "note": ""
+  },
+  {
+    "name": "JobExecutorOutcomeReportReturned",
+    "params": [
+      "s",
+      "t"
+    ],
+    "guards": [
+      "client[s][t].cleanup = \"reportWait\"",
+      "Msg(\"OutcomeOK\",s,t) \\notin network",
+      "Msg(\"OutcomeFailed\",s,t) \\notin network",
+      "Msg(\"OutcomeAborted\",s,t) \\notin network"
+    ],
+    "updates": {
+      "client": "[client EXCEPT ![s][t].cleanup = \"free\"]"
+    },
+    "source": "nvflare/private/fed/client/client_executor.py:665-679",
+    "scenario": "4",
+    "fault": null,
+    "note": "Reply success or already consumed/lost request followed by return; ReportTimeout covers still-in-flight requests."
+  },
+  {
+    "name": "JobExecutorOutcomeReportException",
+    "params": [
+      "s",
+      "t"
+    ],
+    "guards": [
+      "client[s][t].cleanup \\in {\"report\",\"reportWait\"}"
+    ],
+    "updates": {
+      "client": "[client EXCEPT ![s][t].cleanup = \"free\"]"
+    },
+    "source": "nvflare/private/fed/client/client_executor.py:648-678",
+    "scenario": "4",
+    "fault": "reportError",
+    "note": "Report exception/timeout is caught; it never bypasses normal resource release."
+  },
+  {
+    "name": "JobExecutorFreeAfterExit",
+    "params": [
+      "s",
+      "t"
+    ],
+    "guards": [
+      "ResourceManagerUnlocked(s)",
+      "client[s][t].cleanup = \"free\""
+    ],
+    "updates": {
+      "rm": "[rm EXCEPT ![s].free = Reverse(rm[s].payload[t]) \\o @, ![s].allocated[t] = <<>>, ![s].releases[t] = @+1]",
+      "client": "[client EXCEPT ![s][t].cleanup = \"pop\"]"
+    },
+    "source": "nvflare/private/fed/client/client_executor.py:676-679; nvflare/app_common/resource_managers/auto_clean_resource_manager.py:166-172; nvflare/app_common/resource_managers/list_resource_manager.py:52-55",
+    "scenario": "2,4",
+    "fault": null,
+    "note": "Uses retained payload; deliberately no allocated/token test that would conceal repeated free."
+  },
+  {
+    "name": "JobExecutorRemoveProcess",
+    "params": [
+      "s",
+      "t"
+    ],
+    "guards": [
+      "client[s][t].cleanup = \"pop\""
+    ],
+    "updates": {
+      "client": "[client EXCEPT ![s][t].handle = \"none\", ![s][t].cleanup = \"event\"]"
+    },
+    "source": "nvflare/private/fed/client/client_executor.py:680-682",
+    "scenario": "4",
+    "fault": null,
+    "note": ""
+  },
+  {
+    "name": "JobExecutorJobCompletedEvent",
+    "params": [
+      "s",
+      "t"
+    ],
+    "guards": [
+      "client[s][t].cleanup = \"event\""
+    ],
+    "updates": {
+      "client": "[client EXCEPT ![s][t].cleanup = \"done\"]"
+    },
+    "source": "nvflare/private/fed/client/client_executor.py:684-688; nvflare/apis/utils/event.py:54-84",
+    "scenario": "4",
+    "fault": null,
+    "note": "Site-local completion event does not call the server scheduler. Explicit job identity is preserved."
+  },
+  {
+    "name": "ClientEngineAbortApp",
+    "params": [
+      "s",
+      "t"
+    ],
+    "guards": [
+      "Msg(\"Stop\", s, t) \\in network"
+    ],
+    "updates": {
+      "network": "network \\ {Msg(\"Stop\", s, t)}",
+      "client": "[client EXCEPT ![s][t].abortRequested = @ \\/ client[s][t].handle # \"none\"]"
+    },
+    "source": "nvflare/private/fed/client/client_engine.py:390-404; nvflare/private/fed/client/client_executor.py:497-534; nvflare/private/fed/client/client_executor.py:65-77",
+    "scenario": "4",
+    "fault": null,
+    "note": "At executor abort ownership update under lock, or ClientEngine no-op early return; termination and wait completion are separate."
+  },
+  {
+    "name": "ClientEngineHeartbeatAbort",
+    "params": [
+      "s",
+      "t"
+    ],
+    "guards": [
+      "Msg(\"HeartbeatStop\", s, t) \\in network"
+    ],
+    "updates": {
+      "network": "network \\ {Msg(\"HeartbeatStop\", s, t)}",
+      "client": "[client EXCEPT ![s][t].abortRequested = @ \\/ client[s][t].handle # \"none\"]"
+    },
+    "source": "nvflare/private/fed/client/client_engine.py:390-404; nvflare/private/fed/client/client_executor.py:497-534; nvflare/private/fed/client/client_executor.py:65-77",
+    "scenario": "4",
+    "fault": null,
+    "note": "At executor abort ownership update under lock, or ClientEngine no-op early return; termination and wait completion are separate."
+  },
+  {
+    "name": "JobExecutorTerminateAfterGrace",
+    "params": [
+      "s",
+      "t"
+    ],
+    "guards": [
+      "client[s][t].abortRequested",
+      "client[s][t].handle = \"attached\"",
+      "~client[s][t].terminateRequested"
+    ],
+    "updates": {
+      "client": "[client EXCEPT ![s][t].terminateRequested = TRUE]"
+    },
+    "source": "nvflare/private/fed/client/client_executor.py:581-601",
+    "scenario": "4",
+    "fault": null,
+    "note": "10s bounded graceful wait before terminate; physical process exit remains separate."
+  },
+  {
+    "name": "FederatedServerHeartbeatCleanup",
+    "params": [
+      "s",
+      "t"
+    ],
+    "guards": [
+      "client[s][t].handle # \"none\"",
+      "~jobs[t[1]].serverRegistered",
+      "~jobs[t[1]].outcomeKey \\/ jobs[t[1]].serverFailed",
+      "Msg(\"HeartbeatStop\", s, t) \\notin network"
+    ],
+    "updates": {
+      "network": "network \\cup {Msg(\"HeartbeatStop\", s, t)}"
+    },
+    "source": "nvflare/private/fed/server/fed_server.py:1004-1017; nvflare/private/fed/client/communicator.py:621-646",
+    "scenario": "2,4",
+    "fault": null,
+    "note": "Outcome-map key protects normally completing jobs even when pending set is empty. Repeated heartbeat requests never free resources. Normal periodic response; not an injected, exhaustible fault."
+  },
+  {
+    "name": "ServerEngineReceiveOutcome",
+    "params": [
+      "s",
+      "t"
+    ],
+    "guards": [
+      "Msg(\"OutcomeOK\", s, t) \\in network",
+      "s \\in jobs[t[1]].pending"
+    ],
+    "updates": {
+      "network": "network \\ {Msg(\"OutcomeOK\", s, t)}",
+      "jobs": "[jobs EXCEPT ![t[1]].pending = @ \\ {s}]"
+    },
+    "source": "nvflare/private/fed/server/fed_server.py:938-956; nvflare/private/fed/server/job_runner.py:114-120",
+    "scenario": "4",
+    "fault": null,
+    "note": "Idempotent discard for exact job/site. Receiver authentication and reporter classification are boundary assumptions."
+  },
+  {
+    "name": "ServerEngineReceiveFailureOutcome",
+    "params": [
+      "s",
+      "t"
+    ],
+    "guards": [
+      "Msg(\"OutcomeFailed\", s, t) \\in network",
+      "s \\in jobs[t[1]].pending"
+    ],
+    "updates": {
+      "network": "(network \\ {Msg(\"OutcomeFailed\",s,t)}) \\cup (IF jobs[t[1]].serverRegistered THEN {Msg(\"Stop\",v,t) : v \\in jobs[t[1]].deployed} ELSE {})",
+      "jobs": "[jobs EXCEPT ![t[1]].pending = IF jobs[t[1]].serverRegistered \\/ jobs[t[1]].running THEN {} ELSE @ \\ {s}, ![t[1]].outcomeKey = IF jobs[t[1]].serverRegistered \\/ jobs[t[1]].running THEN FALSE ELSE @, ![t[1]].serverFailed = @ \\/ jobs[t[1]].serverRegistered \\/ jobs[t[1]].running, ![t[1]].serverAborted = IF jobs[t[1]].serverRegistered \\/ jobs[t[1]].running THEN FALSE ELSE @, ![t[1]].serverStop = @ \\/ jobs[t[1]].serverRegistered]"
+    },
+    "source": "nvflare/private/fed/server/fed_server.py:938-956; nvflare/private/fed/server/job_runner.py:114-120; nvflare/private/fed/server/job_runner.py:813-843",
+    "scenario": "4",
+    "fault": null,
+    "note": "Authoritative failure bypasses the outcome barrier. Late failure after final removal does not resurrect a job."
+  },
+  {
+    "name": "ServerChildExit",
+    "params": [
+      "j"
+    ],
+    "guards": [
+      "jobs[j].serverAlive"
+    ],
+    "updates": {
+      "jobs": "[jobs EXCEPT ![j].serverAlive = FALSE]"
+    },
+    "source": "nvflare/private/fed/server/server_engine.py:203-204",
+    "scenario": "3,4",
+    "fault": null,
+    "note": ""
+  },
+  {
+    "name": "ServerChildFailure",
+    "params": [
+      "j"
+    ],
+    "guards": [
+      "jobs[j].serverAlive"
+    ],
+    "updates": {
+      "jobs": "[jobs EXCEPT ![j].serverAlive = FALSE, ![j].serverFailed = TRUE]"
+    },
+    "source": "nvflare/private/fed/server/server_engine.py:219-233",
+    "scenario": "4",
+    "fault": "childError",
+    "note": ""
+  },
+  {
+    "name": "ServerEngineObserveExit",
+    "params": [
+      "j"
+    ],
+    "guards": [
+      "jobs[j].serverWaiter",
+      "jobs[j].serverRegistered",
+      "~jobs[j].serverAlive"
+    ],
+    "updates": {
+      "jobs": "[jobs EXCEPT ![j].serverRegistered = FALSE]"
+    },
+    "source": "nvflare/private/fed/server/server_engine.py:203-234",
+    "scenario": "3,4",
+    "fault": null,
+    "note": "Includes finite <=2s UPDATE_RUN_STATUS grace; process already exited."
+  },
+  {
+    "name": "ServerEngineTerminateAfterGrace",
+    "params": [
+      "j"
+    ],
+    "guards": [
+      "jobs[j].serverStop \\/ jobs[j].adminPC=\"stopWait\" \\/ (scheduler.current=j /\\ scheduler.pc=\"failStopWait\")",
+      "jobs[j].serverSpawned"
+    ],
+    "updates": {
+      "jobs": "[jobs EXCEPT ![j].serverTerminated = TRUE]"
+    },
+    "source": "nvflare/private/fed/server/server_engine.py:385-407",
+    "scenario": "4",
+    "fault": null,
+    "note": "The full 10-second grace branch. Separate early-exit and command-error branches retain their actual deadlines; physical OS exit is independent. Multiple supported abort workers may repeat termination; serverTerminated records occurrence and is not a production guard."
+  },
+  {
+    "name": "ServerEngineRemoveAfterTerminate",
+    "params": [
+      "j"
+    ],
+    "guards": [
+      "jobs[j].serverTerminated"
+    ],
+    "updates": {
+      "jobs": "[jobs EXCEPT ![j].serverRegistered = FALSE]"
+    },
+    "source": "nvflare/private/fed/server/server_engine.py:408-409",
+    "scenario": "4",
+    "fault": null,
+    "note": "CR-2 boundary retained. No injected permanently ineffective SIGKILL or process-count invariant. The final pop(job_id,None) may be a no-op after the exit waiter removed it."
+  },
+  {
+    "name": "JobCommandAbortRead",
+    "params": [
+      "j"
+    ],
+    "guards": [
+      "jobs[j].adminPC = \"idle\""
+    ],
+    "updates": {
+      "jobs": "[jobs EXCEPT ![j].adminRead = jobs[j].status, ![j].adminPC = \"read\"]"
+    },
+    "source": "nvflare/private/fed/server/job_cmds.py:1055-1061",
+    "scenario": "3,4",
+    "fault": "adminAbort",
+    "note": ""
+  },
+  {
+    "name": "JobCommandAbortPreRunWrite",
+    "params": [
+      "j"
+    ],
+    "guards": [
+      "jobs[j].adminPC = \"read\"",
+      "jobs[j].adminRead \\in {\"SUBMITTED\",\"DISPATCHED\"}"
+    ],
+    "updates": {
+      "jobs": "[jobs EXCEPT ![j].status = \"ABORTED\", ![j].adminPC = \"ackPreRun\"]"
+    },
+    "source": "nvflare/private/fed/server/job_cmds.py:1061-1063; nvflare/apis/impl/job_def_manager.py:459-481",
+    "scenario": "3",
+    "fault": null,
+    "note": ""
+  },
+  {
+    "name": "JobCommandAbortPreRunAcknowledge",
+    "params": [
+      "j"
+    ],
+    "guards": [
+      "jobs[j].adminPC = \"ackPreRun\""
+    ],
+    "updates": {
+      "jobs": "[jobs EXCEPT ![j].abortAck = TRUE, ![j].adminPC = \"idle\"]"
+    },
+    "source": "nvflare/private/fed/server/job_cmds.py:1063-1066",
+    "scenario": "3",
+    "fault": null,
+    "note": "Acknowledges the saved branch, without rereading status or sending process stop."
+  },
+  {
+    "name": "JobCommandAbortAlreadyTerminal",
+    "params": [
+      "j"
+    ],
+    "guards": [
+      "jobs[j].adminPC = \"read\"",
+      "jobs[j].adminRead \\in Terminal"
+    ],
+    "updates": {
+      "jobs": "[jobs EXCEPT ![j].adminPC = \"idle\"]"
+    },
+    "source": "nvflare/private/fed/server/job_cmds.py:1067-1070",
+    "scenario": "4",
+    "fault": null,
+    "note": ""
+  },
+  {
+    "name": "JobCommandAbortRunning",
+    "params": [
+      "j"
+    ],
+    "guards": [
+      "jobs[j].adminPC=\"stopWait\" \\/ (jobs[j].adminPC=\"read\" /\\ jobs[j].adminRead=\"RUNNING\" /\\ ~jobs[j].serverRegistered)"
+    ],
+    "updates": {
+      "jobs": "[jobs EXCEPT ![j].serverStop = @ \\/ jobs[j].serverRegistered, ![j].adminPC = \"markAborted\"]"
+    },
+    "source": "nvflare/private/fed/server/job_cmds.py:1071-1078; nvflare/private/fed/server/job_runner.py:374-413; nvflare/private/fed/server/job_runner.py:798-800",
+    "scenario": "4",
+    "fault": null,
+    "note": ""
+  },
+  {
+    "name": "JobRunnerMarkAborted",
+    "params": [
+      "j"
+    ],
+    "guards": [
+      "jobs[j].adminPC = \"markAborted\""
+    ],
+    "updates": {
+      "jobs": "[jobs EXCEPT ![j].runAborted = @ \\/ jobs[j].running, ![j].adminPC = \"idle\"]"
+    },
+    "source": "nvflare/private/fed/server/job_runner.py:802-811",
+    "scenario": "4",
+    "fault": null,
+    "note": "Only an existing running_jobs entry receives run_aborted; missing entry returns an error."
+  },
+  {
+    "name": "JobRunnerSelectCompletion",
+    "params": [
+      "j"
+    ],
+    "guards": [
+      "jobs[j].running",
+      "~jobs[j].serverRegistered",
+      "jobs[j].completion = \"idle\""
+    ],
+    "updates": {
+      "jobs": "[jobs EXCEPT ![j].completion = IF jobs[j].pending # {} /\\ ~jobs[j].runAborted /\\ ~(jobs[j].serverFailed /\\ ~jobs[j].serverAborted) THEN \"outcomeWait\" ELSE \"classify\", ![j].pending = IF (jobs[j].serverFailed /\\ ~jobs[j].serverAborted) THEN {} ELSE @, ![j].outcomeKey = IF (jobs[j].serverFailed /\\ ~jobs[j].serverAborted) THEN FALSE ELSE @]"
+    },
+    "source": "nvflare/private/fed/server/job_runner.py:443-476",
+    "scenario": "3,4",
+    "fault": null,
+    "note": ""
+  },
+  {
+    "name": "JobRunnerOutcomesResolved",
+    "params": [
+      "j"
+    ],
+    "guards": [
+      "jobs[j].completion = \"outcomeWait\"",
+      "jobs[j].pending = {} \\/ jobs[j].runAborted \\/ (jobs[j].serverFailed /\\ ~jobs[j].serverAborted)"
+    ],
+    "updates": {
+      "jobs": "[jobs EXCEPT ![j].completion = \"classify\"]"
+    },
+    "source": "nvflare/private/fed/server/job_runner.py:451-476",
+    "scenario": "3,4",
+    "fault": null,
+    "note": ""
+  },
+  {
+    "name": "JobRunnerOutcomeGraceExpired",
+    "params": [
+      "j"
+    ],
+    "guards": [
+      "jobs[j].completion = \"outcomeWait\"",
+      "jobs[j].pending # {}"
+    ],
+    "updates": {
+      "jobs": "[jobs EXCEPT ![j].pending = {}, ![j].completion = \"classify\"]"
+    },
+    "source": "nvflare/private/fed/server/job_runner.py:466-480",
+    "scenario": "3,4",
+    "fault": "outcomeTimeout",
+    "note": "Crossing the real OutcomeGrace (900s) deadline. No inference that clients have exited."
+  },
+  {
+    "name": "JobRunnerClassifyCompletion",
+    "params": [
+      "j"
+    ],
+    "guards": [
+      "jobs[j].completion = \"classify\""
+    ],
+    "updates": {
+      "jobs": "[jobs EXCEPT ![j].finishStatus = IF jobs[j].runAborted \\/ jobs[j].serverAborted THEN \"ABORTED\" ELSE IF jobs[j].serverFailed THEN \"FAILED\" ELSE \"COMPLETED\", ![j].completion = \"archive\"]",
+      "network": "network \\cup (IF jobs[j].serverFailed THEN {Msg(\"Stop\",s,<<j,scheduler.issued[j]>>) : s \\in jobs[j].deployed} ELSE {})"
+    },
+    "source": "nvflare/private/fed/server/job_runner.py:482-496; nvflare/private/fed/server/job_runner.py:574-585",
+    "scenario": "3,4",
+    "fault": null,
+    "note": "Completion retains a saved reference/status; failure requests client stop independently."
+  },
+  {
+    "name": "JobRunnerArchiveSuccess",
+    "params": [
+      "j"
+    ],
+    "guards": [
+      "jobs[j].completion = \"archive\""
+    ],
+    "updates": {
+      "jobs": "[jobs EXCEPT ![j].completion = \"publish\"]"
+    },
+    "source": "nvflare/private/fed/server/job_runner.py:494-522",
+    "scenario": "3,4",
+    "fault": null,
+    "note": ""
+  },
+  {
+    "name": "JobRunnerArchiveException",
+    "params": [
+      "j"
+    ],
+    "guards": [
+      "jobs[j].completion = \"archive\""
+    ],
+    "updates": {
+      "jobs": "[jobs EXCEPT ![j].archiveFailed = TRUE, ![j].completion = \"archiveRetry\"]"
+    },
+    "source": "nvflare/private/fed/server/job_runner.py:495-507",
+    "scenario": "3,4",
+    "fault": "archiveError",
+    "note": "Retry yields to other jobs; contents omitted, error grace retained."
+  },
+  {
+    "name": "JobRunnerRetryArchive",
+    "params": [
+      "j"
+    ],
+    "guards": [
+      "jobs[j].completion = \"archiveRetry\""
+    ],
+    "updates": {
+      "jobs": "[jobs EXCEPT ![j].completion = \"archive\"]"
+    },
+    "source": "nvflare/private/fed/server/job_runner.py:443-444; nvflare/private/fed/server/job_runner.py:501-507; nvflare/private/fed/server/job_runner.py:541",
+    "scenario": "4,5",
+    "fault": null,
+    "note": ""
+  },
+  {
+    "name": "JobRunnerArchiveGraceExpired",
+    "params": [
+      "j"
+    ],
+    "guards": [
+      "jobs[j].archiveFailed",
+      "jobs[j].completion \\in {\"archive\",\"archiveRetry\"}"
+    ],
+    "updates": {
+      "jobs": "[jobs EXCEPT ![j].completion = \"publish\"]"
+    },
+    "source": "nvflare/private/fed/server/job_runner.py:498-522",
+    "scenario": "4,5",
+    "fault": null,
+    "note": "An archive call fails at/after the 60s grace. Reactive completion of prior error, not a newly injected independent fault."
+  },
+  {
+    "name": "JobRunnerPublishTerminal",
+    "params": [
+      "j"
+    ],
+    "guards": [
+      "jobs[j].completion = \"publish\""
+    ],
+    "updates": {
+      "jobs": "[jobs EXCEPT ![j].status = jobs[j].finishStatus, ![j].terminalPublished = TRUE, ![j].completion = \"remove\"]"
+    },
+    "source": "nvflare/private/fed/server/job_runner.py:523-530; nvflare/apis/impl/job_def_manager.py:459-481",
+    "scenario": "3",
+    "fault": null,
+    "note": ""
+  },
+  {
+    "name": "JobRunnerTerminalStoreException",
+    "params": [
+      "j"
+    ],
+    "guards": [
+      "jobs[j].completion = \"publish\""
+    ],
+    "updates": {
+      "jobs": "jobs"
+    },
+    "source": "nvflare/private/fed/server/job_runner.py:523-530",
+    "scenario": "4,5",
+    "fault": "storeError",
+    "note": "Caught store error retries; finite injected errors do not kill completion service."
+  },
+  {
+    "name": "JobRunnerRemoveCompleted",
+    "params": [
+      "j"
+    ],
+    "guards": [
+      "jobs[j].completion = \"remove\"",
+      "jobs[j].running"
+    ],
+    "updates": {
+      "jobs": "[jobs EXCEPT ![j].running = FALSE, ![j].pending = {}, ![j].outcomeKey = FALSE, ![j].completedRemoved = TRUE, ![j].completion = IF jobs[j].finishStatus = \"ABORTED\" THEN \"abortedEvent\" ELSE \"completedEvent\"]"
+    },
+    "source": "nvflare/private/fed/server/job_runner.py:531-538",
+    "scenario": "3,4",
+    "fault": null,
+    "note": "TV-3 missing-key race is not silently repaired: if running was removed by failure path this action is disabled; see PendingCompletionRemoval structural diagnostic, not a service-death model."
+  },
+  {
+    "name": "DefaultJobSchedulerJobAbortedOnCompletion",
+    "params": [
+      "j"
+    ],
+    "guards": [
+      "jobs[j].completion = \"abortedEvent\""
+    ],
+    "updates": {
+      "jobs": "[jobs EXCEPT ![j].completion = \"completedEvent\"]",
+      "scheduler": "[scheduler EXCEPT !.scheduled = @ \\ {j}]"
+    },
+    "source": "nvflare/private/fed/server/job_runner.py:536-537; nvflare/app_common/job_schedulers/job_scheduler.py:281-285; nvflare/apis/utils/event.py:54-84",
+    "scenario": "4",
+    "fault": null,
+    "note": "ABORTED then COMPLETED are two supported notifications for the same job."
+  },
+  {
+    "name": "DefaultJobSchedulerJobCompleted",
+    "params": [
+      "j"
+    ],
+    "guards": [
+      "jobs[j].completion = \"completedEvent\""
+    ],
+    "updates": {
+      "jobs": "[jobs EXCEPT ![j].completion = \"done\"]",
+      "scheduler": "[scheduler EXCEPT !.scheduled = @ \\ {j}]"
+    },
+    "source": "nvflare/private/fed/server/job_runner.py:538; nvflare/app_common/job_schedulers/job_scheduler.py:281-285; nvflare/apis/utils/event.py:54-84",
+    "scenario": "3,4",
+    "fault": null,
+    "note": ""
+  },
+  {
+    "name": "TransportLoseMessage",
+    "params": [
+      "m"
+    ],
+    "guards": [
+      "m \\in network"
+    ],
+    "updates": {
+      "network": "network \\ {m}"
+    },
+    "source": "nvflare/private/fed/server/admin.py:307-339; nvflare/private/fed/server/server_engine.py:1007-1008; nvflare/private/fed/client/client_executor.py:657-674",
+    "scenario": "1,4,5",
+    "fault": "loss",
+    "note": "Ordinary request/reply loss, no forgery. Tokens and late messages are never reassociated."
+  },
+  {
+    "name": "DefaultJobSchedulerPersistFailed",
+    "params": [
+      "j"
+    ],
+    "guards": [
+      "scheduler.pc=\"persistFailed\"",
+      "j \\in scheduler.failedPending"
+    ],
+    "updates": {
+      "scheduler": "[scheduler EXCEPT !.persisted[j] = scheduler.count[j], !.failedPending = @ \\ {j}]"
+    },
+    "source": "nvflare/app_common/job_schedulers/job_scheduler.py:298-304",
+    "scenario": "5",
+    "fault": null,
+    "note": "Deferred end-of-pass failed-job metadata write; successful store boundary."
+  },
+  {
+    "name": "DefaultJobSchedulerPersistBlocked",
+    "params": [
+      "j"
+    ],
+    "guards": [
+      "scheduler.pc=\"persistFailed\"",
+      "scheduler.failedPending={}",
+      "j \\in scheduler.blockedPending"
+    ],
+    "updates": {
+      "scheduler": "[scheduler EXCEPT !.persisted[j] = scheduler.count[j], !.blockedPending = @ \\ {j}]",
+      "jobs": "[jobs EXCEPT ![j].status = \"CANT_SCHEDULE\"]"
+    },
+    "source": "nvflare/app_common/job_schedulers/job_scheduler.py:305-310",
+    "scenario": "5",
+    "fault": null,
+    "note": "Deferred blocked-job metadata/status processing; successful store boundary."
+  },
+  {
+    "name": "DefaultJobSchedulerReturnPass",
+    "params": [],
+    "guards": [
+      "scheduler.pc=\"persistFailed\"",
+      "scheduler.failedPending={}",
+      "scheduler.blockedPending={}"
+    ],
+    "updates": {
+      "scheduler": "[scheduler EXCEPT !.pc = scheduler.returnTo]"
+    },
+    "source": "nvflare/app_common/job_schedulers/job_scheduler.py:311",
+    "scenario": "5",
+    "fault": null,
+    "note": ""
+  },
+  {
+    "name": "JobRunnerMissingPendingOutcomes",
+    "params": [],
+    "guards": [
+      "scheduler.pc=\"filterOutcomes\"",
+      "~jobs[CurrentJob].outcomeKey"
+    ],
+    "updates": {
+      "scheduler": "[scheduler EXCEPT !.pc = \"failRemove\"]"
+    },
+    "source": "nvflare/private/fed/server/job_runner.py:359-360; nvflare/private/fed/server/job_runner.py:713-719",
+    "scenario": "2,4",
+    "fault": null,
+    "note": "Reactive KeyError path if authoritative failure removed the map during startup. Do not counter-bound an existing-state response."
+  },
+  {
+    "name": "JobCommandAbortRunningSend",
+    "params": [
+      "j"
+    ],
+    "guards": [
+      "jobs[j].adminPC=\"read\"",
+      "jobs[j].adminRead=\"RUNNING\"",
+      "jobs[j].serverRegistered"
+    ],
+    "updates": {
+      "network": "network \\cup {Msg(\"Stop\",s,<<j,scheduler.issued[j]>>) : s \\in jobs[j].deployed}",
+      "jobs": "[jobs EXCEPT ![j].adminPC = \"stopWait\"]"
+    },
+    "source": "nvflare/private/fed/server/job_runner.py:374-413; nvflare/private/fed/server/job_cmds.py:1071-1078",
+    "scenario": "3,4",
+    "fault": null,
+    "note": "Actual client stop send; blocking return and server abort are later."
+  },
+  {
+    "name": "JobRunnerFailureSendStop",
+    "params": [],
+    "guards": [
+      "scheduler.pc=\"failStop\"",
+      "jobs[CurrentJob].serverRegistered"
+    ],
+    "updates": {
+      "network": "network \\cup {Msg(\"Stop\",s,CurrentToken) : s \\in jobs[CurrentJob].deployed}",
+      "scheduler": "[scheduler EXCEPT !.pc = \"failStopWait\"]"
+    },
+    "source": "nvflare/private/fed/server/job_runner.py:374-413; nvflare/private/fed/server/job_runner.py:719-720",
+    "scenario": "2,4,5",
+    "fault": null,
+    "note": "Failure cleanup sends client stops before blocking return."
+  },
+  {
+    "name": "JobExecutorAbortStarting",
+    "params": [
+      "s",
+      "t"
+    ],
+    "guards": [
+      "client[s][t].abortRequested",
+      "client[s][t].logical=\"STARTING\"",
+      "client[s][t].handle # \"none\"",
+      "~client[s][t].terminateRequested",
+      "~client[s][t].pendingAbort"
+    ],
+    "updates": {
+      "client": "[client EXCEPT ![s][t].pendingAbort = client[s][t].handle=\"pending\", ![s][t].terminateRequested = client[s][t].handle=\"attached\"]"
+    },
+    "source": "nvflare/private/fed/client/client_executor.py:497-512; nvflare/private/fed/client/client_executor.py:65-77",
+    "scenario": "4",
+    "fault": null,
+    "note": "STARTING branch invokes pending/attached handle termination after ownership flag update."
+  },
+  {
+    "name": "ServerEngineReceiveAbortedOutcome",
+    "params": [
+      "s",
+      "t"
+    ],
+    "guards": [
+      "Msg(\"OutcomeAborted\", s, t) \\in network",
+      "s \\in jobs[t[1]].pending"
+    ],
+    "updates": {
+      "network": "(network \\ {Msg(\"OutcomeAborted\",s,t)}) \\cup (IF jobs[t[1]].serverRegistered THEN {Msg(\"Stop\",v,t) : v \\in jobs[t[1]].deployed} ELSE {})",
+      "jobs": "[jobs EXCEPT ![t[1]].pending = IF jobs[t[1]].serverRegistered \\/ jobs[t[1]].running THEN {} ELSE @ \\ {s}, ![t[1]].outcomeKey = IF jobs[t[1]].serverRegistered \\/ jobs[t[1]].running THEN FALSE ELSE @, ![t[1]].serverFailed = @ \\/ jobs[t[1]].serverRegistered \\/ jobs[t[1]].running, ![t[1]].serverAborted = IF (jobs[t[1]].serverRegistered \\/ jobs[t[1]].running) /\\ ~jobs[t[1]].serverFailed THEN TRUE ELSE @, ![t[1]].serverStop = @ \\/ jobs[t[1]].serverRegistered]"
+    },
+    "source": "nvflare/private/fed/server/fed_server.py:938-956; nvflare/private/fed/server/job_runner.py:813-843",
+    "scenario": "3,4",
+    "fault": null,
+    "note": "Accepted ABORTED code sets an exception classification only for an active job and does not overwrite an existing stronger code."
+  },
+  {
+    "name": "ServerEngineIgnoreOutcome",
+    "params": [
+      "s",
+      "t"
+    ],
+    "guards": [
+      "s \\notin jobs[t[1]].pending",
+      "\\E k \\in {\"OutcomeOK\",\"OutcomeFailed\",\"OutcomeAborted\"} : Msg(k,s,t) \\in network"
+    ],
+    "updates": {
+      "network": "network \\ {Msg(k,s,t) : k \\in {\"OutcomeOK\",\"OutcomeFailed\",\"OutcomeAborted\"}}"
+    },
+    "source": "nvflare/private/fed/server/fed_server.py:938-940",
+    "scenario": "4",
+    "fault": null,
+    "note": "An untracked job/site receives an OK acknowledgement without touching status, pending outcomes or stop state; one terminal report per site/attempt in this slice."
+  },
+  {
+    "name": "ServerEngineResolveMissingOutcome",
+    "params": [
+      "s",
+      "t"
+    ],
+    "guards": [
+      "~jobs[t[1]].serverRegistered",
+      "s \\in jobs[t[1]].pending",
+      "~RegisteredAtSite(s,t[1])",
+      "t[2]=scheduler.issued[t[1]]"
+    ],
+    "updates": {
+      "jobs": "[jobs EXCEPT ![t[1]].pending = IF jobs[t[1]].running /\\ ~jobs[t[1]].serverFailed THEN {} ELSE @ \\ {s}, ![t[1]].outcomeKey = IF jobs[t[1]].running /\\ ~jobs[t[1]].serverFailed THEN FALSE ELSE @, ![t[1]].serverFailed = @ \\/ jobs[t[1]].running, ![t[1]].serverAborted = IF jobs[t[1]].running /\\ ~jobs[t[1]].serverFailed THEN FALSE ELSE @]"
+    },
+    "source": "nvflare/private/fed/server/fed_server.py:1045-1094; nvflare/private/fed/server/job_runner.py:813-843; nvflare/private/fed/server/job_runner.py:114-120",
+    "scenario": "4",
+    "fault": null,
+    "note": "Heartbeat observes the job absent at this site after server registry removal. It resolves the pending site without an Outcome envelope; active running-map membership gates fail_run. Delayed heartbeat snapshots remain an explicit projection boundary."
+  },
+  {
+    "name": "JobExecutorClassifyAbortedExit",
+    "params": [
+      "s",
+      "t"
+    ],
+    "guards": [
+      "~client[s][t].alive",
+      "client[s][t].cleanup=\"wait\"",
+      "client[s][t].exitCode=\"ok\"",
+      "client[s][t].abortRequested"
+    ],
+    "updates": {
+      "client": "[client EXCEPT ![s][t].exitCode = \"aborted\"]"
+    },
+    "source": "nvflare/private/fed/client/client_executor.py:630-647",
+    "scenario": "4",
+    "fault": null,
+    "note": "Returned ABORTED code after a supported stop; independent of physical exit observation."
+  },
+  {
+    "name": "ServerEngineTerminateAfterExit",
+    "params": [
+      "j"
+    ],
+    "guards": [
+      "jobs[j].serverStop \\/ jobs[j].adminPC=\"stopWait\" \\/ (scheduler.current=j /\\ scheduler.pc=\"failStopWait\")",
+      "jobs[j].serverSpawned",
+      "~jobs[j].serverRegistered"
+    ],
+    "updates": {
+      "jobs": "[jobs EXCEPT ![j].serverTerminated = TRUE]"
+    },
+    "source": "nvflare/private/fed/server/server_engine.py:385-409",
+    "scenario": "4",
+    "fault": null,
+    "note": "The graceful loop observes the registry entry already removed and terminates the captured handle without requiring ten seconds. Multiple supported abort workers may repeat termination; serverTerminated records occurrence and is not a production guard."
+  },
+  {
+    "name": "ServerEngineTerminateAfterAbortCommandError",
+    "params": [
+      "j"
+    ],
+    "guards": [
+      "jobs[j].serverStop \\/ jobs[j].adminPC=\"stopWait\" \\/ (scheduler.current=j /\\ scheduler.pc=\"failStopWait\")",
+      "jobs[j].serverSpawned"
+    ],
+    "updates": {
+      "jobs": "[jobs EXCEPT ![j].serverTerminated = TRUE]"
+    },
+    "source": "nvflare/private/fed/server/server_engine.py:361-409",
+    "scenario": "4",
+    "fault": "serverAbortError",
+    "note": "Ordinary abort-command exception selects max_wait=0; no claim that a termination request proves process exit. Multiple supported abort workers may repeat termination; serverTerminated records occurrence and is not a production guard."
+  }
+]

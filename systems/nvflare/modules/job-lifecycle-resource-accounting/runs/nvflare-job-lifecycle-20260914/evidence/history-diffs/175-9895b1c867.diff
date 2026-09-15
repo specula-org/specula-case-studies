@@ -1,0 +1,101 @@
+commit 9895b1c867920c2e081cbf0f1d5db735548b9871
+Author:     Yuan-Ting Hsieh (謝沅廷) <yuantinghsieh@gmail.com>
+AuthorDate: Wed Aug 17 16:35:08 2022 -0700
+Commit:     GitHub <noreply@github.com>
+CommitDate: Wed Aug 17 16:35:08 2022 -0700
+
+    Use secure traceback/logging (#769)
+    
+    * Use secure traceback/logging
+    
+    * Add secure formatting for exceptions
+    
+    * Add docstrings
+---
+ nvflare/private/fed/client/client_engine.py   | 6 +++---
+ nvflare/private/fed/client/client_executor.py | 4 ++--
+ nvflare/private/fed/server/server_engine.py   | 6 +++---
+ 3 files changed, 8 insertions(+), 8 deletions(-)
+
+diff --git a/nvflare/private/fed/client/client_engine.py b/nvflare/private/fed/client/client_engine.py
+index 210fdd38..943f587e 100644
+--- a/nvflare/private/fed/client/client_engine.py
++++ b/nvflare/private/fed/client/client_engine.py
+@@ -18,7 +18,6 @@ import re
+ import shutil
+ import sys
+ import time
+-import traceback
+ from concurrent.futures import ThreadPoolExecutor
+ 
+ from nvflare.apis.fl_constant import MachineStatus
+@@ -26,6 +25,7 @@ from nvflare.apis.shareable import Shareable
+ from nvflare.fuel.hci.zip_utils import unzip_all_from_bytes
+ from nvflare.private.admin_defs import Message
+ from nvflare.private.defs import ClientStatusKey
++from nvflare.security.logging import secure_format_exception, secure_log_traceback
+ 
+ from .client_engine_internal_spec import ClientEngineInternalSpec
+ from .client_executor import ProcessExecutor
+@@ -266,6 +266,6 @@ def _shutdown_client(client, admin_agent, touch_file):
+ 
+         admin_agent.shutdown()
+     except BaseException as e:
+-        traceback.print_exc()
+-        print("FL client execution exception: " + str(e))
++        secure_log_traceback()
++        logging.getLogger().error(f"FL client execution exception: {secure_format_exception(e)}")
+         # client.status = ClientStatus.TRAINING_EXCEPTION
+diff --git a/nvflare/private/fed/client/client_executor.py b/nvflare/private/fed/client/client_executor.py
+index ac5561cb..bf65d804 100644
+--- a/nvflare/private/fed/client/client_executor.py
++++ b/nvflare/private/fed/client/client_executor.py
+@@ -156,7 +156,7 @@ class ProcessExecutor(ClientExecutor):
+             try:
+                 address = ("localhost", self.listen_port)
+                 self.conn_client = Client(address, authkey="client process secret password".encode())
+-            except Exception as e:
++            except Exception:
+                 pass
+ 
+     def create_pipe(self):
+@@ -300,7 +300,7 @@ class ProcessExecutor(ClientExecutor):
+                     try:
+                         os.killpg(os.getpgid(client.process.pid), 9)
+                         self.logger.debug("kill signal sent")
+-                    except Exception as e:
++                    except Exception:
+                         pass
+                     client.process.terminate()
+                     self.logger.debug("terminated")
+diff --git a/nvflare/private/fed/server/server_engine.py b/nvflare/private/fed/server/server_engine.py
+index 3c5d0837..02f3a8fe 100644
+--- a/nvflare/private/fed/server/server_engine.py
++++ b/nvflare/private/fed/server/server_engine.py
+@@ -20,7 +20,6 @@ import re
+ import shutil
+ import sys
+ import time
+-import traceback
+ from concurrent.futures import ThreadPoolExecutor
+ from threading import Lock
+ from typing import List, Tuple
+@@ -33,6 +32,7 @@ from nvflare.apis.workspace import Workspace
+ from nvflare.fuel.hci.zip_utils import zip_directory_to_bytes
+ from nvflare.private.admin_defs import Message
+ from nvflare.private.fed.server.server_json_config import ServerJsonConfigurator
++from nvflare.security.logging import secure_format_exception, secure_log_traceback
+ from nvflare.widgets.info_collector import InfoCollector
+ from nvflare.widgets.widget import Widget, WidgetID
+ 
+@@ -420,8 +420,8 @@ def start_server_training(server, args, app_root, run_number):
+ 
+         server.start_run(run_number, app_root, conf, args)
+     except BaseException as e:
+-        traceback.print_exc()
+-        logging.getLogger().warning("FL server execution exception: " + str(e))
++        logging.getLogger().warning(f"FL server execution exception: {secure_format_exception(e)}")
++        secure_log_traceback()
+     finally:
+         server.status = ServerStatus.STOPPED
+         server.engine.engine_info.status = MachineStatus.STOPPED

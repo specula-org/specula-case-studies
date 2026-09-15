@@ -1,0 +1,1 @@
+Diagnostic checkpoint copied verbatim from final matched State 128 (l=128) in output/traces-r4/abort_completion.out. Only this isolated TraceInit starts at that saved state; all full validation uses original Init. Debugger level is 1 at the checkpoint.

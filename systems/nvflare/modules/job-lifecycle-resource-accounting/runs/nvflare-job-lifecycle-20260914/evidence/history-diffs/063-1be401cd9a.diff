@@ -1,0 +1,115 @@
+commit 1be401cd9a7da6532b9282be068f242539231be3
+Author:     Sean Yang <seany314@gmail.com>
+AuthorDate: Wed Jan 15 15:15:59 2025 -0800
+Commit:     GitHub <noreply@github.com>
+CommitDate: Wed Jan 15 15:15:59 2025 -0800
+
+    Dynamic logging with admin commands (#3127)
+    
+    depends on https://github.com/NVIDIA/NVFlare/pull/3126
+    - Add dynamic logging mechanism with options to provide a file,
+    levelname/level for root level, or to reload
+    - Add log_config argument for simulator
+    - `configure_site_log target config` under operate command category
+    - `configure_job_log job_id target config` under manage_job command
+    category
+    
+    ### Types of changes
+    <!--- Put an `x` in all the boxes that apply, and remove the not
+    applicable items -->
+    - [x] Non-breaking change (fix or new feature that would not break
+    existing functionality).
+    - [ ] Breaking change (fix or new feature that would cause existing
+    functionality to change).
+    - [ ] New tests added to cover the changes.
+    - [ ] Quick tests passed locally by running `./runtest.sh`.
+    - [ ] In-line docstrings updated.
+    - [ ] Documentation updated.
+---
+ nvflare/private/fed/client/client_engine.py   |  3 +++
+ nvflare/private/fed/client/client_executor.py | 31 +++++++++++++++++++++++++++
+ nvflare/private/fed/server/server_engine.py   | 15 +++++++++++++
+ 3 files changed, 49 insertions(+)
+
+diff --git a/nvflare/private/fed/client/client_engine.py b/nvflare/private/fed/client/client_engine.py
+index eeb90446..cec1ae1d 100644
+--- a/nvflare/private/fed/client/client_engine.py
++++ b/nvflare/private/fed/client/client_engine.py
+@@ -450,6 +450,9 @@ class ClientEngine(ClientEngineInternalSpec, StreamableEngine):
+     def get_errors(self, job_id):
+         return self.client_executor.get_errors(job_id)
+ 
++    def configure_job_log(self, job_id, config):
++        return self.client_executor.configure_job_log(job_id, config)
++
+     def reset_errors(self, job_id):
+         self.client_executor.reset_errors(job_id)
+ 
+diff --git a/nvflare/private/fed/client/client_executor.py b/nvflare/private/fed/client/client_executor.py
+index b1f980f6..cbf94777 100644
+--- a/nvflare/private/fed/client/client_executor.py
++++ b/nvflare/private/fed/client/client_executor.py
+@@ -317,6 +317,37 @@ class JobExecutor(ClientExecutor):
+             secure_log_traceback()
+             return None
+ 
++    def configure_job_log(self, job_id, config):
++        """Configure the job log.
++
++        Args:
++            job_id: the job_id
++            config: log config
++
++         Returns:
++            configure_job_log command message
++        """
++        try:
++            request = new_cell_message({}, config)
++            return_data = self.client.cell.send_request(
++                target=self._job_fqcn(job_id),
++                channel=CellChannel.CLIENT_COMMAND,
++                topic=AdminCommandNames.CONFIGURE_JOB_LOG,
++                request=request,
++                optional=True,
++                timeout=self.job_query_timeout,
++            )
++            return_code = return_data.get_header(MessageHeaderKey.RETURN_CODE)
++            if return_code == ReturnCode.OK:
++                return return_data.payload
++            else:
++                return f"failed to configure_job_log with return code: {return_code}"
++        except Exception as e:
++            err = f"configure_job_log execution exception: {secure_format_exception(e)}."
++            self.logger.error(err)
++            secure_log_traceback()
++            return err
++
+     def reset_errors(self, job_id):
+         """Resets the error information.
+ 
+diff --git a/nvflare/private/fed/server/server_engine.py b/nvflare/private/fed/server/server_engine.py
+index fe59de77..762f81c3 100644
+--- a/nvflare/private/fed/server/server_engine.py
++++ b/nvflare/private/fed/server/server_engine.py
+@@ -912,6 +912,21 @@ class ServerEngine(ServerEngineInternalSpec, StreamableEngine):
+ 
+         return f"reset the server error stats for job: {job_id}"
+ 
++    def configure_job_log(self, job_id, data) -> str:
++        error = None
++        try:
++            error = self.send_command_to_child_runner_process(
++                job_id=job_id,
++                command_name=AdminCommandNames.CONFIGURE_JOB_LOG,
++                command_data=data,
++            )
++        except Exception as ex:
++            err = f"Failed to configure_job_log for JOB: {job_id}: {secure_format_exception(ex)}"
++            self.logger.error(err)
++            return err
++
++        return error
++
+     def _send_admin_requests(self, requests, fl_ctx: FLContext, timeout_secs=10) -> List[ClientReply]:
+         return self.server.admin_server.send_requests(requests, fl_ctx, timeout_secs=timeout_secs)
+ 

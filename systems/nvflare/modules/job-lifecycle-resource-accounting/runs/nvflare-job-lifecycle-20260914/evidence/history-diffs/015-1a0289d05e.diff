@@ -1,0 +1,57 @@
+commit 1a0289d05edfc6754eb8be137c1857af5d491943
+Author:     Zhihong Zhang <100308595+nvidianz@users.noreply.github.com>
+AuthorDate: Fri Aug 7 01:34:31 2026 -0400
+Commit:     GitHub <noreply@github.com>
+CommitDate: Fri Aug 7 05:34:31 2026 +0000
+
+    FLARE-3096: Downgrade harmless abort and fail logs to INFO (#5051)
+    
+    ## Summary
+    
+    When a late stop, abort, or failure report reaches a job that has
+    already left `JobRunner.running_jobs`, the condition is an expected
+    lifecycle race rather than a server error. This change downgrades those
+    messages from ERROR to INFO while preserving the returned status message
+    for callers.
+    
+    The fix intentionally leaves `ServerEngine.run_processes` cleanup with
+    the existing asynchronous launcher cleanup path instead of mutating
+    process maps from the job-start exception handler.
+    
+    Jira: [FLARE-3096](https://jirasw.nvidia.com/browse/FLARE-3096)
+    NVBug: 6563308
+    
+    ## Validation
+    
+    - `58 passed`: `job_runner_test.py` and `fed_server_test.py`
+    - Scoped `./runtest.sh -s` passed for both changed files
+    - Added coverage for late abort, late failure, and `stop_all_runs()`
+    encountering an untracked process
+    
+    Co-authored-by: Yuan-Ting Hsieh (謝沅廷) <yuantingh@nvidia.com>
+---
+ nvflare/private/fed/server/job_runner.py | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/nvflare/private/fed/server/job_runner.py b/nvflare/private/fed/server/job_runner.py
+index 3bf086ac..58d0697e 100644
+--- a/nvflare/private/fed/server/job_runner.py
++++ b/nvflare/private/fed/server/job_runner.py
+@@ -698,7 +698,7 @@ class JobRunner(FLComponent):
+             job.run_aborted = True
+             return ""
+         else:
+-            self.log_error(fl_ctx, f"Job {job_id} is not running. It can not be stopped.")
++            self.log_info(fl_ctx, f"Job {job_id} is not running. It can not be stopped.")
+             return f"Job {job_id} is not running."
+ 
+     def fail_run(self, job_id: str, process_return_code: int, fl_ctx: FLContext):
+@@ -722,7 +722,7 @@ class JobRunner(FLComponent):
+             fl_ctx.set_prop(FLContextKey.CURRENT_JOB_ID, job.job_id)
+             return ""
+         else:
+-            self.log_error(fl_ctx, f"Job {job_id} is not running. It can not be failed.")
++            self.log_info(fl_ctx, f"Job {job_id} is not running. It can not be failed.")
+             return f"Job {job_id} is not running."
+ 
+     def stop_all_runs(self, fl_ctx: FLContext):

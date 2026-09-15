@@ -1,0 +1,61 @@
+{
+  "schema_version": "2",
+  "system": "nvflare-job-lifecycle",
+  "generated_by": "validation-workflow",
+  "findings": [
+    {
+      "id": "MC-2",
+      "title": "Startup rollback frees a resource while the spawned child is still live",
+      "source": "model-checking",
+      "scenario": "2 - startup cleanup ownership",
+      "severity": "Medium",
+      "invariant": "NoFreeWhileInUse",
+      "config": "MC_hunt_s2_cleanup_handoff.cfg",
+      "counterexample": "spec/output/MC_hunt_s2_cleanup_handoff-bfs.out",
+      "affected_code": [
+        "nvflare/private/fed/client/client_executor.py:299",
+        "nvflare/private/fed/client/client_executor.py:318",
+        "nvflare/private/fed/client/client_executor.py:330",
+        "nvflare/private/fed/client/scheduler_cmds.py:129",
+        "nvflare/app_common/resource_managers/auto_clean_resource_manager.py:166"
+      ],
+      "summary": "JobExecutor attaches a spawned process handle before creating and starting the sole child-exit waiter. A waiter-installation exception propagates to StartJobProcessor, whose catch frees the retained allocation without checking whether a child already owns it. The resource manager immediately returns the unit to its free deque. This exposes available capacity while the child may still use its launch binding, without an installed waiter owning normal cleanup."
+    },
+    {
+      "id": "MC-3",
+      "title": "A stale deployment write can undo an acknowledged pre-run abort",
+      "source": "model-checking",
+      "scenario": "3 - pre-run abort status",
+      "severity": "Medium",
+      "invariant": "AcceptedPreRunAbortPersists",
+      "config": "MC_hunt_s3_abort_status.cfg",
+      "counterexample": "spec/output/MC_hunt_s3_abort_status-bfs.out",
+      "affected_code": [
+        "nvflare/private/fed/server/job_runner.py:661",
+        "nvflare/private/fed/server/job_runner.py:669",
+        "nvflare/private/fed/server/job_cmds.py:1059",
+        "nvflare/private/fed/server/job_cmds.py:1062",
+        "nvflare/apis/impl/job_def_manager.py:459"
+      ],
+      "summary": "JobRunner checks SUBMITTED before deployment, then writes DISPATCHED unconditionally. The concurrent pre-run abort handler reads status once, stores ABORTED, and constructs a success response from its saved branch. Deployment can overwrite that terminal value before the response is constructed. The built-in job manager performs a plain metadata update without an expected-state condition."
+    },
+    {
+      "id": "MC-4",
+      "title": "A delayed startup write can restore RUNNING after terminal publication",
+      "source": "model-checking",
+      "scenario": "3 - terminal status publication",
+      "severity": "Medium",
+      "invariant": "NoTerminalResurrection",
+      "config": "MC_hunt_s3_terminal_status.cfg",
+      "counterexample": "spec/output/MC_hunt_s3_terminal_status-bfs.out",
+      "affected_code": [
+        "nvflare/private/fed/server/job_runner.py:709",
+        "nvflare/private/fed/server/job_runner.py:711",
+        "nvflare/private/fed/server/job_runner.py:524",
+        "nvflare/private/fed/server/job_runner.py:531",
+        "nvflare/apis/impl/job_def_manager.py:459"
+      ],
+      "summary": "JobRunner publishes running_jobs membership under its lock, then stores RUNNING after releasing that lock. The completion thread can observe the entry after server exit and outcome resolution and publish a terminal status first. The delayed startup write then restores RUNNING. Completion can subsequently delete its bookkeeping without another status publication."
+    }
+  ]
+}

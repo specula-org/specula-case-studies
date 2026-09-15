@@ -1,0 +1,300 @@
+commit df92fab40ae0732b570c2a16e02e71c55dfabef6
+Author:     Yuan-Ting Hsieh (謝沅廷) <yuantinghsieh@gmail.com>
+AuthorDate: Fri May 20 13:52:49 2022 -0700
+Commit:     GitHub <noreply@github.com>
+CommitDate: Fri May 20 13:52:49 2022 -0700
+
+    Fix handling of config exception during job running (#580)
+---
+ nvflare/private/fed/client/client_executor.py | 98 +++++++++++++--------------
+ nvflare/private/fed/server/job_runner.py      | 17 +++--
+ nvflare/private/fed/server/server_engine.py   |  4 +-
+ 3 files changed, 63 insertions(+), 56 deletions(-)
+
+diff --git a/nvflare/private/fed/client/client_executor.py b/nvflare/private/fed/client/client_executor.py
+index e86e2608..18292298 100644
+--- a/nvflare/private/fed/client/client_executor.py
++++ b/nvflare/private/fed/client/client_executor.py
+@@ -100,12 +100,16 @@ class ClientExecutor(object):
+ 
+         Args:
+             client: the FL client object
++            run_number: the run_number
+         """
+         pass
+ 
+     def get_run_info(self, run_number) -> dict:
+         """Get the run information.
+ 
++        Args:
++            run_number: the run_number
++
+         Returns:
+             A dict of run information.
+         """
+@@ -129,6 +133,7 @@ class ClientExecutor(object):
+ 
+         Args:
+             shareable: aux message Shareable
++            run_number: the run_number
+         """
+         pass
+ 
+@@ -150,12 +155,11 @@ class ProcessExecutor(ClientExecutor):
+         ClientExecutor.__init__(self, uid, startup)
+ 
+         self.startup = startup
+-
+         self.run_processes = {}
+-
+         self.lock = threading.Lock()
+ 
+     def get_conn_client(self, run_number):
++        # should be call within self.lock
+         listen_port = self.run_processes.get(run_number, {}).get(RunProcessKey.LISTEN_PORT)
+         conn_client = self.run_processes.get(run_number, {}).get(RunProcessKey.CONNECTION, None)
+ 
+@@ -164,17 +168,11 @@ class ProcessExecutor(ClientExecutor):
+                 address = ("localhost", listen_port)
+                 conn_client = Client(address, authkey="client process secret password".encode())
+                 self.run_processes[run_number][RunProcessKey.CONNECTION] = conn_client
+-            except Exception as e:
++            except Exception:
+                 pass
+ 
+         return conn_client
+ 
+-    def create_pipe(self):
+-        """Create pipe to communicate between child (training) and main (logic) thread."""
+-        pipe = FilePipe(root_path="/fl/server", name="training")
+-
+-        return pipe
+-
+     def start_train(
+         self,
+         client,
+@@ -222,7 +220,7 @@ class ProcessExecutor(ClientExecutor):
+             }
+ 
+         thread = threading.Thread(
+-            target=self.wait_training_process_finish,
++            target=self._wait_child_process_finish,
+             args=(client, run_number, allocated_resource, token, resource_manager),
+         )
+         thread.start()
+@@ -241,8 +239,8 @@ class ProcessExecutor(ClientExecutor):
+                 else:
+                     process_status = ClientStatus.NOT_STARTED
+                     return get_status_message(process_status)
+-        except:
+-            self.logger.error("check_status() execution exception.")
++        except Exception as e:
++            self.logger.error(f"check_status execution exception: {e}.", exc_info=True)
+             return "execution exception. Please try again."
+ 
+     def get_run_info(self, run_number):
+@@ -257,8 +255,8 @@ class ProcessExecutor(ClientExecutor):
+                     return run_info
+                 else:
+                     return {}
+-        except:
+-            self.logger.error("get_run_info() execution exception.")
++        except Exception as e:
++            self.logger.error(f"get_run_info execution exception: {e}.", exc_info=True)
+             return {"error": "no info collector. Please try again."}
+ 
+     def get_errors(self, run_number):
+@@ -273,8 +271,8 @@ class ProcessExecutor(ClientExecutor):
+                     return errors_info
+                 else:
+                     return None
+-        except:
+-            self.logger.error("get_errors() execution exception.")
++        except Exception as e:
++            self.logger.error(f"get_errors execution exception: {e}.", exc_info=True)
+             return None
+ 
+     def reset_errors(self, run_number):
+@@ -285,8 +283,8 @@ class ProcessExecutor(ClientExecutor):
+                 if conn_client:
+                     data = {"command": AdminCommandNames.RESET_ERRORS, "data": {}}
+                     conn_client.send(data)
+-        except:
+-            self.logger.error("reset_errors() execution exception.")
++        except Exception as e:
++            self.logger.error(f"reset_errors execution exception: {e}.", exc_info=True)
+ 
+     def send_aux_command(self, shareable: Shareable, run_number):
+         try:
+@@ -299,29 +297,29 @@ class ProcessExecutor(ClientExecutor):
+                     return reply
+                 else:
+                     return make_reply(ReturnCode.EXECUTION_EXCEPTION)
+-        except:
++        except Exception:
+             return make_reply(ReturnCode.EXECUTION_EXCEPTION)
+ 
+     def abort_train(self, client, run_number):
+-        process_status = self.run_processes.get(run_number, {}).get(RunProcessKey.STATUS, ClientStatus.NOT_STARTED)
+-        if process_status == ClientStatus.STARTED:
+-            with self.lock:
++        with self.lock:
++            process_status = self.run_processes.get(run_number, {}).get(RunProcessKey.STATUS, ClientStatus.NOT_STARTED)
++            if process_status == ClientStatus.STARTED:
+                 try:
+-                    child_process = self.run_processes[run_number].get(RunProcessKey.CHILD_PROCESS, None)
+-                    if child_process:
+-                        # kill the sub-process group directly
+-                        conn_client = self.get_conn_client(run_number)
+-                        if conn_client:
+-                            data = {"command": AdminCommandNames.ABORT, "data": {}}
+-                            conn_client.send(data)
+-                            self.logger.debug("abort sent")
+-
+-                        threading.Thread(target=self._terminate_process, args=[child_process]).start()
++                    child_process = self.run_processes[run_number][RunProcessKey.CHILD_PROCESS]
++                    # kill the sub-process group directly
++                    conn_client = self.get_conn_client(run_number)
++                    if conn_client:
++                        data = {"command": AdminCommandNames.ABORT, "data": {}}
++                        conn_client.send(data)
++                        self.logger.debug("abort sent")
++
++                    threading.Thread(target=self._terminate_process, args=[child_process]).start()
++                except Exception as e:
++                    self.logger.error(f"abort_train execution exception: {e}.", exc_info=True)
+                 finally:
+                     if conn_client:
+                         conn_client.close()
+-                    if run_number in self.run_processes.keys():
+-                        self.run_processes.pop(run_number)
++                    self.run_processes.pop(run_number)
+                     self.cleanup()
+ 
+         self.logger.info("Client training was terminated.")
+@@ -333,21 +331,22 @@ class ProcessExecutor(ClientExecutor):
+         try:
+             os.killpg(os.getpgid(child_process.pid), 9)
+             self.logger.debug("kill signal sent")
+-        except Exception as e:
++        except Exception:
+             pass
+         child_process.terminate()
+         self.logger.debug("terminated")
+ 
+     def abort_task(self, client, run_number):
+-        process_status = self.run_processes.get(run_number, {}).get(RunProcessKey.STATUS, ClientStatus.NOT_STARTED)
+-        if process_status == ClientStatus.STARTED:
+-            conn_client = self.get_conn_client(run_number)
+-            if conn_client:
+-                data = {"command": AdminCommandNames.ABORT_TASK, "data": {}}
+-                conn_client.send(data)
+-                self.logger.debug("abort_task sent")
++        with self.lock:
++            process_status = self.run_processes.get(run_number, {}).get(RunProcessKey.STATUS, ClientStatus.NOT_STARTED)
++            if process_status == ClientStatus.STARTED:
++                conn_client = self.get_conn_client(run_number)
++                if conn_client:
++                    data = {"command": AdminCommandNames.ABORT_TASK, "data": {}}
++                    conn_client.send(data)
++                    self.logger.debug("abort_task sent")
+ 
+-    def wait_training_process_finish(self, client, run_number, allocated_resource, token, resource_manager):
++    def _wait_child_process_finish(self, client, run_number, allocated_resource, token, resource_manager):
+         # wait for the listen_command thread to start, and send "start" message to wake up the connection.
+         start = time.time()
+         while True:
+@@ -362,10 +361,12 @@ class ProcessExecutor(ClientExecutor):
+                 break
+ 
+         self.logger.info("waiting for process to finish.")
+-        child_process = self.run_processes.get(run_number, {}).get(RunProcessKey.CHILD_PROCESS)
+-        child_process.wait()
+-        returncode = child_process.returncode
+-        self.logger.info(f"process finished with execution code: {returncode}")
++        with self.lock:
++            child_process = self.run_processes.get(run_number, {}).get(RunProcessKey.CHILD_PROCESS)
++        if child_process:
++            child_process.wait()
++            return_code = child_process.returncode
++            self.logger.info(f"process finished with execution code: {return_code}")
+ 
+         if allocated_resource:
+             resource_manager.free_resources(resources=allocated_resource, token=token, fl_ctx=FLContext())
+@@ -377,9 +378,6 @@ class ProcessExecutor(ClientExecutor):
+             if run_number in self.run_processes.keys():
+                 self.run_processes.pop(run_number)
+ 
+-        # Not to run cross_validation in a new process anymore
+-        client.cross_site_validate = False
+-
+     def get_status(self, run_number):
+         with self.lock:
+             process_status = self.run_processes.get(run_number, {}).get(RunProcessKey.STATUS, ClientStatus.STOPPED)
+diff --git a/nvflare/private/fed/server/job_runner.py b/nvflare/private/fed/server/job_runner.py
+index 24474a13..c2cb683d 100644
+--- a/nvflare/private/fed/server/job_runner.py
++++ b/nvflare/private/fed/server/job_runner.py
+@@ -155,11 +155,11 @@ class JobRunner(FLComponent):
+ 
+             replies = self.abort_client_run(engine, run_number, client_sites, fl_ctx)
+             if not replies:
+-                self.log_error(fl_ctx, f"Failed to send abort command to clients for run_{run_number}")
++                self.log_error(fl_ctx, f"Failed to send abort command to clients for run: {run_number}")
+ 
+             err = engine.abort_app_on_server(run_number)
+             if err:
+-                self.log_error(fl_ctx, f"Failed to abort the server for run_.{run_number}")
++                self.log_error(fl_ctx, f"Failed to abort the server for run: {run_number}")
+ 
+     def abort_client_run(self, engine, run_number, client_sites, fl_ctx):
+         """Send the abort run command to the clients
+@@ -176,7 +176,7 @@ class JobRunner(FLComponent):
+         admin_server = engine.server.admin_server
+         message = Message(topic=TrainingTopic.ABORT, body="")
+         message.set_header(RequestHeader.RUN_NUM, str(run_number))
+-        self.log_debug(fl_ctx, f"Send stop command to the site for run:{run_number}")
++        self.log_debug(fl_ctx, f"Send abort command to the site for run: {run_number}")
+         replies = self._send_to_clients(admin_server, client_sites, engine, message)
+         return replies
+ 
+@@ -215,7 +215,16 @@ class JobRunner(FLComponent):
+                     with self.lock:
+                         job = self.running_jobs.get(run_number)
+                         if job:
+-                            if run_number in engine.execution_exception_run_number:
++                            if run_number in engine.execution_exception_run_processes:
++                                run_process = engine.execution_exception_run_processes[run_number]
++                                # stop client run
++                                client_sites = run_process.get(RunProcessKey.PARTICIPANTS)
++
++                                replies = self.abort_client_run(engine, run_number, client_sites, fl_ctx)
++                                if not replies:
++                                    self.log_error(
++                                        fl_ctx, f"Failed to send abort command to clients for run: {run_number}"
++                                    )
+                                 job_manager.set_status(job.job_id, RunStatus.FINISHED_EXECUTION_EXCEPTION, fl_ctx)
+                             else:
+                                 job_manager.set_status(job.job_id, RunStatus.FINISHED_COMPLETED, fl_ctx)
+diff --git a/nvflare/private/fed/server/server_engine.py b/nvflare/private/fed/server/server_engine.py
+index cdb097ac..b53b971a 100644
+--- a/nvflare/private/fed/server/server_engine.py
++++ b/nvflare/private/fed/server/server_engine.py
+@@ -93,7 +93,7 @@ class ServerEngine(ServerEngineInternalSpec):
+         self.server = server
+         self.args = args
+         self.run_processes = {}
+-        self.execution_exception_run_number = []
++        self.execution_exception_run_processes = {}
+         self.run_manager = None
+         self.conf = None
+         # TODO:: does this class need client manager?
+@@ -260,7 +260,7 @@ class ServerEngine(ServerEngineInternalSpec):
+                     return_code = run_process_info[RunProcessKey.CHILD_PROCESS].poll()
+                     # if process exit but with Execution exception
+                     if return_code and return_code != 0:
+-                        self.execution_exception_run_number.append(run_number)
++                        self.execution_exception_run_processes[run_number] = run_process_info
+                 self.engine_info.status = MachineStatus.STOPPED
+                 break
+ 

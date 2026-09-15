@@ -1,0 +1,111 @@
+author:	greptile-apps
+association:	contributor
+edited:	true
+status:	none
+--
+<!-- greptile_summary -->
+
+<h2><a href="https://app.greptile.com/api/retrigger?id=58887161"><picture><source media="(prefers-color-scheme: dark)" srcset="https://greptile-static-assets.s3.amazonaws.com/badges/RetriggerDark.svg?v=1"><source media="(prefers-color-scheme: light)" srcset="https://greptile-static-assets.s3.amazonaws.com/badges/Retrigger.svg?v=1"><img alt="Retrigger" src="https://greptile-static-assets.s3.amazonaws.com/badges/Retrigger.svg?v=1" align="right"></picture></a>Confidence Score: 3/5</h2>
+
+The PR is not yet safe to merge because unbounded finite client updates can still dominate and corrupt the aggregated global update.
+
+<h3>Summary</h3>
+
+- Adds adaptive peer-similarity and temporal-stability aggregation.
+- Adds client training, evaluation, and dataset preparation with explicit validation.
+- Documents setup, execution, algorithm assumptions, and limitations.
+
+<sub>Reviews (13) · Last reviewed commit: ["Address FedSCS review feedback"](https://github.com/nvidia/nvflare/commit/d5106a4d569a27daf7ac4895be2b9ee9a6cb46b0)</sub>
+--
+author:	ZiyueXu77
+association:	collaborator
+edited:	false
+status:	commented
+--
+thanks for the PR! Some comments
+--
+author:	chesterxgchen
+association:	collaborator
+edited:	false
+status:	commented
+--
+
+FedSCS: Robust Federated Learning via Stable Cosine Similarity
+FedSCS is a robust federated aggregation method that uses client update similarity and temporal stability scores to compute adaptive aggregation weights.
+
+
+Please add some background information, the title only describe the name and what it does, but did not explain why do we need this ? in what cases, we should use this algorithm ? what kind of the problem it is trying to solve. 
+
+
+--
+author:	holgerroth
+association:	collaborator
+edited:	false
+status:	commented
+--
+Low-effort single-pass review; three inline notes below.
+--
+author:	holgerroth
+association:	collaborator
+edited:	false
+status:	none
+--
+Thanks for the contribution. One structural suggestion that would simplify this a lot and also fix the server-side memory profile.
+
+**Suggestion: drop the custom `FedSCS` controller and `FedSCSRecipe`, and implement FedSCS as a custom aggregator only, using DIFF transfer.**
+
+Right now `fedscs_controller.py` copies the whole `FedAvg.run()` loop just to add `aggregator.reset_stats()` + `aggregator.load_model(model)` so the aggregator can subtract the global model. That freezes a copy of FedAvg internals (`_aggr_helper`, `_received_count`, `_maybe_cleanup_memory`, the disk-offload plumbing, ...) which will drift from upstream, and it needs a `FedAvgRecipe` subclass in `job.py` on top.
+
+You don't need the global model on the aggregator side at all. The stock recipe already supports sending deltas:
+
+```python
+from nvflare.client.config import TransferType
+
+recipe = FedAvgRecipe(
+    ...,
+    aggregator=FedSCSAggregator(...),
+    params_transfer_type=TransferType.DIFF,
+)
+```
+
+With that, the Client API computes `delta_i = w_i - w_global` on the client and `accept_model()` receives the delta directly. The aggregator then clips, scores cosine similarity against the peer sum, and returns the weighted delta:
+
+```python
+return FLModel(params=aggregated_delta, params_type=ParamsType.DIFF, metrics=...)
+```
+
+`FedAvg.update_model()` -> `FLModelUtils.update_model()` adds a DIFF result onto the server's global model, which is exactly `w_global + sum_i(alpha_i * clipped_delta_i)` from your docstring. Stock `FedAvg` + stock `FedAvgRecipe`, no controller, no recipe subclass. This is also the pattern used by the other custom-aggregator examples (`examples/advanced/cifar10/pt/cifar10-sim/cifar10_custom_aggr`, `examples/advanced/medgemma`).
+
+**Memory.** This matters beyond tidiness. The current aggregator keeps a float64 copy of the global model (`load_model`), a float64 copy of every client model (`client_models`), and a second float64 copy of every delta (`client_updates`), and rebuilds the N-1 peer sum from scratch for each client. For float32 weights that is roughly 4N+2 model-sizes at peak, and the `np.asarray` calls also materialize any tensor-disk-offload refs FedAvg passes through. FedSCS inherently needs all N deltas before it can weight anything, so O(N) is the floor, but it can be close to that floor: store each incoming delta once (flattened, original dtype, clipped on arrival), keep one running total, and compute the peer sum for client i as `total - delta_i`. That gets you to about N+1 flattened models with no extra copy of the global model.
+
+Happy to look at a revised version. If it helps, I can sketch the accept/aggregate skeleton for the DIFF-based aggregator.
+
+--
+author:	greptile-apps
+association:	contributor
+edited:	false
+status:	none
+--
+Want your agent to iterate on Greptile's feedback? Try [*greploops*](https://github.com/greptileai/skills/blob/main/greploop/SKILL.md).
+--
+author:	Rakib-Ul-Haque
+association:	none
+edited:	false
+status:	none
+--
+Thanks for the detailed review. I’ve addressed the requested changes:
+
+* Removed the unused duplicate `src/fedscs.py` implementation.
+* Removed the custom FedSCS controller/recipe and implemented FedSCS as a custom `ModelAggregator` using the standard `FedAvgRecipe`.
+* Switched the example to `TransferType.DIFF`.
+* Increased the simulation to five clients and documented the two-client limitation.
+* Hardened CIFAR-10 preparation with temporary download/extraction, checksum verification, and dataset validation.
+* Updated the README with the motivation, workflow, integration details, and limitations of FedSCS.
+* Removed update clipping and corrected the temporal stability calculation to follow the published FedSCS formulation.
+* Added the required license headers and cleaned up formatting and unused imports.
+* Verified the example with a complete 10-round NVIDIA FLARE simulation.
+* Confirmed that the targeted repository checks pass, including Black, isort, flake8, agent-skill-lint, license checks, and `git diff --check`.
+
+The changes have been pushed to the `fedscs` branch. Thanks again for the helpful feedback!
+
+--

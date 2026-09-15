@@ -1,0 +1,68 @@
+commit e385955ecef088cf7986d59d24c2d903ccb4c121
+Author:     Yuhong Wen <yh_wen@hotmail.com>
+AuthorDate: Fri May 27 14:29:55 2022 -0400
+Commit:     GitHub <noreply@github.com>
+CommitDate: Fri May 27 11:29:55 2022 -0700
+
+    Added proper system shutdown to avoid random Bad file descriptor errors. (#611)
+    
+    * Added proper system shutdown to avoid random Bad file descriptor errors.
+    
+    * added if self.executor: for shutdown().
+---
+ nvflare/private/fed/client/client_engine.py | 2 ++
+ nvflare/private/fed/server/server_engine.py | 6 ++++++
+ 2 files changed, 8 insertions(+)
+
+diff --git a/nvflare/private/fed/client/client_engine.py b/nvflare/private/fed/client/client_engine.py
+index 5180fcde..d0464c3a 100644
+--- a/nvflare/private/fed/client/client_engine.py
++++ b/nvflare/private/fed/client/client_engine.py
+@@ -222,6 +222,7 @@ class ClientEngine(ClientEngineInternalSpec):
+         self.fire_event(EventType.SYSTEM_END, self.new_context())
+         _ = self.executor.submit(lambda p: _shutdown_client(*p), [self.client, self.admin_agent, touch_file])
+ 
++        self.executor.shutdown()
+         return "Shutdown the client..."
+ 
+     def restart(self) -> str:
+@@ -231,6 +232,7 @@ class ClientEngine(ClientEngineInternalSpec):
+         self.fire_event(EventType.SYSTEM_END, self.new_context())
+         _ = self.executor.submit(lambda p: _shutdown_client(*p), [self.client, self.admin_agent, touch_file])
+ 
++        self.executor.shutdown()
+         return "Restart the client..."
+ 
+     def deploy_app(self, app_name: str, run_num: int, client_name: str, app_data) -> str:
+diff --git a/nvflare/private/fed/server/server_engine.py b/nvflare/private/fed/server/server_engine.py
+index 16d6cbd7..bb49f984 100644
+--- a/nvflare/private/fed/server/server_engine.py
++++ b/nvflare/private/fed/server/server_engine.py
+@@ -380,6 +380,8 @@ class ServerEngine(ServerEngineInternalSpec):
+ 
+         touch_file = os.path.join(self.args.workspace, "shutdown.fl")
+         _ = self.executor.submit(lambda p: server_shutdown(*p), [self.server, touch_file])
++        while self.server.status != ServerStatus.SHUTDOWN:
++            time.sleep(1.0)
+         return ""
+ 
+     def restart_server(self) -> str:
+@@ -391,6 +393,8 @@ class ServerEngine(ServerEngineInternalSpec):
+ 
+         touch_file = os.path.join(self.args.workspace, "restart.fl")
+         _ = self.executor.submit(lambda p: server_shutdown(*p), [self.server, touch_file])
++        while self.server.status != ServerStatus.SHUTDOWN:
++            time.sleep(1.0)
+         return ""
+ 
+     def get_widget(self, widget_id: str) -> Widget:
+@@ -778,7 +782,9 @@ def server_shutdown(server, touch_file):
+     try:
+         server.fl_shutdown()
+         server.admin_server.stop()
++        time.sleep(3.0)
+     finally:
++        server.status = ServerStatus.SHUTDOWN
+         sys.exit(2)
+ 
+ 

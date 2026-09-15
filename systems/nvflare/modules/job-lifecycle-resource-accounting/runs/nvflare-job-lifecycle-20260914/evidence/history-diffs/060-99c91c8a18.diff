@@ -1,0 +1,141 @@
+commit 99c91c8a187ca3100bc53b2e62f268d625803fca
+Author:     Yan Cheng <58191769+yanchengnv@users.noreply.github.com>
+AuthorDate: Wed Feb 19 10:20:50 2025 -0500
+Commit:     GitHub <noreply@github.com>
+CommitDate: Wed Feb 19 23:20:50 2025 +0800
+
+    Support client hierarchy (#3234)
+    
+    Fixes # .
+    
+    ### Description
+    
+    This PR adds support of client hierarchy, which is needed to support
+    edge device applications.
+    
+    - The Provision tool has been enhanced such that a "parent" property can
+    be specified for a client. The "parent" of a client is another
+    provisioned client. Circular parent/child relationship is detected and
+    prohibited. Once provisioned, the client's fed_client.json is augmented
+    with the client's FQSN (fully qualified site name), which specifies the
+    client's position in the client hierarchy.
+    
+    - The client communicator has been modified to interact with the
+    client's parent (instead of Server) for task and job-related
+    interactions (pull task, submit result, sync runner, job heartbeat,
+    etc.).
+    
+    - Added support to controller to allow dynamic task requests (i.e. tasks
+    are pulled from clients not pre-determined) such that only children of
+    the server need to pull tasks.
+    
+    - Developed the HierarchicalAggregationManager executor, which is to be
+    used for hierarchical aggregations based on client hierarchy. This
+    executor must be used if client hierarchy is defined.
+    
+    - Consolidated the keys for peer FL context in both Shareable and
+    FLContext to the same value. Currently the two keys have different
+    values, but some code has been misusing them (set with one key and get
+    with another). By making them into the same value, we make it less
+    error-prone. Also defined methods for both Shareable and FLContext for
+    setting and getting peer context, and refactored code to use these
+    methods.
+    
+    - Changed to use dict to look up client from name to speed up the lookup
+    process. Current code linearly search thru the client list. In case of
+    edge applications, the number of clients could be huge, which makes
+    linear search very inefficient.
+    
+    ### Types of changes
+    <!--- Put an `x` in all the boxes that apply, and remove the not
+    applicable items -->
+    - [x] Non-breaking change (fix or new feature that would not break
+    existing functionality).
+    - [ ] Breaking change (fix or new feature that would cause existing
+    functionality to change).
+    - [ ] New tests added to cover the changes.
+    - [ ] Quick tests passed locally by running `./runtest.sh`.
+    - [ ] In-line docstrings updated.
+    - [ ] Documentation updated.
+    
+    ---------
+    
+    Co-authored-by: Ziyue Xu <ziyuex@nvidia.com>
+---
+ nvflare/private/fed/client/client_engine.py | 21 ++++++++++++++++++---
+ nvflare/private/fed/server/server_engine.py |  4 ++--
+ 2 files changed, 20 insertions(+), 5 deletions(-)
+
+diff --git a/nvflare/private/fed/client/client_engine.py b/nvflare/private/fed/client/client_engine.py
+index cec1ae1d..3543fb16 100644
+--- a/nvflare/private/fed/client/client_engine.py
++++ b/nvflare/private/fed/client/client_engine.py
+@@ -21,7 +21,14 @@ from typing import List
+ 
+ from nvflare.apis.event_type import EventType
+ from nvflare.apis.fl_component import FLComponent
+-from nvflare.apis.fl_constant import FLContextKey, MachineStatus, ProcessType, SystemComponents, WorkspaceConstants
++from nvflare.apis.fl_constant import (
++    FLContextKey,
++    MachineStatus,
++    ProcessType,
++    ReservedKey,
++    SystemComponents,
++    WorkspaceConstants,
++)
+ from nvflare.apis.fl_context import FLContext, FLContextManager
+ from nvflare.apis.shareable import Shareable
+ from nvflare.apis.streaming import ConsumerFactory, ObjectProducer, StreamableEngine, StreamContext
+@@ -78,11 +85,18 @@ class ClientEngine(ClientEngineInternalSpec, StreamableEngine):
+         self.object_streamer = ObjectStreamer(self.aux_runner)
+         self.cell = None
+ 
++        client_config = client.client_args
++        fqsn = client_config.get("fqsn", client.client_name)
++        is_leaf = client_config.get("is_leaf", True)
++
+         self.fl_ctx_mgr = FLContextManager(
+             engine=self,
+             identity_name=self.client_name,
+             job_id="",
+-            public_stickers={},
++            public_stickers={
++                ReservedKey.FQSN: fqsn,
++                ReservedKey.IS_LEAF: is_leaf,
++            },
+             private_stickers={
+                 SystemComponents.DEFAULT_APP_DEPLOYER: AppDeployer(),
+                 SystemComponents.JOB_META_VALIDATOR: JobMetaValidator(),
+@@ -138,8 +152,9 @@ class ClientEngine(ClientEngineInternalSpec, StreamableEngine):
+         topic = request.get_header(MessageHeaderKey.TOPIC)
+         with self.new_context() as fl_ctx:
+             reply = self.aux_runner.dispatch(topic=topic, request=data, fl_ctx=fl_ctx)
++            assert isinstance(reply, Shareable)
+             shared_fl_ctx = gen_new_peer_ctx(fl_ctx)
+-            reply.set_header(key=FLContextKey.PEER_CONTEXT, value=shared_fl_ctx)
++            reply.set_peer_context(shared_fl_ctx)
+ 
+             if reply is not None:
+                 return_message = new_cell_message({}, reply)
+diff --git a/nvflare/private/fed/server/server_engine.py b/nvflare/private/fed/server/server_engine.py
+index 762f81c3..5643384d 100644
+--- a/nvflare/private/fed/server/server_engine.py
++++ b/nvflare/private/fed/server/server_engine.py
+@@ -480,7 +480,7 @@ class ServerEngine(ServerEngineInternalSpec, StreamableEngine):
+         with self.new_context() as fl_ctx:
+             reply = self.run_manager.aux_runner.dispatch(topic=topic, request=data, fl_ctx=fl_ctx)
+             shared_fl_ctx = gen_new_peer_ctx(fl_ctx)
+-            reply.set_header(key=FLContextKey.PEER_CONTEXT, value=shared_fl_ctx)
++            reply.set_peer_context(shared_fl_ctx)
+ 
+             if reply is not None:
+                 return_message = new_cell_message({}, reply)
+@@ -713,7 +713,7 @@ class ServerEngine(ServerEngineInternalSpec, StreamableEngine):
+         while True:
+             clients = self._retrieve_clients_data(job_id)
+             if clients:
+-                self.client_manager.clients = clients
++                self.client_manager.set_clients(clients)
+                 self.logger.debug(f"received participating clients {clients}")
+                 return
+ 

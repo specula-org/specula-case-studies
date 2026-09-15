@@ -1,0 +1,159 @@
+commit eb6e08d27395241f3d8f3fdc6a6dadf1342f8475
+Author:     Chester Chen <512707+chesterxgchen@users.noreply.github.com>
+AuthorDate: Mon Apr 6 12:17:44 2026 -0700
+Commit:     GitHub <noreply@github.com>
+CommitDate: Mon Apr 6 12:17:44 2026 -0700
+
+    Add distributed provisioning: nvflare cert/package CLI + runtime security fixes (#4380)
+    
+    ## Summary
+    
+    Implements distributed provisioning for NVFlare — an inverted-trust
+    workflow where each
+    site generates its own RSA private key locally. Only CSRs are exchanged
+    out-of-band; the
+    Project Admin never handles any site private key. The produced startup
+    kits are structurally
+    identical to centrally provisioned kits at runtime.
+    
+    ## New CLI Commands
+    
+    - **`nvflare cert init`** — Project Admin bootstraps the root CA
+    (one-time per federation).
+      Produces `rootCA.pem`, `rootCA.key` (0600), `ca.json`.
+    - **`nvflare cert csr`** — Site Admin generates RSA key + CSR locally.
+    Types: `client`,
+    `server`, `org_admin`, `lead`, `member`. Private key never leaves the
+    machine.
+    - **`nvflare cert sign`** — Project Admin signs a received CSR with the
+    root CA. The `-t`
+    type arg is authoritative — CSR role field is ignored (prevents
+    privilege escalation).
+    - **`nvflare package`** — Site Admin assembles a startup kit from their
+    local key + the
+    signed cert + rootCA.pem received from the Project Admin. Supports
+    `--dir` auto-discovery
+      or explicit `--cert/--key/--rootca` paths.
+    
+    All commands support `--output json` (machine-readable), `--output
+    quiet`, and `--schema`
+    (prints JSON schema for the command and exits).
+    
+    ## Runtime Security Fixes
+    
+    | Fix | File | Change |
+    |-----|------|--------|
+    | D1 | `lighter/impl/signature.py` | Stop generating `signature.json`
+    for non-CC, non-HE kits — mTLS is the trust anchor for plain kits |
+    | D2 | `fed/utils/fed_utils.py` | Gate startup integrity check on
+    `valid_config` (not just `secure_train`) — prevents false abort when
+    `signature.json` is absent |
+    | D3 | `fed/server/job_runner.py`, `fed/client/training_cmds.py`,
+    `hub/hub_app_deployer.py`, `fed/server/job_cmds.py` | Job signature
+    verification now checks `__nvfl_sig.json` presence +
+    `require_signed_jobs` policy instead of `secure_train`; strips
+    `FROM_HUB_SITE` from user-submitted job meta to prevent privilege
+    escalation |
+    | D4 | `fuel/hci/client/file_transfer.py` | Guard `push_folder` signing
+    behind key-file existence check — simulator mode no longer errors on
+    missing key |
+    | D5 | `fuel/hci/client/config.py` | `secure_load_admin_config` allows
+    `NOT_SIGNED` when `valid_config=False` — admin login works for manual
+    workflow and non-CC kits |
+    | D6 | `fed/server/job_runner.py` | Add
+    `_require_signed_jobs(workspace)` helper: reads `fed_server.json`,
+    defaults to `True` when `rootCA.pem` present |
+    
+    ## New Infrastructure
+    
+    - `nvflare/tool/cli_output.py` — `output()` / `output_error()` with
+    json/quiet/human-readable rendering
+    - `nvflare/tool/cli_errors.py` — centralized error code registry with
+    template messages and hints
+    - `nvflare/tool/cli_schema.py` — `parser_to_schema()` generates JSON
+    schema from argparse definitions
+    
+    ## Test Coverage
+    
+    215 unit tests added across 12 new test files. All pass.
+    
+    ## Test plan
+    
+    - [ ] `python3 -m pytest tests/unit_test/tool/ -v` — CLI + cert +
+    package (186 tests)
+    - [ ] `python3 -m pytest
+    tests/unit_test/lighter/test_signature_builder.py -v` — D1 (7 tests)
+    - [ ] `python3 -m pytest tests/unit_test/fuel/hci/client/ -v` — D4 + D5
+    (13 tests)
+    - [ ] `python3 -m pytest tests/unit_test/private/fed/ -v` — D2 + D3 + D6
+    (9 + 8 + 21 + 9 tests)
+    - [ ] Manual workflow: `cert init` → `cert csr` → `cert sign` →
+    `package` → site start
+    - [ ] Verify simulator still works (no `signature.json`, no
+    `require_signed_jobs` enforcement)
+    - [ ] Verify CC kit startup check still runs (regression)
+    
+    🤖 Generated with [Claude Code](https://claude.com/claude-code)
+    
+    ---------
+    
+    Co-authored-by: Claude Sonnet 4.6 <noreply@anthropic.com>
+---
+ nvflare/private/fed/server/job_runner.py | 22 +++++++++++++---------
+ 1 file changed, 13 insertions(+), 9 deletions(-)
+
+diff --git a/nvflare/private/fed/server/job_runner.py b/nvflare/private/fed/server/job_runner.py
+index 01cb4cb1..6af95904 100644
+--- a/nvflare/private/fed/server/job_runner.py
++++ b/nvflare/private/fed/server/job_runner.py
+@@ -1,4 +1,4 @@
+-# Copyright (c) 2022, NVIDIA CORPORATION.  All rights reserved.
++# Copyright (c) 2022-2026, NVIDIA CORPORATION.  All rights reserved.
+ #
+ # Licensed under the Apache License, Version 2.0 (the "License");
+ # you may not use this file except in compliance with the License.
+@@ -34,15 +34,15 @@ from nvflare.apis.fl_context import FLContext
+ from nvflare.apis.job_def import ALL_SITES, Job, JobMetaKey, RunStatus
+ from nvflare.apis.job_scheduler_spec import DispatchInfo
+ from nvflare.apis.workspace import Workspace
+-from nvflare.fuel.utils.argument_utils import parse_vars
+ from nvflare.fuel.utils.config_service import ConfigService
++from nvflare.lighter.tool_consts import NVFLARE_SIG_FILE
+ from nvflare.lighter.utils import verify_folder_signature
+ from nvflare.private.admin_defs import Message, MsgHeader, ReturnCode
+ from nvflare.private.defs import RequestHeader, TrainingTopic
+ from nvflare.private.fed.server.admin import check_client_replies
+ from nvflare.private.fed.server.server_state import HotState
+ from nvflare.private.fed.utils.app_deployer import AppDeployer
+-from nvflare.private.fed.utils.fed_utils import extract_participants, set_message_security_data
++from nvflare.private.fed.utils.fed_utils import extract_participants, require_signed_jobs, set_message_security_data
+ from nvflare.security.logging import secure_format_exception
+ 
+ 
+@@ -161,16 +161,20 @@ class JobRunner(FLComponent):
+                         deploy_detail.append(f"server: {err}")
+                         raise RuntimeError(f"Failed to deploy app '{app_name}': {err}")
+ 
+-                    kv_list = parse_vars(engine.args.set)
+-                    secure_train = kv_list.get("secure_train", True)
+                     from_hub_site = job.meta.get(JobMetaKey.FROM_HUB_SITE.value)
+-                    if secure_train and not from_hub_site:
++                    if not from_hub_site:
+                         app_path = workspace.get_app_dir(job.job_id)
+                         root_ca_path = os.path.join(workspace.get_startup_kit_dir(), "rootCA.pem")
+-                        if not verify_folder_signature(app_path, root_ca_path):
+-                            err = "job signature verification failed"
++                        sig_file = os.path.join(app_path, NVFLARE_SIG_FILE)
++                        if os.path.exists(sig_file):
++                            if not verify_folder_signature(app_path, root_ca_path):
++                                err = "job signature verification failed"
++                                deploy_detail.append(f"server: {err}")
++                                raise RuntimeError(f"Failed to verify app '{app_name}': {err}")
++                        elif require_signed_jobs(workspace):
++                            err = "unsigned job rejected — require_signed_jobs is enabled"
+                             deploy_detail.append(f"server: {err}")
+-                            raise RuntimeError(f"Failed to verify app '{app_name}': {err}")
++                            raise RuntimeError(f"UNSIGNED_JOB_REJECTED: {err}")
+ 
+                     self.log_info(
+                         fl_ctx, f"Application {app_name} deployed to the server for job: {run_number}", fire_event=False

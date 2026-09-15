@@ -1,0 +1,514 @@
+commit 6ddf1d3768f0e5acef2a559a0a9f057e215b3270
+Author:     Yuan-Ting Hsieh (謝沅廷) <yuantinghsieh@gmail.com>
+AuthorDate: Mon Aug 29 10:56:11 2022 -0700
+Commit:     GitHub <noreply@github.com>
+CommitDate: Mon Aug 29 10:56:11 2022 -0700
+
+    Clean up fuel utils and client executor (#761)
+    
+    * Clean up fuel utils and client executor
+    
+    * Address comments
+---
+ nvflare/private/fed/client/client_engine.py   |  33 +++---
+ nvflare/private/fed/client/client_executor.py | 165 ++++++++++++++++----------
+ nvflare/private/fed/client/scheduler_cmds.py  |   1 -
+ 3 files changed, 115 insertions(+), 84 deletions(-)
+
+diff --git a/nvflare/private/fed/client/client_engine.py b/nvflare/private/fed/client/client_engine.py
+index f8fd32db..e7853078 100644
+--- a/nvflare/private/fed/client/client_engine.py
++++ b/nvflare/private/fed/client/client_engine.py
+@@ -38,6 +38,13 @@ from .client_run_manager import ClientRunInfo
+ from .client_status import ClientStatus
+ 
+ 
++def _remove_custom_path():
++    regex = re.compile(".*/run_.*/custom")
++    custom_paths = list(filter(regex.search, sys.path))
++    for path in custom_paths:
++        sys.path.remove(path)
++
++
+ class ClientEngine(ClientEngineInternalSpec):
+     """ClientEngine runs in the client parent process."""
+ 
+@@ -59,7 +66,8 @@ class ClientEngine(ClientEngineInternalSpec):
+         self.args = args
+         self.rank = rank
+         self.client.process = None
+-        self.client_executor = ProcessExecutor(client.client_name, os.path.join(args.workspace, "startup"))
++        self.client_executor = ProcessExecutor(os.path.join(args.workspace, "startup"))
++        self.admin_agent = None
+ 
+         self.fl_ctx_mgr = FLContextManager(
+             engine=self, identity_name=client_name, job_id="", public_stickers={}, private_stickers={}
+@@ -102,7 +110,7 @@ class ClientEngine(ClientEngineInternalSpec):
+             job = {
+                 ClientStatusKey.APP_NAME: app_name,
+                 ClientStatusKey.JOB_ID: job_id,
+-                ClientStatusKey.STATUS: self.client_executor.check_status(self.client, job_id),
++                ClientStatusKey.STATUS: self.client_executor.check_status(job_id),
+             }
+             running_jobs.append(job)
+ 
+@@ -117,7 +125,6 @@ class ClientEngine(ClientEngineInternalSpec):
+         job_id: str,
+         allocated_resource: dict = None,
+         token: str = None,
+-        resource_consumer=None,
+         resource_manager=None,
+     ) -> str:
+         status = self.client_executor.get_status(job_id)
+@@ -137,7 +144,7 @@ class ClientEngine(ClientEngineInternalSpec):
+             try:
+                 sys.path.index(app_custom_folder)
+             except ValueError:
+-                self.remove_custom_path()
++                _remove_custom_path()
+                 sys.path.append(app_custom_folder)
+         else:
+             app_custom_folder = ""
+@@ -146,16 +153,14 @@ class ClientEngine(ClientEngineInternalSpec):
+ 
+         open_port = get_open_ports(1)[0]
+ 
+-        self.client_executor.start_train(
++        self.client_executor.start_app(
+             self.client,
+             job_id,
+             self.args,
+-            app_root,
+             app_custom_folder,
+             open_port,
+             allocated_resource,
+             token,
+-            resource_consumer,
+             resource_manager,
+             list(self.client.servers.values())[0]["target"],
+         )
+@@ -182,12 +187,6 @@ class ClientEngine(ClientEngineInternalSpec):
+                 )
+             )
+ 
+-    def remove_custom_path(self):
+-        regex = re.compile(".*/run_.*/custom")
+-        custom_paths = list(filter(regex.search, sys.path))
+-        for path in custom_paths:
+-            sys.path.remove(path)
+-
+     def abort_app(self, job_id: str) -> str:
+         status = self.client_executor.get_status(job_id)
+         if status == ClientStatus.STOPPED:
+@@ -199,7 +198,7 @@ class ClientEngine(ClientEngineInternalSpec):
+         if status == ClientStatus.STARTING:
+             return "Client app is starting, please wait for client to have started before abort."
+ 
+-        self.client_executor.abort_train(self.client, job_id)
++        self.client_executor.abort_app(job_id)
+ 
+         return "Abort signal has been sent to the client App."
+ 
+@@ -211,14 +210,13 @@ class ClientEngine(ClientEngineInternalSpec):
+         if status == ClientStatus.STARTING:
+             return "Client app is starting, please wait for started before abort_task."
+ 
+-        self.client_executor.abort_task(self.client, job_id)
++        self.client_executor.abort_task(job_id)
+ 
+         return "Abort signal has been sent to the current task."
+ 
+     def shutdown(self) -> str:
+         self.logger.info("Client shutdown...")
+         touch_file = os.path.join(self.args.workspace, "shutdown.fl")
+-        self.client_executor.close()
+         self.fire_event(EventType.SYSTEM_END, self.new_context())
+ 
+         _ = self.executor.submit(lambda p: _shutdown_client(*p), [self.client, self.admin_agent, touch_file])
+@@ -229,7 +227,6 @@ class ClientEngine(ClientEngineInternalSpec):
+     def restart(self) -> str:
+         self.logger.info("Client shutdown...")
+         touch_file = os.path.join(self.args.workspace, "restart.fl")
+-        self.client_executor.close()
+         self.fire_event(EventType.SYSTEM_END, self.new_context())
+         _ = self.executor.submit(lambda p: _shutdown_client(*p), [self.client, self.admin_agent, touch_file])
+ 
+@@ -260,7 +257,7 @@ class ClientEngine(ClientEngineInternalSpec):
+         self.client_executor.reset_errors(job_id)
+ 
+     def send_aux_command(self, shareable: Shareable, job_id):
+-        return self.client_executor.send_aux_command(shareable, job_id)
++        return self.client_executor.process_aux_command(shareable, job_id)
+ 
+     def get_all_job_ids(self):
+         return self.client_executor.get_run_processes_keys()
+diff --git a/nvflare/private/fed/client/client_executor.py b/nvflare/private/fed/client/client_executor.py
+index b991f173..6058b73e 100644
+--- a/nvflare/private/fed/client/client_executor.py
++++ b/nvflare/private/fed/client/client_executor.py
+@@ -19,68 +19,50 @@ import subprocess
+ import sys
+ import threading
+ import time
++from abc import ABC, abstractmethod
+ from multiprocessing.connection import Client
+ 
+ from nvflare.apis.fl_constant import AdminCommandNames, ReturnCode, RunProcessKey
+-from nvflare.apis.resource_manager_spec import ResourceConsumerSpec, ResourceManagerSpec
++from nvflare.apis.resource_manager_spec import ResourceManagerSpec
+ from nvflare.apis.shareable import Shareable, make_reply
+-from nvflare.fuel.utils.pipe.file_pipe import FilePipe
+ 
+ from .client_status import ClientStatus, get_status_message
+ 
+ 
+-class ClientExecutor(object):
+-    def __init__(self, uid, startup) -> None:
+-        """To init the ClientExecutor.
+-
+-        Args:
+-            uid: client name
+-            startup: startup folder
+-        """
+-        pipe_path = startup + "/comm"
+-        if not os.path.exists(pipe_path):
+-            os.makedirs(pipe_path)
+-
+-        self.pipe = FilePipe(root_path=pipe_path, name="training")
+-        self.logger = logging.getLogger(self.__class__.__name__)
+-
+-    def start_train(
++class ClientExecutor(ABC):
++    @abstractmethod
++    def start_app(
+         self,
+         client,
+         job_id,
+         args,
+-        app_root,
+         app_custom_folder,
+         listen_port,
+         allocated_resource,
+         token,
+-        resource_consumer,
+         resource_manager,
+         target: str,
+     ):
+-        """start_train method to start the FL client training.
++        """Starts the client app.
+ 
+         Args:
+             client: the FL client object
+             job_id: the job_id
+             args: admin command arguments for starting the FL client training
+-            app_root: the root folder of the running APP
+             app_custom_folder: FL application custom folder
+             listen_port: port to listen the command.
+             allocated_resource: allocated resources
+             token: token from resource manager
+-            resource_consumer: resource consumer
+             resource_manager: resource manager
+             target: SP target location
+-
+         """
+         pass
+ 
+-    def check_status(self, client, job_id) -> str:
+-        """To check the status of the running client.
++    @abstractmethod
++    def check_status(self, job_id) -> str:
++        """Checks the status of the running client.
+ 
+         Args:
+-            client: the FL client object
+             job_id: the job_id
+ 
+         Returns:
+@@ -88,26 +70,27 @@ class ClientExecutor(object):
+         """
+         pass
+ 
+-    def abort_train(self, client, job_id):
+-        """To abort the client training.
++    @abstractmethod
++    def abort_app(self, job_id):
++        """Aborts the running app.
+ 
+         Args:
+-            client: the FL client object
+             job_id: the job_id
+         """
+         pass
+ 
+-    def abort_task(self, client, job_id):
+-        """To abort the client executing task.
++    @abstractmethod
++    def abort_task(self, job_id):
++        """Aborts the client executing task.
+ 
+         Args:
+-            client: the FL client object
+             job_id: the job_id
+         """
+         pass
+ 
+-    def get_run_info(self, job_id) -> dict:
+-        """Get the run information.
++    @abstractmethod
++    def get_run_info(self, job_id):
++        """Gets the run information.
+ 
+         Args:
+             job_id: the job_id
+@@ -115,8 +98,8 @@ class ClientExecutor(object):
+         Returns:
+             A dict of run information.
+         """
+-        pass
+ 
++    @abstractmethod
+     def get_errors(self, job_id):
+         """Get the error information.
+ 
+@@ -124,14 +107,18 @@ class ClientExecutor(object):
+             A dict of error information.
+ 
+         """
+-        pass
+ 
++    @abstractmethod
+     def reset_errors(self, job_id):
+-        """Reset the error information."""
+-        pass
++        """Resets the error information.
++
++        Args:
++            job_id: the job_id
++        """
+ 
+-    def send_aux_command(self, shareable: Shareable, job_id):
+-        """To send the aux command to child process.
++    @abstractmethod
++    def process_aux_command(self, shareable: Shareable, job_id):
++        """Processes the aux command.
+ 
+         Args:
+             shareable: aux message Shareable
+@@ -139,23 +126,17 @@ class ClientExecutor(object):
+         """
+         pass
+ 
+-    def cleanup(self):
+-        """Cleanup."""
+-        self.pipe.clear()
+-
+ 
+ class ProcessExecutor(ClientExecutor):
+     """Run the Client executor in a child process."""
+ 
+-    def __init__(self, uid, startup):
++    def __init__(self, startup):
+         """To init the ProcessExecutor.
+ 
+         Args:
+-            uid: client name
+             startup: startup folder
+         """
+-        ClientExecutor.__init__(self, uid, startup)
+-
++        self.logger = logging.getLogger(self.__class__.__name__)
+         self.startup = startup
+         self.run_processes = {}
+         self.lock = threading.Lock()
+@@ -175,20 +156,31 @@ class ProcessExecutor(ClientExecutor):
+ 
+         return conn_client
+ 
+-    def start_train(
++    def start_app(
+         self,
+         client,
+         job_id,
+         args,
+-        app_root,
+         app_custom_folder,
+         listen_port,
+         allocated_resource,
+         token,
+-        resource_consumer: ResourceConsumerSpec,
+         resource_manager: ResourceManagerSpec,
+         target: str,
+     ):
++        """Starts the app.
++
++        Args:
++            client: the FL client object
++            job_id: the job_id
++            args: admin command arguments for starting the worker process
++            app_custom_folder: FL application custom folder
++            listen_port: port to listen the command.
++            allocated_resource: allocated resources
++            token: token from resource manager
++            resource_manager: resource manager
++            target: SP target location
++        """
+         new_env = os.environ.copy()
+         if app_custom_folder != "":
+             new_env["PYTHONPATH"] = new_env.get("PYTHONPATH", "") + os.pathsep + app_custom_folder
+@@ -219,7 +211,7 @@ class ProcessExecutor(ClientExecutor):
+         # use os.setsid to create new process group ID
+         process = subprocess.Popen(shlex.split(command, True), preexec_fn=os.setsid, env=new_env)
+ 
+-        self.logger.info("training child process ID: {}".format(process.pid))
++        self.logger.info("Worker child process ID: {}".format(process.pid))
+ 
+         client.multi_gpu = False
+ 
+@@ -237,7 +229,15 @@ class ProcessExecutor(ClientExecutor):
+         )
+         thread.start()
+ 
+-    def check_status(self, client, job_id):
++    def check_status(self, job_id):
++        """Checks the status of the running client.
++
++        Args:
++            job_id: the job_id
++
++        Returns:
++            A client status message
++        """
+         try:
+             with self.lock:
+                 conn_client = self.get_conn_client(job_id)
+@@ -256,6 +256,14 @@ class ProcessExecutor(ClientExecutor):
+             return "execution exception. Please try again."
+ 
+     def get_run_info(self, job_id):
++        """Gets the run information.
++
++        Args:
++            job_id: the job_id
++
++        Returns:
++            A dict of run information.
++        """
+         try:
+             with self.lock:
+                 conn_client = self.get_conn_client(job_id)
+@@ -272,6 +280,14 @@ class ProcessExecutor(ClientExecutor):
+             return {"error": "no info collector. Please try again."}
+ 
+     def get_errors(self, job_id):
++        """Get the error information.
++
++        Args:
++            job_id: the job_id
++
++        Returns:
++            A dict of error information.
++        """
+         try:
+             with self.lock:
+                 conn_client = self.get_conn_client(job_id)
+@@ -288,6 +304,11 @@ class ProcessExecutor(ClientExecutor):
+             return None
+ 
+     def reset_errors(self, job_id):
++        """Resets the error information.
++
++        Args:
++            job_id: the job_id
++        """
+         try:
+             with self.lock:
+                 conn_client = self.get_conn_client(job_id)
+@@ -298,7 +319,13 @@ class ProcessExecutor(ClientExecutor):
+         except Exception as e:
+             self.logger.error(f"reset_errors execution exception: {e}.", exc_info=True)
+ 
+-    def send_aux_command(self, shareable: Shareable, job_id):
++    def process_aux_command(self, shareable: Shareable, job_id):
++        """Processes the aux command.
++
++        Args:
++            shareable: aux message Shareable
++            job_id: the job_id
++        """
+         try:
+             with self.lock:
+                 conn_client = self.get_conn_client(job_id)
+@@ -312,9 +339,14 @@ class ProcessExecutor(ClientExecutor):
+         except Exception:
+             return make_reply(ReturnCode.EXECUTION_EXCEPTION)
+ 
+-    def abort_train(self, client, job_id):
++    def abort_app(self, job_id):
++        """Aborts the running app.
++
++        Args:
++            job_id: the job_id
++        """
+         with self.lock:
+-            # When the HeartBeat cleanup process try to abort the train, the job maybe already terminated,
++            # When the HeartBeat cleanup process try to abort the worker process, the job maybe already terminated,
+             # Use retry to avoid print out the error stack trace.
+             retry = 1
+             while retry >= 0:
+@@ -333,18 +365,19 @@ class ProcessExecutor(ClientExecutor):
+                         break
+                     except Exception as e:
+                         if retry == 0:
+-                            self.logger.error(f"abort_train execution exception: {e} for run: {job_id}.", exc_info=True)
++                            self.logger.error(
++                                f"abort_worker_process execution exception: {e} for run: {job_id}.", exc_info=True
++                            )
+                         retry -= 1
+                         time.sleep(5.0)
+                     finally:
+                         if conn_client:
+                             conn_client.close()
+-                        self.cleanup()
+                 else:
+-                    self.logger.info(f"run: {job_id} already terminated.")
++                    self.logger.info(f"Client worker process for run: {job_id} was already terminated.")
+                     break
+ 
+-        self.logger.info("Client training was terminated.")
++        self.logger.info("Client worker process is terminated.")
+ 
+     def _terminate_process(self, child_process, job_id):
+         # wait for client to handle abort
+@@ -358,7 +391,12 @@ class ProcessExecutor(ClientExecutor):
+         child_process.terminate()
+         self.logger.info(f"run ({job_id}): child worker process terminated")
+ 
+-    def abort_task(self, client, job_id):
++    def abort_task(self, job_id):
++        """Aborts the client executing task.
++
++        Args:
++            job_id: the job_id
++        """
+         with self.lock:
+             process_status = self.run_processes.get(job_id, {}).get(RunProcessKey.STATUS, ClientStatus.NOT_STARTED)
+             if process_status == ClientStatus.STARTED:
+@@ -410,6 +448,3 @@ class ProcessExecutor(ClientExecutor):
+     def get_run_processes_keys(self):
+         with self.lock:
+             return [x for x in self.run_processes.keys()]
+-
+-    def close(self):
+-        self.cleanup()
+diff --git a/nvflare/private/fed/client/scheduler_cmds.py b/nvflare/private/fed/client/scheduler_cmds.py
+index 30955fdc..1b8f52b4 100644
+--- a/nvflare/private/fed/client/scheduler_cmds.py
++++ b/nvflare/private/fed/client/scheduler_cmds.py
+@@ -92,7 +92,6 @@ class StartJobProcessor(RequestProcessor):
+                 job_id,
+                 allocated_resource=allocated_resources,
+                 token=token,
+-                resource_consumer=resource_consumer,
+                 resource_manager=resource_manager,
+             )
+         except Exception as e:

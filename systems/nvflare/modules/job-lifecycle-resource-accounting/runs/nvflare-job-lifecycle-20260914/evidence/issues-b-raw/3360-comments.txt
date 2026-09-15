@@ -1,0 +1,88 @@
+author:	chesterxgchen
+association:	collaborator
+edited:	false
+status:	none
+--
+This shouldn't work for multi-GPU.  The ScriptRunner is wrapper for InProcessClientAPI , which is designed for in-memory message exchange between Executor and training code.  
+
+For Multi-GPU, the SubPrcessLauncherExecutor should be used, where the executor and training scripts are in different processes and communicates via CellPipe.  
+
+You mentioned (in separate threat) this one doesn't work. 
+https://github.com/NVIDIA/NVFlare/tree/main/examples/hello-world/ml-to-fl/pt#transform-cifar10-pytorch-lightning--ddp-training-code-to-fl-with-nvflare-client-lightning-integration-api
+
+Notice you are using the "main" branch ( which is dev branch), did you check 2.5 branch for the same example ? 
+--
+author:	avelinoapheris
+association:	none
+edited:	false
+status:	none
+--
+Thanks a lot for the clarification @chesterxgche. That make a lot of sense but [Here](https://github.com/NVIDIA/NVFlare/blob/main/examples/hello-world/ml-to-fl/README.md?plain=1#L46) is mentioned that the ScriptRunner can change to use `ClientAPILauncherExecutor` if `launch_external_process=True`.
+
+
+About [this script ](https://github.com/NVIDIA/NVFlare/tree/main/examples/hello-world/ml-to-fl/pt#transform-cifar10-pytorch-lightning--ddp-training-code-to-fl-with-nvflare-client-lightning-integration-api), I tested the script in both the main branch and the branch `2.5`. The relevant error i have is:
+
+```
+2025-04-07 14:57:43,399 - SubprocessLauncher - INFO -     raise MisconfigurationException(
+2025-04-07 14:57:43,399 - SubprocessLauncher - INFO - lightning_fabric.utilities.exceptions.MisconfigurationException: You requested gpu: [0, 1]
+2025-04-07 14:57:43,399 - SubprocessLauncher - INFO -  But your machine only has: [0]
+```
+
+It seems to me that the issue is that we are requesting two devices [here](https://github.com/NVIDIA/NVFlare/blob/main/examples/hello-world/ml-to-fl/pt/src/cifar10_lightning_ddp_original.py#L72), but the client api is initialising only one device [here](https://github.com/NVIDIA/NVFlare/blob/main/examples/hello-world/ml-to-fl/pt/pt_client_api_job.py#L71).
+However, if I change that line to `job.simulator_run("/tmp/nvflare/jobs/workdir", gpu="0,1")` and  then the call the script `python3 pt_client_api_job.py --script src/cifar10_lightning_ddp_fl.py --key_metric val_acc_epoch --launch_process --n_clients 1`. I gest the error:
+```
+2025-04-07 15:03:29,902 - SimulatorRunner - ERROR - The number of clients (1) must be larger than or equal to the number of GPU groups: (2)
+```
+
+Is there a hard constrain on using simulator mode with more than one device per client? 
+--
+author:	avelinoapheris
+association:	none
+edited:	false
+status:	none
+--
+I did another experiment, where i called the `ScriptRunner` with the flag `launch_external_process=True`. I can confirm that the script generate the `config_fed_client.json` uses `nvflare.app_opt.pt.client_api_launcher_executor.PTClientAPILauncherExecutor` as executor. However, my dummy example still fails with the error below. The error happens in both nvflare 2.5.2 and 2.6.0rc2.
+
+```
+2025-04-09 13:11:13,472 - SubprocessLauncher - INFO - Initializing distributed: GLOBAL_RANK: 0, MEMBER: 1/2
+2025-04-09 13:11:17,969 - SubprocessLauncher - INFO - Traceback (most recent call last):
+2025-04-09 13:11:17,969 - SubprocessLauncher - INFO -   File "/tmp/nvflare/workspace/site-1/simulate_job/app_site-1/custom/client.py", line 60, in <module>
+2025-04-09 13:11:17,969 - SubprocessLauncher - INFO -     while flare.is_running():
+2025-04-09 13:11:17,969 - SubprocessLauncher - INFO -   File "/home/avelinojaver/miniconda3/envs/model-huggingface/lib/python3.10/site-packages/nvflare/client/api.py", line 147, in is_running
+2025-04-09 13:11:17,969 - SubprocessLauncher - INFO -     return client_api.is_running()
+2025-04-09 13:11:17,969 - SubprocessLauncher - INFO -   File "/home/avelinojaver/miniconda3/envs/model-huggingface/lib/python3.10/site-packages/nvflare/client/ex_process/api.py", line 178, in is_running
+2025-04-09 13:11:17,970 - SubprocessLauncher - INFO -     self.__receive()
+2025-04-09 13:11:17,970 - SubprocessLauncher - INFO -   File "/home/avelinojaver/miniconda3/envs/model-huggingface/lib/python3.10/site-packages/nvflare/client/ex_process/api.py", line 144, in __receive
+2025-04-09 13:11:17,970 - SubprocessLauncher - INFO -     return model_registry.get_model(timeout)
+2025-04-09 13:11:17,970 - SubprocessLauncher - INFO -   File "/home/avelinojaver/miniconda3/envs/model-huggingface/lib/python3.10/site-packages/nvflare/client/model_registry.py", line 39, in get_model
+2025-04-09 13:11:17,970 - SubprocessLauncher - INFO -     task = self.get_task(timeout)
+2025-04-09 13:11:17,970 - SubprocessLauncher - INFO -   File "/home/avelinojaver/miniconda3/envs/model-huggingface/lib/python3.10/site-packages/nvflare/client/task_registry.py", line 82, in get_task
+2025-04-09 13:11:17,970 - SubprocessLauncher - INFO -     self._set_task(task)
+2025-04-09 13:11:17,970 - SubprocessLauncher - INFO -   File "/home/avelinojaver/miniconda3/envs/model-huggingface/lib/python3.10/site-packages/nvflare/client/task_registry.py", line 54, in _set_task
+2025-04-09 13:11:17,970 - SubprocessLauncher - INFO -     self.task_name = task.task_name
+2025-04-09 13:11:17,970 - SubprocessLauncher - INFO - AttributeError: 'NoneType' object has no attribute 'task_name'
+```
+--
+author:	YuanTingHsieh
+association:	collaborator
+edited:	false
+status:	none
+--
+@avelinoapheris  thanks for the reporting!
+
+Yes, we do have an issue in multi GPU.
+
+I've included a fix in #3392.
+
+Additionally, I've updated the documentation for that example.
+
+Please take a look.
+
+You are right about Lightning; we set "trainer = Trainer(max_epochs=1, strategy="ddp", devices=2 if torch.cuda.is_available() else None)".
+
+In the new instructions, I demonstrate how to set up multiple GPUs for different simulated devices:
+
+nvflare simulator -n 2 -t 2 /tmp/nvflare/jobs/job_config/pt_client_api --gpu "[0,1],[0,1]"
+
+Note that each bracket corresponds to a client. So, if you specify --gpu "[0,1],[2,3]", it means client 1 will use GPU IDs 0 and 1, while client 2 will use GPU IDs 2 and 3.
+--

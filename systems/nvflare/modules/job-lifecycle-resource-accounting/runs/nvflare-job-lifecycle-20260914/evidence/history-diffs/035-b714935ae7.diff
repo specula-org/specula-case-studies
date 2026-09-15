@@ -1,0 +1,144 @@
+commit b714935ae7931ea120f9bc2297b17ae01489dca6
+Author:     Zhihong Zhang <100308595+nvidianz@users.noreply.github.com>
+AuthorDate: Wed May 13 15:20:27 2026 -0400
+Commit:     GitHub <noreply@github.com>
+CommitDate: Wed May 13 19:20:27 2026 +0000
+
+    [2.8] Fix JobLogReceiver not registering in server-job subprocess (#4586)
+    
+    ## Summary
+    
+    Restores live log streaming on the 2.8 branch. After #4558 the receiver
+    silently stops registering its `log_streaming:live_log` handler in
+    per-job server subprocesses, so every chunk from a client's
+    `JobLogStreamer` is rejected with:
+    
+    ```
+    ObjectStreamer - ERROR - [tx_id='…' channel='log_streaming' topic='live_log' seq=0] no stream processing info registered for log_streaming:live_log
+    _LogTailProducer - ERROR - error from target server: EXECUTION_EXCEPTION
+    ```
+    
+    The bootstrap-tolerant retry from #4558 hides the first 10 chunks and
+    then surfaces the ERROR, so it looks like a teardown race in short jobs;
+    on a longer job the first heartbeat (default `liveness_interval=10s`)
+    fires mid-run, well before any shutdown — which is what tipped this off.
+    
+    ## Root cause
+    
+    `JobLogReceiver.__init__` registers `_register` on
+    `[SYSTEM_START, ABOUT_TO_START_RUN]`. Neither event fires in the
+    server-job subprocess spawned by `ServerProcessJobLauncher`:
+    
+    - `SYSTEM_START` is only fired by `server_deployer.deploy()`, which the
+      parent process runs. The subprocess enters through
+      `nvflare/private/fed/app/server/runner_process.py:99`
+      (`deployer.create_fl_server(...)`, **not** `deploy()`).
+    - `ABOUT_TO_START_RUN` is only fired in
+      `nvflare/private/fed/client/client_runner.py:739` — client-side only.
+    
+    The only server-job lifecycle event is `START_RUN`
+    (`nvflare/private/fed/server/server_runner.py:188`), which the receiver
+    no longer listens to. Result: the subprocess's `JobLogReceiver` instance
+    has `_registered=False` for the entire job and never calls
+    `engine.register_stream_processing`, leaving the run's
+    `ObjectStreamer.registry` empty for the live-log channel.
+    
+    The `_registered` latch is also wrong for in-process deployments where
+    `engine.set_run_manager(...)` swaps in a new
+    `RunManager`/`ObjectStreamer`
+    per job: registering once against the parent's streamer would leave each
+    new job's registry empty even if the trigger events did fire.
+    
+    ## Fix
+    
+    `nvflare/app_common/logging/job_log_receiver.py`:
+    
+    1. Trigger `_register` on **`SYSTEM_START`, `ABOUT_TO_START_RUN`, and
+       `START_RUN`** so the receiver wires up wherever it happens to live.
+    2. Drop the `_registered` early-return — `Registry.set` is idempotent
+       for the same channel/topic, and re-registering after a run-manager
+       swap is the desired behavior.
+    
+    Docstring updated to describe the new placement-aware behavior.
+    
+    ## Why this shape
+    
+    - **Restores the original (pre-#4558) server-subprocess behavior.** The
+      bootstrap-tolerant `_LogTailProducer.process_replies` from #4558 is
+      the actual fix for the client/server startup race; the
+      `START_RUN` → `ABOUT_TO_START_RUN` event change was only listed as
+      "defense in depth" and turns out to disable registration entirely in
+      the subprocess. Reverting just the event list keeps the real fix
+      intact.
+    - **Surgical.** Two-file change, no churn outside `JobLogReceiver`.
+    - **Forward-compatible.** Listing all three events also covers
+      in-process deployments where the run manager is swapped per job.
+    
+    ## Tests
+    
+    `tests/unit_test/app_common/logging/job_log_receiver_test.py` — 3 new:
+    
+    -
+    `test_register_fires_on_run_lifecycle_events[_system_start|_about_to_start_run|_start_run]`
+    —
+      every trigger event invokes `register_stream_processing` with the
+      expected channel/topic.
+    - `test_register_reregisters_on_each_event` — repeat triggers all
+      re-register, no "registered once" latch.
+    - `test_register_event_handlers_cover_server_subprocess_path` —
+      regression guard so `START_RUN` cannot be silently dropped from the
+      trigger list again.
+    
+    Existing security/test coverage (peer-identity routing, site
+    `allow_log_streaming` enforcement) unchanged.
+    
+    ## Verified locally
+    
+    - `pytest tests/unit_test/app_common/logging
+    tests/unit_test/app_common/streamers -v`
+      → **50 passed** (Python 3.10.17, pytest 7.4.3).
+    - `black`, `isort`, `flake8` clean on changed files.
+    
+    ## Test plan
+    
+    - [ ] CI: license + style + full unit test suite green on the 2.8 base.
+    - [ ] Manual: run an auth_test-style integration job; confirm
+          `grep "no stream processing info registered" /tmp/.../log.txt`
+          returns no lines after the fix and that
+          `JobLogReceiver - Saving live log` lines appear for both the
+          in-job stream and the post-completion error_log upload.
+    
+    ### Types of changes
+    - [x] Non-breaking change (fix or new feature that would not break
+    existing functionality).
+    - [ ] Breaking change (fix or new feature that would cause existing
+    functionality to change).
+    - [x] New tests added to cover the changes.
+    - [x] Quick tests passed locally by running unit tests for
+    `app_common/logging/` and `app_common/streamers/`.
+    - [x] In-line docstrings updated.
+    - [ ] Documentation updated.
+    
+    🤖 Generated with [Claude Code](https://claude.com/claude-code)
+    
+    ---------
+    
+    Co-authored-by: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
+---
+ nvflare/private/fed/server/server_engine.py | 3 +++
+ 1 file changed, 3 insertions(+)
+
+diff --git a/nvflare/private/fed/server/server_engine.py b/nvflare/private/fed/server/server_engine.py
+index e1d1b028..a6adcbd6 100644
+--- a/nvflare/private/fed/server/server_engine.py
++++ b/nvflare/private/fed/server/server_engine.py
+@@ -699,6 +699,9 @@ class ServerEngine(ServerEngineInternalSpec, StreamableEngine):
+         )
+ 
+     def _get_aux_msg_target(self, name: str):
++        if name.lower() == SiteType.SERVER_PARENT:
++            return AuxMsgTarget.server_parent_target()
++
+         if name.lower() == SiteType.SERVER:
+             return AuxMsgTarget.server_target()
+ 

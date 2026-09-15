@@ -1,0 +1,54 @@
+commit 689983d6920fb18b22266dfacfdf0039236b2eba
+Author:     Yuhong Wen <yh_wen@hotmail.com>
+AuthorDate: Fri May 13 18:14:57 2022 -0400
+Commit:     GitHub <noreply@github.com>
+CommitDate: Fri May 13 18:14:57 2022 -0400
+
+    Snapshot concurrent persist (#512)
+    
+    * Proper snapshot persist lock.
+    
+    * enhanced the _turn_to_hot(), ignore error when removing the workspace.
+---
+ nvflare/private/fed/server/server_engine.py | 14 +++++++++++++-
+ 1 file changed, 13 insertions(+), 1 deletion(-)
+
+diff --git a/nvflare/private/fed/server/server_engine.py b/nvflare/private/fed/server/server_engine.py
+index b305816e..68bea5be 100644
+--- a/nvflare/private/fed/server/server_engine.py
++++ b/nvflare/private/fed/server/server_engine.py
+@@ -13,6 +13,7 @@
+ # limitations under the License.
+ 
+ import copy
++import fcntl
+ import logging
+ import multiprocessing
+ import os
+@@ -612,7 +613,16 @@ class ServerEngine(ServerEngineInternalSpec):
+         #    Make sure to include the current round number
+         # 2. call persistence API to save the component states
+ 
+-        with self.snapshot_lock:
++        lockfile = open(os.path.join(fl_ctx.get_prop(FLContextKey.WORKSPACE_ROOT), "snapshot.flock"), "w")
++        acquired_lock = False
++        while not acquired_lock:
++            try:
++                fcntl.flock(lockfile, fcntl.LOCK_EX | fcntl.LOCK_NB)
++                acquired_lock = True
++            except IOError:
++                time.sleep(0.1)
++
++        try:
+             fl_snapshot = self.snapshot_persistor.retrieve()
+             if fl_snapshot:
+                 for run_number in list(fl_snapshot.run_snapshots.keys()):
+@@ -657,6 +667,8 @@ class ServerEngine(ServerEngineInternalSpec):
+ 
+             fl_snapshot.add_snapshot(fl_ctx.get_prop(FLContextKey.CURRENT_RUN), snapshot)
+             self.server.snapshot_location = self.snapshot_persistor.save(snapshot=fl_snapshot)
++        finally:
++            lockfile.close()
+         self.logger.info(f"persist the snapshot to: {self.server.snapshot_location}")
+ 
+     def restore_components(self, snapshot: RunSnapshot, fl_ctx: FLContext):

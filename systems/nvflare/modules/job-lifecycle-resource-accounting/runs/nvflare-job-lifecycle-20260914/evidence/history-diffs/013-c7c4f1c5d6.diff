@@ -1,0 +1,170 @@
+commit c7c4f1c5d60f5452bda6c954720697c3ee828c01
+Author:     Yuan-Ting Hsieh (謝沅廷) <yuantingh@nvidia.com>
+AuthorDate: Tue Aug 11 16:38:48 2026 -0700
+Commit:     GitHub <noreply@github.com>
+CommitDate: Tue Aug 11 23:38:48 2026 +0000
+
+    Fix workspace archive cleanup retries (#5091)
+    
+    ## Summary
+    
+    - record when finished-job workspace packaging has succeeded and which
+    source directories it consumed
+    - retry only source cleanup after a post-packaging failure instead of
+    packaging the now-empty directories again
+    - preserve the existing workspace-save retry log contract and
+    distinguish persistent cleanup failures from archive-write failures
+    - add helper-level and completion-loop regression coverage
+    
+    ## Root cause
+    
+    `FilesystemStorage._write_multi` moves workspace contents into the
+    job-store archive. If the later `shutil.rmtree` failed, `JobRunner`
+    retried the whole operation. That retry repackaged emptied source
+    directories and replaced the complete archive with an empty ZIP, while
+    the job could still be published as `FINISHED:COMPLETED`.
+    
+    ## Impact
+    
+    A successful archive can no longer be overwritten by a cleanup retry.
+    Cleanup remains retryable within the existing grace period, and
+    completed job artifacts remain downloadable.
+    
+    ## Validation
+    
+    - `tests/unit_test/private/fed/server/job_runner_test.py`: 39 passed
+    - job definition manager and filesystem storage tests: 36 passed
+    - `tests/unit_test/private/fed/server`: 410 passed
+    - scoped Black, isort, flake8, and `git diff --check`: passed
+    - unchanged DLQASH MR !195 production/subprocess reproducer on Colossus,
+    1 server + 2 clients:
+      - pytest RC 0
+      - archive peak/final: 95,017 == 95,017 bytes
+      - job reached `FINISHED:COMPLETED`
+    - `download_job` succeeded with intact, nonempty workspace/model
+    artifacts
+    - cleanup retried 18 times while workspace packaging occurred exactly
+    once
+    - persistent-failure grace-bound and transient-recovery companion cases:
+    2 passed
+---
+ nvflare/private/fed/server/job_runner.py | 84 +++++++++++++++++++-------------
+ 1 file changed, 51 insertions(+), 33 deletions(-)
+
+diff --git a/nvflare/private/fed/server/job_runner.py b/nvflare/private/fed/server/job_runner.py
+index a129ef24..71d98ce7 100644
+--- a/nvflare/private/fed/server/job_runner.py
++++ b/nvflare/private/fed/server/job_runner.py
+@@ -56,6 +56,8 @@ class _FinishedJobState:
+     status: RunStatus
+     workspace_archival_complete: bool = False
+     workspace_save_started_at: float | None = None
++    workspace_archive_written: bool = False
++    workspace_archive_sources: Tuple[str, ...] = ()
+ 
+ 
+ def _send_to_clients(admin_server, client_sites: List[str], engine, message, timeout=None, optional=False):
+@@ -426,7 +428,7 @@ class JobRunner(FLComponent):
+                             # Publish terminal status only after artifacts are ready for download.
+                             if not finished_state.workspace_archival_complete:
+                                 try:
+-                                    self._save_workspace(completion_ctx)
++                                    self._save_workspace(completion_ctx, finished_state)
+                                 except Exception as e:
+                                     now = time.monotonic()
+                                     if finished_state.workspace_save_started_at is None:
+@@ -438,12 +440,20 @@ class JobRunner(FLComponent):
+                                             f"{secure_format_exception(e)}",
+                                         )
+                                         continue
+-                                    self.log_error(
+-                                        completion_ctx,
+-                                        f"Workspace archival for finished job ({job.job_id}) kept failing for "
+-                                        f"{WORKSPACE_SAVE_RETRY_GRACE_TIME} seconds; publishing terminal status without "
+-                                        f"archived artifacts: {secure_format_exception(e)}",
+-                                    )
++                                    if finished_state.workspace_archive_written:
++                                        self.log_error(
++                                            completion_ctx,
++                                            f"Workspace cleanup for finished job ({job.job_id}) kept failing for "
++                                            f"{WORKSPACE_SAVE_RETRY_GRACE_TIME} seconds; publishing terminal status with "
++                                            f"archived artifacts: {secure_format_exception(e)}",
++                                        )
++                                    else:
++                                        self.log_error(
++                                            completion_ctx,
++                                            f"Workspace archival for finished job ({job.job_id}) kept failing for "
++                                            f"{WORKSPACE_SAVE_RETRY_GRACE_TIME} seconds; publishing terminal status without "
++                                            f"archived artifacts: {secure_format_exception(e)}",
++                                        )
+                                 finished_state.workspace_archival_complete = True
+                             try:
+                                 job_manager.set_status(job.job_id, status, completion_ctx)
+@@ -509,33 +519,41 @@ class JobRunner(FLComponent):
+             status = RunStatus.FINISHED_COMPLETED
+         return status
+ 
+-    def _save_workspace(self, fl_ctx: FLContext):
++    def _save_workspace(self, fl_ctx: FLContext, finished_state: _FinishedJobState | None = None):
+         job_id = fl_ctx.get_prop(FLContextKey.CURRENT_JOB_ID)
+-        workspace = fl_ctx.get_workspace()
+-        run_dir = workspace.get_run_dir(job_id)
+-        engine = fl_ctx.get_engine()
+-        job_manager = engine.get_component(SystemComponents.JOB_MANAGER)
+-        result_root = workspace.get_result_root(job_id)
+-        log_root = workspace.get_log_root(job_id)
+-        audit_root = workspace.get_audit_root(job_id)
+-
+-        ws_dirs = []
+-        seen_paths = set()
+-        for path in (run_dir, result_root, log_root, audit_root):
+-            if path in seen_paths:
+-                continue
+-            seen_paths.add(path)
+-            if not os.path.isdir(path):
+-                self.log_warning(fl_ctx, f"Skipping unavailable workspace archive source for job {job_id}: {path}")
+-                continue
+-            ws_dirs.append(path)
+-
+-        if not ws_dirs:
+-            self.log_warning(fl_ctx, f"No workspace archive sources are available for finished job {job_id}")
+-            return
+-
+-        location = job_manager.save_workspace(job_id, ws_dirs, fl_ctx)
+-        self.log_debug(fl_ctx, f"Workspace {ws_dirs} saved to {location}")
++        if finished_state and finished_state.workspace_archive_written:
++            ws_dirs = list(finished_state.workspace_archive_sources)
++        else:
++            workspace = fl_ctx.get_workspace()
++            run_dir = workspace.get_run_dir(job_id)
++            result_root = workspace.get_result_root(job_id)
++            log_root = workspace.get_log_root(job_id)
++            audit_root = workspace.get_audit_root(job_id)
++
++            ws_dirs = []
++            seen_paths = set()
++            for path in (run_dir, result_root, log_root, audit_root):
++                if path in seen_paths:
++                    continue
++                seen_paths.add(path)
++                if not os.path.isdir(path):
++                    self.log_warning(fl_ctx, f"Skipping unavailable workspace archive source for job {job_id}: {path}")
++                    continue
++                ws_dirs.append(path)
++
++            if not ws_dirs:
++                self.log_warning(fl_ctx, f"No workspace archive sources are available for finished job {job_id}")
++                return
++
++            engine = fl_ctx.get_engine()
++            job_manager = engine.get_component(SystemComponents.JOB_MANAGER)
++            location = job_manager.save_workspace(job_id, ws_dirs, fl_ctx)
++            if finished_state:
++                # save_workspace moves source contents. Record that irreversible step before cleanup so a cleanup retry
++                # cannot replace the complete archive with one built from the now-empty sources.
++                finished_state.workspace_archive_written = True
++                finished_state.workspace_archive_sources = tuple(ws_dirs)
++            self.log_debug(fl_ctx, f"Workspace {ws_dirs} saved to {location}")
+ 
+         # Only remove sources after the complete set has been archived successfully.
+         for d in ws_dirs:

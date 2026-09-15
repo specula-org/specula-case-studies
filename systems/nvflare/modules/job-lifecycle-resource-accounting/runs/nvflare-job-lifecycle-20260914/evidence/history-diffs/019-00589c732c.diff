@@ -1,0 +1,77 @@
+commit 00589c732c015d78f9d7a1fe058e3978c1b18c41
+Author:     Peter Cnudde <pcnudde@nvidia.com>
+AuthorDate: Thu Jul 30 16:17:14 2026 -0700
+Commit:     GitHub <noreply@github.com>
+CommitDate: Thu Jul 30 16:17:14 2026 -0700
+
+    Distinguish Slurm infrastructure failures (#4986)
+    
+    ## What changed
+    
+    - add an internal infrastructure failure process exit code
+    - return it for Slurm scheduler terminal states, unexpected
+    cancellation, and exhausted accounting lookup
+    - preserve it through the client/server failure report path
+    - map it to the existing `FINISHED:ABNORMAL` status
+    
+    ## Why
+    
+    Slurm already distinguishes scheduler failures such as `TIMEOUT`,
+    `OUT_OF_MEMORY`, `NODE_FAIL`, and `PREEMPTED` from application exit
+    failures. That distinction was discarded when both paths became
+    `FINISHED:EXECUTION_EXCEPTION`, preventing operators and retry
+    automation from telling infrastructure failures from application errors.
+    
+    This intentionally reuses the existing `FINISHED:ABNORMAL` status. It
+    does not add a new public status or change Docker or Kubernetes
+    behavior.
+    
+    ## Validation
+    
+    - `127 passed` across the Slurm manager, client executor, federated
+    server, and job runner unit-test modules
+    - `./runtest.sh -s`
+    
+    Jira: [FLARE-3065](https://jirasw.nvidia.com/browse/FLARE-3065)
+---
+ nvflare/private/fed/client/client_executor.py | 1 +
+ nvflare/private/fed/server/job_runner.py      | 7 +++++--
+ 2 files changed, 6 insertions(+), 2 deletions(-)
+
+diff --git a/nvflare/private/fed/client/client_executor.py b/nvflare/private/fed/client/client_executor.py
+index 29072cdd..5037567c 100644
+--- a/nvflare/private/fed/client/client_executor.py
++++ b/nvflare/private/fed/client/client_executor.py
+@@ -42,6 +42,7 @@ REPORTABLE_JOB_FAILURES = {
+     ProcessExitCode.EXCEPTION: PROCESS_EXIT_REASON[ProcessExitCode.EXCEPTION],
+     ProcessExitCode.UNSAFE_COMPONENT: PROCESS_EXIT_REASON[ProcessExitCode.UNSAFE_COMPONENT],
+     ProcessExitCode.CONFIG_ERROR: PROCESS_EXIT_REASON[ProcessExitCode.CONFIG_ERROR],
++    ProcessExitCode.INFRASTRUCTURE_ERROR: PROCESS_EXIT_REASON[ProcessExitCode.INFRASTRUCTURE_ERROR],
+     JobReturnCode.ABORTED: "aborted",
+ }
+ 
+diff --git a/nvflare/private/fed/server/job_runner.py b/nvflare/private/fed/server/job_runner.py
+index d7eb342e..6935b2be 100644
+--- a/nvflare/private/fed/server/job_runner.py
++++ b/nvflare/private/fed/server/job_runner.py
+@@ -465,7 +465,9 @@ class JobRunner(FLComponent):
+ 
+             finished = run_process.get(RunProcessKey.PROCESS_FINISHED, False)
+             process_return_code = run_process.get(RunProcessKey.PROCESS_RETURN_CODE)
+-            if process_return_code == JobReturnCode.ABORTED:
++            if process_return_code == ProcessExitCode.INFRASTRUCTURE_ERROR:
++                status = RunStatus.FINISHED_ABNORMAL
++            elif process_return_code == JobReturnCode.ABORTED:
+                 status = RunStatus.FINISHED_ABORTED
+             elif process_return_code in (
+                 ProcessExitCode.CONFIG_ERROR,
+@@ -708,7 +710,8 @@ class JobRunner(FLComponent):
+                 run_process = engine.run_processes.get(job_id)
+             if run_process is None:
+                 run_process = {RunProcessKey.PARTICIPANTS: {}}
+-            run_process[RunProcessKey.PROCESS_RETURN_CODE] = process_return_code
++            if run_process.get(RunProcessKey.PROCESS_RETURN_CODE) != ProcessExitCode.INFRASTRUCTURE_ERROR:
++                run_process[RunProcessKey.PROCESS_RETURN_CODE] = process_return_code
+             engine.exception_run_processes[job_id] = run_process
+         self._stop_run(job_id, fl_ctx)
+ 

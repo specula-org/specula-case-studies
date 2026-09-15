@@ -1,0 +1,89 @@
+commit 0a0d3abd8f3eb68349f8db21d2fcfc7a5bb382a8
+Author:     Yuhong Wen <yuhongw@nvidia.com>
+AuthorDate: Thu Jan 4 09:59:56 2024 -0500
+Commit:     GitHub <noreply@github.com>
+CommitDate: Thu Jan 4 09:59:56 2024 -0500
+
+    Enhanced the client job status (#2247)
+    
+    * Enhanced the client job status report.
+    
+    * Made notify_timeout configurable.
+    
+    * codestyle fix.
+    
+    * Updated changes from PR review.
+    
+    * codestyle fix.
+---
+ nvflare/private/fed/client/client_engine.py   |  3 +++
+ nvflare/private/fed/client/client_executor.py | 28 +++++++++------------------
+ 2 files changed, 12 insertions(+), 19 deletions(-)
+
+diff --git a/nvflare/private/fed/client/client_engine.py b/nvflare/private/fed/client/client_engine.py
+index 4e197897..a54a944c 100644
+--- a/nvflare/private/fed/client/client_engine.py
++++ b/nvflare/private/fed/client/client_engine.py
+@@ -168,6 +168,9 @@ class ClientEngine(ClientEngineInternalSpec):
+ 
+         return "Start the client app..."
+ 
++    def notify_job_status(self, job_id: str, job_status):
++        self.client_executor.notify_job_status(job_id, job_status)
++
+     def get_client_name(self):
+         return self.client.client_name
+ 
+diff --git a/nvflare/private/fed/client/client_executor.py b/nvflare/private/fed/client/client_executor.py
+index 9ced2ba8..e2b7ba86 100644
+--- a/nvflare/private/fed/client/client_executor.py
++++ b/nvflare/private/fed/client/client_executor.py
+@@ -206,7 +206,7 @@ class ProcessExecutor(ClientExecutor):
+                 RunProcessKey.LISTEN_PORT: listen_port,
+                 RunProcessKey.CONNECTION: None,
+                 RunProcessKey.CHILD_PROCESS: process,
+-                RunProcessKey.STATUS: ClientStatus.STARTED,
++                RunProcessKey.STATUS: ClientStatus.STARTING,
+             }
+ 
+         thread = threading.Thread(
+@@ -215,6 +215,12 @@ class ProcessExecutor(ClientExecutor):
+         )
+         thread.start()
+ 
++    def notify_job_status(self, job_id, job_status):
++        with self.lock:
++            run_process = self.run_processes.get(job_id)
++            if run_process:
++                run_process[RunProcessKey.STATUS] = job_status
++
+     def check_status(self, job_id):
+         """Checks the status of the running client.
+ 
+@@ -226,24 +232,8 @@ class ProcessExecutor(ClientExecutor):
+         """
+         try:
+             with self.lock:
+-                data = {}
+-                fqcn = FQCN.join([self.client.client_name, job_id])
+-                request = new_cell_message({}, data)
+-                return_data = self.client.cell.send_request(
+-                    target=fqcn,
+-                    channel=CellChannel.CLIENT_COMMAND,
+-                    topic=AdminCommandNames.CHECK_STATUS,
+-                    request=request,
+-                    optional=True,
+-                )
+-                return_code = return_data.get_header(MessageHeaderKey.RETURN_CODE)
+-                if return_code == ReturnCode.OK:
+-                    status_message = return_data.payload
+-                    self.logger.debug("check status from process listener......")
+-                    return status_message
+-                else:
+-                    process_status = ClientStatus.NOT_STARTED
+-                    return get_status_message(process_status)
++                process_status = self.run_processes.get(job_id, {}).get(RunProcessKey.STATUS, ClientStatus.NOT_STARTED)
++                return get_status_message(process_status)
+         except Exception as e:
+             self.logger.error(f"check_status execution exception: {secure_format_exception(e)}.")
+             secure_log_traceback()

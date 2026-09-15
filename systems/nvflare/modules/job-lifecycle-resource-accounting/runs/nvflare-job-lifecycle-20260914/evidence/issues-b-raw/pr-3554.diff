@@ -1,0 +1,1062 @@
+diff --git a/examples/advanced/llm_hf/README.md b/examples/advanced/llm_hf/README.md
+index 5e32f213ef..fdd0cfbe21 100644
+--- a/examples/advanced/llm_hf/README.md
++++ b/examples/advanced/llm_hf/README.md
+@@ -9,11 +9,11 @@ We used the [Llama-3.2-1B model](https://huggingface.co/meta-llama/Llama-3.2-1B)
+ For PEFT, we used LoRA method, other PEFT methods (e.g. p-tuning, prompt-tuning) can be easily adapted as well by modifying the configs following [PEFT](https://github.com/huggingface/peft) examples.
+ 
+ We would like to showcase three key points in this example:
+-- Adapt local HuggingFace training scripts, both SFT and PEFT, to federated application
++- Adapt local HuggingFace training scripts, both SFT and PEFT, to federated application. This further includes local training with multiple GPUs.
+ - Handling large model weights (~6 GB for Llama-3.2-1B model with float32 precision for communication), which is beyond protobuf's 2 GB hard limit. It is supported by NVFlare infrastructure via streaming, and does not need any code change.
+ - Use NVFlare's filter functionality to enable model quantization and precision conversion for communication, which can significantly reduce the message size and is thus important for communicating LLM updates.  
+ 
+-We conducted these experiments on a single 48GB RTX 6000 Ada GPU. 
++We conducted experiments on 48GB RTX 6000 Ada GPUs. 
+ 
+ To use Llama-3.2-1B model, please request access to the model here https://huggingface.co/meta-llama/Llama-3.2-1B and login with an access token using huggingface-cli.
+ 
+@@ -54,18 +54,19 @@ Therefore, we will perform the adaptation process in two steps:
+ 
+ During the process, we will examine three training modes:
+ 1. Centralized one-call training (baseline) without NVFlare
+-2. Centralized iterative training (adapted) without NVFlare
++2. Centralized iterative training (adapted) without NVFlare, both basic and enhanced with multi-gpu capabilities and callback to handle scheduler alignment.
+ 3. Federated training (adapted) with NVFlare
+ 
+ > Note: all training runs are logged with TensorBoard, and the training loss curves can be visualized with TensorBoard via `tensorboard --logdir=./workspace`. 
+ > Curves related to each experiment will be associated with the corresponding workspace folder, e.g. `./workspace/dolly_cen_sft`, `./workspace/dolly_cen_peft`, etc.
+ 
++In the following, we will illustrate the SFT training process, and the PEFT training process follows the same steps by setting `--train_mode PEFT`.
++
+ ### Baseline: One-call training
+ The original HuggingFace training script is a single call to `trainer.train()`, which is not suitable for federated training.
+ Centralized trainings, as the baseline for comparison with other results, are done with the following command:
+ ```
+-python3 ./utils/hf_sft_peft.py --output_path ./workspace/dolly_cen_sft --train_mode SFT
+-python3 ./utils/hf_sft_peft.py --output_path ./workspace/dolly_cen_peft --train_mode PEFT
++python3 ./utils/hf_sft_peft.py --output_path ./workspace/dolly_cen_onecall
+ ```
+ 
+ ### Adaptation Step 1: iterative training
+@@ -90,18 +91,50 @@ If the correct "global model" is successfully reloaded each round, the training
+ 
+ To run iterative training, we use the following command:
+ ``` 
+-python3 ./utils/hf_sft_peft_iter.py --output_path ./workspace/dolly_cen_sft_iter --train_mode SFT
+-python3 ./utils/hf_sft_peft_iter.py --output_path ./workspace/dolly_cen_peft_iter --train_mode PEFT
++python3 ./utils/hf_sft_peft_iter.py --output_path ./workspace/dolly_cen_iter 
+ ```
+ 
+ The SFT curves are shown below, black for single call, blue for iterative. We can see the "zig-zag" pattern in the iterative training loss curve.
+ ![sft](./figs/cen_sft.png)
+ 
+-Similar patterns can be observed from the PEFT curves, purple for single call, green for iterative.
+-![peft](./figs/cen_peft.png)
++### Adaptation Step 1.5: iterative training with scheduler alignment and multi-gpu support
++The above iterative training script is a basic version, it works fine if using a constant learning rate. However, if using more complicated lr_scheduler like "cosine_with_restarts", the lr will not be aligned with the iterative training process, which can lead to unexpected results.
++We can see this with the following experiment, which uses cosine_with_restarts scheduler:
++```
++python3 ./utils/hf_sft_peft.py --output_path ./workspace/dolly_cen_onecall_cosine --lr_scheduler cosine_with_restarts
++python3 ./utils/hf_sft_peft_iter.py --output_path ./workspace/dolly_cen_iter_cosine --lr_scheduler cosine_with_restarts
++```
++
++We can notice below lr discrepancy:
++![lr](./figs/lr.png)
++
++As shown, the lr in each round of iterative training is determined by the `num_train_epochs` for that round, which is incremented by 1 each time. This means that only the lr in the last round will be aligned with the single call training, but not in any other round. This can lead to quite different training results:
++![sft_cosine](./figs/cen_sft_cosine.png)
++
++Also, the basic iterative training script does not support multi-GPU training.
++
++To enhance the iterative training script, we can add scheduler alignment via callback and multi-GPU support with `./utils/hf_sft_peft_iter_callback_multigpu.py`.
++
++Single-GPU experiment can be run with the following command:
++``` 
++python3 ./utils/hf_sft_peft_iter_callback_multigpu.py --output_path ./workspace/dolly_cen_iter_callback_cosine --lr_scheduler cosine_with_restarts 
++```
++For multi-GPU experiments, we can use the following command:
++```
++accelerate launch \
++    --num_processes 2 \
++    ./utils/hf_sft_peft_iter_callback_multigpu.py \
++    --output_path ./workspace/dolly_cen_iter_callback_cosine_multigpu \
++    --lr_scheduler cosine_with_restarts
++```
++Note that for this experiment to check proper lr alignment and multi-gpu training, we load the model weights from the previous round rather than the fixed starting model.
++
++The SFT curves are shown below, black for single call, blue for iterative with callback, and red for iterative with callback under 2-gpu training. 
++We can see the three curves align well.
++![sft](./figs/callback_multigpu.png)
+ 
+ ### Adaptation Step 2: federated with NVFlare
+-Once we have the iterative training script ready with "starting model" loading capability, it can be easily adapted to a NVFlare trainer by using [Client API](../../hello-world/ml-to-fl/pt/README.md).
++Once we have the iterative training script ready with "starting model" loading capability, scheduler alignment, and mult-gpu support, it can be easily adapted to a NVFlare trainer by using [Client API](../../hello-world/ml-to-fl/pt/README.md).
+ 
+ The major code modifications are for replacing the fixed model reloading processing with 
+ receiving and returning the global model, as shown below:
+@@ -109,16 +142,28 @@ receiving and returning the global model, as shown below:
+ ![diff](./figs/diff_fl_1.png)
+ ![diff](./figs/diff_fl_2.png)
+ 
+-We run the federated training on a single client using NVFlare Simulator via [JobAPI](https://nvflare.readthedocs.io/en/main/programming_guide/fed_job_api.html).
++We run the federated training on a single client with single GPU using NVFlare Simulator via [JobAPI](https://nvflare.readthedocs.io/en/main/programming_guide/fed_job_api.html).
+ ```
+-python3 llm_hf_fl_job.py --client_ids dolly --data_path ${PWD}/dataset --workspace_dir ${PWD}/workspace/hf_sft --job_dir ${PWD}/workspace/jobs/hf_sft --train_mode SFT 
+-python3 llm_hf_fl_job.py --client_ids dolly --data_path ${PWD}/dataset --workspace_dir ${PWD}/workspace/hf_peft --job_dir ${PWD}/workspace/jobs/hf_peft --train_mode PEFT 
++python3 llm_hf_fl_job.py \
++    --client_ids dolly \
++    --data_path ${PWD}/dataset \
++    --workspace_dir ${PWD}/workspace/dolly_fl_single_gpu \
++    --job_dir ${PWD}/workspace/jobs/dolly_fl_single_gpu \
++    --message_mode tensor
+ ```
+-The SFT curves are shown below, black for centralized results, magenta for FL training. With some training randomness, the two SFT training loss curves align with each other. 
++The loss curves are shown below, black for centralized results, magenta for FL training. With some training randomness, the two SFT training loss curves align with each other. 
+ ![sft](./figs/fl_sft.png)
+ 
+-Similar patterns can be observed from the PEFT curves, purple for centralized results, orange for FL training. Alignment better than SFT can be observed.
+-![peft](./figs/fl_peft.png)
++Similarly, 2-GPU training with two clients can be run with the following command:
++```
++python3 llm_hf_fl_job.py \
++       --client_ids dolly oasst1\
++       --data_path ${PWD}/dataset \
++       --workspace_dir ${PWD}/workspace/dolly_fl_multi_gpu \
++       --job_dir ${PWD}/workspace/jobs/dolly_fl_multi_gpu \
++       --gpu "[0,1],[2,3]" \
++       --ports 7777 8888
++```
+ 
+ ## Model Quantization for Communication
+ In the above example, we used numpy in float32 for communication. To reduce the message size, we can use model precision conversion and quantization 
+diff --git a/examples/advanced/llm_hf/figs/callback_multigpu.png b/examples/advanced/llm_hf/figs/callback_multigpu.png
+new file mode 100644
+index 0000000000..ef36118f55
+Binary files /dev/null and b/examples/advanced/llm_hf/figs/callback_multigpu.png differ
+diff --git a/examples/advanced/llm_hf/figs/cen_sft_cosine.png b/examples/advanced/llm_hf/figs/cen_sft_cosine.png
+new file mode 100644
+index 0000000000..5cb037b0a2
+Binary files /dev/null and b/examples/advanced/llm_hf/figs/cen_sft_cosine.png differ
+diff --git a/examples/advanced/llm_hf/figs/diff_fl_2.png b/examples/advanced/llm_hf/figs/diff_fl_2.png
+index 45499b307c..19a413050d 100644
+Binary files a/examples/advanced/llm_hf/figs/diff_fl_2.png and b/examples/advanced/llm_hf/figs/diff_fl_2.png differ
+diff --git a/examples/advanced/llm_hf/figs/lr.png b/examples/advanced/llm_hf/figs/lr.png
+new file mode 100644
+index 0000000000..2cd8cdd8e5
+Binary files /dev/null and b/examples/advanced/llm_hf/figs/lr.png differ
+diff --git a/examples/advanced/llm_hf/llm_hf_fl_job.py b/examples/advanced/llm_hf/llm_hf_fl_job.py
+index 35ff896d44..0a0f60ef71 100644
+--- a/examples/advanced/llm_hf/llm_hf_fl_job.py
++++ b/examples/advanced/llm_hf/llm_hf_fl_job.py
+@@ -22,6 +22,7 @@
+ from nvflare.app_opt.pt.quantization.dequantizer import ModelDequantizer
+ from nvflare.app_opt.pt.quantization.quantizer import ModelQuantizer
+ from nvflare.job_config.script_runner import ScriptRunner
++from nvflare.private.fed.utils.fed_utils import split_gpus
+ 
+ 
+ def main():
+@@ -29,18 +30,24 @@ def main():
+     train_script = "src/hf_sft_peft_fl.py"
+     client_ids = args.client_ids
+     num_clients = len(client_ids)
++    # get the GPU assignments and ports
++    gpus = split_gpus(args.gpu)
++    gpus = [g.split(",") for g in gpus]
++    ports = args.ports
++
++    print(f"Clients: {client_ids}, GPUs: {gpus}, ports: {ports}")
++    # make sure the number of GPUs matches the number of clients
++    if len(gpus) != num_clients:
++        raise ValueError(f"Number of GPUs ({len(gpus)}) does not match number of clients ({num_clients}).")
++    # make sure the number of ports equal or greater than the number of clients
++    if len(ports) < num_clients:
++        raise ValueError(f"Number of ports ({len(ports)}) is less than number of clients ({num_clients}).")
+ 
+     if args.threads:
+         num_threads = args.threads
+     else:
+         num_threads = num_clients
+ 
+-    if num_threads < num_clients:
+-        print("The number of threads smaller than the number of clients, runner clean-up will be performed.")
+-        clean_up = 1
+-    else:
+-        clean_up = 0
+-
+     num_rounds = args.num_rounds
+     workspace_dir = args.workspace_dir
+     job_dir = args.job_dir
+@@ -95,7 +102,7 @@ def main():
+         data_path_train = os.path.join(args.data_path, client_id, "training.jsonl")
+         data_path_valid = os.path.join(args.data_path, client_id, "validation.jsonl")
+ 
+-        script_args = f"--model_name_or_path {model_name_or_path} --data_path_train {data_path_train} --data_path_valid {data_path_valid} --output_path {output_path} --train_mode {train_mode} --message_mode {message_mode} --clean_up {clean_up}"
++        script_args = f"--model_name_or_path {model_name_or_path} --data_path_train {data_path_train} --data_path_valid {data_path_valid} --output_path {output_path} --train_mode {train_mode} --message_mode {message_mode} --num_rounds {num_rounds}"
+         if message_mode == "tensor":
+             server_expected_format = "pytorch"
+         elif message_mode == "numpy":
+@@ -103,12 +110,21 @@ def main():
+         else:
+             raise ValueError(f"Invalid message_mode: {message_mode}, only numpy and tensor are supported.")
+ 
+-        runner = ScriptRunner(
+-            script=train_script,
+-            script_args=script_args,
+-            server_expected_format=server_expected_format,
+-            launch_external_process=False,
+-        )
++        if len(gpus[i]) == 1:
++            runner = ScriptRunner(
++                script=train_script,
++                script_args=script_args,
++                server_expected_format=server_expected_format,
++                launch_external_process=True,
++            )
++        else:
++            runner = ScriptRunner(
++                script=train_script,
++                script_args=script_args,
++                server_expected_format=server_expected_format,
++                launch_external_process=True,
++                command=f"python3 -m torch.distributed.run --nnodes=1 --nproc_per_node={len(gpus[i])} --master_port={ports[i]}",
++            )
+         job.to(runner, site_name, tasks=["train"])
+ 
+         if args.quantize_mode:
+@@ -138,7 +154,7 @@ def define_parser():
+         "--num_rounds",
+         type=int,
+         default=3,
+-        help="Number of rounds, default to 5",
++        help="Number of rounds, default to 3",
+     )
+     parser.add_argument(
+         "--workspace_dir",
+@@ -193,6 +209,12 @@ def define_parser():
+         default="0",
+         help="gpu assignments for simulating clients, comma separated, default to single gpu",
+     )
++    parser.add_argument(
++        "--ports",
++        nargs="+",
++        default="7777",
++        help="ports for the clients, default to one client 7777",
++    )
+     return parser.parse_args()
+ 
+ 
+diff --git a/examples/advanced/llm_hf/src/hf_sft_peft_fl.py b/examples/advanced/llm_hf/src/hf_sft_peft_fl.py
+index 96667151bc..f48412b88d 100755
+--- a/examples/advanced/llm_hf/src/hf_sft_peft_fl.py
++++ b/examples/advanced/llm_hf/src/hf_sft_peft_fl.py
+@@ -18,16 +18,27 @@
+ 
+ # Add deterministic seed for reproducibility illustration
+ import random
++import shutil
+ 
+ import datasets
+ import numpy as np
+ import torch
++import torch.distributed as dist
++from accelerate import PartialState
+ from peft import LoraConfig, get_peft_model, get_peft_model_state_dict, set_peft_model_state_dict, utils
+-from transformers import AutoModelForCausalLM, trainer_utils
++from transformers import AutoModelForCausalLM, TrainerCallback, trainer_utils
+ from trl import SFTConfig, SFTTrainer
+ 
+ import nvflare.client as flare
+ 
++
++# Add callback to stop at each epoch
++class StopCallback(TrainerCallback):
++    def on_epoch_end(self, args, state, control, logs=None, **kwargs):
++        control.should_training_stop = True
++
++
++# set deterministic seed for reproducibility
+ torch.manual_seed(0)
+ random.seed(0)
+ np.random.seed(0)
+@@ -41,6 +52,29 @@ def format_instruction(example):
+     return output_texts
+ 
+ 
++def setup_distributed_training():
++    """Setup distributed training environment."""
++    if "RANK" in os.environ and "WORLD_SIZE" in os.environ:
++        rank = int(os.environ["RANK"])
++        world_size = int(os.environ["WORLD_SIZE"])
++        local_rank = int(os.environ.get("LOCAL_RANK", 0))
++
++        # Set device
++        torch.cuda.set_device(local_rank)
++
++        print(f"Distributed training initialized: rank={rank}, world_size={world_size}, local_rank={local_rank}")
++        return rank, world_size, local_rank
++    else:
++        print("No distributed training environment detected, running in single GPU mode")
++        return 0, 1, 0
++
++
++def cleanup_distributed_training():
++    """Cleanup distributed training environment."""
++    if dist.is_initialized():
++        dist.destroy_process_group()
++
++
+ def main():
+     parser = argparse.ArgumentParser()
+     parser.add_argument(
+@@ -69,6 +103,12 @@ def main():
+         default="SFT",
+         help="training mode, SFT or PEFT, default to SFT",
+     )
++    parser.add_argument(
++        "--lr_scheduler",
++        type=str,
++        default="constant",
++        help="learning rate scheduler type, default to 'constant'",
++    )
+     parser.add_argument(
+         "--message_mode",
+         type=str,
+@@ -76,30 +116,51 @@ def main():
+         help="message mode, numpy or tensor, default to numpy",
+     )
+     parser.add_argument("--local_epoch", type=int, default=1)
+-    parser.add_argument("--clean_up", type=int, default=0)
++    parser.add_argument("--num_rounds", type=int, default=3)
+     args = parser.parse_args()
+ 
++    # Setup distributed training
++    rank, world_size, local_rank = setup_distributed_training()
++
++    # Set up device for DDP
++    device_string = PartialState().process_index
++    device_map = {"": device_string}
++
++    # If output path exists, remove it (only on main process)
++    if local_rank == 0:
++        try:
++            print(f"Attempting to remove output path {args.output_path}.")
++            shutil.rmtree(args.output_path)
++        except FileNotFoundError:
++            print(f"Output path {args.output_path} does not exist, skipping removal.")
++
++    # Wait for main process to finish cleanup
++    if dist.is_initialized():
++        dist.barrier()
++
+     # Dataset
+     dataset_train = datasets.load_dataset("json", data_files=args.data_path_train, split="train")
+     dataset_valid = datasets.load_dataset("json", data_files=args.data_path_valid, split="train")
+     # Print dataset info
+-    print(f"Dataset size: training {len(dataset_train)}, validation {len(dataset_valid)}")
++    if local_rank == 0:
++        print(f"Dataset size: training {len(dataset_train)}, validation {len(dataset_valid)}")
+     # record every 5% of the dataset
+     batch_size = 4
+     gra_accu_steps = 10
+     logging_steps = int(len(dataset_train) / (20 * batch_size * gra_accu_steps))
+-    print(f"logging_steps: {logging_steps}")
++    if local_rank == 0:
++        print(f"logging_steps: {logging_steps}")
+ 
+     # Model configs
+     model_name_or_path = args.model_name_or_path
+     peft_config = None
+ 
+-    # Load model
++    # Load model with device_map
+     default_dtype = torch.get_default_dtype()
+     torch.set_default_dtype(torch.bfloat16)
+     model = AutoModelForCausalLM.from_pretrained(
+         model_name_or_path,
+-        device_map="auto",
++        device_map=device_map,
+         use_cache=False,
+         torch_dtype=torch.bfloat16,
+     )
+@@ -129,23 +190,36 @@ def main():
+     # Training arguments
+     train_args = SFTConfig(
+         output_dir=args.output_path,
+-        num_train_epochs=args.local_epoch,
++        # Using callback, stop at each epoch, so specify num_train_epochs
++        # the same as the total epoch in one-call training
++        num_train_epochs=args.local_epoch * args.num_rounds,
+         per_device_train_batch_size=batch_size,
+         gradient_accumulation_steps=gra_accu_steps,
+         gradient_checkpointing=False,
+-        optim="paged_adamw_32bit",
++        gradient_checkpointing_kwargs={"use_reentrant": False},
++        # optimizers using bitsandbytes like "paged_adamw_32bit" have an issue with
++        # multi-gpu training, to be consistent, use regular optimizer
++        optim="adamw_torch",
+         logging_steps=logging_steps,
+         save_strategy="epoch",
+         learning_rate=5e-4,
+         bf16=True,
+         max_grad_norm=0.3,
+         warmup_ratio=0.03,
+-        lr_scheduler_type="constant",
++        # use cosine_with_restarts scheduler to check the iterative behavior
++        lr_scheduler_type=args.lr_scheduler,
++        lr_scheduler_kwargs={"num_cycles": 2},
+         disable_tqdm=True,
+         max_seq_length=1024,
+         save_total_limit=2,
+-        # safetensors has some issues in saving lm_head.weight, disable it for now
++        # safetensors will remove shared layers, e.g. lm_head.weight
++        # disable for local checkpointing
+         save_safetensors=False,
++        seed=0,
++        data_seed=0,
++        # Multi-GPU specific settings
++        ddp_find_unused_parameters=False,
++        dataloader_pin_memory=False,
+     )
+ 
+     # Trainer
+@@ -156,6 +230,8 @@ def main():
+         peft_config=peft_config,
+         formatting_func=format_instruction,
+         args=train_args,
++        # Add a callback to stop training after one epoch
++        callbacks=[StopCallback()],
+     )
+ 
+     # initializes NVFlare client API
+@@ -164,86 +240,114 @@ def main():
+     # Train federated rounds
+     # start with global model at the beginning of each round
+     while flare.is_running():
+-        # receives FLModel from NVFlare
+-        input_model = flare.receive()
+-        curr_round = input_model.current_round
+-        print(f"current_round={curr_round}")
+-
+-        # Update the key name received from global model if using model def file
+-        global_model = copy.deepcopy(input_model.params)
+-        for key in list(global_model.keys()):
+-            global_model[key.replace("model.", "", 1)] = global_model.pop(key)
+-
+-        # wraps evaluation logic into a method to re-use for
+-        # evaluation on both trained and received model
+-        def evaluate(input_weights, mode):
+-            # Special load func for PEFT
+-            if train_mode:
+-                set_peft_model_state_dict(trainer.model, input_weights)
+-            else:
+-                trainer.model.load_state_dict(input_weights)
+-            metric_score = trainer.evaluate()
+-            print(f"Evaluation metric score: {metric_score}")
+-            return metric_score
++        # receives golobal model from NVFlare (only on main process)
++        if local_rank == 0:
++            input_model = flare.receive()
++            curr_round = input_model.current_round
++            print(f"current_round={curr_round}")
++            # Update the key name received from global model if using model def file
++            global_model = copy.deepcopy(input_model.params)
++            for key in list(global_model.keys()):
++                global_model[key.replace("model.", "", 1)] = global_model.pop(key)
++        else:
++            curr_round = None
++            global_model = None
++
++        # broadcast current round and global_model to all processes
++        if dist.is_initialized():
++            curr_round_list = [curr_round]
++            global_model_list = [global_model]
++            dist.broadcast_object_list(curr_round_list, src=0)
++            dist.broadcast_object_list(global_model_list, src=0)
++            curr_round = curr_round_list[0]
++            global_model = global_model_list[0]
++
++        if dist.is_initialized():
++            dist.barrier()
++
++        # Load state dict
++        if train_mode:
++            set_peft_model_state_dict(trainer.model, global_model)
++        else:
++            trainer.model.load_state_dict(global_model)
++        # Wait for main process to finish model loading
++        if dist.is_initialized():
++            dist.barrier()
+ 
+-        # evaluate on received global model
+-        eval_loss = evaluate(global_model, train_mode)
++        # Evaluate the global model
++        eval_loss = trainer.evaluate()
+         eval_loss = float(eval_loss["eval_loss"])
+ 
+-        # Load global model and previous training states
+-        # Since we perform iterative training by using "resume" functionality
+-        # we need to replace the resume weights with global weights every round
++        # Train
+         if curr_round == 0:
+             # First round, start from pretrained model
+-            trainer.train()
++            for epoch in range(args.local_epoch):
++                print(f"Training local epoch {epoch + 1}/{args.local_epoch}")
++                # train for one epoch
++                if epoch == 0:
++                    trainer.train()
++                else:
++                    # continue training
++                    trainer.train(resume_from_checkpoint=True)
+         else:
+-            # replace local resume weights with global weights
+-            resume_from_checkpoint_folder = trainer_utils.get_last_checkpoint(trainer.args.output_dir)
++            # replace local resume weights with global weights (only on main process)
++            if local_rank == 0:
++                resume_from_checkpoint_folder = trainer_utils.get_last_checkpoint(trainer.args.output_dir)
++                if train_mode:
++                    # PEFT model small, directly save via torch.save
++                    resume_model_file_path = os.path.join(resume_from_checkpoint_folder, utils.WEIGHTS_NAME)
++                    torch.save(global_model, resume_model_file_path)
++                else:
++                    # SFT model can be large, save via HF API
++                    # Disable safetensor for now
++                    trainer.model.save_pretrained(
++                        resume_from_checkpoint_folder, state_dict=global_model, safe_serialization=False
++                    )
++
++            # Wait for main process to finish saving before continuing
++            if dist.is_initialized():
++                dist.barrier()
++
++            # continue training
++            # as we used callback, no need to increment num_train_epochs
++            for epoch in range(args.local_epoch):
++                print(f"Training local epoch {epoch + 1}/{args.local_epoch}")
++                trainer.train(resume_from_checkpoint=True)
++
++        # Wait for all process to finish training before continuing
++        if dist.is_initialized():
++            dist.barrier()
++
++        # compose output model to send back to server (only on main process)
++        if local_rank == 0:
+             if train_mode:
+-                # PEFT model small, directly save via torch.save
+-                resume_model_file_path = os.path.join(resume_from_checkpoint_folder, utils.WEIGHTS_NAME)
+-                torch.save(global_model, resume_model_file_path)
+-            else:
+-                # SFT model can be large, save via HF API
+-                # Disable safetensor for now
+-                trainer.model.save_pretrained(resume_from_checkpoint_folder, safe_serialization=False)
+-            # increment num_train_epochs so that the trainer will continue training
+-            if args.clean_up:
+-                # runner got cleaned up, set num_train_epochs with curr_round
+-                trainer.args.num_train_epochs = (curr_round + 1) * args.local_epoch
++                # PEFT, load PEFT part from trainer model
++                out_param = get_peft_model_state_dict(trainer.model)
+             else:
+-                # runner still alive, increment num_train_epochs with local_epoch
+-                trainer.args.num_train_epochs += args.local_epoch
+-            print(f"Increment num_train_epochs to {trainer.args.num_train_epochs}")
+-            # continue training
+-            trainer.train(resume_from_checkpoint=True)
++                # SFT, load whole model state_dict
++                out_param = trainer.model.state_dict()
+ 
+-        # compose output model to send back to server
+-        if train_mode:
+-            # PEFT, load PEFT part from trainer model
+-            out_param = get_peft_model_state_dict(trainer.model)
+-        else:
+-            # SFT, load whole model state_dict
+-            out_param = trainer.model.state_dict()
+-
+-        # update the key name sent to global model
+-        if not train_mode:
+-            for key in list(out_param.keys()):
+-                out_param["model." + key] = out_param.pop(key).cpu()
+-
+-        if args.message_mode.lower() == "numpy":
+-            # cast out_param to float32 preparing for communication with numpy
+-            # otherwise do nothing
+-            out_param = {k: v.to(torch.float32) for k, v in out_param.items()}
+-
+-        # construct trained FL model
+-        output_model = flare.FLModel(
+-            params=out_param,
+-            metrics={"eval_loss": eval_loss},
+-            meta={"NUM_STEPS_CURRENT_ROUND": trainer.train_dataset.num_rows},
+-        )
+-        # send model back to NVFlare
+-        flare.send(output_model)
++            # update the key name sent to global model
++            if not train_mode:
++                for key in list(out_param.keys()):
++                    out_param["model." + key] = out_param.pop(key).cpu()
++
++            if args.message_mode.lower() == "numpy":
++                # cast out_param to float32 preparing for communication with numpy
++                # otherwise do nothing
++                out_param = {k: v.to(torch.float32) for k, v in out_param.items()}
++
++            # print the dict size
++            print(f"In total {len(out_param.keys())} params to be sent to server.")
++
++            # construct trained FL model
++            output_model = flare.FLModel(
++                params=out_param,
++                metrics={"eval_loss": eval_loss},
++                meta={"NUM_STEPS_CURRENT_ROUND": trainer.train_dataset.num_rows},
++            )
++            # send model back to NVFlare
++            flare.send(output_model)
+ 
+ 
+ if __name__ == "__main__":
+diff --git a/examples/advanced/llm_hf/utils/hf_sft_peft.py b/examples/advanced/llm_hf/utils/hf_sft_peft.py
+index 862148368c..8206e535cd 100755
+--- a/examples/advanced/llm_hf/utils/hf_sft_peft.py
++++ b/examples/advanced/llm_hf/utils/hf_sft_peft.py
+@@ -65,6 +65,12 @@ def main():
+         default="SFT",
+         help="training mode, SFT or PEFT, default to SFT",
+     )
++    parser.add_argument(
++        "--lr_scheduler",
++        type=str,
++        default="constant",
++        help="learning rate scheduler type, default to 'constant'",
++    )
+     args = parser.parse_args()
+ 
+     # Dataset
+@@ -121,16 +127,23 @@ def main():
+         per_device_train_batch_size=batch_size,
+         gradient_accumulation_steps=gra_accu_steps,
+         gradient_checkpointing=False,
+-        optim="paged_adamw_32bit",
++        # optimizers using bitsandbytes like "paged_adamw_32bit" have an issue with
++        # multi-gpu training, to be consistent, use regular optimizer
++        optim="adamw_torch",
+         logging_steps=logging_steps,
+         save_strategy="epoch",
+         learning_rate=5e-4,
+         bf16=True,
+         max_grad_norm=0.3,
+         warmup_ratio=0.03,
+-        lr_scheduler_type="constant",
++        # use cosine_with_restarts scheduler to check the iterative behavior
++        lr_scheduler_type=args.lr_scheduler,
++        lr_scheduler_kwargs={"num_cycles": 2},
+         disable_tqdm=True,
+         max_seq_length=1024,
++        save_total_limit=2,
++        seed=0,
++        data_seed=0,
+     )
+ 
+     # Trainer
+diff --git a/examples/advanced/llm_hf/utils/hf_sft_peft_iter.py b/examples/advanced/llm_hf/utils/hf_sft_peft_iter.py
+index ddb3ce2709..47eae79315 100755
+--- a/examples/advanced/llm_hf/utils/hf_sft_peft_iter.py
++++ b/examples/advanced/llm_hf/utils/hf_sft_peft_iter.py
+@@ -26,6 +26,7 @@
+ from transformers import AutoModelForCausalLM, trainer_utils
+ from trl import SFTConfig, SFTTrainer
+ 
++# set deterministic seed for reproducibility
+ torch.manual_seed(0)
+ random.seed(0)
+ np.random.seed(0)
+@@ -67,6 +68,12 @@ def main():
+         default="SFT",
+         help="training mode, SFT or PEFT, default to SFT",
+     )
++    parser.add_argument(
++        "--lr_scheduler",
++        type=str,
++        default="constant",
++        help="learning rate scheduler type, default to 'constant'",
++    )
+     args = parser.parse_args()
+ 
+     # If output path exists, remove it
+@@ -128,18 +135,26 @@ def main():
+         per_device_train_batch_size=batch_size,
+         gradient_accumulation_steps=gra_accu_steps,
+         gradient_checkpointing=False,
+-        optim="paged_adamw_32bit",
++        # optimizers using bitsandbytes like "paged_adamw_32bit" have an issue with
++        # multi-gpu training, to be consistent, use regular optimizer
++        optim="adamw_torch",
+         logging_steps=logging_steps,
+         save_strategy="epoch",
+         learning_rate=5e-4,
+         bf16=True,
+         max_grad_norm=0.3,
+         warmup_ratio=0.03,
+-        lr_scheduler_type="constant",
++        # use cosine_with_restarts scheduler to check the iterative behavior
++        lr_scheduler_type=args.lr_scheduler,
++        lr_scheduler_kwargs={"num_cycles": 2},
+         disable_tqdm=True,
+         max_seq_length=1024,
+-        # safetensors has some issues in saving lm_head.weight, disable it for now
++        save_total_limit=2,
++        # safetensors will remove shared layers, e.g. lm_head.weight
++        # disable for local checkpointing
+         save_safetensors=False,
++        seed=0,
++        data_seed=0,
+     )
+ 
+     # Trainer
+@@ -154,7 +169,7 @@ def main():
+ 
+     # Save base model state_dict, which will be used as the starting
+     # weights for each round - to show the weights are loaded correctly
+-    initial_model_path = os.path.join(args.output_path, "model_dict_base.pt")
++    initial_model_path = os.path.join(args.output_path, "pytorch_model_initial.pth")
+     if train_mode:
+         params = get_peft_model_state_dict(model)
+     else:
+@@ -167,11 +182,12 @@ def main():
+         print(f"current_round={curr_round}")
+ 
+         # Load and Evaluate model file
+-        state_dict_replace = torch.load(initial_model_path, map_location="cpu", weights_only=True)
++        state_dict_replace = torch.load(initial_model_path)
+         if train_mode:
+             set_peft_model_state_dict(trainer.model, state_dict_replace)
+         else:
+             trainer.model.load_state_dict(state_dict_replace)
++        # Evaluate
+         trainer.evaluate()
+ 
+         # Train
+@@ -187,8 +203,11 @@ def main():
+                 torch.save(state_dict_replace, resume_model_file_path)
+             else:
+                 # SFT model can be large, save via HF API
+-                # Disable safetensor for now
+-                trainer.model.save_pretrained(resume_from_checkpoint_folder, safe_serialization=False)
++                # Disable safetensor for local checkpointing
++                trainer.model.save_pretrained(
++                    resume_from_checkpoint_folder, state_dict=state_dict_replace, safe_serialization=False
++                )
++
+             # increment num_train_epochs so that the trainer will continue training
+             trainer.args.num_train_epochs += 1
+             # continue training
+diff --git a/examples/advanced/llm_hf/utils/hf_sft_peft_iter_callback_multigpu.py b/examples/advanced/llm_hf/utils/hf_sft_peft_iter_callback_multigpu.py
+new file mode 100755
+index 0000000000..e5f8491c3e
+--- /dev/null
++++ b/examples/advanced/llm_hf/utils/hf_sft_peft_iter_callback_multigpu.py
+@@ -0,0 +1,303 @@
++# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++import argparse
++import os
++
++# Add deterministic seed for reproducibility illustration
++import random
++import shutil
++
++import datasets
++import numpy as np
++import torch
++import torch.distributed as dist
++from accelerate import PartialState
++from peft import LoraConfig, get_peft_model, get_peft_model_state_dict, set_peft_model_state_dict, utils
++from transformers import AutoModelForCausalLM, TrainerCallback, trainer_utils
++from trl import SFTConfig, SFTTrainer
++
++
++# Add callback to stop at each epoch
++class StopCallback(TrainerCallback):
++    def on_epoch_end(self, args, state, control, logs=None, **kwargs):
++        control.should_training_stop = True
++
++
++# set deterministic seed for reproducibility
++torch.manual_seed(0)
++random.seed(0)
++np.random.seed(0)
++
++
++def format_instruction(example):
++    output_texts = []
++    for i in range(len(example["input"])):
++        text = f"### Instruction: Generate Output according to the information and question given by Input. ### Input:{example['input'][i]} ### Response: {example['output'][i]}"
++        output_texts.append(text)
++    return output_texts
++
++
++def setup_distributed_training():
++    """Setup distributed training environment."""
++    if "RANK" in os.environ and "WORLD_SIZE" in os.environ:
++        rank = int(os.environ["RANK"])
++        world_size = int(os.environ["WORLD_SIZE"])
++        local_rank = int(os.environ.get("LOCAL_RANK", 0))
++
++        # Set device
++        torch.cuda.set_device(local_rank)
++
++        print(f"Distributed training initialized: rank={rank}, world_size={world_size}, local_rank={local_rank}")
++        return rank, world_size, local_rank
++    else:
++        print("No distributed training environment detected, running in single GPU mode")
++        return 0, 1, 0
++
++
++def cleanup_distributed_training():
++    """Cleanup distributed training environment."""
++    if dist.is_initialized():
++        dist.destroy_process_group()
++
++
++def main():
++    parser = argparse.ArgumentParser()
++    parser.add_argument(
++        "--model_name_or_path",
++        type=str,
++        default="meta-llama/llama-3.2-1b",
++    )
++    parser.add_argument(
++        "--data_path_train",
++        type=str,
++        default="./dataset/dolly/training.jsonl",
++    )
++    parser.add_argument(
++        "--data_path_valid",
++        type=str,
++        default="./dataset/dolly/validation.jsonl",
++    )
++    parser.add_argument(
++        "--output_path",
++        type=str,
++        default="./workspace_centralized/llama-3.2-1b-dolly-sft-iter",
++    )
++    parser.add_argument(
++        "--train_mode",
++        type=str,
++        default="SFT",
++        help="training mode, SFT or PEFT, default to SFT",
++    )
++    parser.add_argument(
++        "--lr_scheduler",
++        type=str,
++        default="constant",
++        help="learning rate scheduler type, default to 'constant'",
++    )
++    args = parser.parse_args()
++
++    # Setup distributed training
++    rank, world_size, local_rank = setup_distributed_training()
++
++    # Set up device for DDP
++    device_string = PartialState().process_index
++    device_map = {"": device_string}
++
++    # If output path exists, remove it (only on main process)
++    if local_rank == 0:
++        try:
++            print(f"Attempting to remove output path {args.output_path}.")
++            shutil.rmtree(args.output_path)
++        except FileNotFoundError:
++            print(f"Output path {args.output_path} does not exist, skipping removal.")
++
++    # Wait for main process to finish cleanup
++    if dist.is_initialized():
++        dist.barrier()
++
++    # Dataset
++    dataset_train = datasets.load_dataset("json", data_files=args.data_path_train, split="train")
++    dataset_valid = datasets.load_dataset("json", data_files=args.data_path_valid, split="train")
++    # Print dataset info
++    if local_rank == 0:
++        print(f"Dataset size: training {len(dataset_train)}, validation {len(dataset_valid)}")
++    # record every 5% of the dataset
++    batch_size = 4
++    gra_accu_steps = 10
++    logging_steps = int(len(dataset_train) / (20 * batch_size * gra_accu_steps))
++    if local_rank == 0:
++        print(f"logging_steps: {logging_steps}")
++
++    # Model configs
++    model_name_or_path = args.model_name_or_path
++    peft_config = None
++
++    # Load model with device_map
++    default_dtype = torch.get_default_dtype()
++    torch.set_default_dtype(torch.bfloat16)
++    model = AutoModelForCausalLM.from_pretrained(
++        model_name_or_path,
++        device_map=device_map,
++        use_cache=False,
++        torch_dtype=torch.bfloat16,
++    )
++    torch.set_default_dtype(default_dtype)
++
++    # Train mode
++    if args.train_mode.lower() == "sft":
++        train_mode = 0
++    elif args.train_mode.lower() == "peft":
++        train_mode = 1
++    else:
++        raise ValueError(f"Invalid train_mode: {args.train_mode}, only SFT and PEFT are supported.")
++
++    # PEFT specific
++    if train_mode:
++        # PEFT configs
++        peft_config = LoraConfig(
++            lora_alpha=16,
++            lora_dropout=0.1,
++            r=64,
++            bias="none",
++            task_type="CAUSAL_LM",
++        )
++        model = get_peft_model(model, peft_config)
++    model.config.pretraining_tp = 1
++
++    # Training arguments
++    train_args = SFTConfig(
++        output_dir=args.output_path,
++        # Using callback, stop at each epoch, so specify num_train_epochs
++        # the same as one-call training
++        num_train_epochs=3,
++        per_device_train_batch_size=batch_size,
++        gradient_accumulation_steps=gra_accu_steps,
++        gradient_checkpointing=False,
++        gradient_checkpointing_kwargs={"use_reentrant": False},
++        # optimizers using bitsandbytes like "paged_adamw_32bit" have an issue with
++        # multi-gpu training, to be consistent, use regular optimizer
++        optim="adamw_torch",
++        logging_steps=logging_steps,
++        save_strategy="epoch",
++        learning_rate=5e-4,
++        bf16=True,
++        max_grad_norm=0.3,
++        warmup_ratio=0.03,
++        # use cosine_with_restarts scheduler to check the iterative behavior
++        lr_scheduler_type=args.lr_scheduler,
++        lr_scheduler_kwargs={"num_cycles": 2},
++        disable_tqdm=True,
++        max_seq_length=1024,
++        save_total_limit=2,
++        # safetensors will remove shared layers, e.g. lm_head.weight
++        # disable for local checkpointing
++        save_safetensors=False,
++        seed=0,
++        data_seed=0,
++        # Multi-GPU specific settings
++        ddp_find_unused_parameters=False,
++        dataloader_pin_memory=False,
++    )
++
++    # Trainer
++    trainer = SFTTrainer(
++        model=model,
++        train_dataset=dataset_train,
++        eval_dataset=dataset_valid,
++        peft_config=peft_config,
++        formatting_func=format_instruction,
++        args=train_args,
++        # Add a callback to stop training after one epoch
++        callbacks=[StopCallback()],
++    )
++
++    # Save base model state_dict, which will be used as the starting
++    # weights for each round - to show the weights are loaded correctly
++    # Only save on main process
++    if local_rank == 0:
++        initial_model_path = os.path.join(args.output_path, "pytorch_model_initial.pth")
++        if train_mode:
++            params = get_peft_model_state_dict(model)
++        else:
++            params = model.state_dict()
++        torch.save(params, initial_model_path)
++
++    # Wait for main process to finish saving
++    if dist.is_initialized():
++        dist.barrier()
++
++    # Train iteratively by using "resume" functionality
++    # and replace the resume weights every round
++    for curr_round in range(3):
++        # Load initial model (only on main process)
++        if local_rank == 0:
++            print(f"current_round={curr_round}")
++
++            if curr_round == 0:
++                # Load initial model weights
++                resume_model_file_path = os.path.join(args.output_path, "pytorch_model_initial.pt")
++            else:
++                # Get the last checkpoint folder
++                resume_from_checkpoint_folder = trainer_utils.get_last_checkpoint(trainer.args.output_dir)
++                # Load the last checkpoint weights "pytorch_model.bin"
++                resume_model_file_path = os.path.join(resume_from_checkpoint_folder, "pytorch_model.bin")
++            state_dict_replace = torch.load(resume_model_file_path)
++
++            # Load state dict
++            if train_mode:
++                set_peft_model_state_dict(trainer.model, state_dict_replace)
++            else:
++                trainer.model.load_state_dict(state_dict_replace)
++
++        # Wait for main process to finish model loading
++        if dist.is_initialized():
++            dist.barrier()
++
++        # Evaluate
++        trainer.evaluate()
++
++        # Train
++        if curr_round == 0:
++            # First round, start from pretrained model
++            trainer.train()
++        else:
++            # replace local resume weights with global weights (only on main process)
++            if local_rank == 0:
++                resume_from_checkpoint_folder = trainer_utils.get_last_checkpoint(trainer.args.output_dir)
++                if train_mode:
++                    # PEFT model small, directly save via torch.save
++                    resume_model_file_path = os.path.join(resume_from_checkpoint_folder, utils.WEIGHTS_NAME)
++                    torch.save(state_dict_replace, resume_model_file_path)
++                else:
++                    # SFT model can be large, save via HF API
++                    # Disable safetensor for local checkpointing
++                    trainer.model.save_pretrained(
++                        resume_from_checkpoint_folder, state_dict=state_dict_replace, safe_serialization=False
++                    )
++
++            # Wait for main process to finish saving before continuing
++            if dist.is_initialized():
++                dist.barrier()
++
++            # continue training
++            # as we used callback, no need to increment num_train_epochs
++            trainer.train(resume_from_checkpoint=True)
++
++    # Cleanup distributed training
++    cleanup_distributed_training()
++
++
++if __name__ == "__main__":
++    main()

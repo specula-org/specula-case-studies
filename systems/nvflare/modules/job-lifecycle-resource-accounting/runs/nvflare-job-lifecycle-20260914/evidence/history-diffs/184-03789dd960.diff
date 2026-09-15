@@ -1,0 +1,81 @@
+commit 03789dd960e5d6ab5291c65cd3b04e7bd55d0952
+Author:     Yuhong Wen <yh_wen@hotmail.com>
+AuthorDate: Thu Jun 2 17:35:05 2022 -0400
+Commit:     GitHub <noreply@github.com>
+CommitDate: Thu Jun 2 17:35:05 2022 -0400
+
+    Enhance the abort_train with retry. (#634)
+    
+    * Enhance the abort_train with retry.
+    
+    * Added comment.
+    
+    * When the run already terminated, break out from the abort_train loop.
+    
+    * Added the self.run_processes.pop(run_number) in the right place.
+---
+ nvflare/private/fed/client/client_executor.py | 51 +++++++++++++++++----------
+ 1 file changed, 33 insertions(+), 18 deletions(-)
+
+diff --git a/nvflare/private/fed/client/client_executor.py b/nvflare/private/fed/client/client_executor.py
+index 03c6bc51..c5e4783a 100644
+--- a/nvflare/private/fed/client/client_executor.py
++++ b/nvflare/private/fed/client/client_executor.py
+@@ -317,24 +317,39 @@ class ProcessExecutor(ClientExecutor):
+ 
+     def abort_train(self, client, run_number):
+         with self.lock:
+-            process_status = self.run_processes.get(run_number, {}).get(RunProcessKey.STATUS, ClientStatus.NOT_STARTED)
+-            if process_status == ClientStatus.STARTED:
+-                try:
+-                    child_process = self.run_processes[run_number][RunProcessKey.CHILD_PROCESS]
+-                    conn_client = self.get_conn_client(run_number)
+-                    if conn_client:
+-                        data = {"command": AdminCommandNames.ABORT, "data": {}}
+-                        conn_client.send(data)
+-                        self.logger.debug("abort sent")
+-
+-                    threading.Thread(target=self._terminate_process, args=[child_process, run_number]).start()
+-                except Exception as e:
+-                    self.logger.error(f"abort_train execution exception: {e}.", exc_info=True)
+-                finally:
+-                    if conn_client:
+-                        conn_client.close()
+-                    self.run_processes.pop(run_number)
+-                    self.cleanup()
++            # When the HeartBeat cleanup process try to abort the train, the job maybe already terminated,
++            # Use retry to avoid print out the error stack trace.
++            retry = 1
++            while retry >= 0:
++                process_status = self.run_processes.get(run_number, {}).get(
++                    RunProcessKey.STATUS, ClientStatus.NOT_STARTED
++                )
++                if process_status == ClientStatus.STARTED:
++                    try:
++                        child_process = self.run_processes[run_number][RunProcessKey.CHILD_PROCESS]
++                        conn_client = self.get_conn_client(run_number)
++                        if conn_client:
++                            data = {"command": AdminCommandNames.ABORT, "data": {}}
++                            conn_client.send(data)
++                            self.logger.debug("abort sent")
++
++                        threading.Thread(target=self._terminate_process, args=[child_process, run_number]).start()
++                        self.run_processes.pop(run_number)
++                        break
++                    except Exception as e:
++                        if retry == 0:
++                            self.logger.error(
++                                f"abort_train execution exception: {e} for run: {run_number}.", exc_info=True
++                            )
++                        retry -= 1
++                        time.sleep(5.0)
++                    finally:
++                        if conn_client:
++                            conn_client.close()
++                        self.cleanup()
++                else:
++                    self.logger.info(f"run: {run_number} already terminated.")
++                    break
+ 
+         self.logger.info("Client training was terminated.")
+ 

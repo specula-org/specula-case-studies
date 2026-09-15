@@ -1,0 +1,231 @@
+commit 0e443f88ccf1719a5dda7093964930f25f84737e
+Author:     Yuhong Wen <yuhongw@nvidia.com>
+AuthorDate: Tue Mar 19 14:38:16 2024 -0400
+Commit:     GitHub <noreply@github.com>
+CommitDate: Tue Mar 19 14:38:16 2024 -0400
+
+    Multiple CC Authorizer support CCManager (#2396)
+    
+    * WIP: tdx_cc integration.
+    
+    * fixed toke_file read.
+    
+    * WIP: added info for CC add client tokens.:
+    
+    * Fixed an error when client does not have CC token reported.
+    
+    * Added handle for client does not have CC_INFO.
+    
+    * Added CLIENT_QUIT event for CCManager to remove client token.
+    
+    * Added _add_client_token client token logging info.
+    
+    * Added peer_ctx for client quit.
+    
+    * set_peer_context for client quit.
+    
+    * Changed the AUTHORIZATION_REASON set_prop sticky to False.
+    
+    * WIP: TokenPundit interface change.
+    
+    * WIP: added cc_authorizer_ids config.
+    
+    * Added cc_issuer_id for CCManager.
+    
+    * renamed the TokenPundit to CCAutorizer.
+    
+    * Added CC token adding through client heartbeat.
+    
+    * Added function to stop current running job if CC verify fail.
+    
+    * if CC failed to get toke, don't allow the system to start.
+    
+    * Added exceptions None check.
+    
+    * Address the client side CC check before job scheduled.
+    
+    * fixed the PEER_FL_CONTEXT error.
+    
+    * Added CCManager support to have multiple cc_issuers.
+    
+    * optimized CCManager.
+    
+    * updated the _verify_participants() logic.
+    
+    * set up the proper fl_ctx for admin send_requests().
+    
+    * Add proper fl_ctx.
+    
+    * Refactor the CCManager.
+    
+    * Refactor the CCManager and TDX_authorizer.
+    
+    * Added TOKEN_EXPIRATION for each cc_issue in CCManager.
+    
+    * Fixed CC TOKEN_EXPIRATION error.
+    
+    * refactor the CCManager _prepare_cc_info()
+    
+    * Refactor.
+    
+    * refactor the cc tokens periodic verification.
+    
+    * added critical_level for CCManager.
+    
+    * codestyle fix.
+    
+    * removed no used import.
+    
+    * removed no use import.
+    
+    * Fixed the unitest.
+    
+    * Added CCManager unit tests.
+    
+    * Added CCTokenGenerateError and CCTokenVerifyError. Updated CCAuthorizer interface.
+    
+    * Addressed some PR reviews.
+    
+    * Added exception catch for TDXAuthorizer.
+    
+    * renamed some events.
+    
+    * renamed event names.
+    
+    * renamed event names.
+---
+ nvflare/app_common/job_schedulers/job_scheduler.py |  3 ++-
+ nvflare/private/fed/client/scheduler_cmds.py       |  6 ++++--
+ nvflare/private/fed/server/job_runner.py           |  5 +++--
+ nvflare/private/fed/server/server_engine.py        | 14 +++++++-------
+ 4 files changed, 16 insertions(+), 12 deletions(-)
+
+diff --git a/nvflare/app_common/job_schedulers/job_scheduler.py b/nvflare/app_common/job_schedulers/job_scheduler.py
+index 2619b98d..c7e03d39 100644
+--- a/nvflare/app_common/job_schedulers/job_scheduler.py
++++ b/nvflare/app_common/job_schedulers/job_scheduler.py
+@@ -93,7 +93,7 @@ class DefaultJobScheduler(JobSchedulerSpec, FLComponent):
+         if not isinstance(engine, ServerEngineSpec):
+             raise RuntimeError(f"engine inside fl_ctx should be of type ServerEngineSpec, but got {type(engine)}.")
+ 
+-        engine.cancel_client_resources(resource_check_results, resource_reqs)
++        engine.cancel_client_resources(resource_check_results, resource_reqs, fl_ctx)
+         self.log_debug(fl_ctx, f"cancel client resources using check results: {resource_check_results}")
+         return False, None
+ 
+@@ -165,6 +165,7 @@ class DefaultJobScheduler(JobSchedulerSpec, FLComponent):
+             return SCHEDULE_RESULT_NO_RESOURCE, None, block_reason
+ 
+         resource_check_results = self._check_client_resources(job=job, resource_reqs=resource_reqs, fl_ctx=fl_ctx)
++        fl_ctx.set_prop(FLContextKey.RESOURCE_CHECK_RESULT, resource_check_results, private=True, sticky=False)
+         self.fire_event(EventType.AFTER_CHECK_CLIENT_RESOURCES, fl_ctx)
+ 
+         if not resource_check_results:
+diff --git a/nvflare/private/fed/client/scheduler_cmds.py b/nvflare/private/fed/client/scheduler_cmds.py
+index 58828121..7ea2e8d5 100644
+--- a/nvflare/private/fed/client/scheduler_cmds.py
++++ b/nvflare/private/fed/client/scheduler_cmds.py
+@@ -16,7 +16,7 @@ import json
+ from typing import List
+ 
+ from nvflare.apis.event_type import EventType
+-from nvflare.apis.fl_constant import FLContextKey, ReturnCode, SystemComponents
++from nvflare.apis.fl_constant import FLContextKey, ReturnCode, ServerCommandKey, SystemComponents
+ from nvflare.apis.resource_manager_spec import ResourceConsumerSpec, ResourceManagerSpec
+ from nvflare.apis.shareable import Shareable
+ from nvflare.private.admin_defs import Message
+@@ -68,6 +68,8 @@ class CheckResourceProcessor(RequestProcessor):
+                 fl_ctx.set_prop(key=FLContextKey.CLIENT_RESOURCE_SPECS, value=resource_spec, private=True, sticky=False)
+ 
+                 fl_ctx.set_prop(FLContextKey.CURRENT_JOB_ID, job_id, private=True, sticky=False)
++                shared_fl_ctx = req.get_header(ServerCommandKey.PEER_FL_CONTEXT)
++                fl_ctx.set_peer_context(shared_fl_ctx)
+ 
+                 engine.fire_event(EventType.BEFORE_CHECK_RESOURCE_MANAGER, fl_ctx)
+                 block_reason = fl_ctx.get_prop(FLContextKey.JOB_BLOCK_REASON)
+@@ -78,7 +80,7 @@ class CheckResourceProcessor(RequestProcessor):
+                     is_resource_enough, token = resource_manager.check_resources(
+                         resource_requirement=resource_spec, fl_ctx=fl_ctx
+                     )
+-            except Exception:
++            except Exception as e:
+                 result.set_return_code(ReturnCode.EXECUTION_EXCEPTION)
+ 
+         result.set_header(ShareableHeader.IS_RESOURCE_ENOUGH, is_resource_enough)
+diff --git a/nvflare/private/fed/server/job_runner.py b/nvflare/private/fed/server/job_runner.py
+index ae2cb7d5..15a9bea8 100644
+--- a/nvflare/private/fed/server/job_runner.py
++++ b/nvflare/private/fed/server/job_runner.py
+@@ -49,7 +49,8 @@ def _send_to_clients(admin_server, client_sites: List[str], engine, message, tim
+ 
+     if timeout is None:
+         timeout = admin_server.timeout
+-    replies = admin_server.send_requests(requests, timeout_secs=timeout, optional=optional)
++    with admin_server.sai.new_context() as fl_ctx:
++        replies = admin_server.send_requests(requests, fl_ctx, timeout_secs=timeout, optional=optional)
+     return replies
+ 
+ 
+@@ -248,7 +249,7 @@ class JobRunner(FLComponent):
+         if err:
+             raise RuntimeError(f"Could not start the server App for job: {job_id}.")
+ 
+-        replies = engine.start_client_job(job_id, client_sites)
++        replies = engine.start_client_job(job_id, client_sites, fl_ctx)
+         client_sites_names = list(client_sites.keys())
+         check_client_replies(replies=replies, client_sites=client_sites_names, command=f"start job ({job_id})")
+         display_sites = ",".join(client_sites_names)
+diff --git a/nvflare/private/fed/server/server_engine.py b/nvflare/private/fed/server/server_engine.py
+index d6b636b5..ed52b4e9 100644
+--- a/nvflare/private/fed/server/server_engine.py
++++ b/nvflare/private/fed/server/server_engine.py
+@@ -721,8 +721,8 @@ class ServerEngine(ServerEngineInternalSpec):
+ 
+         return f"reset the server error stats for job: {job_id}"
+ 
+-    def _send_admin_requests(self, requests, timeout_secs=10) -> List[ClientReply]:
+-        return self.server.admin_server.send_requests(requests, timeout_secs=timeout_secs)
++    def _send_admin_requests(self, requests, fl_ctx: FLContext, timeout_secs=10) -> List[ClientReply]:
++        return self.server.admin_server.send_requests(requests, fl_ctx, timeout_secs=timeout_secs)
+ 
+     def check_client_resources(self, job: Job, resource_reqs, fl_ctx: FLContext) -> Dict[str, Tuple[bool, str]]:
+         requests = {}
+@@ -737,7 +737,7 @@ class ServerEngine(ServerEngineInternalSpec):
+                 requests.update({client.token: request})
+         replies = []
+         if requests:
+-            replies = self._send_admin_requests(requests, 15)
++            replies = self._send_admin_requests(requests, fl_ctx, 15)
+         result = {}
+         for r in replies:
+             site_name = r.client_name
+@@ -765,7 +765,7 @@ class ServerEngine(ServerEngineInternalSpec):
+         return request
+ 
+     def cancel_client_resources(
+-        self, resource_check_results: Dict[str, Tuple[bool, str]], resource_reqs: Dict[str, dict]
++        self, resource_check_results: Dict[str, Tuple[bool, str]], resource_reqs: Dict[str, dict], fl_ctx: FLContext
+     ):
+         requests = {}
+         for site_name, result in resource_check_results.items():
+@@ -778,9 +778,9 @@ class ServerEngine(ServerEngineInternalSpec):
+                 if client:
+                     requests.update({client.token: request})
+         if requests:
+-            _ = self._send_admin_requests(requests)
++            _ = self._send_admin_requests(requests, fl_ctx)
+ 
+-    def start_client_job(self, job_id, client_sites):
++    def start_client_job(self, job_id, client_sites, fl_ctx: FLContext):
+         requests = {}
+         for site, dispatch_info in client_sites.items():
+             resource_requirement = dispatch_info.resource_requirements
+@@ -793,7 +793,7 @@ class ServerEngine(ServerEngineInternalSpec):
+                 requests.update({client.token: request})
+         replies = []
+         if requests:
+-            replies = self._send_admin_requests(requests, timeout_secs=20)
++            replies = self._send_admin_requests(requests, fl_ctx, timeout_secs=20)
+         return replies
+ 
+     def stop_all_jobs(self):

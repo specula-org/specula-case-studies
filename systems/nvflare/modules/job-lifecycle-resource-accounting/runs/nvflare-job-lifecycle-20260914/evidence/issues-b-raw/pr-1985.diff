@@ -1,0 +1,611 @@
+diff --git a/nvflare/apis/fl_constant.py b/nvflare/apis/fl_constant.py
+index 6357e4e52c..fa8dbd9a7e 100644
+--- a/nvflare/apis/fl_constant.py
++++ b/nvflare/apis/fl_constant.py
+@@ -413,6 +413,7 @@ class FLMetaKey:
+     TOTAL_ROUNDS = "total_rounds"
+     JOB_ID = "job_id"
+     SITE_NAME = "site_name"
++    PROCESS_RC_FILE = "_process_rc.txt"
+     SUBMIT_MODEL_NAME = "submit_model_name"
+ 
+ 
+diff --git a/nvflare/fuel/f3/mpm.py b/nvflare/fuel/f3/mpm.py
+index 8b1b5c2e58..046836f65c 100644
+--- a/nvflare/fuel/f3/mpm.py
++++ b/nvflare/fuel/f3/mpm.py
+@@ -17,6 +17,7 @@
+ import threading
+ import time
+ 
++from nvflare.apis.fl_constant import FLMetaKey
+ from nvflare.fuel.common.excepts import ComponentNotAuthorized, ConfigError
+ from nvflare.fuel.common.exit_codes import ProcessExitCode
+ from nvflare.fuel.f3.drivers.aio_context import AioContext
+@@ -128,7 +129,7 @@ def _do_cleanup(cls, waiter: threading.Event):
+         waiter.set()
+ 
+     @classmethod
+-    def run(cls, main_func, shutdown_grace_time=1.5, cleanup_grace_time=1.5):
++    def run(cls, main_func, run_dir=None, shutdown_grace_time=1.5, cleanup_grace_time=1.5, **kwargs):
+         if not callable(main_func):
+             raise ValueError("main_func must be runnable")
+ 
+@@ -139,11 +140,18 @@ def run(cls, main_func, shutdown_grace_time=1.5, cleanup_grace_time=1.5):
+                 f"{cls.name}: the mpm.run() method is called from {t.name}: it must be called from the MainThread"
+             )
+ 
++        if not run_dir:
++            run_dir = os.getcwd()
++        rc_file = os.path.join(run_dir, FLMetaKey.PROCESS_RC_FILE)
++
+         # call and wait for the main_func to complete
+         logger = cls.logger()
+         logger.debug(f"=========== {cls.name}: started to run forever")
+         try:
+-            rc = main_func()
++            if os.path.exists(rc_file):
++                os.remove(rc_file)
++
++            rc = main_func(**kwargs)
+         except ConfigError as ex:
+             # already handled
+             rc = ProcessExitCode.CONFIG_ERROR
+@@ -169,10 +177,12 @@ def run(cls, main_func, shutdown_grace_time=1.5, cleanup_grace_time=1.5):
+             if thread.name != "MainThread" and not thread.daemon:
+                 logger.warning(f"#### {cls.name}: still running thread {thread.name}")
+                 num_active_threads += 1
+-
+         logger.info(f"{cls.name}: Good Bye!")
+         if num_active_threads > 0:
+             try:
++                with open(rc_file, "w") as outfile:
++                    outfile.write(f"{rc}")
++
+                 os.kill(os.getpid(), signal.SIGKILL)
+             except Exception as ex:
+                 logger.debug(f"Failed to kill process {os.getpid()}: {secure_format_exception(ex)}")
+diff --git a/nvflare/private/fed/app/client/client_train.py b/nvflare/private/fed/app/client/client_train.py
+index 73f2feec98..f933c14349 100644
+--- a/nvflare/private/fed/app/client/client_train.py
++++ b/nvflare/private/fed/app/client/client_train.py
+@@ -27,6 +27,7 @@
+ from nvflare.fuel.utils.argument_utils import parse_vars
+ from nvflare.private.defs import AppFolderConstants
+ from nvflare.private.fed.app.fl_conf import FLClientStarterConfiger, create_privacy_manager
++from nvflare.private.fed.app.utils import version_check
+ from nvflare.private.fed.client.admin import FedAdminAgent
+ from nvflare.private.fed.client.client_engine import ClientEngine
+ from nvflare.private.fed.client.client_status import ClientStatus
+@@ -36,19 +37,7 @@
+ from nvflare.security.logging import secure_format_exception
+ 
+ 
+-def main():
+-    if sys.version_info >= (3, 11):
+-        raise RuntimeError("Python versions 3.11 and above are not yet supported. Please use Python 3.8, 3.9 or 3.10.")
+-    if sys.version_info < (3, 8):
+-        raise RuntimeError("Python versions 3.7 and below are not supported. Please use Python 3.8, 3.9 or 3.10")
+-
+-    parser = argparse.ArgumentParser()
+-    parser.add_argument("--workspace", "-m", type=str, help="WORKSPACE folder", required=True)
+-    parser.add_argument("--fed_client", "-s", type=str, help="client config json file", required=True)
+-    parser.add_argument("--set", metavar="KEY=VALUE", nargs="*")
+-    parser.add_argument("--local_rank", type=int, default=0)
+-
+-    args = parser.parse_args()
++def main(args):
+     kv_list = parse_vars(args.set)
+ 
+     config_folder = kv_list.get("config_folder", "")
+@@ -143,6 +132,16 @@ def main():
+         print(f"ConfigError: {secure_format_exception(e)}")
+ 
+ 
++def parse_arguments():
++    parser = argparse.ArgumentParser()
++    parser.add_argument("--workspace", "-m", type=str, help="WORKSPACE folder", required=True)
++    parser.add_argument("--fed_client", "-s", type=str, help="client config json file", required=True)
++    parser.add_argument("--set", metavar="KEY=VALUE", nargs="*")
++    parser.add_argument("--local_rank", type=int, default=0)
++    args = parser.parse_args()
++    return args
++
++
+ def create_admin_agent(req_processors, federated_client: FederatedClient, client_engine: ClientEngine):
+     """Creates an admin agent.
+ 
+@@ -182,5 +181,7 @@ def create_admin_agent(req_processors, federated_client: FederatedClient, client
+     # multiprocessing.set_start_method('spawn')
+ 
+     # main()
+-    rc = mpm.run(main_func=main)
++    version_check()
++    args = parse_arguments()
++    rc = mpm.run(main_func=main, run_dir=args.workspace, args=args)
+     sys.exit(rc)
+diff --git a/nvflare/private/fed/app/client/sub_worker_process.py b/nvflare/private/fed/app/client/sub_worker_process.py
+index ff00a918c0..9ad491f23b 100644
+--- a/nvflare/private/fed/app/client/sub_worker_process.py
++++ b/nvflare/private/fed/app/client/sub_worker_process.py
+@@ -309,19 +309,7 @@ def stop(self):
+         self.done = True
+ 
+ 
+-def main():
+-    """Sub_worker process program."""
+-    parser = argparse.ArgumentParser()
+-    parser.add_argument("--workspace", "-m", type=str, help="WORKSPACE folder", required=True)
+-    parser.add_argument("--num_processes", type=str, help="Listen ports", required=True)
+-    parser.add_argument("--job_id", "-n", type=str, help="job_id", required=True)
+-    parser.add_argument("--client_name", "-c", type=str, help="client name", required=True)
+-    parser.add_argument("--simulator_engine", "-s", type=str, help="simulator engine", required=True)
+-    parser.add_argument("--parent_pid", type=int, help="parent process pid", required=True)
+-    parser.add_argument("--root_url", type=str, help="root cell url", required=True)
+-    parser.add_argument("--parent_url", type=str, help="parent cell url", required=True)
+-
+-    args = parser.parse_args()
++def main(args):
+     workspace = Workspace(args.workspace, args.client_name)
+     app_custom_folder = workspace.get_client_custom_dir()
+     if os.path.isdir(app_custom_folder):
+@@ -367,9 +355,26 @@ def main():
+         logger.warning(err)
+ 
+ 
++def parse_arguments():
++    """Sub_worker process program."""
++    parser = argparse.ArgumentParser()
++    parser.add_argument("--workspace", "-m", type=str, help="WORKSPACE folder", required=True)
++    parser.add_argument("--num_processes", type=str, help="Listen ports", required=True)
++    parser.add_argument("--job_id", "-n", type=str, help="job_id", required=True)
++    parser.add_argument("--client_name", "-c", type=str, help="client name", required=True)
++    parser.add_argument("--simulator_engine", "-s", type=str, help="simulator engine", required=True)
++    parser.add_argument("--parent_pid", type=int, help="parent process pid", required=True)
++    parser.add_argument("--root_url", type=str, help="root cell url", required=True)
++    parser.add_argument("--parent_url", type=str, help="parent cell url", required=True)
++    args = parser.parse_args()
++    return args
++
++
+ if __name__ == "__main__":
+     """
+     This is the program for running rank processes in multi-process mode.
+     """
+     # main()
+-    mpm.run(main_func=main)
++    args = parse_arguments()
++    run_dir = os.path.join(args.workspace, args.job_id)
++    mpm.run(main_func=main, run_dir=run_dir, args=args)
+diff --git a/nvflare/private/fed/app/client/worker_process.py b/nvflare/private/fed/app/client/worker_process.py
+index 46bab6b4b1..1823ed74e2 100644
+--- a/nvflare/private/fed/app/client/worker_process.py
++++ b/nvflare/private/fed/app/client/worker_process.py
+@@ -41,28 +41,7 @@
+ from nvflare.security.logging import secure_format_exception
+ 
+ 
+-def main():
+-    """Worker process start program."""
+-    parser = argparse.ArgumentParser()
+-    parser.add_argument("--workspace", "-m", type=str, help="WORKSPACE folder", required=True)
+-    parser.add_argument("--startup", "-w", type=str, help="startup folder", required=True)
+-    parser.add_argument("--token", "-t", type=str, help="token", required=True)
+-    parser.add_argument("--ssid", "-d", type=str, help="ssid", required=True)
+-    parser.add_argument("--job_id", "-n", type=str, help="job_id", required=True)
+-    parser.add_argument("--client_name", "-c", type=str, help="client name", required=True)
+-    # parser.add_argument("--listen_port", "-p", type=str, help="listen port", required=True)
+-    parser.add_argument("--sp_target", "-g", type=str, help="Sp target", required=True)
+-    parser.add_argument("--parent_url", "-p", type=str, help="parent_url", required=True)
+-
+-    parser.add_argument(
+-        "--fed_client", "-s", type=str, help="an aggregation server specification json file", required=True
+-    )
+-
+-    parser.add_argument("--set", metavar="KEY=VALUE", nargs="*")
+-
+-    parser.add_argument("--local_rank", type=int, default=0)
+-
+-    args = parser.parse_args()
++def main(args):
+     kv_list = parse_vars(args.set)
+ 
+     # get parent process id
+@@ -159,6 +138,27 @@ def main():
+             logger.warning(err)
+ 
+ 
++def parse_arguments():
++    """Worker process start program."""
++    parser = argparse.ArgumentParser()
++    parser.add_argument("--workspace", "-m", type=str, help="WORKSPACE folder", required=True)
++    parser.add_argument("--startup", "-w", type=str, help="startup folder", required=True)
++    parser.add_argument("--token", "-t", type=str, help="token", required=True)
++    parser.add_argument("--ssid", "-d", type=str, help="ssid", required=True)
++    parser.add_argument("--job_id", "-n", type=str, help="job_id", required=True)
++    parser.add_argument("--client_name", "-c", type=str, help="client name", required=True)
++    # parser.add_argument("--listen_port", "-p", type=str, help="listen port", required=True)
++    parser.add_argument("--sp_target", "-g", type=str, help="Sp target", required=True)
++    parser.add_argument("--parent_url", "-p", type=str, help="parent_url", required=True)
++    parser.add_argument(
++        "--fed_client", "-s", type=str, help="an aggregation server specification json file", required=True
++    )
++    parser.add_argument("--set", metavar="KEY=VALUE", nargs="*")
++    parser.add_argument("--local_rank", type=int, default=0)
++    args = parser.parse_args()
++    return args
++
++
+ def _create_sp(args):
+     sp = SP()
+     target = args.sp_target.split(":")
+@@ -190,5 +190,7 @@ def remove_restart_file(workspace: Workspace):
+     """
+ 
+     # main()
+-    rc = mpm.run(main_func=main)
++    args = parse_arguments()
++    run_dir = os.path.join(args.workspace, args.job_id)
++    rc = mpm.run(main_func=main, run_dir=run_dir, args=args)
+     sys.exit(rc)
+diff --git a/nvflare/private/fed/app/server/runner_process.py b/nvflare/private/fed/app/server/runner_process.py
+index 2762748a80..e8dc0b0cc1 100644
+--- a/nvflare/private/fed/app/server/runner_process.py
++++ b/nvflare/private/fed/app/server/runner_process.py
+@@ -41,25 +41,7 @@
+ from nvflare.security.logging import secure_format_exception, secure_log_traceback
+ 
+ 
+-def main():
+-    """FL Server program starting point."""
+-    parser = argparse.ArgumentParser()
+-    parser.add_argument("--workspace", "-m", type=str, help="WORKSPACE folder", required=True)
+-    parser.add_argument(
+-        "--fed_server", "-s", type=str, help="an aggregation server specification json file", required=True
+-    )
+-    parser.add_argument("--app_root", "-r", type=str, help="App Root", required=True)
+-    parser.add_argument("--job_id", "-n", type=str, help="job id", required=True)
+-    parser.add_argument("--root_url", "-u", type=str, help="root_url", required=True)
+-    parser.add_argument("--host", "-host", type=str, help="server host", required=True)
+-    parser.add_argument("--port", "-port", type=str, help="service port", required=True)
+-    parser.add_argument("--ssid", "-id", type=str, help="SSID", required=True)
+-    parser.add_argument("--parent_url", "-p", type=str, help="parent_url", required=True)
+-    parser.add_argument("--ha_mode", "-ha_mode", type=str, help="HA mode", required=True)
+-
+-    parser.add_argument("--set", metavar="KEY=VALUE", nargs="*")
+-
+-    args = parser.parse_args()
++def main(args):
+     kv_list = parse_vars(args.set)
+ 
+     config_folder = kv_list.get("config_folder", "")
+@@ -153,10 +135,32 @@ def main():
+         raise e
+ 
+ 
++def parse_arguments():
++    """FL Server program starting point."""
++    parser = argparse.ArgumentParser()
++    parser.add_argument("--workspace", "-m", type=str, help="WORKSPACE folder", required=True)
++    parser.add_argument(
++        "--fed_server", "-s", type=str, help="an aggregation server specification json file", required=True
++    )
++    parser.add_argument("--app_root", "-r", type=str, help="App Root", required=True)
++    parser.add_argument("--job_id", "-n", type=str, help="job id", required=True)
++    parser.add_argument("--root_url", "-u", type=str, help="root_url", required=True)
++    parser.add_argument("--host", "-host", type=str, help="server host", required=True)
++    parser.add_argument("--port", "-port", type=str, help="service port", required=True)
++    parser.add_argument("--ssid", "-id", type=str, help="SSID", required=True)
++    parser.add_argument("--parent_url", "-p", type=str, help="parent_url", required=True)
++    parser.add_argument("--ha_mode", "-ha_mode", type=str, help="HA mode", required=True)
++    parser.add_argument("--set", metavar="KEY=VALUE", nargs="*")
++    args = parser.parse_args()
++    return args
++
++
+ if __name__ == "__main__":
+     """
+     This is the program when starting the child process for running the NVIDIA FLARE server runner.
+     """
+     # main()
+-    rc = mpm.run(main_func=main)
++    args = parse_arguments()
++    run_dir = os.path.join(args.workspace, args.job_id)
++    rc = mpm.run(main_func=main, run_dir=run_dir, args=args)
+     sys.exit(rc)
+diff --git a/nvflare/private/fed/app/server/server_train.py b/nvflare/private/fed/app/server/server_train.py
+index a7a3b18ca7..45c3529d6a 100644
+--- a/nvflare/private/fed/app/server/server_train.py
++++ b/nvflare/private/fed/app/server/server_train.py
+@@ -27,27 +27,14 @@
+ from nvflare.fuel.utils.argument_utils import parse_vars
+ from nvflare.private.defs import AppFolderConstants
+ from nvflare.private.fed.app.fl_conf import FLServerStarterConfiger, create_privacy_manager
+-from nvflare.private.fed.app.utils import create_admin_server
++from nvflare.private.fed.app.utils import create_admin_server, version_check
+ from nvflare.private.fed.server.server_status import ServerStatus
+ from nvflare.private.fed.utils.fed_utils import add_logfile_handler, fobs_initialize, security_init
+ from nvflare.private.privacy_manager import PrivacyService
+ from nvflare.security.logging import secure_format_exception
+ 
+ 
+-def main():
+-    if sys.version_info >= (3, 11):
+-        raise RuntimeError("Python versions 3.11 and above are not yet supported. Please use Python 3.8, 3.9 or 3.10.")
+-    if sys.version_info < (3, 8):
+-        raise RuntimeError("Python versions 3.7 and below are not supported. Please use Python 3.8, 3.9 or 3.10")
+-
+-    parser = argparse.ArgumentParser()
+-    parser.add_argument("--workspace", "-m", type=str, help="WORKSPACE folder", required=True)
+-    parser.add_argument(
+-        "--fed_server", "-s", type=str, help="an aggregation server specification json file", required=True
+-    )
+-    parser.add_argument("--set", metavar="KEY=VALUE", nargs="*")
+-
+-    args = parser.parse_args()
++def main(args):
+     kv_list = parse_vars(args.set)
+ 
+     config_folder = kv_list.get("config_folder", "")
+@@ -153,10 +140,23 @@ def main():
+         raise e
+ 
+ 
++def parse_arguments():
++    parser = argparse.ArgumentParser()
++    parser.add_argument("--workspace", "-m", type=str, help="WORKSPACE folder", required=True)
++    parser.add_argument(
++        "--fed_server", "-s", type=str, help="an aggregation server specification json file", required=True
++    )
++    parser.add_argument("--set", metavar="KEY=VALUE", nargs="*")
++    args = parser.parse_args()
++    return args
++
++
+ if __name__ == "__main__":
+     """
+     This is the main program when starting the NVIDIA FLARE server process.
+     """
+ 
+-    rc = mpm.run(main_func=main)
++    version_check()
++    args = parse_arguments()
++    rc = mpm.run(main_func=main, run_dir=args.workspace, args=args)
+     sys.exit(rc)
+diff --git a/nvflare/private/fed/app/simulator/simulator.py b/nvflare/private/fed/app/simulator/simulator.py
+index 7f35edeb86..246cb61b68 100644
+--- a/nvflare/private/fed/app/simulator/simulator.py
++++ b/nvflare/private/fed/app/simulator/simulator.py
+@@ -19,6 +19,7 @@
+ from sys import platform
+ 
+ from nvflare.private.fed.app.simulator.simulator_runner import SimulatorRunner
++from nvflare.private.fed.app.utils import version_check
+ 
+ 
+ def define_simulator_parser(simulator_parser):
+@@ -59,8 +60,7 @@ def run_simulator(simulator_args):
+ 
+         multiprocessing.set_start_method("spawn")
+ 
+-    if sys.version_info < (3, 8):
+-        raise RuntimeError("Please use Python 3.8 or above.")
++    version_check()
+ 
+     parser = argparse.ArgumentParser()
+     define_simulator_parser(parser)
+diff --git a/nvflare/private/fed/app/simulator/simulator_runner.py b/nvflare/private/fed/app/simulator/simulator_runner.py
+index 9a63026d13..d508919f53 100644
+--- a/nvflare/private/fed/app/simulator/simulator_runner.py
++++ b/nvflare/private/fed/app/simulator/simulator_runner.py
+@@ -32,6 +32,7 @@
+ from nvflare.apis.job_def import ALL_SITES, JobMetaKey
+ from nvflare.apis.utils.job_utils import convert_legacy_zipped_app_to_job
+ from nvflare.apis.workspace import Workspace
++from nvflare.fuel.common.exit_codes import ProcessExitCode
+ from nvflare.fuel.common.multi_process_executor_constants import CommunicationMetaData
+ from nvflare.fuel.f3.mpm import MainProcessMonitor as mpm
+ from nvflare.fuel.f3.stats_pool import StatsPoolManager
+@@ -348,7 +349,13 @@ def run(self):
+ 
+     def run_processs(self, return_dict):
+         # run_status = self.simulator_run_main()
+-        run_status = mpm.run(main_func=self.simulator_run_main, shutdown_grace_time=3, cleanup_grace_time=6)
++        try:
++            run_status = mpm.run(
++                main_func=self.simulator_run_main, run_dir=self.workspace, shutdown_grace_time=3, cleanup_grace_time=6
++            )
++        except Exception as e:
++            self.logger.error(f"Simulator main run with exception: {secure_format_exception(e)}")
++            run_status = ProcessExitCode.EXCEPTION
+ 
+         return_dict["run_status"] = run_status
+ 
+diff --git a/nvflare/private/fed/app/simulator/simulator_worker.py b/nvflare/private/fed/app/simulator/simulator_worker.py
+index 4c88f21d2e..ddcd10e523 100644
+--- a/nvflare/private/fed/app/simulator/simulator_worker.py
++++ b/nvflare/private/fed/app/simulator/simulator_worker.py
+@@ -211,18 +211,7 @@ def _create_connection(listen_port):
+     return conn
+ 
+ 
+-def main():
+-    parser = argparse.ArgumentParser()
+-    parser.add_argument("--workspace", "-o", type=str, help="WORKSPACE folder", required=True)
+-    parser.add_argument("--client", type=str, help="Client name", required=True)
+-    parser.add_argument("--token", type=str, help="Client token", required=True)
+-    parser.add_argument("--port", type=str, help="Listen port", required=True)
+-    parser.add_argument("--gpu", "-g", type=str, help="gpu index number")
+-    parser.add_argument("--parent_pid", type=int, help="parent process pid", required=True)
+-    parser.add_argument("--simulator_root", "-root", type=str, help="Simulator root folder")
+-    parser.add_argument("--root_url", "-r", type=str, help="cellnet root_url")
+-    parser.add_argument("--parent_url", "-p", type=str, help="cellnet parent_url")
+-    args = parser.parse_args()
++def main(args):
+ 
+     # start parent process checking thread
+     parent_pid = args.parent_pid
+@@ -259,12 +248,28 @@ def main():
+         AuditService.close()
+ 
+ 
++def parse_arguments():
++    parser = argparse.ArgumentParser()
++    parser.add_argument("--workspace", "-o", type=str, help="WORKSPACE folder", required=True)
++    parser.add_argument("--client", type=str, help="Client name", required=True)
++    parser.add_argument("--token", type=str, help="Client token", required=True)
++    parser.add_argument("--port", type=str, help="Listen port", required=True)
++    parser.add_argument("--gpu", "-g", type=str, help="gpu index number")
++    parser.add_argument("--parent_pid", type=int, help="parent process pid", required=True)
++    parser.add_argument("--simulator_root", "-root", type=str, help="Simulator root folder")
++    parser.add_argument("--root_url", "-r", type=str, help="cellnet root_url")
++    parser.add_argument("--parent_url", "-p", type=str, help="cellnet parent_url")
++    args = parser.parse_args()
++    return args
++
++
+ if __name__ == "__main__":
+     """
+     This is the main program of simulator worker process when running the NVFlare Simulator..
+     """
+ 
+     # main()
+-    mpm.run(main_func=main)
++    args = parse_arguments()
++    mpm.run(main_func=main, run_dir=args.workspace, args=args)
+     time.sleep(2)
+     # os._exit(0)
+diff --git a/nvflare/private/fed/app/utils.py b/nvflare/private/fed/app/utils.py
+index 1fcf978b33..8552ec4945 100644
+--- a/nvflare/private/fed/app/utils.py
++++ b/nvflare/private/fed/app/utils.py
+@@ -14,6 +14,7 @@
+ 
+ import os
+ import signal
++import sys
+ import threading
+ import time
+ 
+@@ -90,3 +91,10 @@ def create_admin_server(fl_server: FederatedServer, server_conf=None, args=None,
+         download_job_url=server_conf.get("download_job_url", "http://"),
+     )
+     return admin_server
++
++
++def version_check():
++    if sys.version_info >= (3, 11):
++        raise RuntimeError("Python versions 3.11 and above are not yet supported. Please use Python 3.8, 3.9 or 3.10.")
++    if sys.version_info < (3, 8):
++        raise RuntimeError("Python versions 3.7 and below are not supported. Please use Python 3.8, 3.9 or 3.10")
+diff --git a/nvflare/private/fed/client/client_executor.py b/nvflare/private/fed/client/client_executor.py
+index c4b4f364ae..3727fb3875 100644
+--- a/nvflare/private/fed/client/client_executor.py
++++ b/nvflare/private/fed/client/client_executor.py
+@@ -27,6 +27,7 @@
+ from nvflare.fuel.f3.cellnet.core_cell import FQCN
+ from nvflare.fuel.f3.cellnet.defs import MessageHeaderKey, ReturnCode
+ from nvflare.private.defs import CellChannel, CellChannelTopic, JobFailureMsgKey, new_cell_message
++from nvflare.private.fed.utils.fed_utils import get_return_code
+ from nvflare.security.logging import secure_format_exception, secure_log_traceback
+ 
+ from .client_status import ClientStatus, get_status_message
+@@ -204,7 +205,7 @@ def start_app(
+ 
+         thread = threading.Thread(
+             target=self._wait_child_process_finish,
+-            args=(client, job_id, allocated_resource, token, resource_manager),
++            args=(client, job_id, allocated_resource, token, resource_manager, args.workspace),
+         )
+         thread.start()
+ 
+@@ -423,13 +424,15 @@ def abort_task(self, job_id):
+                 )
+                 self.logger.debug("abort_task sent")
+ 
+-    def _wait_child_process_finish(self, client, job_id, allocated_resource, token, resource_manager):
++    def _wait_child_process_finish(self, client, job_id, allocated_resource, token, resource_manager, workspace):
+         self.logger.info(f"run ({job_id}): waiting for child worker process to finish.")
+         with self.lock:
+             child_process = self.run_processes.get(job_id, {}).get(RunProcessKey.CHILD_PROCESS)
+         if child_process:
+             child_process.wait()
+-            return_code = child_process.returncode
++
++            return_code = get_return_code(child_process, job_id, workspace)
++
+             self.logger.info(f"run ({job_id}): child worker process finished with RC {return_code}")
+             if return_code in [ProcessExitCode.UNSAFE_COMPONENT, ProcessExitCode.CONFIG_ERROR]:
+                 request = new_cell_message(
+diff --git a/nvflare/private/fed/server/server_engine.py b/nvflare/private/fed/server/server_engine.py
+index 5a33cb6f29..d9466ad8f4 100644
+--- a/nvflare/private/fed/server/server_engine.py
++++ b/nvflare/private/fed/server/server_engine.py
+@@ -56,7 +56,7 @@
+ from nvflare.private.defs import CellChannel, CellMessageHeaderKeys, RequestHeader, TrainingTopic, new_cell_message
+ from nvflare.private.fed.server.server_json_config import ServerJsonConfigurator
+ from nvflare.private.fed.server.server_state import ServerState
+-from nvflare.private.fed.utils.fed_utils import security_close, set_message_security_data
++from nvflare.private.fed.utils.fed_utils import get_return_code, security_close, set_message_security_data
+ from nvflare.private.scheduler_constants import ShareableHeader
+ from nvflare.security.logging import secure_format_exception
+ from nvflare.widgets.info_collector import InfoCollector
+@@ -195,7 +195,7 @@ def remove_exception_process(self, job_id):
+             if job_id in self.exception_run_processes:
+                 self.exception_run_processes.pop(job_id)
+ 
+-    def wait_for_complete(self, job_id, process):
++    def wait_for_complete(self, workspace, job_id, process):
+         process.wait()
+         run_process_info = self.run_processes.get(job_id)
+         if run_process_info:
+@@ -211,7 +211,7 @@ def wait_for_complete(self, job_id, process):
+                     break
+                 time.sleep(0.1)
+             with self.lock:
+-                return_code = process.poll()
++                return_code = get_return_code(process, job_id, workspace)
+                 # if process exit but with Execution exception
+                 if return_code and return_code != 0:
+                     self.logger.info(f"Job: {job_id} child process exit with return code {return_code}")
+@@ -290,7 +290,7 @@ def _start_runner_process(
+                 RunProcessKey.PARTICIPANTS: job_clients,
+             }
+ 
+-        threading.Thread(target=self.wait_for_complete, args=[run_number, process]).start()
++        threading.Thread(target=self.wait_for_complete, args=[args.workspace, run_number, process]).start()
+         return process
+ 
+     def get_job_clients(self, client_sites):
+diff --git a/nvflare/private/fed/utils/fed_utils.py b/nvflare/private/fed/utils/fed_utils.py
+index ba39d26e23..19a28b7f98 100644
+--- a/nvflare/private/fed/utils/fed_utils.py
++++ b/nvflare/private/fed/utils/fed_utils.py
+@@ -24,7 +24,7 @@
+ from nvflare.apis.client import Client
+ from nvflare.apis.event_type import EventType
+ from nvflare.apis.fl_component import FLContext
+-from nvflare.apis.fl_constant import FLContextKey, SiteType, WorkspaceConstants
++from nvflare.apis.fl_constant import FLContextKey, FLMetaKey, SiteType, WorkspaceConstants
+ from nvflare.apis.fl_exception import UnsafeComponentError
+ from nvflare.apis.job_def import JobMetaKey
+ from nvflare.apis.utils.decomposers import flare_decomposers
+@@ -315,3 +315,18 @@ def get_target_names(targets):
+         if name not in target_names:
+             target_names.append(t)
+     return target_names
++
++
++def get_return_code(process, job_id, workspace):
++    run_dir = os.path.join(workspace, job_id)
++    rc_file = os.path.join(run_dir, FLMetaKey.PROCESS_RC_FILE)
++    try:
++        if os.path.exists(rc_file):
++            with open(rc_file, "r") as f:
++                return_code = int(f.readline())
++            os.remove(rc_file)
++        else:
++            return_code = process.poll()
++        return return_code
++    except Exception:
++        raise RuntimeError(f"Could not get the return_code of the {job_id} execution, process_id:{process.pid}")

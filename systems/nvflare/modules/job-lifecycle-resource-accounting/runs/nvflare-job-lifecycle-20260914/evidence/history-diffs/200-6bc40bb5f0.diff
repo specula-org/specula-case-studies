@@ -1,0 +1,99 @@
+commit 6bc40bb5f08e2e91749f615f17fa4c80d4103a21
+Author:     Yuan-Ting Hsieh (謝沅廷) <yuantinghsieh@gmail.com>
+AuthorDate: Thu May 19 12:59:53 2022 -0700
+Commit:     GitHub <noreply@github.com>
+CommitDate: Thu May 19 12:59:53 2022 -0700
+
+    Add execution exception status to a job (#558)
+    
+    * Add execution exception status to a job to indicate the job starts to run but failed when running
+    
+    * Address comments
+---
+ nvflare/private/fed/server/job_runner.py    |  5 ++++-
+ nvflare/private/fed/server/server_engine.py | 14 +++++++++-----
+ 2 files changed, 13 insertions(+), 6 deletions(-)
+
+diff --git a/nvflare/private/fed/server/job_runner.py b/nvflare/private/fed/server/job_runner.py
+index b6961d8b..24474a13 100644
+--- a/nvflare/private/fed/server/job_runner.py
++++ b/nvflare/private/fed/server/job_runner.py
+@@ -215,7 +215,10 @@ class JobRunner(FLComponent):
+                     with self.lock:
+                         job = self.running_jobs.get(run_number)
+                         if job:
+-                            job_manager.set_status(job.job_id, RunStatus.FINISHED_COMPLETED, fl_ctx)
++                            if run_number in engine.execution_exception_run_number:
++                                job_manager.set_status(job.job_id, RunStatus.FINISHED_EXECUTION_EXCEPTION, fl_ctx)
++                            else:
++                                job_manager.set_status(job.job_id, RunStatus.FINISHED_COMPLETED, fl_ctx)
+                             del self.running_jobs[run_number]
+                             fl_ctx.set_prop(FLContextKey.CURRENT_JOB_ID, job.job_id)
+                             self.fire_event(EventType.JOB_COMPLETED, fl_ctx)
+diff --git a/nvflare/private/fed/server/server_engine.py b/nvflare/private/fed/server/server_engine.py
+index 22e19e9c..07a7ba6f 100644
+--- a/nvflare/private/fed/server/server_engine.py
++++ b/nvflare/private/fed/server/server_engine.py
+@@ -94,6 +94,7 @@ class ServerEngine(ServerEngineInternalSpec):
+         self.server = server
+         self.args = args
+         self.run_processes = {}
++        self.execution_exception_run_number = []
+         self.run_manager = None
+         self.conf = None
+         # TODO:: does this class need client manager?
+@@ -254,7 +255,11 @@ class ServerEngine(ServerEngineInternalSpec):
+                 time.sleep(1.0)
+             except BaseException:
+                 with self.lock:
+-                    self.run_processes.pop(run_number)
++                    run_process_info = self.run_processes.pop(run_number)
++                    return_code = run_process_info[RunProcessKey.CHILD_PROCESS].poll()
++                    # if process exit but with Execution exception
++                    if return_code and return_code != 0:
++                        self.execution_exception_run_number.append(run_number)
+                 self.engine_info.status = MachineStatus.STOPPED
+                 break
+ 
+@@ -294,8 +299,6 @@ class ServerEngine(ServerEngineInternalSpec):
+ 
+         process = subprocess.Popen(shlex.split(command, True), preexec_fn=os.setsid, env=new_env)
+ 
+-        threading.Thread(target=self.wait_for_complete, args=[run_number]).start()
+-
+         if not job_id:
+             job_id = ""
+         if not job_clients:
+@@ -309,6 +312,8 @@ class ServerEngine(ServerEngineInternalSpec):
+                 RunProcessKey.JOB_ID: job_id,
+                 RunProcessKey.PARTICIPANTS: job_clients,
+             }
++
++        threading.Thread(target=self.wait_for_complete, args=[run_number]).start()
+         return process
+ 
+     def get_job_clients(self, client_sites):
+@@ -409,7 +414,6 @@ class ServerEngine(ServerEngineInternalSpec):
+     def _get_all_clients_from_inputs(self, inputs):
+         clients = []
+         invalid_inputs = []
+-        all_clients = self.get_clients()
+         for item in inputs:
+             client = self.client_manager.clients.get(item)
+             # if item in self.get_all_clients():
+@@ -589,6 +593,7 @@ class ServerEngine(ServerEngineInternalSpec):
+         return results
+ 
+     def get_command_conn(self, run_number):
++        # this function need to be called with self.lock
+         port = self.run_processes.get(run_number, {}).get(RunProcessKey.LISTEN_PORT)
+         command_conn = self.run_processes.get(run_number, {}).get(RunProcessKey.CONNECTION, None)
+ 
+@@ -597,7 +602,6 @@ class ServerEngine(ServerEngineInternalSpec):
+                 address = ("localhost", port)
+                 command_conn = CommandClient(address, authkey="client process secret password".encode())
+                 command_conn = ClientConnection(command_conn)
+-
+                 self.run_processes[run_number][RunProcessKey.CONNECTION] = command_conn
+             except Exception:
+                 pass

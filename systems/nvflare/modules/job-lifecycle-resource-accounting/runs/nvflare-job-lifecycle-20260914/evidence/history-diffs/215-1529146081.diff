@@ -1,0 +1,164 @@
+commit 1529146081235467ed0f7de421c8b92e3ba98658
+Author:     Yuhong Wen <yh_wen@hotmail.com>
+AuthorDate: Mon May 2 15:38:25 2022 -0400
+Commit:     GitHub <noreply@github.com>
+CommitDate: Mon May 2 15:38:25 2022 -0400
+
+    Changed the job scheduler to use event. (#468)
+    
+    * Changed the job scheduler to use event.
+    
+    * updated.
+    
+    * when no job manager defined, give error message.
+---
+ nvflare/app_common/job_schedulers/job_scheduler.py | 21 ++++++++++++------
+ nvflare/private/fed/server/job_runner.py           | 15 +++++++------
+ nvflare/private/fed/server/server_engine.py        | 25 ++++++++++++----------
+ 3 files changed, 37 insertions(+), 24 deletions(-)
+
+diff --git a/nvflare/app_common/job_schedulers/job_scheduler.py b/nvflare/app_common/job_schedulers/job_scheduler.py
+index 543fa817..48c03cc2 100644
+--- a/nvflare/app_common/job_schedulers/job_scheduler.py
++++ b/nvflare/app_common/job_schedulers/job_scheduler.py
+@@ -15,7 +15,9 @@
+ import threading
+ from typing import Dict, List, Optional, Tuple
+ 
++from nvflare.apis.event_type import EventType
+ from nvflare.apis.fl_component import FLComponent
++from nvflare.apis.fl_constant import FLContextKey
+ from nvflare.apis.fl_context import FLContext
+ from nvflare.apis.job_def import Job
+ from nvflare.apis.job_scheduler_spec import DispatchInfo, JobSchedulerSpec
+@@ -116,6 +118,18 @@ class DefaultJobScheduler(JobSchedulerSpec, FLComponent):
+         self.scheduled_jobs = []
+         self.lock = threading.Lock()
+ 
++    def handle_event(self, event_type: str, fl_ctx: FLContext):
++        if event_type == EventType.JOB_STARTED:
++            with self.lock:
++                job_id = fl_ctx.get_prop(FLContextKey.CURRENT_JOB_ID)
++                if job_id not in self.scheduled_jobs:
++                    self.scheduled_jobs.append(job_id)
++        elif event_type == EventType.JOB_COMPLETED or event_type == EventType.JOB_ABORTED:
++            with self.lock:
++                job_id = fl_ctx.get_prop(FLContextKey.CURRENT_JOB_ID)
++                if job_id in self.scheduled_jobs:
++                    self.scheduled_jobs.remove(job_id)
++
+     def schedule_job(
+         self, job_candidates: List[Job], fl_ctx: FLContext
+     ) -> (Optional[Job], Optional[Dict[str, DispatchInfo]]):
+@@ -125,12 +139,5 @@ class DefaultJobScheduler(JobSchedulerSpec, FLComponent):
+         for job in job_candidates:
+             ok, sites_dispatch_info = _try_job(job, fl_ctx)
+             if ok:
+-                with self.lock:
+-                    self.scheduled_jobs.append(job)
+                 return job, sites_dispatch_info
+         return None, None
+-
+-    def remove_job(self, job: Job):
+-        with self.lock:
+-            if job in self.scheduled_jobs:
+-                self.scheduled_jobs.remove(job)
+diff --git a/nvflare/private/fed/server/job_runner.py b/nvflare/private/fed/server/job_runner.py
+index bcb14c62..6913469e 100644
+--- a/nvflare/private/fed/server/job_runner.py
++++ b/nvflare/private/fed/server/job_runner.py
+@@ -18,7 +18,7 @@ import time
+ 
+ from nvflare.apis.event_type import EventType
+ from nvflare.apis.fl_component import FLComponent
+-from nvflare.apis.fl_constant import RunProcessKey, SystemComponents, WorkspaceConstants
++from nvflare.apis.fl_constant import FLContextKey, RunProcessKey, SystemComponents, WorkspaceConstants
+ from nvflare.apis.fl_context import FLContext
+ from nvflare.apis.job_def import Job, RunStatus
+ from nvflare.private.admin_defs import Message
+@@ -168,7 +168,7 @@ class JobRunner(FLComponent):
+                         if job:
+                             job_manager.set_status(job.job_id, RunStatus.FINISHED_COMPLETED, fl_ctx)
+                             del self.running_jobs[run_number]
+-                            self.scheduler.remove_job(job)
++                            fl_ctx.set_prop(FLContextKey.CURRENT_JOB_ID, job.job_id)
+                             self.fire_event(EventType.JOB_COMPLETED, fl_ctx)
+                             self.log_debug(fl_ctx, f"Finished running job:{job.job_id}")
+             time.sleep(1.0)
+@@ -179,8 +179,8 @@ class JobRunner(FLComponent):
+         threading.Thread(target=self._job_complete_process, args=[fl_ctx]).start()
+ 
+         job_manager = engine.get_component(SystemComponents.JOB_MANAGER)
+-        while not self.ask_to_stop:
+-            if job_manager:
++        if job_manager:
++            while not self.ask_to_stop:
+                 # approved_jobs = job_manager.get_jobs_by_status(RunStatus.APPROVED, fl_ctx)
+                 approved_jobs = job_manager.get_jobs_by_status(RunStatus.SUBMITTED, fl_ctx)
+                 if self.scheduler:
+@@ -189,6 +189,7 @@ class JobRunner(FLComponent):
+                     if ready_job:
+                         try:
+                             self.log_info(fl_ctx, f"Got the job:{ready_job.job_id} from the scheduler to run")
++                            fl_ctx.set_prop(FLContextKey.CURRENT_JOB_ID, ready_job.job_id)
+                             run_number = self._deploy_job(ready_job, sites, fl_ctx)
+                             job_manager.set_status(ready_job.job_id, RunStatus.DISPATCHED, fl_ctx)
+                             self._start_run(run_number, ready_job, sites, fl_ctx)
+@@ -198,7 +199,9 @@ class JobRunner(FLComponent):
+                         except Exception as e:
+                             self.log_error(fl_ctx, f"Failed to run the Job ({ready_job.job_id}): {e}")
+ 
+-            time.sleep(1.0)
++                time.sleep(1.0)
++        else:
++            self.log_error(fl_ctx, "There's no Job Manager defined. Won't be able to run the jobs.")
+ 
+     def restore_running_job(self, run_number: str, job_id: str, job_clients, snapshot, fl_ctx: FLContext):
+         engine = fl_ctx.get_engine()
+@@ -220,9 +223,9 @@ class JobRunner(FLComponent):
+             job = self.running_jobs.get(run_number)
+             if job:
+                 self.log_info(fl_ctx, f"Stop the job run:{run_number}")
++                fl_ctx.set_prop(FLContextKey.CURRENT_JOB_ID, job.job_id)
+                 job_manager.set_status(job.job_id, RunStatus.FINISHED_ABORTED, fl_ctx)
+                 del self.running_jobs[run_number]
+-                self.scheduler.remove_job(job)
+                 self.fire_event(EventType.JOB_ABORTED, fl_ctx)
+ 
+     def stop_all_runs(self, fl_ctx: FLContext):
+diff --git a/nvflare/private/fed/server/server_engine.py b/nvflare/private/fed/server/server_engine.py
+index 977af90d..466c95ec 100644
+--- a/nvflare/private/fed/server/server_engine.py
++++ b/nvflare/private/fed/server/server_engine.py
+@@ -525,17 +525,20 @@ class ServerEngine(ServerEngineInternalSpec):
+         self.run_manager.aux_runner.register_aux_message_handler(topic, message_handle_func)
+ 
+     def send_aux_request(self, targets: [], topic: str, request: Shareable, timeout: float, fl_ctx: FLContext) -> dict:
+-        if not targets:
+-            self.sync_clients_from_main_process()
+-            targets = []
+-            for t in self.get_clients():
+-                targets.append(t.name)
+-        if targets:
+-            return self.run_manager.aux_runner.send_aux_request(
+-                targets=targets, topic=topic, request=request, timeout=timeout, fl_ctx=fl_ctx
+-            )
+-        else:
+-            return {}
++        try:
++            if not targets:
++                self.sync_clients_from_main_process()
++                targets = []
++                for t in self.get_clients():
++                    targets.append(t.name)
++            if targets:
++                return self.run_manager.aux_runner.send_aux_request(
++                    targets=targets, topic=topic, request=request, timeout=timeout, fl_ctx=fl_ctx
++                )
++            else:
++                return {}
++        except Exception as e:
++            self.logger.error(f"Failed to send the aux_message: {topic} with exception: {e}.")
+ 
+     def sync_clients_from_main_process(self):
+         with self.parent_conn_lock:

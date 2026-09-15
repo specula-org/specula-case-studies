@@ -1,0 +1,185 @@
+commit 387e04a4d2ea4b2965272409529f4debedd332de
+Author:     Yan Cheng <58191769+yanchengnv@users.noreply.github.com>
+AuthorDate: Mon May 22 18:32:24 2023 -0400
+Commit:     GitHub <noreply@github.com>
+CommitDate: Mon May 22 18:32:24 2023 -0400
+
+    FL Hub (#1739)
+    
+    * add hub functions to dev
+    
+    * fix a few issues
+    
+    * add license text
+    
+    * fix license text
+    
+    * polish and adjust
+    
+    * added validation
+    
+    * polish
+    
+    * added docstr for pipe monitor
+    
+    * fix imports
+    
+    * make operators optional in config_fed_server.json
+    
+    * improve file pipe closing handling
+    
+    * changed based on pr comments
+    
+    * changed template file names
+    
+    * changed order of job signature validation
+    
+    * changed to use log_warning for missing contribution round
+    
+    * address pr comments
+    
+    * re-org some code to make it more readable
+    
+    * support x-site val in hub
+    
+    revert some changes
+    
+    address comments
+    
+    fix license header
+    
+    formatting
+    
+    * address private import violation
+    
+    ---------
+    
+    Co-authored-by: Holger Roth <hroth@nvidia.com>
+---
+ nvflare/private/fed/client/client_engine.py | 28 ++++++++++++++++++++++------
+ nvflare/private/fed/server/job_runner.py    | 24 ++++++++++++++++--------
+ 2 files changed, 38 insertions(+), 14 deletions(-)
+
+diff --git a/nvflare/private/fed/client/client_engine.py b/nvflare/private/fed/client/client_engine.py
+index f2b7fd24..d82525eb 100644
+--- a/nvflare/private/fed/client/client_engine.py
++++ b/nvflare/private/fed/client/client_engine.py
+@@ -21,12 +21,13 @@ import threading
+ 
+ from nvflare.apis.event_type import EventType
+ from nvflare.apis.fl_component import FLComponent
+-from nvflare.apis.fl_constant import MachineStatus, WorkspaceConstants
++from nvflare.apis.fl_constant import MachineStatus, SystemComponents, WorkspaceConstants
+ from nvflare.apis.fl_context import FLContext, FLContextManager
+ from nvflare.apis.workspace import Workspace
+ from nvflare.fuel.utils.network_utils import get_open_ports
+ from nvflare.private.defs import ERROR_MSG_PREFIX, ClientStatusKey, EngineConstant
+ from nvflare.private.event import fire_event
++from nvflare.private.fed.server.job_meta_validator import JobMetaValidator
+ from nvflare.private.fed.utils.app_deployer import AppDeployer
+ from nvflare.private.fed.utils.fed_utils import security_close
+ from nvflare.security.logging import secure_format_exception, secure_log_traceback
+@@ -66,7 +67,14 @@ class ClientEngine(ClientEngineInternalSpec):
+         self.admin_agent = None
+ 
+         self.fl_ctx_mgr = FLContextManager(
+-            engine=self, identity_name=client_name, job_id="", public_stickers={}, private_stickers={}
++            engine=self,
++            identity_name=client_name,
++            job_id="",
++            public_stickers={},
++            private_stickers={
++                SystemComponents.DEFAULT_APP_DEPLOYER: AppDeployer(),
++                SystemComponents.JOB_META_VALIDATOR: JobMetaValidator(),
++            },
+         )
+ 
+         self.status = MachineStatus.STOPPED
+@@ -222,12 +230,20 @@ class ClientEngine(ClientEngineInternalSpec):
+         return "Restart the client..."
+ 
+     def deploy_app(self, app_name: str, job_id: str, job_meta: dict, client_name: str, app_data) -> str:
+-
+         workspace = Workspace(root_dir=self.args.workspace, site_name=client_name)
+-        app_deployer = AppDeployer(
+-            workspace=workspace, job_id=job_id, job_meta=job_meta, app_name=app_name, app_data=app_data
++        app_deployer = self.get_component(SystemComponents.APP_DEPLOYER)
++        if not app_deployer:
++            # use default deployer
++            app_deployer = AppDeployer()
++
++        err = app_deployer.deploy(
++            workspace=workspace,
++            job_id=job_id,
++            job_meta=job_meta,
++            app_name=app_name,
++            app_data=app_data,
++            fl_ctx=self.new_context(),
+         )
+-        err = app_deployer.deploy()
+         if err:
+             return f"{ERROR_MSG_PREFIX}: {err}"
+ 
+diff --git a/nvflare/private/fed/server/job_runner.py b/nvflare/private/fed/server/job_runner.py
+index 5217a739..b3b78d23 100644
+--- a/nvflare/private/fed/server/job_runner.py
++++ b/nvflare/private/fed/server/job_runner.py
+@@ -90,7 +90,8 @@ class JobRunner(FLComponent):
+         elif event_type == EventType.SYSTEM_END:
+             self.stop()
+ 
+-    def _make_deploy_message(self, job: Job, app_data, app_name):
++    @staticmethod
++    def _make_deploy_message(job: Job, app_data, app_name):
+         message = Message(topic=TrainingTopic.DEPLOY, body=app_data)
+         message.set_header(RequestHeader.REQUIRE_AUTHZ, "true")
+ 
+@@ -143,18 +144,23 @@ class JobRunner(FLComponent):
+             client_sites = []
+             for p in participants:
+                 if p == "server":
+-                    app_deployer = AppDeployer(
+-                        app_name=app_name, workspace=workspace, job_id=job.job_id, job_meta=job.meta, app_data=app_data
++                    app_deployer = AppDeployer()
++                    err = app_deployer.deploy(
++                        app_name=app_name,
++                        workspace=workspace,
++                        job_id=job.job_id,
++                        job_meta=job.meta,
++                        app_data=app_data,
++                        fl_ctx=fl_ctx,
+                     )
+-
+-                    err = app_deployer.deploy()
+                     if err:
+                         deploy_detail.append(f"server: {err}")
+                         raise RuntimeError(f"Failed to deploy app '{app_name}': {err}")
+ 
+                     kv_list = parse_vars(engine.args.set)
+                     secure_train = kv_list.get("secure_train", True)
+-                    if secure_train:
++                    from_hub_site = job.meta.get(JobMetaKey.FROM_HUB_SITE.value)
++                    if secure_train and not from_hub_site:
+                         app_path = workspace.get_app_dir(job.job_id)
+                         if not verify_folder_signature(app_path):
+                             err = "job signature verification failed"
+@@ -468,7 +474,8 @@ class JobRunner(FLComponent):
+         else:
+             self.log_error(fl_ctx, "There's no Job Manager defined. Won't be able to run the jobs.")
+ 
+-    def _check_job_status(self, job_manager, job_id, job_run_status, fl_ctx: FLContext):
++    @staticmethod
++    def _check_job_status(job_manager, job_id, job_run_status, fl_ctx: FLContext):
+         reload_job = job_manager.get_job(job_id, fl_ctx)
+         return reload_job.meta.get(JobMetaKey.STATUS) != job_run_status
+ 
+@@ -524,7 +531,8 @@ class JobRunner(FLComponent):
+                     f"Failed to update the job: {job.job_id} to {RunStatus.ABANDONED}: {secure_format_exception(e)}.",
+                 )
+ 
+-    def _get_all_running_jobs(self, job_manager, fl_ctx):
++    @staticmethod
++    def _get_all_running_jobs(job_manager, fl_ctx):
+         all_jobs = []
+         dispatched_jobs = job_manager.get_jobs_by_status(RunStatus.DISPATCHED, fl_ctx)
+         all_jobs.extend(dispatched_jobs)

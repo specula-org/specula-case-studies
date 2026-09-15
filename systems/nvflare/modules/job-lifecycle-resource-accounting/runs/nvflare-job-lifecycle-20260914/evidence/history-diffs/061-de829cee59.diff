@@ -1,0 +1,77 @@
+commit de829cee59bd29787e7f1502daa4d0e87541ae44
+Author:     Yan Cheng <58191769+yanchengnv@users.noreply.github.com>
+AuthorDate: Tue Feb 4 11:25:10 2025 -0500
+Commit:     GitHub <noreply@github.com>
+CommitDate: Wed Feb 5 00:25:10 2025 +0800
+
+    Support relay - Part 1 (#3198)
+    
+    Fixes # .
+    
+    ### Description
+    
+    This PR implements support of using relays in building NVFLARE cellnet.
+    Relays are nodes in the cellnet that are only used for routing messages.
+    They do not have any learning functions.
+    
+    This is the Part 1 of the relay support. It does not include
+    provisioning functions for creating startup kits for relays. These
+    functions will be done in future PRs.
+    
+    Just like regular clients, relays also register to the Server when they
+    are started. Once successfully registered, the Server sends auth token
+    and signature to the relay.
+    
+    Relay nodes also perform message authentication: relays validate auth
+    headers for all messages going thru them. Since all cross-site messages
+    must go thru either the server or relays (or both), by enforcing message
+    authentication at both the Server and relays ensure that no cross-site
+    messages can go through without valid auth headers.
+    
+    Currently peers of a CellPipe can only communicate via the Server. This
+    PR includes an enhancement that allows peers to communicate via CP or
+    Relay nodes. This can make the peer-to-peer communication more
+    efficient.
+    
+    ### Types of changes
+    <!--- Put an `x` in all the boxes that apply, and remove the not
+    applicable items -->
+    - [x] Non-breaking change (fix or new feature that would not break
+    existing functionality).
+    - [ ] Breaking change (fix or new feature that would cause existing
+    functionality to change).
+    - [ ] New tests added to cover the changes.
+    - [ ] Quick tests passed locally by running `./runtest.sh`.
+    - [ ] In-line docstrings updated.
+    - [ ] Documentation updated.
+---
+ nvflare/private/fed/client/client_executor.py | 9 ++++++++-
+ 1 file changed, 8 insertions(+), 1 deletion(-)
+
+diff --git a/nvflare/private/fed/client/client_executor.py b/nvflare/private/fed/client/client_executor.py
+index cbf94777..c1c178d2 100644
+--- a/nvflare/private/fed/client/client_executor.py
++++ b/nvflare/private/fed/client/client_executor.py
+@@ -17,7 +17,7 @@ import time
+ from abc import ABC, abstractmethod
+ 
+ from nvflare.apis.event_type import EventType
+-from nvflare.apis.fl_constant import AdminCommandNames, FLContextKey, RunProcessKey, SystemConfigs
++from nvflare.apis.fl_constant import AdminCommandNames, ConnPropKey, FLContextKey, RunProcessKey, SystemConfigs
+ from nvflare.apis.fl_context import FLContext
+ from nvflare.apis.job_launcher_spec import JobLauncherSpec, JobProcessArgs
+ from nvflare.apis.resource_manager_spec import ResourceManagerSpec
+@@ -201,6 +201,13 @@ class JobExecutor(ClientExecutor):
+             JobProcessArgs.STARTUP_CONFIG_FILE: ("-s", "fed_client.json"),
+             JobProcessArgs.OPTIONS: ("--set", command_options),
+         }
++
++        params = client.cell.get_internal_listener_params()
++        if params:
++            parent_conn_sec = params.get(ConnPropKey.CONNECTION_SECURITY)
++            if parent_conn_sec:
++                job_args[JobProcessArgs.PARENT_CONN_SEC] = ("-pcs", parent_conn_sec)
++
+         fl_ctx.set_prop(key=FLContextKey.JOB_PROCESS_ARGS, value=job_args, private=True, sticky=False)
+         job_handle = job_launcher.launch_job(job_meta, fl_ctx)
+         self.logger.info(f"Launch job_id: {job_id}  with job launcher: {type(job_launcher)} ")

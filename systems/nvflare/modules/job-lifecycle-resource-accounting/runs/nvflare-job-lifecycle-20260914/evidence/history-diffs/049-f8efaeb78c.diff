@@ -1,0 +1,307 @@
+commit f8efaeb78c0dff3a28eb9c82c1d50187459d305a
+Author:     Yuan-Ting Hsieh (謝沅廷) <yuantingh@nvidia.com>
+AuthorDate: Thu Mar 12 11:43:40 2026 -0700
+Commit:     GitHub <noreply@github.com>
+CommitDate: Thu Mar 12 11:43:40 2026 -0700
+
+    Cherry-pick [2.7] Fix hierarchical FL startup failures: deployment timeouts, selective client exclusion, and dead-detection debounce (#4209) (#4288)
+    
+    ## Problem
+    
+    Large-scale hierarchical FL jobs (e.g. BERT NER, 144 clients, 6 relays
+    on Frontier) abort in
+    Round 0 due to a cascading startup failure chain.  The root sequence is:
+    
+    1. F3 streaming HOL stall (PR #4206) delays deployment ACKs from
+    relay-connected clients
+    2. **`_deploy_job()`** treats `reply=None` (timeout) as `"unknown"` —
+    not a failure — so
+       timed-out clients silently appear to have been deployed
+    3. **`_start_run()`** tries to start those clients; they again time out,
+    and
+       `check_client_replies()` ignores the `None` reply
+    4. **`_sync_client_jobs()`** fires dead-job notification on the very
+    first heartbeat with
+       no startup grace period
+    5. FedAvg requires 144/144 — one or two missing clients → abort
+    6. A late-starting CJ crashes with `TypeError: 'NoneType' object is not
+    iterable` when
+    `get_job_clients()` receives `None` metadata from an already-aborted job
+    
+    PRs #4206, #4204, #4174, #4172, #4186, #4211, #4210 (all merged in
+    2.7.2) address the
+    transport layer.  This PR addresses the remaining job lifecycle layer.
+    
+    ---
+    
+    ## Fixes Included
+    
+    ### 1 — `_deploy_job()`: Treat deployment timeout as failure
+    (`job_runner.py`)
+    
+    **Root bug**: `reply=None` was logged as `"unknown"` and excluded from
+    `failed_clients`,
+    so timed-out clients counted as "successfully deployed" for the
+    `min_sites` check.
+    
+    **Fix**: Add timed-out clients to `failed_clients` with a `"deployment
+    timeout"` label.
+    The existing `min_sites` / `required_sites` logic then correctly decides
+    whether to abort.
+    
+    ### 2 — `check_client_replies()`: Return timed-out clients instead of
+    raising (`admin.py`)
+    
+    **Root bug**: In strict mode, any timeout raised immediately, aborting
+    the whole job even
+    when the remaining active clients satisfied `min_sites`.
+    
+    **Fix**: In strict mode, collect timed-out clients into a return list
+    rather than raising.
+    Explicit errors (non-OK return code or error body) still raise. Also
+    fixes the non-strict
+    mode to use name-keyed dict lookup instead of fragile positional
+    `zip()`.
+    
+    New signature: `check_client_replies(...) -> List[str]` (timed-out
+    client names; empty = none).
+    
+    ### 3 — `_start_run()`: Selective exclusion with min_sites re-evaluation
+    (`job_runner.py`)
+    
+    **Root bug**: A start-job timeout under strict mode aborted the entire
+    job with no
+    tolerance for stragglers within `min_sites` bounds.
+    
+    **Fix**: Use the returned timed-out list from `check_client_replies()`.
+    If remaining
+    active clients >= `min_sites`, log a warning and proceed. Only abort
+    when below tolerance.
+    
+    ### 4 — `_sync_client_jobs()`: Require-prior-report default changed to
+    `True` (`fed_server.py`)
+    
+    **Root bug**: `SYNC_CLIENT_JOBS_REQUIRE_PREVIOUS_REPORT` defaulted to
+    `False`, meaning
+    the bug fix was opt-in and the unsafe behaviour remained the default.
+    
+    **Fix**: Default changed to `True`. Operators who want the aggressive
+    legacy detection
+    can set it to `False` explicitly.
+    
+    ### 5 — `_sync_client_jobs()`: Move `_reported_clients` out of
+    `job_info` dict (`fed_server.py`)
+    
+    **Root bug**: Positive-observation tracking was stored as
+    `job_info["_reported_clients"]`,
+    injecting algorithm state into a data dict with no corresponding
+    `RunProcessKey` constant.
+    
+    **Fix**: Tracking moved to `self._job_reported_clients: Dict[str, set]`
+    on `FederatedServer`.
+    Stale entries are purged whenever a job is no longer in `run_processes`.
+    
+    ### 6 — `ClientRunManager.get_job_clients()`: Explicit meta validation
+    (`client_run_manager.py`)
+    
+    Raises `RuntimeError` with a descriptive message instead of an opaque
+    `TypeError` when
+    `JOB_CLIENTS` is absent or the wrong type.
+    
+    ---
+    
+    ## Configuration Recommendations (No Code Change Needed)
+    
+    | Setting | Recommended value | Effect |
+    |---|---|---|
+    | `FedAvg(min_clients=...)` | 96-98% of `num_clients` | Tolerates a few
+    startup stragglers |
+    | `runner_sync_timeout` | `120` s | Allows Lustre-backed deployments
+    time to complete |
+    | `strict_start_job_reply_check` | `true` | Start-job timeouts surfaced,
+    straggler clients excluded |
+    | `sync_client_jobs_require_previous_report` | `true` (now the default)
+    | Prevents premature dead-job from startup delay | |
+    `SFM_CLOSE_STALLED_CONNECTION` (PR #4206) | `true` after staging |
+    Disconnects stalled relay connections |
+    
+    ---
+    
+    ## Files Changed
+    
+    - `nvflare/private/fed/server/job_runner.py` — `_deploy_job()` timeout
+    as failure; `_start_run()` selective exclusion
+    - `nvflare/private/fed/server/admin.py` — `check_client_replies()`
+    returns timed-out list; dict-keyed non-strict path
+    - `nvflare/private/fed/server/fed_server.py` — `_sync_client_jobs()`
+    default `True`; `_job_reported_clients` attr; stale cleanup
+    - `nvflare/private/fed/client/client_run_manager.py` — explicit meta
+    validation in `get_job_clients()`
+    
+    ---
+    
+    ## Test Coverage
+    
+    New and updated unit tests with both positive and negative cases:
+    
+    | File | Tests | What they cover |
+    |---|---|---|
+    | `admin_test.py` | 8 | Timeout returned not raised; dict lookup; error
+    still raises; reorder OK |
+    | `job_runner_test.py` | 4 | strict flag wiring; timeout within
+    tolerance → warn; timeout below tolerance → raise | |
+    `job_runner_deploy_test.py` | 9 (new file) | Timeout counted as failure;
+    OK reply not failed; mixed outcomes; detail label; min_sites with
+    timeouts; integration sequence |
+    | `fed_server_test.py` | 5 | Default requires-prior-report; legacy
+    explicit-False still fires; tracking in server attr not job_info; stale
+    cleanup |
+    
+    All 29 targeted unit tests pass.
+    
+    ## Test Plan
+    
+    - [x] Unit tests for each changed function (positive + negative)
+    - [x] New `job_runner_deploy_test.py` covering deployment timeout
+    classification end-to-end
+    - [x] All 29 targeted unit tests pass
+    - [ ] Hierarchical staging run with all flags at default
+    - [ ] Hierarchical staging run with `strict_start_job_reply_check=true`
+    and reduced `min_clients`
+    - [ ] Verify no regression on standard (non-hierarchical) FL jobs
+    
+    ---------
+    
+    Fixes # .
+    
+    ### Description
+    
+    A few sentences describing the changes proposed in this pull request.
+    
+    ### Types of changes
+    <!--- Put an `x` in all the boxes that apply, and remove the not
+    applicable items -->
+    - [x] Non-breaking change (fix or new feature that would not break
+    existing functionality).
+    - [ ] Breaking change (fix or new feature that would cause existing
+    functionality to change).
+    - [ ] New tests added to cover the changes.
+    - [ ] Quick tests passed locally by running `./runtest.sh`.
+    - [ ] In-line docstrings updated.
+    - [ ] Documentation updated.
+    
+    Co-authored-by: Chester Chen <512707+chesterxgchen@users.noreply.github.com>
+    Co-authored-by: Claude Sonnet 4.6 <noreply@anthropic.com>
+    Co-authored-by: Peter Cnudde <pcnudde@nvidia.com>
+---
+ nvflare/private/fed/server/job_runner.py | 72 +++++++++++++++++++++++++++++---
+ 1 file changed, 67 insertions(+), 5 deletions(-)
+
+diff --git a/nvflare/private/fed/server/job_runner.py b/nvflare/private/fed/server/job_runner.py
+index 46c3a038..01cb4cb1 100644
+--- a/nvflare/private/fed/server/job_runner.py
++++ b/nvflare/private/fed/server/job_runner.py
+@@ -21,12 +21,21 @@ from typing import Dict, List, Tuple
+ from nvflare.apis.client import Client
+ from nvflare.apis.event_type import EventType
+ from nvflare.apis.fl_component import FLComponent
+-from nvflare.apis.fl_constant import AdminCommandNames, FLContextKey, RunProcessKey, SiteType, SystemComponents
++from nvflare.apis.fl_constant import (
++    AdminCommandNames,
++    ConfigVarName,
++    FLContextKey,
++    RunProcessKey,
++    SiteType,
++    SystemComponents,
++    SystemConfigs,
++)
+ from nvflare.apis.fl_context import FLContext
+ from nvflare.apis.job_def import ALL_SITES, Job, JobMetaKey, RunStatus
+ from nvflare.apis.job_scheduler_spec import DispatchInfo
+ from nvflare.apis.workspace import Workspace
+ from nvflare.fuel.utils.argument_utils import parse_vars
++from nvflare.fuel.utils.config_service import ConfigService
+ from nvflare.lighter.utils import verify_folder_signature
+ from nvflare.private.admin_defs import Message, MsgHeader, ReturnCode
+ from nvflare.private.defs import RequestHeader, TrainingTopic
+@@ -214,7 +223,12 @@ class JobRunner(FLComponent):
+                     else:
+                         deploy_detail.append(f"{client_name}: OK")
+                 else:
+-                    deploy_detail.append(f"{client_name}: unknown")
++                    # No reply means the client timed out during deployment.
++                    # Count this as a failure so the min_sites / required_sites check
++                    # can decide whether to abort, rather than silently treating a
++                    # timed-out client as successfully deployed.
++                    failed_clients.append(client_name)
++                    deploy_detail.append(f"{client_name}: no reply (deployment timeout)")
+ 
+             # see whether any of the failed clients are required
+             if failed_clients:
+@@ -248,15 +262,63 @@ class JobRunner(FLComponent):
+         # job_clients is a dict of: token => Client
+         assert isinstance(job_clients, dict)
+         participating_clients = [c.to_dict() for c in job_clients.values()]
++        # start_client_job serializes job.meta into request headers; make sure
++        # JOB_CLIENTS is available before client startup.
+         job.meta[JobMetaKey.JOB_CLIENTS] = participating_clients
+         err = engine.start_app_on_server(fl_ctx, job=job, job_clients=job_clients)
+         if err:
+             raise RuntimeError(f"Could not start the server App for job: {job_id}.")
+ 
+         replies = engine.start_client_job(job, client_sites, fl_ctx)
+-        client_sites_names = list(client_sites.keys())
+-        check_client_replies(replies=replies, client_sites=client_sites_names, command=f"start job ({job_id})")
+-        display_sites = ",".join(client_sites_names)
++        all_client_sites = list(client_sites.keys())
++        active_client_sites = list(all_client_sites)
++        strict_start_reply_check = ConfigService.get_bool_var(
++            name=ConfigVarName.STRICT_START_JOB_REPLY_CHECK,
++            conf=SystemConfigs.APPLICATION_CONF,
++            default=False,
++        )
++        timed_out = check_client_replies(
++            replies=replies,
++            client_sites=all_client_sites,
++            command=f"start job ({job_id})",
++            strict=strict_start_reply_check,
++        )
++        if timed_out:
++            active_count = len(all_client_sites) - len(timed_out)
++
++            # A required site timing out is fatal regardless of min_sites, same as deploy phase.
++            if job.required_sites:
++                for c in timed_out:
++                    if c in job.required_sites:
++                        raise RuntimeError(f"start job ({job_id}): required client {c} timed out")
++
++            if job.min_sites and active_count < job.min_sites:
++                raise RuntimeError(
++                    f"start job ({job_id}): {len(timed_out)} client(s) timed out and remaining "
++                    f"{active_count} < min_sites {job.min_sites}: {timed_out}"
++                )
++            self.log_warning(
++                fl_ctx,
++                f"start job ({job_id}): {len(timed_out)} client(s) timed out at start-job: {timed_out}; "
++                f"{active_count} of {len(all_client_sites)} clients started successfully.",
++            )
++            active_client_sites = [c for c in all_client_sites if c not in timed_out]
++
++        if not strict_start_reply_check:
++            # In non-strict mode, check_client_replies() does not return timed-out clients.
++            # Build active clients directly from actual replies so JOB_CLIENTS stays accurate.
++            replies_by_client = {r.client_name: r for r in replies}
++            active_client_sites = []
++            for client_name in all_client_sites:
++                client_reply = replies_by_client.get(client_name)
++                if client_reply and client_reply.reply:
++                    active_client_sites.append(client_name)
++
++        # Set metadata once, after any timeout exclusion, so it always reflects active participants.
++        active_sites = set(active_client_sites)
++        participating_clients = [c.to_dict() for c in job_clients.values() if c.name in active_sites]
++        job.meta[JobMetaKey.JOB_CLIENTS] = participating_clients
++        display_sites = ",".join(active_client_sites)
+ 
+         self.log_info(fl_ctx, f"Started run: {job_id} for clients: {display_sites}")
+         self.fire_event(EventType.JOB_STARTED, fl_ctx)

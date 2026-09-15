@@ -1,0 +1,103 @@
+commit 58eb05f65ff0a42af21ba6ba2dc91b5aba33d537
+Author:     Yuhong Wen <yuhongw@nvidia.com>
+AuthorDate: Wed Nov 16 16:57:09 2022 -0500
+Commit:     GitHub <noreply@github.com>
+CommitDate: Wed Nov 16 16:57:09 2022 -0500
+
+    Dead clients handle (#1136)
+    
+    * Addedd enhancement to handle dead client for running jobs.
+    
+    * Adjust the start_app_on_server().
+    
+    * Added participants check start_app command.
+    
+    * Added mopre checks, and extracted _client_still_alive().
+    
+    * Removed WorkFlowException, re-engineer the _check_dead_clients() and _check_dead_clients().
+    
+    * Refactor start_app_on_server().
+    
+    * Changed the self.run_processes.items() to self.run_processes.keys().
+    
+    * Changed to use keys = list(self.run_processes.keys())
+    
+    * update _monitor_tasks() logic.
+---
+ nvflare/private/fed/server/job_runner.py    |  6 ++++--
+ nvflare/private/fed/server/server_engine.py | 11 ++++++++---
+ 2 files changed, 12 insertions(+), 5 deletions(-)
+
+diff --git a/nvflare/private/fed/server/job_runner.py b/nvflare/private/fed/server/job_runner.py
+index 928b8573..73587ebd 100644
+--- a/nvflare/private/fed/server/job_runner.py
++++ b/nvflare/private/fed/server/job_runner.py
+@@ -202,7 +202,7 @@ class JobRunner(FLComponent):
+         """
+         engine = fl_ctx.get_engine()
+         job_clients = engine.get_job_clients(client_sites)
+-        err = engine.start_app_on_server(job_id, job_id=job.job_id, job_clients=job_clients)
++        err = engine.start_app_on_server(job_id, job=job, job_clients=job_clients)
+         if err:
+             raise RuntimeError(f"Could not start the server App for job: {job_id}.")
+ 
+@@ -385,11 +385,13 @@ class JobRunner(FLComponent):
+ 
+     def restore_running_job(self, run_number: str, job_id: str, job_clients, snapshot, fl_ctx: FLContext):
+         engine = fl_ctx.get_engine()
+-        engine.start_app_on_server(run_number, job_id=job_id, job_clients=job_clients, snapshot=snapshot)
+ 
+         try:
+             job_manager = engine.get_component(SystemComponents.JOB_MANAGER)
+             job = job_manager.get_job(jid=job_id, fl_ctx=fl_ctx)
++            err = engine.start_app_on_server(run_number, job=job, job_clients=job_clients, snapshot=snapshot)
++            if err:
++                raise RuntimeError(f"Could not restore the server App for job: {job_id}.")
+             with self.lock:
+                 self.running_jobs[job_id] = job
+         except Exception as e:
+diff --git a/nvflare/private/fed/server/server_engine.py b/nvflare/private/fed/server/server_engine.py
+index e5b73af6..a4f2abf7 100644
+--- a/nvflare/private/fed/server/server_engine.py
++++ b/nvflare/private/fed/server/server_engine.py
+@@ -45,6 +45,7 @@ from nvflare.apis.fl_constant import (
+ from nvflare.apis.fl_context import FLContext, FLContextManager
+ from nvflare.apis.fl_snapshot import RunSnapshot
+ from nvflare.apis.impl.job_def_manager import JobDefManagerSpec
++from nvflare.apis.job_def import Job
+ from nvflare.apis.shareable import Shareable, make_reply
+ from nvflare.apis.utils.fl_context_utils import get_serializable_data
+ from nvflare.apis.workspace import Workspace
+@@ -138,7 +139,8 @@ class ServerEngine(ServerEngineInternalSpec):
+         else:
+             self.engine_info.status = MachineStatus.STOPPED
+ 
+-        for job_id, _ in self.run_processes.items():
++        keys = list(self.run_processes.keys())
++        for job_id in keys:
+             run_folder = os.path.join(self.args.workspace, WorkspaceConstants.WORKSPACE_PREFIX + str(job_id))
+             app_file = os.path.join(run_folder, "fl_app.txt")
+             if os.path.exists(app_file):
+@@ -196,7 +198,7 @@ class ServerEngine(ServerEngineInternalSpec):
+     def validate_clients(self, client_names: List[str]) -> Tuple[List[Client], List[str]]:
+         return self._get_all_clients_from_inputs(client_names)
+ 
+-    def start_app_on_server(self, run_number: str, job_id: str = None, job_clients=None, snapshot=None) -> str:
++    def start_app_on_server(self, run_number: str, job: Job = None, job_clients=None, snapshot=None) -> str:
+         if run_number in self.run_processes.keys():
+             return f"Server run: {run_number} already started."
+         else:
+@@ -208,9 +210,12 @@ class ServerEngine(ServerEngineInternalSpec):
+             self.engine_info.status = MachineStatus.STARTING
+             app_custom_folder = workspace.get_app_custom_dir(run_number)
+ 
++            if not isinstance(job, Job):
++                return "Must provide a job object to start the server app."
++
+             open_ports = get_open_ports(2)
+             self._start_runner_process(
+-                self.args, app_root, run_number, app_custom_folder, open_ports, job_id, job_clients, snapshot
++                self.args, app_root, run_number, app_custom_folder, open_ports, job.job_id, job_clients, snapshot
+             )
+ 
+             threading.Thread(target=self._listen_command, args=(open_ports[0], run_number)).start()

@@ -1,0 +1,242 @@
+commit 057aec69bc18a404851d6531df21335a09b9190b
+Author:     Yuhong Wen <yh_wen@hotmail.com>
+AuthorDate: Tue Apr 19 12:30:17 2022 -0400
+Commit:     GitHub <noreply@github.com>
+CommitDate: Tue Apr 19 12:30:17 2022 -0400
+
+    Added snapshot write lock. (#419)
+    
+    * Added snapshot write lock.
+    
+    * snapshot keeps the job participating clients.
+    
+    * Restore the running job to Job Runner.
+---
+ nvflare/private/fed/server/job_runner.py    | 20 ++++++-
+ nvflare/private/fed/server/server_engine.py | 87 +++++++++++++++++++----------
+ 2 files changed, 74 insertions(+), 33 deletions(-)
+
+diff --git a/nvflare/private/fed/server/job_runner.py b/nvflare/private/fed/server/job_runner.py
+index 154d249f..ef9fdc6f 100644
+--- a/nvflare/private/fed/server/job_runner.py
++++ b/nvflare/private/fed/server/job_runner.py
+@@ -102,7 +102,7 @@ class JobRunner(FLComponent):
+         replies = admin_server.send_requests(requests, timeout_secs=admin_server.timeout)
+         return replies
+ 
+-    def _start_run(self, run_number, client_sites: list, fl_ctx: FLContext):
++    def _start_run(self, run_number, job: Job, client_sites: list, fl_ctx: FLContext):
+         """Start the application
+ 
+         Args:
+@@ -114,7 +114,8 @@ class JobRunner(FLComponent):
+ 
+         """
+         engine = fl_ctx.get_engine()
+-        err = engine.start_app_on_server(run_number, client_sites=client_sites)
++        job_clients = engine.get_job_clients(client_sites)
++        err = engine.start_app_on_server(run_number, job_id=job.job_id, job_clients=job_clients)
+         if err:
+             raise RuntimeError("Could not start the server App.")
+ 
+@@ -185,7 +186,7 @@ class JobRunner(FLComponent):
+                             self.log_info(fl_ctx, f"Got the job:{ready_job.job_id} from the scheduler to run")
+                             run_number = self._deploy_job(ready_job, sites, fl_ctx)
+                             job_manager.set_status(ready_job.job_id, RunStatus.DISPATCHED, fl_ctx)
+-                            self._start_run(run_number, sites, fl_ctx)
++                            self._start_run(run_number, ready_job, sites, fl_ctx)
+                             with self.lock:
+                                 self.running_jobs[run_number] = ready_job
+                             job_manager.set_status(ready_job.job_id, RunStatus.RUNNING, fl_ctx)
+@@ -194,6 +195,19 @@ class JobRunner(FLComponent):
+ 
+             time.sleep(1.0)
+ 
++    def restore_running_job(self, run_number: str, job_id: str, job_clients, snapshot, fl_ctx: FLContext):
++        engine = fl_ctx.get_engine()
++        engine.start_app_on_server(run_number, job_id=job_id,
++                                   job_clients=job_clients, snapshot=snapshot)
++
++        try:
++            job_manager = engine.get_component(SystemComponents.JOB_MANAGER)
++            job = job_manager.get_job(jid=job_id, fl_ctx=fl_ctx)
++            with self.lock:
++                self.running_jobs[run_number] = job
++        except:
++            self.log_error(fl_ctx, f"Failed to restore the job:{job_id} to the running job table.")
++
+     def stop_run(self, run_number: str, fl_ctx: FLContext):
+         engine = fl_ctx.get_engine()
+         job_manager = engine.get_component(SystemComponents.JOB_MANAGER)
+diff --git a/nvflare/private/fed/server/server_engine.py b/nvflare/private/fed/server/server_engine.py
+index 364c2fb4..ebeea6ca 100644
+--- a/nvflare/private/fed/server/server_engine.py
++++ b/nvflare/private/fed/server/server_engine.py
+@@ -14,6 +14,7 @@
+ 
+ import copy
+ import logging
++import multiprocessing
+ import os
+ import pickle
+ import re
+@@ -103,6 +104,7 @@ class ServerEngine(ServerEngineInternalSpec):
+         self.parent_conn_lock = Lock()
+         self.job_runner = None
+         self.job_def_manager = None
++        self.snapshot_lock = multiprocessing.Lock()
+ 
+     def _get_server_app_folder(self):
+         return WorkspaceConstants.APP_PREFIX + "server"
+@@ -172,7 +174,7 @@ class ServerEngine(ServerEngineInternalSpec):
+     def validate_clients(self, client_names: List[str]) -> Tuple[List[Client], List[str]]:
+         return self._get_all_clients_from_inputs(client_names)
+ 
+-    def start_app_on_server(self, run_number: str, client_sites=None, snapshot=None) -> str:
++    def start_app_on_server(self, run_number: str, job_id: str = None, job_clients=None, snapshot=None) -> str:
+         if run_number in self.run_processes.keys():
+             return f"Server run_{run_number} already started."
+         else:
+@@ -188,7 +190,7 @@ class ServerEngine(ServerEngineInternalSpec):
+ 
+             open_ports = get_open_ports(2)
+             self._start_runner_process(self.args, app_root, run_number, app_custom_folder,
+-                                       open_ports, client_sites, snapshot)
++                                       open_ports, job_id, job_clients, snapshot)
+ 
+             threading.Thread(target=self._listen_command, args=(open_ports[0], run_number)).start()
+ 
+@@ -202,6 +204,7 @@ class ServerEngine(ServerEngineInternalSpec):
+ 
+         while run_number in self.run_processes.keys():
+             clients = self.run_processes.get(run_number).get(RunProcessKey.PARTICIPANTS)
++            job_id = self.run_processes.get(run_number).get(RunProcessKey.JOB_ID)
+             try:
+                 if conn.poll(0.1):
+                     received_data = conn.recv()
+@@ -209,7 +212,8 @@ class ServerEngine(ServerEngineInternalSpec):
+                     data = received_data.get(ServerCommandKey.DATA)
+ 
+                     if command == ServerCommandNames.GET_CLIENTS:
+-                        return_data = {ServerCommandKey.CLIENTS: clients}
++                        return_data = {ServerCommandKey.CLIENTS: clients,
++                                       ServerCommandKey.JOB_ID: job_id}
+                         conn.send(return_data)
+                     elif command == ServerCommandNames.AUX_SEND:
+                         targets = data.get("targets")
+@@ -239,7 +243,8 @@ class ServerEngine(ServerEngineInternalSpec):
+                 self.engine_info.status = MachineStatus.STOPPED
+                 break
+ 
+-    def _start_runner_process(self, args, app_root, run_number, app_custom_folder, open_ports, client_sites, snapshot):
++    def _start_runner_process(self, args, app_root, run_number, app_custom_folder, open_ports,
++                              job_id, job_clients, snapshot):
+         new_env = os.environ.copy()
+         if app_custom_folder != "":
+             new_env["PYTHONPATH"] = new_env["PYTHONPATH"] + ":" + app_custom_folder
+@@ -276,12 +281,8 @@ class ServerEngine(ServerEngineInternalSpec):
+ 
+         threading.Thread(target=self.wait_for_complete, args=[run_number]).start()
+ 
+-        job_clients = {}
+-        if client_sites:
+-            for site, dispatch_info in client_sites.items():
+-                client = self.get_client_from_name(site)
+-                if client:
+-                    job_clients[client.token] = client
++        if not job_id:
++            job_id = ""
+         if not job_clients:
+             job_clients = self.client_manager.clients
+ 
+@@ -290,10 +291,20 @@ class ServerEngine(ServerEngineInternalSpec):
+                 RunProcessKey.LISTEN_PORT: listen_port,
+                 RunProcessKey.CONNECTION: None,
+                 RunProcessKey.CHILD_PROCESS: process,
++                RunProcessKey.JOB_ID: job_id,
+                 RunProcessKey.PARTICIPANTS: job_clients,
+             }
+         return process
+ 
++    def get_job_clients(self, client_sites):
++        job_clients = {}
++        if client_sites:
++            for site, dispatch_info in client_sites.items():
++                client = self.get_client_from_name(site)
++                if client:
++                    job_clients[client.token] = client
++        return job_clients
++
+     def remove_custom_path(self):
+         regex = re.compile(".*/run_.*/custom")
+         custom_paths = list(filter(regex.search, sys.path))
+@@ -594,33 +605,49 @@ class ServerEngine(ServerEngineInternalSpec):
+         #    Make sure to include the current round number
+         # 2. call persistence API to save the component states
+ 
+-        fl_snapshot = self.snapshot_persistor.retrieve()
+-        if fl_snapshot:
+-            for run_number in list(fl_snapshot.run_snapshots.keys()):
+-                snapshot = fl_snapshot.get_snapshot(run_number)
+-                if snapshot.completed:
+-                    fl_snapshot.remove_snapshot(run_number)
+-        else:
+-            fl_snapshot = FLSnapshot()
++        with self.snapshot_lock:
++            fl_snapshot = self.snapshot_persistor.retrieve()
++            if fl_snapshot:
++                for run_number in list(fl_snapshot.run_snapshots.keys()):
++                    snapshot = fl_snapshot.get_snapshot(run_number)
++                    if snapshot.completed:
++                        fl_snapshot.remove_snapshot(run_number)
++            else:
++                fl_snapshot = FLSnapshot()
++
++            snapshot = RunSnapshot()
++            for component_id, component in self.run_manager.components.items():
++                snapshot.set_component_snapshot(
++                    component_id=component_id, component_state=component.get_persist_state(fl_ctx)
++                )
+ 
+-        snapshot = RunSnapshot()
+-        for component_id, component in self.run_manager.components.items():
+             snapshot.set_component_snapshot(
+-                component_id=component_id, component_state=component.get_persist_state(fl_ctx)
++                component_id=SnapshotKey.FL_CONTEXT, component_state=copy.deepcopy(get_serializable_data(fl_ctx).props)
+             )
+ 
+-        snapshot.set_component_snapshot(
+-            component_id=SnapshotKey.FL_CONTEXT, component_state=copy.deepcopy(get_serializable_data(fl_ctx).props)
+-        )
++            workspace = fl_ctx.get_prop(FLContextKey.WORKSPACE_OBJECT)
++            data = zip_directory_to_bytes(workspace.get_run_dir(fl_ctx.get_prop(FLContextKey.CURRENT_RUN)), "")
++            snapshot.set_component_snapshot(component_id=SnapshotKey.WORKSPACE, component_state={"content": data})
+ 
+-        workspace = fl_ctx.get_prop(FLContextKey.WORKSPACE_OBJECT)
+-        data = zip_directory_to_bytes(workspace.get_run_dir(fl_ctx.get_prop(FLContextKey.CURRENT_RUN)), "")
+-        snapshot.set_component_snapshot(component_id=SnapshotKey.WORKSPACE, component_state={"content": data})
++            job_info = fl_ctx.get_prop(FLContextKey.JOB_INFO)
++            if not job_info:
++                with self.parent_conn_lock:
++                    data = {ServerCommandKey.COMMAND: ServerCommandNames.GET_CLIENTS, ServerCommandKey.DATA: {}}
++                    self.parent_conn.send(data)
++                    return_data = self.parent_conn.recv()
++                    job_id = return_data.get(ServerCommandKey.JOB_ID)
++                    job_clients = return_data.get(ServerCommandKey.CLIENTS)
++                    fl_ctx.set_prop(FLContextKey.JOB_INFO, (job_id, job_clients))
++            else:
++                (job_id, job_clients) = job_info
++            snapshot.set_component_snapshot(component_id=SnapshotKey.JOB_INFO,
++                                            component_state={SnapshotKey.JOB_CLIENTS: job_clients,
++                                                             SnapshotKey.JOB_ID: job_id})
+ 
+-        snapshot.completed = completed
++            snapshot.completed = completed
+ 
+-        fl_snapshot.add_snapshot(fl_ctx.get_prop(FLContextKey.CURRENT_RUN), snapshot)
+-        self.server.snapshot_location = self.snapshot_persistor.save(snapshot=fl_snapshot)
++            fl_snapshot.add_snapshot(fl_ctx.get_prop(FLContextKey.CURRENT_RUN), snapshot)
++            self.server.snapshot_location = self.snapshot_persistor.save(snapshot=fl_snapshot)
+         self.logger.info(f"persist the snapshot to: {self.server.snapshot_location}")
+ 
+     def restore_components(self, snapshot: RunSnapshot, fl_ctx: FLContext):

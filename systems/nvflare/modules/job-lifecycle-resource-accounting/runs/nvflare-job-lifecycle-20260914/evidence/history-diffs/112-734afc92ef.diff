@@ -1,0 +1,107 @@
+commit 734afc92ef9ba3bdeccb4338ff96520a6a174a52
+Author:     Yan Cheng <58191769+yanchengnv@users.noreply.github.com>
+AuthorDate: Mon Aug 7 17:15:00 2023 -0400
+Commit:     GitHub <noreply@github.com>
+CommitDate: Mon Aug 7 17:15:00 2023 -0400
+
+    Support admin client handlers and submit_job with custom data (#1881)
+    
+    * prep client runner; add event to admin client
+    
+    * support admin client events
+    
+    * support handlers in config files on admin client
+    
+    * use run_abort_signal to control run loop
+    
+    * removed unused files
+    
+    * removed unused imports
+    
+    * fixed unit tests; check deploy policy for dead clients
+    
+    * remove task instance
+    
+    * changed stop_task to use exception
+    
+    * Revert some changes from POC update commit that caused issues (#1894)
+    
+    * revert some changes from POC update commit that caused issues
+    
+    * fix ci
+    
+    * rename poc to insecure
+    
+    * fix import
+    
+    * improve job status handling
+    
+    * remove unused import
+    
+    * removed dup def
+    
+    ---------
+    
+    Co-authored-by: nvkevlu <55759229+nvkevlu@users.noreply.github.com>
+---
+ nvflare/private/fed/server/job_runner.py    | 23 +++++++++++++++++------
+ nvflare/private/fed/server/server_engine.py |  3 ++-
+ 2 files changed, 19 insertions(+), 7 deletions(-)
+
+diff --git a/nvflare/private/fed/server/job_runner.py b/nvflare/private/fed/server/job_runner.py
+index 5864f584..8dc0d578 100644
+--- a/nvflare/private/fed/server/job_runner.py
++++ b/nvflare/private/fed/server/job_runner.py
+@@ -349,7 +349,7 @@ class JobRunner(FLComponent):
+     def _update_job_status(self, engine, job, job_manager, fl_ctx):
+         exception_run_processes = engine.exception_run_processes
+         if job.job_id in exception_run_processes:
+-            self.log_info(fl_ctx, f"Try to abort run ({job.job_id}) on clients.")
++            self.log_info(fl_ctx, f"Try to abort job ({job.job_id}) on clients ...")
+             run_process = exception_run_processes[job.job_id]
+ 
+             # stop client run
+@@ -359,13 +359,24 @@ class JobRunner(FLComponent):
+             )
+             self.abort_client_run(job.job_id, active_client_sites_names, fl_ctx)
+ 
+-            process_return_code = run_process.get(RunProcessKey.PROCESS_RETURN_CODE)
+-            if process_return_code == -9:
+-                job_manager.set_status(job.job_id, RunStatus.FINISHED_ABNORMAL, fl_ctx)
++            finished = run_process.get(RunProcessKey.PROCESS_FINISHED, False)
++            if finished:
++                # job status is already reported from the Job cell!
++                exe_err = run_process.get(RunProcessKey.PROCESS_EXE_ERROR, False)
++                if exe_err:
++                    status = RunStatus.FINISHED_EXECUTION_EXCEPTION
++                else:
++                    status = RunStatus.FINISHED_COMPLETED
+             else:
+-                job_manager.set_status(job.job_id, RunStatus.FINISHED_EXECUTION_EXCEPTION, fl_ctx)
++                # never got job status report from job cell
++                process_return_code = run_process.get(RunProcessKey.PROCESS_RETURN_CODE)
++                if process_return_code == -9:
++                    status = RunStatus.FINISHED_ABNORMAL
++                else:
++                    status = RunStatus.FINISHED_EXECUTION_EXCEPTION
+         else:
+-            job_manager.set_status(job.job_id, RunStatus.FINISHED_COMPLETED, fl_ctx)
++            status = RunStatus.FINISHED_COMPLETED
++        job_manager.set_status(job.job_id, status, fl_ctx)
+ 
+     def _save_workspace(self, fl_ctx: FLContext):
+         job_id = fl_ctx.get_prop(FLContextKey.CURRENT_JOB_ID)
+diff --git a/nvflare/private/fed/server/server_engine.py b/nvflare/private/fed/server/server_engine.py
+index 234a582a..33d8838c 100644
+--- a/nvflare/private/fed/server/server_engine.py
++++ b/nvflare/private/fed/server/server_engine.py
+@@ -229,7 +229,8 @@ class ServerEngine(ServerEngineInternalSpec):
+                 if return_code and return_code != 0:
+                     self.logger.info(f"Job: {job_id} child process exit with return code {return_code}")
+                     run_process_info[RunProcessKey.PROCESS_RETURN_CODE] = return_code
+-                    self.exception_run_processes[job_id] = run_process_info
++                    if job_id not in self.exception_run_processes:
++                        self.exception_run_processes[job_id] = run_process_info
+                 self.run_processes.pop(job_id, None)
+         self.engine_info.status = MachineStatus.STOPPED
+ 

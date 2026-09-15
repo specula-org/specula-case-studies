@@ -1,0 +1,112 @@
+commit 36e26e95f33d1dcf9678be5a06053575b814522a
+Author:     Yuan-Ting Hsieh (謝沅廷) <yuantingh@nvidia.com>
+AuthorDate: Mon Apr 3 18:35:48 2023 -0700
+Commit:     GitHub <noreply@github.com>
+CommitDate: Mon Apr 3 18:35:48 2023 -0700
+
+    Do not shutdown job runner when server turn to cold state (#1619)
+    
+    * Do not shutdown job runner when server turn to cold state
+    
+    * Fix review comments
+    
+    * address comments
+    
+    * use 1 arg instead of 2 args
+---
+ nvflare/app_common/job_schedulers/job_scheduler.py | 10 ++++++++++
+ nvflare/private/fed/server/job_runner.py           |  8 ++++++++
+ nvflare/private/fed/server/server_engine.py        | 17 +++++++++++++++--
+ 3 files changed, 33 insertions(+), 2 deletions(-)
+
+diff --git a/nvflare/app_common/job_schedulers/job_scheduler.py b/nvflare/app_common/job_schedulers/job_scheduler.py
+index 6d4b36f2..12879cf0 100644
+--- a/nvflare/app_common/job_schedulers/job_scheduler.py
++++ b/nvflare/app_common/job_schedulers/job_scheduler.py
+@@ -336,3 +336,13 @@ class DefaultJobScheduler(JobSchedulerSpec, FLComponent):
+ 
+         self.log_debug(fl_ctx, "No job is scheduled.")
+         return None, None
++
++    def restore_scheduled_job(self, job_id: str):
++        with self.lock:
++            if job_id not in self.scheduled_jobs:
++                self.scheduled_jobs.append(job_id)
++
++    def remove_scheduled_job(self, job_id: str):
++        with self.lock:
++            if job_id in self.scheduled_jobs:
++                self.scheduled_jobs.remove(job_id)
+diff --git a/nvflare/private/fed/server/job_runner.py b/nvflare/private/fed/server/job_runner.py
+index 61e7676b..b4e427c9 100644
+--- a/nvflare/private/fed/server/job_runner.py
++++ b/nvflare/private/fed/server/job_runner.py
+@@ -486,6 +486,7 @@ class JobRunner(FLComponent):
+                 raise RuntimeError(f"Could not restore the server App for job: {job_id}.")
+             with self.lock:
+                 self.running_jobs[job_id] = job
++            self.scheduler.restore_scheduled_job(job_id)
+         except Exception as e:
+             self.log_error(
+                 fl_ctx, f"Failed to restore the job: {job_id} to the running job table: {secure_format_exception(e)}."
+@@ -532,4 +533,11 @@ class JobRunner(FLComponent):
+             self.stop_run(job_id, fl_ctx)
+ 
+         self.log_info(fl_ctx, "Stop all the running jobs.")
++        # also stop the job runner
+         self.ask_to_stop = True
++
++    def remove_running_job(self, job_id: str):
++        with self.lock:
++            if job_id in self.running_jobs:
++                del self.running_jobs[job_id]
++        self.scheduler.remove_scheduled_job(job_id)
+diff --git a/nvflare/private/fed/server/server_engine.py b/nvflare/private/fed/server/server_engine.py
+index b02e89bd..13cfe0d7 100644
+--- a/nvflare/private/fed/server/server_engine.py
++++ b/nvflare/private/fed/server/server_engine.py
+@@ -227,6 +227,7 @@ class ServerEngine(ServerEngineInternalSpec):
+                 return_code = process.poll()
+                 # if process exit but with Execution exception
+                 if return_code and return_code != 0:
++                    self.logger.info(f"Job: {job_id} child process exit with return code {return_code}")
+                     run_process_info[RunProcessKey.PROCESS_RETURN_CODE] = return_code
+                     self.exception_run_processes[job_id] = run_process_info
+                 self.run_processes.pop(job_id, None)
+@@ -327,15 +328,21 @@ class ServerEngine(ServerEngineInternalSpec):
+             return "Server app is starting, please wait for started before abort."
+         return ""
+ 
+-    def abort_app_on_server(self, job_id: str) -> str:
++    def abort_app_on_server(self, job_id: str, turn_to_cold: bool = False) -> str:
+         if job_id not in self.run_processes.keys():
+             return "Server app has not started."
+ 
+         self.logger.info("Abort the server app run.")
++        command_data = Shareable()
++        command_data.set_header(ServerCommandKey.TURN_TO_COLD, turn_to_cold)
+ 
+         try:
+             status_message = self.send_command_to_child_runner_process(
+-                job_id=job_id, command_name=AdminCommandNames.ABORT, command_data={}, timeout=1.0, optional=True
++                job_id=job_id,
++                command_name=AdminCommandNames.ABORT,
++                command_data=command_data,
++                timeout=1.0,
++                optional=True,
+             )
+             self.logger.info(f"Abort server status: {status_message}")
+         except BaseException:
+@@ -780,6 +787,12 @@ class ServerEngine(ServerEngineInternalSpec):
+         fl_ctx = self.new_context()
+         self.job_runner.stop_all_runs(fl_ctx)
+ 
++    def pause_server_jobs(self):
++        running_jobs = list(self.run_processes.keys())
++        for job_id in running_jobs:
++            self.job_runner.remove_running_job(job_id)
++            self.abort_app_on_server(job_id, turn_to_cold=True)
++
+     def close(self):
+         self.executor.shutdown()
+ 

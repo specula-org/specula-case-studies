@@ -1,0 +1,1220 @@
+commit 36c3fc7b55fe9dc2796f5fec8f630915d639e7f1
+Author:     Yuhong Wen <yh_wen@hotmail.com>
+AuthorDate: Wed Apr 6 14:53:55 2022 -0400
+Commit:     GitHub <noreply@github.com>
+CommitDate: Wed Apr 6 14:53:55 2022 -0400
+
+    Multi run support (#388)
+    
+    * FL server supports multi-run.
+    
+    * Client support multi-Run.
+    
+    * Enable the server aux send.
+    
+    * Enable show_stats command.
+    
+    * Made the HA to handle multi-Run.
+    
+    * Clean up.
+    
+    * Changed delete_run command.
+    
+    * Fixed delete_run command.
+    
+    * Fixed codestyle issue.
+    
+    * Cleaned up.
+    
+    * Cleaned up.
+    
+    * remove no use import.
+    
+    * Refactoried.
+    
+    * Fixed codestyle.
+---
+ nvflare/private/fed/client/client_engine.py   |  99 ++++----
+ nvflare/private/fed/client/client_executor.py | 254 +++++++++++---------
+ nvflare/private/fed/server/server_engine.py   | 323 +++++++++++++++++---------
+ 3 files changed, 391 insertions(+), 285 deletions(-)
+
+diff --git a/nvflare/private/fed/client/client_engine.py b/nvflare/private/fed/client/client_engine.py
+index c8802fd6..a6b74d4e 100644
+--- a/nvflare/private/fed/client/client_engine.py
++++ b/nvflare/private/fed/client/client_engine.py
+@@ -23,10 +23,10 @@ from concurrent.futures import ThreadPoolExecutor
+ 
+ from nvflare.apis.fl_constant import MachineStatus
+ from nvflare.apis.shareable import Shareable
++from nvflare.apis.utils.common_utils import get_open_ports
+ from nvflare.fuel.hci.zip_utils import unzip_all_from_bytes
+ from nvflare.private.admin_defs import Message
+-from nvflare.private.defs import ClientStatusKey
+-
++from nvflare.private.defs import ClientStatusKey, WorkspaceConstants
+ from .client_engine_internal_spec import ClientEngineInternalSpec
+ from .client_executor import ProcessExecutor
+ from .client_run_manager import ClientRunInfo
+@@ -55,7 +55,6 @@ class ClientEngine(ClientEngineInternalSpec):
+         self.client.process = None
+         self.client_executor = ProcessExecutor(client.client_name, os.path.join(args.workspace, "startup"))
+ 
+-        self.run_number = -1
+         self.status = MachineStatus.STOPPED
+ 
+         assert workers >= 1, "workers must >= 1"
+@@ -66,16 +65,6 @@ class ClientEngine(ClientEngineInternalSpec):
+     def set_agent(self, admin_agent):
+         self.admin_agent = admin_agent
+ 
+-    def _get_open_port(self):
+-        import socket
+-
+-        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+-        s.bind(("", 0))
+-        s.listen(1)
+-        port = s.getsockname()[1]
+-        s.close()
+-        return port
+-
+     def do_validate(self, req: Message):
+         self.logger.info("starting cross site validation.")
+         future = self.executor.submit(lambda p: _do_validate(*p), [self.sender, req])
+@@ -85,30 +74,32 @@ class ClientEngine(ClientEngineInternalSpec):
+         return "validate process started."
+ 
+     def get_engine_status(self):
+-        app_name = "?"
+-        if self.run_number == -1:
+-            run_number = "?"
+-        else:
+-            run_number = str(self.run_number)
+-            run_folder = os.path.join(self.args.workspace, "run_" + str(run_number))
++        running_jobs = []
++        for run_number in self.get_all_run_numbers():
++            run_folder = os.path.join(self.args.workspace, WorkspaceConstants.WORKSPACE_PREFIX + str(run_number))
+             app_file = os.path.join(run_folder, "fl_app.txt")
+             if os.path.exists(app_file):
+                 with open(app_file, "r") as f:
+                     app_name = f.readline().strip()
++            job = {
++                ClientStatusKey.APP_NAME: app_name,
++                ClientStatusKey.RUN_NUM: run_number,
++                ClientStatusKey.STATUS: self.client_executor.check_status(self.client, run_number),
++            }
++            running_jobs.append(job)
+ 
+         result = {
+-            ClientStatusKey.APP_NAME: app_name,
+-            ClientStatusKey.RUN_NUM: run_number,
+-            ClientStatusKey.STATUS: self.client_executor.check_status(self.client),
++            ClientStatusKey.CLIENT_NAME: self.client.client_name,
++            ClientStatusKey.RUNNING_JOBS: running_jobs,
+         }
+         return result
+ 
+-    def start_app(self, run_number: int) -> str:
+-        status = self.client.status
+-        if status == ClientStatus.STARTING or status == ClientStatus.STARTED:
++    def start_app(self, run_number: str) -> str:
++        status = self.client_executor.get_status(run_number)
++        if status == ClientStatus.STARTED:
+             return "Client app already started."
+ 
+-        app_root = os.path.join(self.args.workspace, "run_" + str(run_number), "app_" + self.client.client_name)
++        app_root = os.path.join(self.args.workspace, WorkspaceConstants.WORKSPACE_PREFIX + str(run_number), "app_" + self.client.client_name)
+         if not os.path.exists(app_root):
+             return "Client app does not exist. Please deploy it before starting client."
+ 
+@@ -124,18 +115,13 @@ class ClientEngine(ClientEngineInternalSpec):
+ 
+         self.logger.info("Starting client app. rank: {}".format(self.rank))
+ 
+-        open_port = self._get_open_port()
++        open_port = get_open_ports(1)[0]
+         self._write_token_file(run_number, open_port)
+-        self.run_number = run_number
+ 
+-        self.client_executor.start_train(self.client, self.args, app_root, app_custom_folder, open_port)
++        self.client_executor.start_train(self.client, run_number, self.args, app_root, app_custom_folder, open_port)
+ 
+         return "Start the client app..."
+ 
+-    def set_run_number(self, run_number: int) -> str:
+-        self.run_number = run_number
+-        return ""
+-
+     def get_client_name(self):
+         return self.client.client_name
+ 
+@@ -149,20 +135,14 @@ class ClientEngine(ClientEngineInternalSpec):
+                 % (self.client.token, self.client.ssid, run_number, self.client.client_name, open_port)
+             )
+ 
+-    def wait_process_complete(self):
+-        self.client.process.wait()
+-
+-        # self.client.cross_validation()
+-        self.client.status = ClientStatus.STOPPED
+-
+     def remove_custom_path(self):
+         regex = re.compile(".*/run_.*/custom")
+         custom_paths = list(filter(regex.search, sys.path))
+         for path in custom_paths:
+             sys.path.remove(path)
+ 
+-    def abort_app(self, run_number: int) -> str:
+-        status = self.client.status
++    def abort_app(self, run_number: str) -> str:
++        status = self.client_executor.get_status(run_number)
+         if status == ClientStatus.STOPPED:
+             return "Client app already stopped."
+ 
+@@ -172,21 +152,19 @@ class ClientEngine(ClientEngineInternalSpec):
+         if status == ClientStatus.STARTING:
+             return "Client app is starting, please wait for client to have started before abort."
+ 
+-        self.client_executor.abort_train(self.client)
+-        # self.run_number = -1
++        self.client_executor.abort_train(self.client, run_number)
+ 
+         return "Abort signal has been sent to the client App."
+ 
+-    def abort_task(self, run_number: int) -> str:
+-        status = self.client.status
++    def abort_task(self, run_number: str) -> str:
++        status = self.client_executor.get_status(run_number)
+         if status == ClientStatus.NOT_STARTED:
+             return "Client app has not started."
+ 
+         if status == ClientStatus.STARTING:
+             return "Client app is starting, please wait for started before abort_task."
+ 
+-        self.client_executor.abort_task(self.client)
+-        # self.run_number = -1
++        self.client_executor.abort_task(self.client, run_number)
+ 
+         return "Abort signal has been sent to the current task. "
+ 
+@@ -207,9 +185,7 @@ class ClientEngine(ClientEngineInternalSpec):
+         return "Restart the client..."
+ 
+     def deploy_app(self, app_name: str, run_num: int, client_name: str, app_data) -> str:
+-        # if not os.path.exists('/tmp/tmp'):
+-        #     os.makedirs('/tmp/tmp')
+-        dest = os.path.join(self.args.workspace, "run_" + str(run_num), "app_" + client_name)
++        dest = os.path.join(self.args.workspace, WorkspaceConstants.WORKSPACE_PREFIX + str(run_num), "app_" + client_name)
+         # Remove the previous deployed app.
+         if os.path.exists(dest):
+             shutil.rmtree(dest)
+@@ -218,7 +194,7 @@ class ClientEngine(ClientEngineInternalSpec):
+             os.makedirs(dest)
+         unzip_all_from_bytes(app_data, dest)
+ 
+-        app_file = os.path.join(self.args.workspace, "run_" + str(run_num), "fl_app.txt")
++        app_file = os.path.join(self.args.workspace, WorkspaceConstants.WORKSPACE_PREFIX + str(run_num), "fl_app.txt")
+         if os.path.exists(app_file):
+             os.remove(app_file)
+         with open(app_file, "wt") as f:
+@@ -227,22 +203,25 @@ class ClientEngine(ClientEngineInternalSpec):
+         return ""
+ 
+     def delete_run(self, run_num: int) -> str:
+-        run_number_folder = os.path.join(self.args.workspace, "run_" + str(run_num))
++        run_number_folder = os.path.join(self.args.workspace, WorkspaceConstants.WORKSPACE_PREFIX + str(run_num))
+         if os.path.exists(run_number_folder):
+             shutil.rmtree(run_number_folder)
+         return "Delete run folder: {}".format(run_number_folder)
+ 
+-    def get_current_run_info(self) -> ClientRunInfo:
+-        return self.client_executor.get_run_info()
++    def get_current_run_info(self, run_number) -> ClientRunInfo:
++        return self.client_executor.get_run_info(run_number)
++
++    def get_errors(self, run_number):
++        return self.client_executor.get_errors(run_number)
+ 
+-    def get_errors(self):
+-        return self.client_executor.get_errors()
++    def reset_errors(self, run_number):
++        self.client_executor.reset_errors(run_number)
+ 
+-    def reset_errors(self):
+-        self.client_executor.reset_errors()
++    def send_aux_command(self, shareable: Shareable, run_number):
++        return self.client_executor.send_aux_command(shareable, run_number)
+ 
+-    def send_aux_command(self, shareable: Shareable):
+-        return self.client_executor.send_aux_command(shareable)
++    def get_all_run_numbers(self):
++        return self.client_executor.run_processes.keys()
+ 
+ 
+ def _do_validate(sender, message):
+diff --git a/nvflare/private/fed/client/client_executor.py b/nvflare/private/fed/client/client_executor.py
+index 1bec0bf3..37d9047d 100644
+--- a/nvflare/private/fed/client/client_executor.py
++++ b/nvflare/private/fed/client/client_executor.py
+@@ -21,11 +21,9 @@ import threading
+ import time
+ from multiprocessing.connection import Client
+ 
+-from nvflare.apis.fl_constant import AdminCommandNames, ReturnCode
++from nvflare.apis.fl_constant import AdminCommandNames, ReturnCode, RunProcessKey
+ from nvflare.apis.shareable import Shareable, make_reply
+-from nvflare.apis.utils.common_utils import get_open_ports
+ from nvflare.fuel.utils.pipe.file_pipe import FilePipe
+-
+ from .client_status import ClientStatus, get_status_message
+ 
+ 
+@@ -44,11 +42,12 @@ class ClientExecutor(object):
+         self.pipe = FilePipe(root_path=pipe_path, name="training")
+         self.logger = logging.getLogger(self.__class__.__name__)
+ 
+-    def start_train(self, client, args, app_root, app_custom_folder, listen_port):
++    def start_train(self, client, run_number, args, app_root, app_custom_folder, listen_port):
+         """start_train method to start the FL client training.
+ 
+         Args:
+             client: the FL client object
++            run_number: the run_number
+             args: admin command arguments for starting the FL client training
+             app_root: the root folder of the running APP
+             app_custom_folder: FL application custom folder
+@@ -57,26 +56,28 @@ class ClientExecutor(object):
+         """
+         pass
+ 
+-    def check_status(self, client) -> str:
++    def check_status(self, client, run_number) -> str:
+         """To check the status of the running client.
+ 
+         Args:
+             client: the FL client object
++            run_number: the run_number
+ 
+         Returns:
+             A client status message
+         """
+         pass
+ 
+-    def abort_train(self, client):
++    def abort_train(self, client, run_number):
+         """To abort the client training.
+ 
+         Args:
+             client: the FL client object
++            run_number: the run_number
+         """
+         pass
+ 
+-    def abort_task(self, client):
++    def abort_task(self, client, run_number):
+         """To abort the client executing task.
+ 
+         Args:
+@@ -84,7 +85,7 @@ class ClientExecutor(object):
+         """
+         pass
+ 
+-    def get_run_info(self) -> dict:
++    def get_run_info(self, run_number) -> dict:
+         """Get the run information.
+ 
+         Returns:
+@@ -92,7 +93,7 @@ class ClientExecutor(object):
+         """
+         pass
+ 
+-    def get_errors(self):
++    def get_errors(self, run_number):
+         """Get the error information.
+ 
+         Returns:
+@@ -101,11 +102,11 @@ class ClientExecutor(object):
+         """
+         pass
+ 
+-    def reset_errors(self):
++    def reset_errors(self, run_number):
+         """Reset the error information."""
+         pass
+ 
+-    def send_aux_command(self, shareable: Shareable):
++    def send_aux_command(self, shareable: Shareable, run_number):
+         """To send the aux command to child process.
+ 
+         Args:
+@@ -132,28 +133,31 @@ class ProcessExecutor(ClientExecutor):
+ 
+         self.startup = startup
+ 
+-        self.conn_client = None
+-
+-        self.listen_port = get_open_ports(1)[0]
++        self.run_processes = {}
+ 
+         self.lock = threading.Lock()
+ 
+-    def get_conn_client(self):
+-        if not self.conn_client:
++    def get_conn_client(self, run_number):
++        listen_port = self.run_processes.get(run_number, {}).get(RunProcessKey.LISTEN_PORT)
++        conn_client = self.run_processes.get(run_number, {}).get(RunProcessKey.CONNECTION, None)
++
++        if not conn_client:
+             try:
+-                address = ("localhost", self.listen_port)
+-                self.conn_client = Client(address, authkey="client process secret password".encode())
++                address = ("localhost", listen_port)
++                conn_client = Client(address, authkey="client process secret password".encode())
++                self.run_processes[run_number][RunProcessKey.CONNECTION] = conn_client
+             except Exception as e:
+                 pass
+ 
++        return conn_client
++
+     def create_pipe(self):
+         """Create pipe to communicate between child (training) and main (logic) thread."""
+         pipe = FilePipe(root_path="/fl/server", name="training")
+ 
+         return pipe
+ 
+-    def start_train(self, client, args, app_root, app_custom_folder, listen_port):
+-        self.listen_port = listen_port
++    def start_train(self, client, run_number, args, app_root, app_custom_folder, listen_port):
+ 
+         new_env = os.environ.copy()
+         if app_custom_folder != "":
+@@ -175,151 +179,173 @@ class ProcessExecutor(ClientExecutor):
+ 
+         print("training child process ID: {}".format(process.pid))
+ 
+-        client.process = process
+         client.multi_gpu = False
+ 
+-        client.status = ClientStatus.STARTED
++        with self.lock:
++            self.run_processes[run_number] = {RunProcessKey.LISTEN_PORT: listen_port,
++                                              RunProcessKey.CONNECTION: None,
++                                              RunProcessKey.CHILD_PROCESS: process,
++                                              RunProcessKey.STATUS: ClientStatus.STARTED}
++
+         thread = threading.Thread(
+-            target=self.wait_training_process_finish, args=(client, args, app_root, app_custom_folder)
++            target=self.wait_training_process_finish, args=(client, run_number, args, app_root, app_custom_folder)
+         )
+         thread.start()
+ 
+-    def check_status(self, client):
++    def check_status(self, client, run_number):
+         try:
+-            self.get_conn_client()
+-
+-            if self.conn_client:
+-                data = {"command": AdminCommandNames.CHECK_STATUS, "data": {}}
+-                self.conn_client.send(data)
+-                status_message = self.conn_client.recv()
+-                self.logger.debug("check status from process listener......")
+-                return status_message
+-            else:
+-                return get_status_message(client.status)
++            with self.lock:
++                conn_client = self.get_conn_client(run_number)
++
++                if conn_client:
++                    data = {"command": AdminCommandNames.CHECK_STATUS, "data": {}}
++                    conn_client.send(data)
++                    status_message = conn_client.recv()
++                    self.logger.debug("check status from process listener......")
++                    return status_message
++                else:
++                    process_status = ClientStatus.NOT_STARTED
++                    return get_status_message(process_status)
+         except:
+             self.logger.error("check_status() execution exception.")
+             return "execution exception. Please try again."
+ 
+-    def get_run_info(self):
++    def get_run_info(self, run_number):
+         try:
+-            self.get_conn_client()
+-
+-            if self.conn_client:
+-                data = {"command": AdminCommandNames.SHOW_STATS, "data": {}}
+-                self.conn_client.send(data)
+-                run_info = self.conn_client.recv()
+-                return run_info
+-            else:
+-                return {}
++            with self.lock:
++                conn_client = self.get_conn_client(run_number)
++
++                if conn_client:
++                    data = {"command": AdminCommandNames.SHOW_STATS, "data": {}}
++                    conn_client.send(data)
++                    run_info = conn_client.recv()
++                    return run_info
++                else:
++                    return {}
+         except:
+             self.logger.error("get_run_info() execution exception.")
+             return {"error": "no info collector. Please try again."}
+ 
+-    def get_errors(self):
++    def get_errors(self, run_number):
+         try:
+-            self.get_conn_client()
+-
+-            if self.conn_client:
+-                data = {"command": AdminCommandNames.SHOW_ERRORS, "data": {}}
+-                self.conn_client.send(data)
+-                errors_info = self.conn_client.recv()
+-                return errors_info
+-            else:
+-                return None
++            with self.lock:
++                conn_client = self.get_conn_client(run_number)
++
++                if conn_client:
++                    data = {"command": AdminCommandNames.SHOW_ERRORS, "data": {}}
++                    conn_client.send(data)
++                    errors_info = conn_client.recv()
++                    return errors_info
++                else:
++                    return None
+         except:
+             self.logger.error("get_errors() execution exception.")
+             return None
+ 
+-    def reset_errors(self):
++    def reset_errors(self, run_number):
+         try:
+-            self.get_conn_client()
++            with self.lock:
++                conn_client = self.get_conn_client(run_number)
+ 
+-            if self.conn_client:
+-                data = {"command": AdminCommandNames.RESET_ERRORS, "data": {}}
+-                self.conn_client.send(data)
++                if conn_client:
++                    data = {"command": AdminCommandNames.RESET_ERRORS, "data": {}}
++                    conn_client.send(data)
+         except:
+             self.logger.error("reset_errors() execution exception.")
+ 
+-    def send_aux_command(self, shareable: Shareable):
++    def send_aux_command(self, shareable: Shareable, run_number):
+         try:
+-            self.get_conn_client()
+-            if self.conn_client:
+-                data = {"command": AdminCommandNames.AUX_COMMAND, "data": shareable}
+-                self.conn_client.send(data)
+-                reply = self.conn_client.recv()
+-                return reply
+-            else:
+-                return make_reply(ReturnCode.EXECUTION_EXCEPTION)
++            with self.lock:
++                conn_client = self.get_conn_client(run_number)
++                if conn_client:
++                    data = {"command": AdminCommandNames.AUX_COMMAND, "data": shareable}
++                    conn_client.send(data)
++                    reply = conn_client.recv()
++                    return reply
++                else:
++                    return make_reply(ReturnCode.EXECUTION_EXCEPTION)
+         except:
+             return make_reply(ReturnCode.EXECUTION_EXCEPTION)
+ 
+-    def abort_train(self, client):
+-        if client.status == ClientStatus.STARTED:
++    def abort_train(self, client, run_number):
++        process_status = self.run_processes.get(run_number, {}).get(RunProcessKey.STATUS, ClientStatus.NOT_STARTED)
++        if process_status == ClientStatus.STARTED:
+             with self.lock:
+-                if client.process:
+-                    # kill the sub-process group directly
+-                    if self.conn_client:
+-                        data = {"command": AdminCommandNames.ABORT, "data": {}}
+-                        self.conn_client.send(data)
+-                        self.logger.debug("abort sent")
+-                        # wait for client to handle abort
+-                        time.sleep(2.0)
+-
+-                    # kill the sub-process group directly
+-                    try:
+-                        os.killpg(os.getpgid(client.process.pid), 9)
+-                        self.logger.debug("kill signal sent")
+-                    except Exception as e:
+-                        pass
+-                    client.process.terminate()
+-                    self.logger.debug("terminated")
+-
+-                if self.conn_client:
+-                    self.conn_client.close()
+-                self.conn_client = None
+-                self.cleanup()
++                try:
++                    child_process = self.run_processes[run_number].get(RunProcessKey.CHILD_PROCESS, None)
++                    if child_process:
++                        # kill the sub-process group directly
++                        conn_client = self.get_conn_client(run_number)
++                        if conn_client:
++                            data = {"command": AdminCommandNames.ABORT, "data": {}}
++                            conn_client.send(data)
++                            self.logger.debug("abort sent")
++
++                        threading.Thread(target=self._terminate_process, args=[child_process]).start()
++                finally:
++                    if conn_client:
++                        conn_client.close()
++                    if run_number in self.run_processes.keys():
++                        self.run_processes.pop(run_number)
++                    self.cleanup()
+ 
+         self.logger.info("Client training was terminated.")
+ 
+-    def abort_task(self, client):
+-        if client.status == ClientStatus.STARTED:
+-            if self.conn_client:
++    def _terminate_process(self, child_process):
++        # wait for client to handle abort
++        time.sleep(10.0)
++        # kill the sub-process group directly
++        try:
++            os.killpg(os.getpgid(child_process.pid), 9)
++            self.logger.debug("kill signal sent")
++        except Exception as e:
++            pass
++        child_process.terminate()
++        self.logger.debug("terminated")
++
++    def abort_task(self, client, run_number):
++        process_status = self.run_processes.get(run_number, {}).get(RunProcessKey.STATUS, ClientStatus.NOT_STARTED)
++        if process_status == ClientStatus.STARTED:
++            conn_client = self.get_conn_client(run_number)
++            if conn_client:
+                 data = {"command": AdminCommandNames.ABORT_TASK, "data": {}}
+-                self.conn_client.send(data)
++                conn_client.send(data)
+                 self.logger.debug("abort_task sent")
+ 
+-    def wait_training_process_finish(self, client, args, app_root, app_custom_folder):
++    def wait_training_process_finish(self, client, run_number, args, app_root, app_custom_folder):
+         # wait for the listen_command thread to start, and send "start" message to wake up the connection.
+         start = time.time()
+         while True:
+-            self.get_conn_client()
+-            if self.conn_client:
+-                data = {"command": AdminCommandNames.START_APP, "data": {}}
+-                self.conn_client.send(data)
+-                break
++            with self.lock:
++                conn_client = self.get_conn_client(run_number)
++                if conn_client:
++                    data = {"command": AdminCommandNames.START_APP, "data": {}}
++                    conn_client.send(data)
++                    break
+             time.sleep(1.0)
+             if time.time() - start > 15:
+                 break
+ 
+         self.logger.info("waiting for process to finish.")
+-        client.process.wait()
+-        returncode = client.process.returncode
++        child_process = self.run_processes.get(run_number, {}).get(RunProcessKey.CHILD_PROCESS)
++        child_process.wait()
++        returncode = child_process.returncode
+         self.logger.info(f"process finished with execution code: {returncode}")
+ 
+         with self.lock:
+-            client.process = None
+-
+-            if self.conn_client:
+-                self.conn_client.close()
+-            self.conn_client = None
++            conn_client = self.get_conn_client(run_number)
++            if conn_client:
++                conn_client.close()
++            if run_number in self.run_processes.keys():
++                self.run_processes.pop(run_number)
+ 
+         # Not to run cross_validation in a new process anymore
+         client.cross_site_validate = False
+-        client.status = ClientStatus.STOPPED
++
++    def get_status(self, run_number):
++        with self.lock:
++            process_status = self.run_processes.get(run_number, {}).get(RunProcessKey.STATUS, ClientStatus.STOPPED)
++            return process_status
+ 
+     def close(self):
+-        if self.conn_client:
+-            data = {"command": AdminCommandNames.SHUTDOWN, "data": {}}
+-            self.conn_client.send(data)
+-            self.conn_client = None
+         self.cleanup()
+diff --git a/nvflare/private/fed/server/server_engine.py b/nvflare/private/fed/server/server_engine.py
+index 156464fe..25c53650 100644
+--- a/nvflare/private/fed/server/server_engine.py
++++ b/nvflare/private/fed/server/server_engine.py
+@@ -24,7 +24,8 @@ import sys
+ import threading
+ import time
+ from concurrent.futures import ThreadPoolExecutor
+-from multiprocessing.connection import Client as CommandCLient
++from multiprocessing.connection import Client as CommandClient
++from multiprocessing.connection import Listener
+ from threading import Lock
+ from typing import List, Tuple
+ 
+@@ -39,21 +40,22 @@ from nvflare.apis.fl_constant import (
+     ServerCommandNames,
+     SnapshotKey,
+ )
++from nvflare.apis.fl_constant import RunProcessKey
+ from nvflare.apis.fl_context import FLContext
+-from nvflare.apis.fl_snapshot import FLSnapshot
++from nvflare.apis.fl_snapshot import RunSnapshot, FLSnapshot
+ from nvflare.apis.impl.job_def_manager import SimpleJobDefManager
++from nvflare.apis.impl.study_manager import StudyManager
+ from nvflare.apis.shareable import Shareable, make_reply
+-from nvflare.apis.study_manager_spec import StudyManagerSpec
+ from nvflare.apis.utils.common_utils import get_open_ports
+ from nvflare.apis.utils.fl_context_utils import get_serializable_data
+ from nvflare.apis.workspace import Workspace
+ from nvflare.app_common.storages.filesystem_storage import FilesystemStorage
+ from nvflare.fuel.hci.zip_utils import zip_directory_to_bytes
+ from nvflare.private.admin_defs import Message
++from nvflare.private.defs import RequestHeader, WorkspaceConstants
+ from nvflare.private.fed.server.server_json_config import ServerJsonConfigurator
+ from nvflare.widgets.info_collector import InfoCollector
+ from nvflare.widgets.widget import Widget, WidgetID
+-
+ from .client_manager import ClientManager
+ from .run_manager import RunManager
+ from .server_engine_internal_spec import EngineInfo, RunInfo, ServerEngineInternalSpec
+@@ -73,7 +75,7 @@ class ServerEngine(ServerEngineInternalSpec):
+         # TODO:: clean up the server function / requirement here should be BaseServer
+         self.server = server
+         self.args = args
+-        self.run_number = -1
++        self.run_processes = {}
+         self.run_manager = None
+         self.conf = None
+         # TODO:: does this class need client manager?
+@@ -95,13 +97,13 @@ class ServerEngine(ServerEngineInternalSpec):
+ 
+         # self.job_def_manager = job_def_manager  # todo: need to figure out how to initialize job manager with inputs
+         self.job_def_manager = SimpleJobDefManager(
+-            StudyManagerSpec(), FilesystemStorage(root_dir="/workspace/nvflare_provis")
++            StudyManager(FilesystemStorage()), FilesystemStorage(root_dir="/workspace/nvflare_provis")
+         )
+ 
+         self.asked_to_stop = False
+         self.snapshot_persistor = snapshot_persistor
+-        self.command_conn = None
+-        self.child_process = None
++        self.parent_conn = None
++        self.parent_conn_lock = Lock()
+ 
+     def _get_server_app_folder(self):
+         return "app_server"
+@@ -109,18 +111,24 @@ class ServerEngine(ServerEngineInternalSpec):
+     def _get_client_app_folder(self, client_name):
+         return "app_" + client_name
+ 
+-    def _get_run_folder(self):
+-        return os.path.join(self.args.workspace, "run_" + str(self.run_number))
++    def _get_run_folder(self, run_destination):
++        return os.path.join(self.args.workspace, WorkspaceConstants.WORKSPACE_PREFIX + str(run_destination))
+ 
+     def get_engine_info(self) -> EngineInfo:
+-        if self.run_number > 0:
+-            run_folder = os.path.join(self.args.workspace, "run_" + str(self.run_number))
++        self.engine_info.app_names = {}
++        if bool(self.run_processes):
++            self.engine_info.status = MachineStatus.STARTED
++        else:
++            self.engine_info.status = MachineStatus.STOPPED
++
++        for run_number, _ in self.run_processes.items():
++            run_folder = os.path.join(self.args.workspace, WorkspaceConstants.WORKSPACE_PREFIX + str(run_number))
+             app_file = os.path.join(run_folder, "fl_app.txt")
+             if os.path.exists(app_file):
+                 with open(app_file, "r") as f:
+-                    self.engine_info.app_name = f.readline().strip()
++                    self.engine_info.app_names[run_number] = f.readline().strip()
+             else:
+-                self.engine_info.app_name = "?"
++                self.engine_info.app_names[run_number] = "?"
+ 
+         return self.engine_info
+ 
+@@ -130,45 +138,46 @@ class ServerEngine(ServerEngineInternalSpec):
+         else:
+             return None
+ 
+-    def set_run_number(self, num):
+-        # status = self.server.status
+-        status = self.engine_info.status
+-        if status == MachineStatus.STARTING or status == MachineStatus.STARTED:
+-            return "run_number can not be changed during the FL app running."
++    def create_parent_connection(self, port):
++        while not self.parent_conn:
++            try:
++                address = ("localhost", port)
++                self.parent_conn = CommandClient(address, authkey="parent process secret password".encode())
++            except Exception as e:
++                time.sleep(1.0)
++                pass
+ 
+-        run_folder = os.path.join(self.args.workspace, "run_" + str(num))
+-        if os.path.exists(run_folder):
+-            self.run_number = num
+-            return "run number already exists. Set the FL run number to {}.".format(num)
+-        else:
+-            self.run_number = num
+-            os.makedirs(run_folder)
+-            return "Created a new run folder: run_{}".format(num)
++        threading.Thread(target=self.heartbeat_to_parent, args=[]).start()
++
++    def heartbeat_to_parent(self):
++        while True:
++            try:
++                with self.parent_conn_lock:
++                    data = {ServerCommandKey.COMMAND: ServerCommandNames.HEARTBEAT, ServerCommandKey.DATA: {}}
++                    self.parent_conn.send(data)
++                time.sleep(1.0)
++            except BaseException:
++                # The parent process can not be reached. Terminate the child process.
++                break
++        os.killpg(os.getpgid(os.getpid()), 9)
+ 
+     def delete_run_number(self, num):
+-        run_number_folder = os.path.join(self.args.workspace, "run_" + str(num))
++        run_number_folder = os.path.join(self.args.workspace, WorkspaceConstants.WORKSPACE_PREFIX + str(num))
+         if os.path.exists(run_number_folder):
+             shutil.rmtree(run_number_folder)
+         return ""
+ 
+-    def get_run_number(self):
+-        return self.run_number
+-
+     def get_clients(self) -> [Client]:
+         return list(self.client_manager.clients.values())
+ 
+     def validate_clients(self, client_names: List[str]) -> Tuple[List[Client], List[str]]:
+         return self._get_all_clients_from_inputs(client_names)
+ 
+-    def start_app_on_server(self, snapshot=None) -> str:
+-        if self.run_number == -1:
+-            return "Please set a run number."
+-
+-        status = self.engine_info.status
+-        if status == MachineStatus.STARTING or status == MachineStatus.STARTED:
+-            return "Server already starting or started."
++    def start_app_on_server(self, run_number: str, snapshot=None) -> str:
++        if run_number in self.run_processes.keys():
++            return f"Server run_{run_number} already started."
+         else:
+-            app_root = os.path.join(self._get_run_folder(), self._get_server_app_folder())
++            app_root = os.path.join(self._get_run_folder(run_number), self._get_server_app_folder())
+             if not os.path.exists(app_root):
+                 return "Server app does not exist. Please deploy the server app before starting."
+ 
+@@ -177,41 +186,65 @@ class ServerEngine(ServerEngineInternalSpec):
+             app_custom_folder = ""
+             if self.server.enable_byoc:
+                 app_custom_folder = os.path.join(app_root, "custom")
+-            self.child_process = self._start_runner_process(
+-                self.args, app_root, self.run_number, app_custom_folder, snapshot
+-            )
+ 
+-            threading.Thread(target=self.wait_for_complete).start()
++            open_ports = get_open_ports(2)
++            self._start_runner_process(self.args, app_root, run_number, app_custom_folder,
++                                       open_ports, snapshot)
+ 
+-            if self.command_conn:
+-                with self.lock:
+-                    self.command_conn.close()
+-                    self.command_conn = None
++            threading.Thread(target=self._listen_command, args=(open_ports[0], run_number)).start()
+ 
+             self.engine_info.status = MachineStatus.STARTED
+             return ""
+ 
+-    def wait_for_complete(self):
++    def _listen_command(self, listen_port, run_number):
++        address = ("localhost", int(listen_port))
++        listener = Listener(address, authkey="parent process secret password".encode())
++        conn = listener.accept()
++
++        while run_number in self.run_processes.keys():
++            clients = self.run_processes.get(run_number).get(RunProcessKey.PARTICIPANTS)
++            try:
++                if conn.poll(0.1):
++                    received_data = conn.recv()
++                    command = received_data.get(ServerCommandKey.COMMAND)
++                    data = received_data.get(ServerCommandKey.DATA)
++
++                    if command == ServerCommandNames.GET_CLIENTS:
++                        return_data = {ServerCommandKey.CLIENTS: clients}
++                        conn.send(return_data)
++                    elif command == ServerCommandNames.AUX_SEND:
++                        targets = data.get("targets")
++                        topic = data.get("topic")
++                        request = data.get("request")
++                        timeout = data.get("timeout")
++                        fl_ctx = data.get("fl_ctx")
++                        replies = self.aux_send(targets=targets, topic=topic, request=request,
++                                                timeout=timeout, fl_ctx=fl_ctx)
++                        conn.send(replies)
++            except:
++                self.logger.warning("Failed to process the child process command.")
++
++    def wait_for_complete(self, run_number):
+         while True:
+             try:
+-                self.get_command_conn()
+-                if self.command_conn:
+-                    with self.lock:
++                with self.lock:
++                    command_conn = self.get_command_conn(run_number)
++                    if command_conn:
+                         data = {ServerCommandKey.COMMAND: ServerCommandNames.HEARTBEAT, ServerCommandKey.DATA: {}}
+-                        self.command_conn.send(data)
++                        command_conn.send(data)
+                 time.sleep(1.0)
+             except BaseException:
+-                self.child_process = None
+-                self.command_conn = None
++                with self.lock:
++                    self.run_processes.pop(run_number)
+                 self.engine_info.status = MachineStatus.STOPPED
+                 break
+ 
+-    def _start_runner_process(self, args, app_root, run_number, app_custom_folder, snapshot):
++    def _start_runner_process(self, args, app_root, run_number, app_custom_folder, open_ports, snapshot):
+         new_env = os.environ.copy()
+         if app_custom_folder != "":
+             new_env["PYTHONPATH"] = new_env["PYTHONPATH"] + ":" + app_custom_folder
+ 
+-        self.open_port = get_open_ports(1)[0]
++        listen_port = open_ports[1]
+         if snapshot:
+             restore_snapshot = True
+         else:
+@@ -220,23 +253,28 @@ class ServerEngine(ServerEngineInternalSpec):
+         for t in args.set:
+             command_options += " " + t
+         command = (
+-            f"{sys.executable} -m nvflare.private.fed.app.server.runner_process -m "
+-            + args.workspace
+-            + " -s fed_server.json -r "
+-            + app_root
+-            + " -n "
+-            + str(run_number)
+-            + " -p "
+-            + str(self.open_port)
+-            + " --set"
+-            + command_options
+-            + " print_conf=True restore_snapshot="
+-            + str(restore_snapshot)
++                sys.executable + " -m nvflare.private.fed.app.server.runner_process -m "
++                + args.workspace
++                + " -s fed_server.json -r " + app_root
++                + " -n " + str(run_number)
++                + " -p " + str(listen_port)
++                + " -c " + str(open_ports[0])
++                + " --set" + command_options + " print_conf=True restore_snapshot=" + str(restore_snapshot)
+         )
+         # use os.setsid to create new process group ID
+ 
+         # command = f"{sys.executable} -m nvflare.private.fed.app.server.worker_process"
+         process = subprocess.Popen(shlex.split(command, " "), preexec_fn=os.setsid, env=new_env)
++
++        threading.Thread(target=self.wait_for_complete, args=[run_number]).start()
++
++        with self.lock:
++            self.run_processes[run_number] = {RunProcessKey.LISTEN_PORT: listen_port,
++                                              RunProcessKey.CONNECTION: None,
++                                              RunProcessKey.CHILD_PROCESS: process,
++                                              # TODO: each run will have its own participants. Use all clients for now.
++                                              RunProcessKey.PARTICIPANTS: self.client_manager.clients
++                                              }
+         return process
+ 
+     def remove_custom_path(self):
+@@ -253,7 +291,7 @@ class ServerEngine(ServerEngineInternalSpec):
+             return "Server app is starting, please wait for started before abort."
+         return ""
+ 
+-    def abort_app_on_server(self) -> str:
++    def abort_app_on_server(self, run_destination: str) -> str:
+         status = self.engine_info.status
+         if status == MachineStatus.STOPPED:
+             return "Server app has not started."
+@@ -266,25 +304,28 @@ class ServerEngine(ServerEngineInternalSpec):
+         # self.server.abort_run()
+ 
+         try:
+-            self.get_command_conn()
+-            if self.command_conn:
+-                with self.lock:
++            with self.lock:
++                command_conn = self.get_command_conn(run_destination)
++                if command_conn:
+                     data = {ServerCommandKey.COMMAND: AdminCommandNames.ABORT, ServerCommandKey.DATA: {}}
+-                    self.command_conn.send(data)
+-                    status_message = self.command_conn.recv()
++                    command_conn.send(data)
++                    status_message = command_conn.recv()
+                     self.logger.info(f"Abort server: {status_message}")
+         except:
+-            if self.child_process:
+-                self.child_process.terminate()
+-                self.child_process = None
++            with self.lock:
++                child_process = self.run_processes.get(run_destination, {}).get(RunProcessKey.CHILD_PROCESS, None)
++                if child_process:
++                    child_process.terminate()
++        finally:
++            with self.lock:
++                self.run_processes.pop(run_destination)
+ 
+         self.engine_info.status = MachineStatus.STOPPED
+         return ""
+ 
+-    def check_app_start_readiness(self) -> str:
+-        status = self.engine_info.status
+-        if status != MachineStatus.STARTING and status != MachineStatus.STARTED:
+-            return "Server app has not started."
++    def check_app_start_readiness(self, run_destination: str) -> str:
++        if run_destination not in self.run_processes.keys():
++            return f"Server app run_{run_destination} has not started."
+         return ""
+ 
+     def shutdown_server(self) -> str:
+@@ -348,9 +389,6 @@ class ServerEngine(ServerEngineInternalSpec):
+         return clients, invalid_inputs
+ 
+     def get_app_data(self, app_name: str) -> Tuple[str, object]:
+-        if self.run_number == -1:
+-            return "Please set a FL run number.", None
+-
+         # folder = self._get_run_folder()
+         # data = zip_directory_to_bytes(folder, self._get_client_app_folder(client_name))
+         fullpath_src = os.path.join(self.server.admin_server.file_upload_dir, app_name)
+@@ -359,22 +397,22 @@ class ServerEngine(ServerEngineInternalSpec):
+ 
+         # folder = self.args.workspace
+         # data = zip_directory_to_bytes(
+-        #     folder, os.path.join("run_" + str(self.run_number), self._get_client_app_folder(client_name))
++        #     folder, os.path.join(WorkspaceConstants.WORKSPACE_PREFIX + str(self.run_number), self._get_client_app_folder(client_name))
+         # )
+         data = zip_directory_to_bytes(fullpath_src, "")
+         return "", data
+ 
+-    def get_app_run_info(self) -> RunInfo:
++    def get_app_run_info(self, run_number) -> RunInfo:
+         run_info = None
+         try:
+-            self.get_command_conn()
+-            if self.command_conn:
+-                with self.lock:
++            with self.lock:
++                command_conn = self.get_command_conn(run_number)
++                if command_conn:
+                     data = {ServerCommandKey.COMMAND: ServerCommandNames.GET_RUN_INFO, ServerCommandKey.DATA: {}}
+-                    self.command_conn.send(data)
+-                    run_info = self.command_conn.recv()
++                    command_conn.send(data)
++                    run_info = command_conn.recv()
+         except:
+-            pass
++            self.logger.error(f"Failed to get_app_run_info from run_{run_number}")
+ 
+         return run_info
+ 
+@@ -406,8 +444,8 @@ class ServerEngine(ServerEngineInternalSpec):
+     def get_staging_path_of_app(self, app_name: str) -> str:
+         return os.path.join(self.server.admin_server.file_upload_dir, app_name)
+ 
+-    def deploy_app_to_server(self, app_name: str, app_staging_path: str) -> str:
+-        return self.deploy_app(app_name, "app_server")
++    def deploy_app_to_server(self, run_destination: str, app_name: str, app_staging_path: str) -> str:
++        return self.deploy_app(run_destination, app_name, "app_server")
+ 
+     def prepare_deploy_app_to_client(self, app_name: str, app_staging_path: str, client_name: str) -> str:
+         return self.deploy_app(app_name, "app_" + client_name)
+@@ -418,19 +456,16 @@ class ServerEngine(ServerEngineInternalSpec):
+     def ask_to_stop(self):
+         self.asked_to_stop = True
+ 
+-    def deploy_app(self, src, dest):
+-        if self.run_number == -1:
+-            return "Please set a run number."
+-
++    def deploy_app(self, run_destination, src, dest):
+         fullpath_src = os.path.join(self.server.admin_server.file_upload_dir, src)
+-        fullpath_dest = os.path.join(self._get_run_folder(), dest)
++        fullpath_dest = os.path.join(self._get_run_folder(run_destination), dest)
+         if not os.path.exists(fullpath_src):
+             return f"App folder '{src}' does not exist in staging area."
+         if os.path.exists(fullpath_dest):
+             shutil.rmtree(fullpath_dest)
+         shutil.copytree(fullpath_src, fullpath_dest)
+ 
+-        app_file = os.path.join(self._get_run_folder(), "fl_app.txt")
++        app_file = os.path.join(self._get_run_folder(run_destination), "fl_app.txt")
+         if os.path.exists(app_file):
+             os.remove(app_file)
+         with open(app_file, "wt") as f:
+@@ -454,6 +489,12 @@ class ServerEngine(ServerEngineInternalSpec):
+ 
+     def send_aux_request(self, targets: [], topic: str, request: Shareable, timeout: float, fl_ctx: FLContext) -> dict:
+         if not targets:
++            with self.parent_conn_lock:
++                data = {ServerCommandKey.COMMAND: ServerCommandNames.GET_CLIENTS, ServerCommandKey.DATA: {}}
++                self.parent_conn.send(data)
++                return_data = self.parent_conn.recv()
++                clients = return_data.get(ServerCommandKey.CLIENTS)
++                self.client_manager.clients = clients
+             targets = []
+             for t in self.get_clients():
+                 targets.append(t.name)
+@@ -464,11 +505,25 @@ class ServerEngine(ServerEngineInternalSpec):
+         else:
+             return {}
+ 
++    def parent_aux_send(self, targets: [], topic: str, request: Shareable, timeout: float, fl_ctx: FLContext) -> dict:
++        with self.parent_conn_lock:
++            data = {ServerCommandKey.COMMAND: ServerCommandNames.AUX_SEND,
++                    ServerCommandKey.DATA: {"targets": targets,
++                                            "topic": topic,
++                                            "request": request,
++                                            "timeout": timeout,
++                                            "fl_ctx": get_serializable_data(fl_ctx)}
++                    }
++            self.parent_conn.send(data)
++            return_data = self.parent_conn.recv()
++            return return_data
++
+     def aux_send(self, targets: [], topic: str, request: Shareable, timeout: float, fl_ctx: FLContext) -> dict:
+         # Send the aux messages through admin_server
+         request.set_peer_props(fl_ctx.get_all_public_props())
+ 
+         message = Message(topic=ReservedTopic.AUX_COMMAND, body=pickle.dumps(request))
++        message.set_header(RequestHeader.RUN_NUM, str(fl_ctx.get_prop(FLContextKey.CURRENT_RUN)))
+         requests = {}
+         for n in targets:
+             requests.update({n: message})
+@@ -491,13 +546,19 @@ class ServerEngine(ServerEngineInternalSpec):
+ 
+         return results
+ 
+-    def get_command_conn(self):
+-        if not self.command_conn:
++    def get_command_conn(self, run_number):
++        port = self.run_processes.get(run_number, {}).get(RunProcessKey.LISTEN_PORT)
++        command_conn = self.run_processes.get(run_number, {}).get(RunProcessKey.CONNECTION, None)
++
++        if not command_conn:
+             try:
+-                address = ("localhost", self.open_port)
+-                self.command_conn = CommandCLient(address, authkey="client process secret password".encode())
++                address = ("localhost", port)
++                command_conn = CommandClient(address, authkey="client process secret password".encode())
++
++                self.run_processes[run_number][RunProcessKey.CONNECTION] = command_conn
+             except Exception as e:
+                 pass
++        return command_conn
+ 
+     def persist_components(self, fl_ctx: FLContext, completed: bool):
+ 
+@@ -506,26 +567,36 @@ class ServerEngine(ServerEngineInternalSpec):
+         #    Make sure to include the current round number
+         # 2. call persistence API to save the component states
+ 
+-        snapshot = FLSnapshot()
++        fl_snapshot = self.snapshot_persistor.retrieve()
++        if fl_snapshot:
++            for run_number in list(fl_snapshot.run_snapshots.keys()):
++                snapshot = fl_snapshot.get_snapshot(run_number)
++                if snapshot.completed:
++                    fl_snapshot.remove_snapshot(run_number)
++        else:
++            fl_snapshot = FLSnapshot()
++
++        snapshot = RunSnapshot()
+         for component_id, component in self.run_manager.components.items():
+-            snapshot.save_component_snapshot(
++            snapshot.set_component_snapshot(
+                 component_id=component_id, component_state=component.get_persist_state(fl_ctx)
+             )
+ 
+-        snapshot.save_component_snapshot(
++        snapshot.set_component_snapshot(
+             component_id=SnapshotKey.FL_CONTEXT, component_state=copy.deepcopy(get_serializable_data(fl_ctx).props)
+         )
+ 
+         workspace = fl_ctx.get_prop(FLContextKey.WORKSPACE_OBJECT)
+-        data = zip_directory_to_bytes(workspace.get_run_dir(self.run_number), "")
+-        snapshot.save_component_snapshot(component_id=SnapshotKey.WORKSPACE, component_state={"content": data})
++        data = zip_directory_to_bytes(workspace.get_run_dir(fl_ctx.get_prop(FLContextKey.CURRENT_RUN)), "")
++        snapshot.set_component_snapshot(component_id=SnapshotKey.WORKSPACE, component_state={"content": data})
+ 
+         snapshot.completed = completed
+ 
+-        self.server.snapshot_location = self.snapshot_persistor.save(snapshot=snapshot)
++        fl_snapshot.add_snapshot(fl_ctx.get_prop(FLContextKey.CURRENT_RUN), snapshot)
++        self.server.snapshot_location = self.snapshot_persistor.save(snapshot=fl_snapshot)
+         self.logger.info(f"persist the snapshot to: {self.server.snapshot_location}")
+ 
+-    def restore_components(self, snapshot: FLSnapshot, fl_ctx: FLContext):
++    def restore_components(self, snapshot: RunSnapshot, fl_ctx: FLContext):
+         for component_id, component in self.run_manager.components.items():
+             component.restore(snapshot.get_component_snapshot(component_id=component_id), fl_ctx)
+ 
+@@ -534,6 +605,36 @@ class ServerEngine(ServerEngineInternalSpec):
+     def dispatch(self, topic: str, request: Shareable, fl_ctx: FLContext) -> Shareable:
+         return self.run_manager.aux_runner.dispatch(topic=topic, request=request, fl_ctx=fl_ctx)
+ 
++    def show_stats(self, run_number):
++        stats = None
++        try:
++            with self.lock:
++                command_conn = self.get_command_conn(run_number)
++                if command_conn:
++                    data = {ServerCommandKey.COMMAND: ServerCommandNames.SHOW_STATS,
++                            ServerCommandKey.DATA: {}}
++                    command_conn.send(data)
++                    stats = command_conn.recv()
++        except:
++            self.logger.error(f"Failed to get_stats from run_{run_number}")
++
++        return stats
++
++    def get_errors(self, run_number):
++        stats = None
++        try:
++            with self.lock:
++                command_conn = self.get_command_conn(run_number)
++                if command_conn:
++                    data = {ServerCommandKey.COMMAND: ServerCommandNames.GET_ERRORS,
++                            ServerCommandKey.DATA: {}}
++                    command_conn.send(data)
++                    stats = command_conn.recv()
++        except:
++            self.logger.error(f"Failed to get_stats from run_{run_number}")
++
++        return stats
++
+     def close(self):
+         self.executor.shutdown()
+ 

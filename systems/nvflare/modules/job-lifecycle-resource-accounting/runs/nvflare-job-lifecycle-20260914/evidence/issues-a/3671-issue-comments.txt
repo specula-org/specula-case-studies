@@ -1,0 +1,138 @@
+author:	evgvain
+association:	none
+edited:	false
+status:	none
+--
+I see in Client log few milliseconds **before** the server:
+```
+CLIENT: exception <class 'grpc._channel._MultiThreadedRendezvous'> in read_loop
+CLIENT in conn_mgr_1: done read_loop
+CLIENT: closing queue
+Connection [CN00002 Not Connected] is closed PID: 230
+Connection removed: GrpcDriver:[CN00002 N/A => auto-4916-node2.dev.acme-test.com:8002]
+CLIENT: finished connection [CN00002 Not Connected]
+Connection CN00002 is removed from endpoint server
+========= 62f0f054-c09a-4956-8625-d9c2e6aaaf6c: EP server state changed to 3
+Retrying [CH00001 ACTIVE grpc://auto-4916-node2.dev.acme-test.com:8002] in 1 seconds
+62f0f054-c09a-4956-8625-d9c2e6aaaf6c: removed CellAgent server
+Queue closed - stop iteration
+```
+
+--
+author:	YuanTingHsieh
+association:	collaborator
+edited:	false
+status:	none
+--
+@evgvain thanks for raising the issue.
+
+- Could you please share a bit more about your workload and environment setup?
+
+    - How large is your model in terms of weights—are we talking several GBs?
+
+    - What’s the disk size on each VM?
+
+- You mentioned: "happens less frequently when no client is running on the same host that server runs."
+Just to clarify, does the issue occur in both setups, but is more frequent when a client is running on the same host as the server?
+
+- Also, would it be possible for you to share the full logs? That would really help us understand the issue better.
+--
+author:	evgvain
+association:	none
+edited:	true
+status:	none
+--
+- Let me provide more detailed information about the latest setup. 
+    - I have 3 VMs: node2, node3, node4. There is a dedicated container for flare server on the node2. In addition there are 10 worker containers on each node. For every computation tasks messages are published. The server container starts flare server process for every task. One arbitrary worker on each VM starts the flare client process. The flare admin monitors the flare server and submits a job after all clients are connected.
+    - The data I am using for test is really small. Every client calculates a histogram over 2 categories. Then the server aggregates histograms calculated by the clients.
+    - Each VM has more than 100GB free disk space, 16 vCPU, 64GB RAM
+    - All VMs are in the same AWS VPC, connected to the same subnet
+
+- I have 2 configurations (I run about 100 jobs on each one):
+    - server no node2, clients are on node2, node3, node4 - in this setup the error happens approximately in 5-7% of runs 
+    - server no node2, clients are on node3, node4 - in this setup the error happens approximately in 2-3% of runs
+   
+- Attaching logs for successful and for failed sessions from the 1st setup (server no node2, clients are on node2, node3, node4)
+
+[failed.client2.log](https://github.com/user-attachments/files/22329879/failed.client2.log)
+[failed.client3.log](https://github.com/user-attachments/files/22329881/failed.client3.log)
+[failed.client4.log](https://github.com/user-attachments/files/22329880/failed.client4.log)
+[failed.server.log](https://github.com/user-attachments/files/22329876/failed.server.log)
+[successful.client2.log](https://github.com/user-attachments/files/22329878/successful.client2.log)
+[successful.client3.log](https://github.com/user-attachments/files/22329877/successful.client3.log)
+[successful.client4.log](https://github.com/user-attachments/files/22329875/successful.client4.log)
+[successful.server.log](https://github.com/user-attachments/files/22329874/successful.server.log)
+--
+author:	chesterxgchen
+association:	collaborator
+edited:	false
+status:	none
+--
+@YuanTingHsieh 
+--
+author:	yanchengnv
+association:	contributor
+edited:	false
+status:	none
+--
+The log file shows grpc.RpcError exception. This happens when the underline gRPC ran into connection issues.
+Can you try HTTP?  You will need to re-provision the project, and specify the "scheme" to be "http" in the project.yml.
+--
+author:	evgvain
+association:	none
+edited:	false
+status:	none
+--
+@yanchengnv 
+I clanged the schema as you suggested and the error did not happen again.
+Could you help me to understand what are the upsides and downsides of using http instead of grpc? Is mTLS connection security preserved? Thanks.
+--
+author:	nvidianz
+association:	collaborator
+edited:	false
+status:	none
+--
+HTTP scheme uses WebSocket (a HTTP extension) for transport. In the past, websockets library is used and it's very slow so we didn't recommend it. Since 2.6, we switched to aiohttp library and the performance is the same as gRPC based on our benchmark. 
+
+The upside is that it has much less issues than gRPC. The downside is sometimes websocket is blocked by the network infrastructure.
+
+mTLS is the same on all schemes.
+--
+author:	evgvain
+association:	none
+edited:	false
+status:	none
+--
+@nvidianz , thanks for you the explanation. So we can use the 'http' driver instead of 'grpc', without any other changes in the configuration, keeping the same security level and performance, correct?
+--
+author:	chesterxgchen
+association:	collaborator
+edited:	false
+status:	none
+--
+Yes.
+
+Get Outlook for iOS<https://aka.ms/o0ukef>
+________________________________
+From: evgvain ***@***.***>
+Sent: Saturday, September 20, 2025 10:23:23 PM
+To: NVIDIA/NVFlare ***@***.***>
+Cc: Chester Chen ***@***.***>; Comment ***@***.***>
+Subject: Re: [NVIDIA/NVFlare] [BUG] job fails due to the communication error (Issue #3671)
+
+[https://avatars.githubusercontent.com/u/6605905?s=20&v=4]evgvain left a comment (NVIDIA/NVFlare#3671)<https://github.com/NVIDIA/NVFlare/issues/3671#issuecomment-3315512173>
+
+@nvidianz<https://github.com/nvidianz> , thanks for you the explanation. So we can use the 'http' driver instead of 'grpc', without any other changes in the configuration, keeping the same security level and performance, correct?
+
+—
+Reply to this email directly, view it on GitHub<https://github.com/NVIDIA/NVFlare/issues/3671#issuecomment-3315512173>, or unsubscribe<https://github.com/notifications/unsubscribe-auth/AAD5FQ7UAPJK5BG7KB7GDPT3TYY4XAVCNFSM6AAAAACGBJYWBOVHI2DSMVQWIX3LMV43OSLTON2WKQ3PNVWWK3TUHMZTGMJVGUYTEMJXGM>.
+You are receiving this because you commented.Message ID: ***@***.***>
+
+--
+author:	evgvain
+association:	none
+edited:	false
+status:	none
+--
+@chesterxgchen Thanks
+--

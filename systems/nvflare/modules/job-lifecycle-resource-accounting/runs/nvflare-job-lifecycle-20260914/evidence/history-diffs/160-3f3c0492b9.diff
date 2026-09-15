@@ -1,0 +1,273 @@
+commit 3f3c0492b939853be7dabc4f838965b645343ec2
+Author:     Yuan-Ting Hsieh (謝沅廷) <yuantingh@nvidia.com>
+AuthorDate: Fri Sep 23 15:08:11 2022 -0700
+Commit:     GitHub <noreply@github.com>
+CommitDate: Fri Sep 23 15:08:11 2022 -0700
+
+    Add secure logging (#919)
+    
+    * Add secure logging
+    
+    * Modify code to use secure logging
+    
+    * Fix unit test
+    
+    * Undo unexpected changes
+---
+ nvflare/private/fed/client/client_engine.py   |  6 +++---
+ nvflare/private/fed/client/client_executor.py | 16 +++++++++++-----
+ nvflare/private/fed/client/scheduler_cmds.py  |  5 +++--
+ nvflare/private/fed/server/job_runner.py      | 15 +++++++++++----
+ nvflare/private/fed/server/server_engine.py   | 15 ++++++++-------
+ 5 files changed, 36 insertions(+), 21 deletions(-)
+
+diff --git a/nvflare/private/fed/client/client_engine.py b/nvflare/private/fed/client/client_engine.py
+index f6a41c07..aa7fda68 100644
+--- a/nvflare/private/fed/client/client_engine.py
++++ b/nvflare/private/fed/client/client_engine.py
+@@ -18,7 +18,6 @@ import re
+ import shutil
+ import sys
+ import time
+-import traceback
+ from concurrent.futures import ThreadPoolExecutor
+ 
+ from nvflare.apis.event_type import EventType
+@@ -33,6 +32,7 @@ from nvflare.private.defs import ERROR_MSG_PREFIX, ClientStatusKey, EngineConsta
+ from nvflare.private.event import fire_event
+ from nvflare.private.fed.utils.app_deployer import AppDeployer
+ from nvflare.private.fed.utils.fed_utils import security_close
++from nvflare.security.logging import secure_format_exception, secure_log_traceback
+ 
+ from .client_engine_internal_spec import ClientEngineInternalSpec
+ from .client_executor import ProcessExecutor
+@@ -292,5 +292,5 @@ def _shutdown_client(federated_client, admin_agent, touch_file):
+         admin_agent.shutdown()
+         security_close()
+     except BaseException as e:
+-        traceback.print_exc()
+-        print("Failed to shutdown client: " + str(e))
++        secure_log_traceback()
++        print(f"Failed to shutdown client: {secure_format_exception(e)}")
+diff --git a/nvflare/private/fed/client/client_executor.py b/nvflare/private/fed/client/client_executor.py
+index 6058b73e..6a7dcc97 100644
+--- a/nvflare/private/fed/client/client_executor.py
++++ b/nvflare/private/fed/client/client_executor.py
+@@ -25,6 +25,7 @@ from multiprocessing.connection import Client
+ from nvflare.apis.fl_constant import AdminCommandNames, ReturnCode, RunProcessKey
+ from nvflare.apis.resource_manager_spec import ResourceManagerSpec
+ from nvflare.apis.shareable import Shareable, make_reply
++from nvflare.security.logging import secure_format_exception, secure_log_traceback
+ 
+ from .client_status import ClientStatus, get_status_message
+ 
+@@ -252,7 +253,8 @@ class ProcessExecutor(ClientExecutor):
+                     process_status = ClientStatus.NOT_STARTED
+                     return get_status_message(process_status)
+         except Exception as e:
+-            self.logger.error(f"check_status execution exception: {e}.", exc_info=True)
++            self.logger.error(f"check_status execution exception: {secure_format_exception(e)}.")
++            secure_log_traceback()
+             return "execution exception. Please try again."
+ 
+     def get_run_info(self, job_id):
+@@ -276,7 +278,8 @@ class ProcessExecutor(ClientExecutor):
+                 else:
+                     return {}
+         except Exception as e:
+-            self.logger.error(f"get_run_info execution exception: {e}.", exc_info=True)
++            self.logger.error(f"get_run_info execution exception: {secure_format_exception(e)}.")
++            secure_log_traceback()
+             return {"error": "no info collector. Please try again."}
+ 
+     def get_errors(self, job_id):
+@@ -300,7 +303,8 @@ class ProcessExecutor(ClientExecutor):
+                 else:
+                     return None
+         except Exception as e:
+-            self.logger.error(f"get_errors execution exception: {e}.", exc_info=True)
++            self.logger.error(f"get_errors execution exception: {secure_format_exception(e)}.")
++            secure_log_traceback()
+             return None
+ 
+     def reset_errors(self, job_id):
+@@ -317,7 +321,8 @@ class ProcessExecutor(ClientExecutor):
+                     data = {"command": AdminCommandNames.RESET_ERRORS, "data": {}}
+                     conn_client.send(data)
+         except Exception as e:
+-            self.logger.error(f"reset_errors execution exception: {e}.", exc_info=True)
++            self.logger.error(f"reset_errors execution exception: {secure_format_exception(e)}.")
++            secure_log_traceback()
+ 
+     def process_aux_command(self, shareable: Shareable, job_id):
+         """Processes the aux command.
+@@ -366,8 +371,9 @@ class ProcessExecutor(ClientExecutor):
+                     except Exception as e:
+                         if retry == 0:
+                             self.logger.error(
+-                                f"abort_worker_process execution exception: {e} for run: {job_id}.", exc_info=True
++                                f"abort_worker_process execution exception: {secure_format_exception(e)} for run: {job_id}."
+                             )
++                            secure_log_traceback()
+                         retry -= 1
+                         time.sleep(5.0)
+                     finally:
+diff --git a/nvflare/private/fed/client/scheduler_cmds.py b/nvflare/private/fed/client/scheduler_cmds.py
+index 7aaff1b4..45ece8bb 100644
+--- a/nvflare/private/fed/client/scheduler_cmds.py
++++ b/nvflare/private/fed/client/scheduler_cmds.py
+@@ -24,6 +24,7 @@ from nvflare.private.defs import ERROR_MSG_PREFIX, RequestHeader, SysCommandTopi
+ from nvflare.private.fed.client.admin import RequestProcessor
+ from nvflare.private.fed.client.client_engine_internal_spec import ClientEngineInternalSpec
+ from nvflare.private.scheduler_constants import ShareableHeader
++from nvflare.security.logging import secure_format_exception
+ 
+ 
+ def _get_resource_manager(engine: ClientEngineInternalSpec):
+@@ -88,7 +89,7 @@ class StartJobProcessor(RequestProcessor):
+             job_id = req.get_header(RequestHeader.JOB_ID)
+             token = req.get_header(ShareableHeader.RESOURCE_RESERVE_TOKEN)
+         except Exception as e:
+-            msg = f"{ERROR_MSG_PREFIX}: Start job execution exception, missing required information: {e}."
++            msg = f"{ERROR_MSG_PREFIX}: Start job execution exception, missing required information: {secure_format_exception(e)}."
+             return Message(topic=f"reply_{req.topic}", body=msg)
+ 
+         try:
+@@ -106,7 +107,7 @@ class StartJobProcessor(RequestProcessor):
+                 resource_manager=resource_manager,
+             )
+         except Exception as e:
+-            result = f"{ERROR_MSG_PREFIX}: Start job execution exception: {e}."
++            result = f"{ERROR_MSG_PREFIX}: Start job execution exception: {secure_format_exception(e)}."
+             if allocated_resources:
+                 with engine.new_context() as fl_ctx:
+                     resource_manager.free_resources(resources=allocated_resources, token=token, fl_ctx=fl_ctx)
+diff --git a/nvflare/private/fed/server/job_runner.py b/nvflare/private/fed/server/job_runner.py
+index d320b28e..6ee21b68 100644
+--- a/nvflare/private/fed/server/job_runner.py
++++ b/nvflare/private/fed/server/job_runner.py
+@@ -30,6 +30,7 @@ from nvflare.private.admin_defs import Message, MsgHeader, ReturnCode
+ from nvflare.private.defs import RequestHeader, TrainingTopic
+ from nvflare.private.fed.server.admin import check_client_replies
+ from nvflare.private.fed.utils.app_deployer import AppDeployer
++from nvflare.security.logging import secure_format_exception
+ 
+ 
+ def _send_to_clients(admin_server, client_sites: List[str], engine, message):
+@@ -247,7 +248,7 @@ class JobRunner(FLComponent):
+             replies = _send_to_clients(admin_server, client_sites, engine, message)
+             check_client_replies(replies=replies, client_sites=client_sites, command="abort the run")
+         except RuntimeError as e:
+-            self.log_error(fl_ctx, f"Failed to abort run ({job_id}) on the clients: {e}")
++            self.log_error(fl_ctx, f"Failed to abort run ({job_id}) on the clients: {secure_format_exception(e)}")
+ 
+     def _delete_run(self, job_id, client_sites: List[str], fl_ctx: FLContext):
+         """Deletes the run workspace
+@@ -267,7 +268,9 @@ class JobRunner(FLComponent):
+             replies = _send_to_clients(admin_server, client_sites, engine, message)
+             check_client_replies(replies=replies, client_sites=client_sites, command="send delete_run command")
+         except RuntimeError as e:
+-            self.log_error(fl_ctx, f"Failed to execute delete run ({job_id}) on the clients: {e}")
++            self.log_error(
++                fl_ctx, f"Failed to execute delete run ({job_id}) on the clients: {secure_format_exception(e)}"
++            )
+ 
+         err = engine.delete_job_id(job_id)
+         if err:
+@@ -367,7 +370,9 @@ class JobRunner(FLComponent):
+                                     )
+ 
+                                 self.fire_event(EventType.JOB_ABORTED, fl_ctx)
+-                                self.log_error(fl_ctx, f"Failed to run the Job ({ready_job.job_id}): {e}")
++                                self.log_error(
++                                    fl_ctx, f"Failed to run the Job ({ready_job.job_id}): {secure_format_exception(e)}"
++                                )
+ 
+                 time.sleep(1.0)
+         else:
+@@ -383,7 +388,9 @@ class JobRunner(FLComponent):
+             with self.lock:
+                 self.running_jobs[job_id] = job
+         except Exception as e:
+-            self.log_error(fl_ctx, f"Failed to restore the job: {job_id} to the running job table: {e}.")
++            self.log_error(
++                fl_ctx, f"Failed to restore the job: {job_id} to the running job table: {secure_format_exception(e)}."
++            )
+ 
+     def stop_run(self, job_id: str, fl_ctx: FLContext):
+         engine = fl_ctx.get_engine()
+diff --git a/nvflare/private/fed/server/server_engine.py b/nvflare/private/fed/server/server_engine.py
+index e4e45b6e..b4d5fd37 100644
+--- a/nvflare/private/fed/server/server_engine.py
++++ b/nvflare/private/fed/server/server_engine.py
+@@ -56,6 +56,7 @@ from nvflare.private.defs import RequestHeader, TrainingTopic
+ from nvflare.private.fed.server.server_json_config import ServerJsonConfigurator
+ from nvflare.private.fed.utils.fed_utils import security_close
+ from nvflare.private.scheduler_constants import ShareableHeader
++from nvflare.security.logging import secure_format_exception
+ from nvflare.widgets.info_collector import InfoCollector
+ from nvflare.widgets.widget import Widget, WidgetID
+ 
+@@ -193,7 +194,7 @@ class ServerEngine(ServerEngineInternalSpec):
+ 
+     def start_app_on_server(self, run_number: str, job_id: str = None, job_clients=None, snapshot=None) -> str:
+         if run_number in self.run_processes.keys():
+-            return f"Server run_{run_number} already started."
++            return f"Server run: {run_number} already started."
+         else:
+             workspace = Workspace(root_dir=self.args.workspace, site_name="server")
+             app_root = workspace.get_app_dir(run_number)
+@@ -241,7 +242,7 @@ class ServerEngine(ServerEngineInternalSpec):
+                         )
+                         conn.send(replies)
+             except BaseException as e:
+-                self.logger.warning(f"Failed to process the child process command: {e}", exc_info=True)
++                self.logger.warning(f"Failed to process the child process command: {secure_format_exception(e)}")
+ 
+     def wait_for_complete(self, job_id):
+         while True:
+@@ -365,7 +366,7 @@ class ServerEngine(ServerEngineInternalSpec):
+ 
+     def check_app_start_readiness(self, job_id: str) -> str:
+         if job_id not in self.run_processes.keys():
+-            return f"Server app run_{job_id} has not started."
++            return f"Server app run: {job_id} has not started."
+         return ""
+ 
+     def shutdown_server(self) -> str:
+@@ -446,7 +447,7 @@ class ServerEngine(ServerEngineInternalSpec):
+                 command_data={},
+             )
+         except BaseException:
+-            self.logger.error(f"Failed to get_app_run_info from run_{job_id}")
++            self.logger.error(f"Failed to get_app_run_info from run: {job_id}")
+ 
+         return run_info
+ 
+@@ -539,7 +540,7 @@ class ServerEngine(ServerEngineInternalSpec):
+             else:
+                 return {}
+         except Exception as e:
+-            self.logger.error(f"Failed to send the aux_message: {topic} with exception: {e}.")
++            self.logger.error(f"Failed to send the aux_message: {topic} with exception: {secure_format_exception(e)}.")
+ 
+     def sync_clients_from_main_process(self):
+         with self.parent_conn_lock:
+@@ -674,7 +675,7 @@ class ServerEngine(ServerEngineInternalSpec):
+             else:
+                 self.logger.info(f"The snapshot: {self.server.snapshot_location} has been removed.")
+         except BaseException as e:
+-            self.logger.error(f"Failed to persist the components. {str(e)}")
++            self.logger.error(f"Failed to persist the components. {secure_format_exception(e)}")
+ 
+     def restore_components(self, snapshot: RunSnapshot, fl_ctx: FLContext):
+         for component_id, component in self.run_manager.components.items():
+@@ -708,7 +709,7 @@ class ServerEngine(ServerEngineInternalSpec):
+                 command_data={},
+             )
+         except BaseException:
+-            self.logger.error(f"Failed to get_stats from run_{job_id}")
++            self.logger.error(f"Failed to get_stats from run: {job_id}")
+ 
+         return stats
+ 

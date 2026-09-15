@@ -1,0 +1,155 @@
+commit ce306e04700b448f7a8ad3af8e59c06bcc9dc1b9
+Author:     Yuhong Wen <yuhongw@nvidia.com>
+AuthorDate: Wed Nov 2 09:31:56 2022 -0400
+Commit:     GitHub <noreply@github.com>
+CommitDate: Wed Nov 2 09:31:56 2022 -0400
+
+    Upgrade for Python 3.10. (#1102)
+    
+    * Upgrade for Python 3.10.
+    
+    * refactor, code styles.
+    
+    * upgrade grpcio version.
+    
+    * Added proper comment and messages.
+    
+    * Removed no used do_validate().
+    
+    * codestyle.
+---
+ nvflare/private/fed/client/client_engine.py | 27 +++++----------------------
+ nvflare/private/fed/server/server_engine.py | 18 +++++++++++-------
+ 2 files changed, 16 insertions(+), 29 deletions(-)
+
+diff --git a/nvflare/private/fed/client/client_engine.py b/nvflare/private/fed/client/client_engine.py
+index ad334d52..2edc879e 100644
+--- a/nvflare/private/fed/client/client_engine.py
++++ b/nvflare/private/fed/client/client_engine.py
+@@ -17,8 +17,8 @@ import os
+ import re
+ import shutil
+ import sys
++import threading
+ import time
+-from concurrent.futures import ThreadPoolExecutor
+ 
+ from nvflare.apis.event_type import EventType
+ from nvflare.apis.fl_component import FLComponent
+@@ -27,7 +27,6 @@ from nvflare.apis.fl_context import FLContext, FLContextManager
+ from nvflare.apis.shareable import Shareable
+ from nvflare.apis.workspace import Workspace
+ from nvflare.fuel.utils.network_utils import get_open_ports
+-from nvflare.private.admin_defs import Message
+ from nvflare.private.defs import ERROR_MSG_PREFIX, ClientStatusKey, EngineConstant
+ from nvflare.private.event import fire_event
+ from nvflare.private.fed.utils.app_deployer import AppDeployer
+@@ -79,7 +78,6 @@ class ClientEngine(ClientEngineInternalSpec):
+ 
+         if workers < 1:
+             raise ValueError("workers must >= 1")
+-        self.executor = ThreadPoolExecutor(max_workers=workers)
+         self.logger = logging.getLogger(self.__class__.__name__)
+         self.fl_components = [x for x in self.client.components.values() if isinstance(x, FLComponent)]
+ 
+@@ -89,12 +87,6 @@ class ClientEngine(ClientEngineInternalSpec):
+     def set_agent(self, admin_agent):
+         self.admin_agent = admin_agent
+ 
+-    def do_validate(self, req: Message):
+-        self.logger.info("starting cross site validation.")
+-        _ = self.executor.submit(lambda p: _do_validate(*p), [self.sender, req])
+-
+-        return "validate process started."
+-
+     def new_context(self) -> FLContext:
+         return self.fl_ctx_mgr.new_context()
+ 
+@@ -219,18 +211,18 @@ class ClientEngine(ClientEngineInternalSpec):
+         touch_file = os.path.join(self.args.workspace, "shutdown.fl")
+         self.fire_event(EventType.SYSTEM_END, self.new_context())
+ 
+-        _ = self.executor.submit(lambda p: _shutdown_client(*p), [self.client, self.admin_agent, touch_file])
++        thread = threading.Thread(target=_shutdown_client, args=(self.client, self.admin_agent, touch_file))
++        thread.start()
+ 
+-        self.executor.shutdown()
+         return "Shutdown the client..."
+ 
+     def restart(self) -> str:
+         self.logger.info("Client shutdown...")
+         touch_file = os.path.join(self.args.workspace, "restart.fl")
+         self.fire_event(EventType.SYSTEM_END, self.new_context())
+-        _ = self.executor.submit(lambda p: _shutdown_client(*p), [self.client, self.admin_agent, touch_file])
++        thread = threading.Thread(target=_shutdown_client, args=(self.client, self.admin_agent, touch_file))
++        thread.start()
+ 
+-        self.executor.shutdown()
+         return "Restart the client..."
+ 
+     def deploy_app(self, app_name: str, job_id: str, job_meta: dict, client_name: str, app_data) -> str:
+@@ -267,15 +259,6 @@ class ClientEngine(ClientEngineInternalSpec):
+         return self.client_executor.get_run_processes_keys()
+ 
+ 
+-def _do_validate(sender, message):
+-    print("starting the validate process .....")
+-    time.sleep(60)
+-    print("Generating processing result ......")
+-    reply = Message(topic=message.topic, body="")
+-    sender.send_result(reply)
+-    pass
+-
+-
+ def _shutdown_client(federated_client, admin_agent, touch_file):
+     with open(touch_file, "a"):
+         os.utime(touch_file, None)
+diff --git a/nvflare/private/fed/server/server_engine.py b/nvflare/private/fed/server/server_engine.py
+index 2bfcd726..e5b73af6 100644
+--- a/nvflare/private/fed/server/server_engine.py
++++ b/nvflare/private/fed/server/server_engine.py
+@@ -176,8 +176,12 @@ class ServerEngine(ServerEngineInternalSpec):
+             except BaseException:
+                 # The parent process can not be reached. Terminate the child process.
+                 break
+-        # delay some time for the wrap up process before the child process self terminate.
+-        time.sleep(30)
++        # wait and delay some time for the wrap up process before the child process self terminate.
++        start_time = time.time()
++        while self.engine_info.status != MachineStatus.STOPPED:
++            time.sleep(1.0)
++            if time.time() - start_time > 30.0:
++                break
+         os.killpg(os.getpgid(os.getpid()), 9)
+ 
+     def delete_job_id(self, num):
+@@ -396,8 +400,8 @@ class ServerEngine(ServerEngineInternalSpec):
+ 
+         touch_file = os.path.join(self.args.workspace, "shutdown.fl")
+         _ = self.executor.submit(lambda p: server_shutdown(*p), [self.server, touch_file])
+-        while self.server.status != ServerStatus.SHUTDOWN:
+-            time.sleep(1.0)
++        # while self.server.status != ServerStatus.SHUTDOWN:
++        #     time.sleep(1.0)
+         return ""
+ 
+     def restart_server(self) -> str:
+@@ -409,8 +413,8 @@ class ServerEngine(ServerEngineInternalSpec):
+ 
+         touch_file = os.path.join(self.args.workspace, "restart.fl")
+         _ = self.executor.submit(lambda p: server_shutdown(*p), [self.server, touch_file])
+-        while self.server.status != ServerStatus.SHUTDOWN:
+-            time.sleep(1.0)
++        # while self.server.status != ServerStatus.SHUTDOWN:
++        #     time.sleep(1.0)
+         return ""
+ 
+     def get_widget(self, widget_id: str) -> Widget:
+@@ -831,6 +835,6 @@ def server_shutdown(server, touch_file):
+         server.admin_server.stop()
+         time.sleep(3.0)
+     finally:
+-        server.status = ServerStatus.SHUTDOWN
+         security_close()
++        server.status = ServerStatus.SHUTDOWN
+         sys.exit(2)

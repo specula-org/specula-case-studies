@@ -1,0 +1,459 @@
+commit dd256fe9973b9515df98b035c0ca4349ec5029fd
+Author:     Yuhong Wen <yuhongw@nvidia.com>
+AuthorDate: Fri Nov 1 14:27:12 2024 -0400
+Commit:     GitHub <noreply@github.com>
+CommitDate: Sat Nov 2 02:27:12 2024 +0800
+
+    Job launcher (#3049)
+    
+    * WIP: implement the ProcessJobLaunch.
+    
+    * WIP: working ProcessJobLauncher impelentation.
+    
+    * Added k8s_launcher implementation.
+    
+    * Added logger for k8s_launcher.py
+    
+    * Added empty launcher_map check.
+    
+    * Added more config for K8sJobLauncher.
+    
+    * renamed RunProcessKey.JOB_LAUNCHER.
+    
+    * Separated out the JobHandleSpec.
+    
+    * Support for the launcher deploy image.
+    
+    * Changed the _get_job_launcher logic.
+    
+    * add more handled for the deployment_map change.
+    
+    * Added logging for job launcher.
+    
+    * Fixed extract_job_image usage.
+    
+    * Added job_meta for launch_job.
+    
+    * codestyle fix.
+    
+    * refactoried.
+    
+    * extract to use constants.
+    
+    * Change the JobLauncherSpec API signiture.
+    
+    * Added can_launch() to JobLauncherSpec.
+    
+    * refactor.
+    
+    * removed duplicate const.
+    
+    * removed no use import.
+    
+    * changed to raise NotImplementedError().
+    
+    * refactored.
+    
+    * Changed to use event to get the job launcher.
+    
+    * updated K8sJobLauncher.
+    
+    * codestyle fix.
+    
+    * removed no use import.
+    
+    * JobReturnCode standard.
+    
+    * fixed the _get_job_launcher() condition logic.
+---
+ nvflare/app_common/job_schedulers/job_scheduler.py |   5 +-
+ nvflare/private/fed/client/client_engine.py        |  10 +-
+ nvflare/private/fed/client/client_executor.py      | 101 ++++++++-------------
+ nvflare/private/fed/client/scheduler_cmds.py       |   2 +
+ nvflare/private/fed/server/job_runner.py           |   5 +-
+ nvflare/private/fed/server/server_engine.py        |   9 +-
+ 6 files changed, 55 insertions(+), 77 deletions(-)
+
+diff --git a/nvflare/app_common/job_schedulers/job_scheduler.py b/nvflare/app_common/job_schedulers/job_scheduler.py
+index c7e03d39..d5cd35c8 100644
+--- a/nvflare/app_common/job_schedulers/job_scheduler.py
++++ b/nvflare/app_common/job_schedulers/job_scheduler.py
+@@ -25,6 +25,7 @@ from nvflare.apis.job_def import ALL_SITES, SERVER_SITE_NAME, Job, JobMetaKey, R
+ from nvflare.apis.job_def_manager_spec import JobDefManagerSpec
+ from nvflare.apis.job_scheduler_spec import DispatchInfo, JobSchedulerSpec
+ from nvflare.apis.server_engine_spec import ServerEngineSpec
++from nvflare.private.fed.utils.fed_utils import extract_participants
+ 
+ SCHEDULE_RESULT_OK = 0  # the job is scheduled
+ SCHEDULE_RESULT_NO_RESOURCE = 1  # job is not scheduled due to lack of resources
+@@ -109,7 +110,9 @@ class DefaultJobScheduler(JobSchedulerSpec, FLComponent):
+         applicable_sites = []
+         sites_to_app = {}
+         for app_name in job.deploy_map:
+-            for site_name in job.deploy_map[app_name]:
++            deployments = job.deploy_map[app_name]
++            deployments = extract_participants(deployments)
++            for site_name in deployments:
+                 if site_name.upper() == ALL_SITES:
+                     # deploy_map: {"app_name": ["ALL_SITES"]} will be treated as deploying to all online clients
+                     applicable_sites = online_site_names
+diff --git a/nvflare/private/fed/client/client_engine.py b/nvflare/private/fed/client/client_engine.py
+index 6c4acb92..6f293abd 100644
+--- a/nvflare/private/fed/client/client_engine.py
++++ b/nvflare/private/fed/client/client_engine.py
+@@ -32,7 +32,7 @@ from nvflare.private.fed.utils.fed_utils import security_close
+ from nvflare.security.logging import secure_format_exception, secure_log_traceback
+ 
+ from .client_engine_internal_spec import ClientEngineInternalSpec
+-from .client_executor import ProcessExecutor
++from .client_executor import JobExecutor
+ from .client_run_manager import ClientRunInfo
+ from .client_status import ClientStatus
+ from .fed_client import FederatedClient
+@@ -62,7 +62,7 @@ class ClientEngine(ClientEngineInternalSpec):
+         self.client_name = client.client_name
+         self.args = args
+         self.rank = rank
+-        self.client_executor = ProcessExecutor(client, os.path.join(args.workspace, "startup"))
++        self.client_executor = JobExecutor(client, os.path.join(args.workspace, "startup"))
+         self.admin_agent = None
+ 
+         self.fl_ctx_mgr = FLContextManager(
+@@ -134,6 +134,7 @@ class ClientEngine(ClientEngineInternalSpec):
+     def start_app(
+         self,
+         job_id: str,
++        job_meta: dict,
+         allocated_resource: dict = None,
+         token: str = None,
+         resource_manager=None,
+@@ -160,17 +161,16 @@ class ClientEngine(ClientEngineInternalSpec):
+ 
+         self.logger.info("Starting client app. rank: {}".format(self.rank))
+ 
+-        server_config = list(self.client.servers.values())[0]
+         self.client_executor.start_app(
+             self.client,
+             job_id,
++            job_meta,
+             self.args,
+             app_custom_folder,
+             allocated_resource,
+             token,
+             resource_manager,
+-            target=server_config["target"],
+-            scheme=server_config.get("scheme", "grpc"),
++            fl_ctx=self.new_context(),
+         )
+ 
+         return "Start the client app..."
+diff --git a/nvflare/private/fed/client/client_executor.py b/nvflare/private/fed/client/client_executor.py
+index e2e8f515..6a8a1112 100644
+--- a/nvflare/private/fed/client/client_executor.py
++++ b/nvflare/private/fed/client/client_executor.py
+@@ -13,22 +13,21 @@
+ # limitations under the License.
+ 
+ import logging
+-import os
+-import shlex
+-import subprocess
+-import sys
+ import threading
+ import time
+ from abc import ABC, abstractmethod
+ 
+-from nvflare.apis.fl_constant import AdminCommandNames, RunProcessKey, SystemConfigs
++from nvflare.apis.event_type import EventType
++from nvflare.apis.fl_constant import AdminCommandNames, FLContextKey, RunProcessKey, SystemConfigs
++from nvflare.apis.fl_context import FLContext
++from nvflare.apis.job_launcher_spec import JobLauncherSpec
+ from nvflare.apis.resource_manager_spec import ResourceManagerSpec
+ from nvflare.fuel.common.exit_codes import PROCESS_EXIT_REASON, ProcessExitCode
+ from nvflare.fuel.f3.cellnet.core_cell import FQCN
+ from nvflare.fuel.f3.cellnet.defs import MessageHeaderKey, ReturnCode
+ from nvflare.fuel.utils.config_service import ConfigService
+ from nvflare.private.defs import CellChannel, CellChannelTopic, JobFailureMsgKey, new_cell_message
+-from nvflare.private.fed.utils.fed_utils import add_custom_dir_to_path, get_return_code
++from nvflare.private.fed.utils.fed_utils import get_return_code
+ from nvflare.security.logging import secure_format_exception, secure_log_traceback
+ 
+ from .client_status import ClientStatus, get_status_message
+@@ -40,13 +39,13 @@ class ClientExecutor(ABC):
+         self,
+         client,
+         job_id,
++        job_meta,
+         args,
+         app_custom_folder,
+         allocated_resource,
+         token,
+         resource_manager,
+-        target: str,
+-        scheme: str,
++        fl_ctx: FLContext,
+     ):
+         """Starts the client app.
+ 
+@@ -58,8 +57,7 @@ class ClientExecutor(ABC):
+             allocated_resource: allocated resources
+             token: token from resource manager
+             resource_manager: resource manager
+-            target: SP target location
+-            scheme: SP target connection scheme
++            fl_ctx: FLContext
+         """
+         pass
+ 
+@@ -122,7 +120,7 @@ class ClientExecutor(ABC):
+         """
+ 
+ 
+-class ProcessExecutor(ClientExecutor):
++class JobExecutor(ClientExecutor):
+     """Run the Client executor in a child process."""
+ 
+     def __init__(self, client, startup):
+@@ -145,66 +143,37 @@ class ProcessExecutor(ClientExecutor):
+         self,
+         client,
+         job_id,
++        job_meta,
+         args,
+         app_custom_folder,
+         allocated_resource,
+         token,
+         resource_manager: ResourceManagerSpec,
+-        target: str,
+-        scheme: str,
++        fl_ctx: FLContext,
+     ):
+         """Starts the app.
+ 
+         Args:
+             client: the FL client object
+             job_id: the job_id
++            job_meta: job meta data
+             args: admin command arguments for starting the worker process
+             app_custom_folder: FL application custom folder
+             allocated_resource: allocated resources
+             token: token from resource manager
+             resource_manager: resource manager
+-            target: SP target location
+-            scheme: SP connection scheme
++            fl_ctx: FLContext
+         """
+-        new_env = os.environ.copy()
+-        if app_custom_folder != "":
+-            add_custom_dir_to_path(app_custom_folder, new_env)
+-
+-        command_options = ""
+-        for t in args.set:
+-            command_options += " " + t
+-        command = (
+-            f"{sys.executable} -m nvflare.private.fed.app.client.worker_process -m "
+-            + args.workspace
+-            + " -w "
+-            + self.startup
+-            + " -t "
+-            + client.token
+-            + " -d "
+-            + client.ssid
+-            + " -n "
+-            + job_id
+-            + " -c "
+-            + client.client_name
+-            + " -p "
+-            + str(client.cell.get_internal_listener_url())
+-            + " -g "
+-            + target
+-            + " -scheme "
+-            + scheme
+-            + " -s fed_client.json "
+-            " --set" + command_options + " print_conf=True"
+-        )
+-        # use os.setsid to create new process group ID
+-        process = subprocess.Popen(shlex.split(command, True), preexec_fn=os.setsid, env=new_env)
+ 
+-        self.logger.info("Worker child process ID: {}".format(process.pid))
++        job_launcher: JobLauncherSpec = self._get_job_launcher(job_meta, fl_ctx)
++        job_handle = job_launcher.launch_job(job_meta, fl_ctx)
++        self.logger.info(f"Launch job_id: {job_id}  with job launcher: {type(job_launcher)} ")
+ 
+         client.multi_gpu = False
+ 
+         with self.lock:
+             self.run_processes[job_id] = {
+-                RunProcessKey.CHILD_PROCESS: process,
++                RunProcessKey.JOB_HANDLE: job_handle,
+                 RunProcessKey.STATUS: ClientStatus.STARTING,
+             }
+ 
+@@ -214,6 +183,17 @@ class ProcessExecutor(ClientExecutor):
+         )
+         thread.start()
+ 
++    def _get_job_launcher(self, job_meta: dict, fl_ctx: FLContext) -> JobLauncherSpec:
++        engine = fl_ctx.get_engine()
++        fl_ctx.set_prop(FLContextKey.JOB_META, job_meta, private=True, sticky=False)
++        engine.fire_event(EventType.GET_JOB_LAUNCHER, fl_ctx)
++
++        job_launcher = fl_ctx.get_prop(FLContextKey.JOB_LAUNCHER)
++        if not (job_launcher and isinstance(job_launcher, list)):
++            raise RuntimeError(f"There's no job launcher can handle this job: {job_meta}.")
++
++        return job_launcher[0]
++
+     def notify_job_status(self, job_id, job_status):
+         run_process = self.run_processes.get(job_id)
+         if run_process:
+@@ -336,7 +316,7 @@ class ProcessExecutor(ClientExecutor):
+             if process_status == ClientStatus.STARTED:
+                 try:
+                     with self.lock:
+-                        child_process = self.run_processes[job_id][RunProcessKey.CHILD_PROCESS]
++                        job_handle = self.run_processes[job_id][RunProcessKey.JOB_HANDLE]
+                     data = {}
+                     request = new_cell_message({}, data)
+                     self.client.cell.fire_and_forget(
+@@ -347,7 +327,7 @@ class ProcessExecutor(ClientExecutor):
+                         optional=True,
+                     )
+                     self.logger.debug("abort sent to worker")
+-                    t = threading.Thread(target=self._terminate_process, args=[child_process, job_id])
++                    t = threading.Thread(target=self._terminate_job, args=[job_handle, job_id])
+                     t.start()
+                     t.join()
+                     break
+@@ -365,7 +345,7 @@ class ProcessExecutor(ClientExecutor):
+ 
+         self.logger.info("Client worker process is terminated.")
+ 
+-    def _terminate_process(self, child_process, job_id):
++    def _terminate_job(self, job_handle, job_id):
+         max_wait = 10.0
+         done = False
+         start = time.time()
+@@ -382,16 +362,7 @@ class ProcessExecutor(ClientExecutor):
+ 
+             time.sleep(0.05)  # we want to quickly check
+ 
+-        # kill the sub-process group directly
+-        if not done:
+-            self.logger.debug(f"still not done after {max_wait} secs")
+-            try:
+-                os.killpg(os.getpgid(child_process.pid), 9)
+-                self.logger.debug("kill signal sent")
+-            except:
+-                pass
+-
+-        child_process.terminate()
++        job_handle.terminate()
+         self.logger.info(f"run ({job_id}): child worker process terminated")
+ 
+     def abort_task(self, job_id):
+@@ -415,11 +386,11 @@ class ProcessExecutor(ClientExecutor):
+ 
+     def _wait_child_process_finish(self, client, job_id, allocated_resource, token, resource_manager, workspace):
+         self.logger.info(f"run ({job_id}): waiting for child worker process to finish.")
+-        child_process = self.run_processes.get(job_id, {}).get(RunProcessKey.CHILD_PROCESS)
+-        if child_process:
+-            child_process.wait()
++        job_handle = self.run_processes.get(job_id, {}).get(RunProcessKey.JOB_HANDLE)
++        if job_handle:
++            job_handle.wait()
+ 
+-            return_code = get_return_code(child_process, job_id, workspace, self.logger)
++            return_code = get_return_code(job_handle, job_id, workspace, self.logger)
+ 
+             self.logger.info(f"run ({job_id}): child worker process finished with RC {return_code}")
+             if return_code in [ProcessExitCode.UNSAFE_COMPONENT, ProcessExitCode.CONFIG_ERROR]:
+diff --git a/nvflare/private/fed/client/scheduler_cmds.py b/nvflare/private/fed/client/scheduler_cmds.py
+index 7ea2e8d5..ef473543 100644
+--- a/nvflare/private/fed/client/scheduler_cmds.py
++++ b/nvflare/private/fed/client/scheduler_cmds.py
+@@ -101,6 +101,7 @@ class StartJobProcessor(RequestProcessor):
+         try:
+             resource_spec = req.body
+             job_id = req.get_header(RequestHeader.JOB_ID)
++            job_meta = req.get_header(RequestHeader.JOB_META)
+             token = req.get_header(ShareableHeader.RESOURCE_RESERVE_TOKEN)
+         except Exception as e:
+             msg = f"{ERROR_MSG_PREFIX}: Start job execution exception, missing required information: {secure_format_exception(e)}."
+@@ -116,6 +117,7 @@ class StartJobProcessor(RequestProcessor):
+                 resource_consumer.consume(allocated_resources)
+             result = engine.start_app(
+                 job_id,
++                job_meta=job_meta,
+                 allocated_resource=allocated_resources,
+                 token=token,
+                 resource_manager=resource_manager,
+diff --git a/nvflare/private/fed/server/job_runner.py b/nvflare/private/fed/server/job_runner.py
+index d6bf91e8..7c382940 100644
+--- a/nvflare/private/fed/server/job_runner.py
++++ b/nvflare/private/fed/server/job_runner.py
+@@ -35,7 +35,7 @@ from nvflare.private.defs import RequestHeader, TrainingTopic
+ from nvflare.private.fed.server.admin import check_client_replies
+ from nvflare.private.fed.server.server_state import HotState
+ from nvflare.private.fed.utils.app_deployer import AppDeployer
+-from nvflare.private.fed.utils.fed_utils import set_message_security_data
++from nvflare.private.fed.utils.fed_utils import extract_participants, set_message_security_data
+ from nvflare.security.logging import secure_format_exception
+ 
+ 
+@@ -131,6 +131,7 @@ class JobRunner(FLComponent):
+ 
+         for app_name, participants in job.get_deployment().items():
+             app_data = job.get_application(app_name, fl_ctx)
++            participants = extract_participants(participants)
+ 
+             if len(participants) == 1 and participants[0].upper() == ALL_SITES:
+                 participants = ["server"]
+@@ -249,7 +250,7 @@ class JobRunner(FLComponent):
+         if err:
+             raise RuntimeError(f"Could not start the server App for job: {job_id}.")
+ 
+-        replies = engine.start_client_job(job_id, client_sites, fl_ctx)
++        replies = engine.start_client_job(job, client_sites, fl_ctx)
+         client_sites_names = list(client_sites.keys())
+         check_client_replies(replies=replies, client_sites=client_sites_names, command=f"start job ({job_id})")
+         display_sites = ",".join(client_sites_names)
+diff --git a/nvflare/private/fed/server/server_engine.py b/nvflare/private/fed/server/server_engine.py
+index 1bf8f415..be982341 100644
+--- a/nvflare/private/fed/server/server_engine.py
++++ b/nvflare/private/fed/server/server_engine.py
+@@ -285,7 +285,7 @@ class ServerEngine(ServerEngineInternalSpec):
+ 
+         with self.lock:
+             self.run_processes[run_number] = {
+-                RunProcessKey.CHILD_PROCESS: process,
++                RunProcessKey.JOB_HANDLE: process,
+                 RunProcessKey.JOB_ID: job_id,
+                 RunProcessKey.PARTICIPANTS: job_clients,
+             }
+@@ -333,7 +333,7 @@ class ServerEngine(ServerEngineInternalSpec):
+             self.logger.info(f"Abort server status: {status_message}")
+         except Exception:
+             with self.lock:
+-                child_process = self.run_processes.get(job_id, {}).get(RunProcessKey.CHILD_PROCESS, None)
++                child_process = self.run_processes.get(job_id, {}).get(RunProcessKey.JOB_HANDLE, None)
+                 if child_process:
+                     child_process.terminate()
+         finally:
+@@ -873,13 +873,14 @@ class ServerEngine(ServerEngineInternalSpec):
+         if requests:
+             _ = self._send_admin_requests(requests, fl_ctx)
+ 
+-    def start_client_job(self, job_id, client_sites, fl_ctx: FLContext):
++    def start_client_job(self, job, client_sites, fl_ctx: FLContext):
+         requests = {}
+         for site, dispatch_info in client_sites.items():
+             resource_requirement = dispatch_info.resource_requirements
+             token = dispatch_info.token
+             request = Message(topic=TrainingTopic.START_JOB, body=resource_requirement)
+-            request.set_header(RequestHeader.JOB_ID, job_id)
++            request.set_header(RequestHeader.JOB_ID, job.job_id)
++            request.set_header(RequestHeader.JOB_META, job.meta)
+             request.set_header(ShareableHeader.RESOURCE_RESERVE_TOKEN, token)
+             client = self.get_client_from_name(site)
+             if client:

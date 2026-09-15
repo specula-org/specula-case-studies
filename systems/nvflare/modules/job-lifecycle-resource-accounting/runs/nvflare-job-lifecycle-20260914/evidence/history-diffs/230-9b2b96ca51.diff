@@ -1,0 +1,824 @@
+commit 9b2b96ca51e797a7c7bb663d41ae3036670fa795
+Author:     Yuhong Wen <yh_wen@hotmail.com>
+AuthorDate: Fri Apr 15 09:23:54 2022 -0400
+Commit:     GitHub <noreply@github.com>
+CommitDate: Fri Apr 15 09:23:54 2022 -0400
+
+    Scheduler integration (#411)
+    
+    * Added Job_Runner.
+    
+    * Added Job_Runner integration.
+    
+    * Added Job_Manager config to fed_server.json.
+    
+    * Refactoried for Job_Scheduler.
+    
+    * Moved the send_aux_request to ClientEngineExecutorSpec.
+    
+    * integrated with job scheduler.
+    
+    * Added job complete status update.
+    
+    * fix job_folder_directory for get_apps (#1)
+    
+    * Job_Runner working.
+    
+    * Added JobScheduler.remove_job().
+    
+    * Added ResourceConsumer.
+    
+    * Refactoried.
+    
+    * Optimized client_executor.py.
+    
+    * integrated with the job commands module.
+    
+    * Refactoried.
+    
+    * Cleanup.
+    
+    * comment out the deploy_app command.
+    
+    * Fixed a typo for logger.
+    
+    * Made the deploy_app command invisible.
+    
+    * Code style isrot and black fix.
+    
+    * code style fix.
+    
+    Co-authored-by: nvkevlu <55759229+nvkevlu@users.noreply.github.com>
+---
+ nvflare/private/fed/client/client_engine.py   |  60 ++++---
+ nvflare/private/fed/client/client_executor.py |  55 ++++++-
+ nvflare/private/fed/client/scheduler_cmds.py  | 125 +++++++++++++++
+ nvflare/private/fed/server/job_runner.py      | 216 ++++++++++++++++++++++++++
+ nvflare/private/fed/server/server_engine.py   | 101 ++++++++++--
+ 5 files changed, 512 insertions(+), 45 deletions(-)
+
+diff --git a/nvflare/private/fed/client/client_engine.py b/nvflare/private/fed/client/client_engine.py
+index a6b74d4e..d814b5ba 100644
+--- a/nvflare/private/fed/client/client_engine.py
++++ b/nvflare/private/fed/client/client_engine.py
+@@ -21,12 +21,13 @@ import time
+ import traceback
+ from concurrent.futures import ThreadPoolExecutor
+ 
+-from nvflare.apis.fl_constant import MachineStatus
++from nvflare.apis.fl_constant import MachineStatus, WorkspaceConstants
+ from nvflare.apis.shareable import Shareable
+ from nvflare.apis.utils.common_utils import get_open_ports
+-from nvflare.fuel.hci.zip_utils import unzip_all_from_bytes
+ from nvflare.private.admin_defs import Message
+-from nvflare.private.defs import ClientStatusKey, WorkspaceConstants
++from nvflare.private.defs import ClientStatusKey
++from nvflare.private.fed.utils.fed_utils import deploy_app
++
+ from .client_engine_internal_spec import ClientEngineInternalSpec
+ from .client_executor import ProcessExecutor
+ from .client_run_manager import ClientRunInfo
+@@ -73,6 +74,9 @@ class ClientEngine(ClientEngineInternalSpec):
+ 
+         return "validate process started."
+ 
++    def get_component(self, component_id: str) -> object:
++        return self.client.components.get(component_id)
++
+     def get_engine_status(self):
+         running_jobs = []
+         for run_number in self.get_all_run_numbers():
+@@ -94,12 +98,23 @@ class ClientEngine(ClientEngineInternalSpec):
+         }
+         return result
+ 
+-    def start_app(self, run_number: str) -> str:
++    def start_app(
++        self,
++        run_number: str,
++        allocated_resource: dict = None,
++        token: str = None,
++        resource_consumer=None,
++        resource_manager=None,
++    ) -> str:
+         status = self.client_executor.get_status(run_number)
+         if status == ClientStatus.STARTED:
+             return "Client app already started."
+ 
+-        app_root = os.path.join(self.args.workspace, WorkspaceConstants.WORKSPACE_PREFIX + str(run_number), "app_" + self.client.client_name)
++        app_root = os.path.join(
++            self.args.workspace,
++            WorkspaceConstants.WORKSPACE_PREFIX + str(run_number),
++            WorkspaceConstants.APP_PREFIX + self.client.client_name,
++        )
+         if not os.path.exists(app_root):
+             return "Client app does not exist. Please deploy it before starting client."
+ 
+@@ -118,7 +133,18 @@ class ClientEngine(ClientEngineInternalSpec):
+         open_port = get_open_ports(1)[0]
+         self._write_token_file(run_number, open_port)
+ 
+-        self.client_executor.start_train(self.client, run_number, self.args, app_root, app_custom_folder, open_port)
++        self.client_executor.start_train(
++            self.client,
++            run_number,
++            self.args,
++            app_root,
++            app_custom_folder,
++            open_port,
++            allocated_resource,
++            token,
++            resource_consumer,
++            resource_manager,
++        )
+ 
+         return "Start the client app..."
+ 
+@@ -185,22 +211,12 @@ class ClientEngine(ClientEngineInternalSpec):
+         return "Restart the client..."
+ 
+     def deploy_app(self, app_name: str, run_num: int, client_name: str, app_data) -> str:
+-        dest = os.path.join(self.args.workspace, WorkspaceConstants.WORKSPACE_PREFIX + str(run_num), "app_" + client_name)
+-        # Remove the previous deployed app.
+-        if os.path.exists(dest):
+-            shutil.rmtree(dest)
+-
+-        if not os.path.exists(dest):
+-            os.makedirs(dest)
+-        unzip_all_from_bytes(app_data, dest)
+-
+-        app_file = os.path.join(self.args.workspace, WorkspaceConstants.WORKSPACE_PREFIX + str(run_num), "fl_app.txt")
+-        if os.path.exists(app_file):
+-            os.remove(app_file)
+-        with open(app_file, "wt") as f:
+-            f.write(f"{app_name}")
+-
+-        return ""
++        workspace = os.path.join(self.args.workspace, WorkspaceConstants.WORKSPACE_PREFIX + str(run_num))
++
++        if deploy_app(app_name, client_name, workspace, app_data):
++            return ""
++        else:
++            return "Failed to deploy_app"
+ 
+     def delete_run(self, run_num: int) -> str:
+         run_number_folder = os.path.join(self.args.workspace, WorkspaceConstants.WORKSPACE_PREFIX + str(run_num))
+diff --git a/nvflare/private/fed/client/client_executor.py b/nvflare/private/fed/client/client_executor.py
+index 37d9047d..105f335e 100644
+--- a/nvflare/private/fed/client/client_executor.py
++++ b/nvflare/private/fed/client/client_executor.py
+@@ -22,8 +22,10 @@ import time
+ from multiprocessing.connection import Client
+ 
+ from nvflare.apis.fl_constant import AdminCommandNames, ReturnCode, RunProcessKey
++from nvflare.apis.fl_context import FLContext
+ from nvflare.apis.shareable import Shareable, make_reply
+ from nvflare.fuel.utils.pipe.file_pipe import FilePipe
++
+ from .client_status import ClientStatus, get_status_message
+ 
+ 
+@@ -42,7 +44,19 @@ class ClientExecutor(object):
+         self.pipe = FilePipe(root_path=pipe_path, name="training")
+         self.logger = logging.getLogger(self.__class__.__name__)
+ 
+-    def start_train(self, client, run_number, args, app_root, app_custom_folder, listen_port):
++    def start_train(
++        self,
++        client,
++        run_number,
++        args,
++        app_root,
++        app_custom_folder,
++        listen_port,
++        allocated_resource,
++        token,
++        resource_consumer,
++        resource_manager,
++    ):
+         """start_train method to start the FL client training.
+ 
+         Args:
+@@ -52,6 +66,10 @@ class ClientExecutor(object):
+             app_root: the root folder of the running APP
+             app_custom_folder: FL application custom folder
+             listen_port: port to listen the command.
++            allocated_resource: allocated resources
++            token: token from resource manager
++            resource_consumer: resource consumer
++            resource_manager: resource manager
+ 
+         """
+         pass
+@@ -157,7 +175,19 @@ class ProcessExecutor(ClientExecutor):
+ 
+         return pipe
+ 
+-    def start_train(self, client, run_number, args, app_root, app_custom_folder, listen_port):
++    def start_train(
++        self,
++        client,
++        run_number,
++        args,
++        app_root,
++        app_custom_folder,
++        listen_port,
++        allocated_resource,
++        token,
++        resource_consumer,
++        resource_manager,
++    ):
+ 
+         new_env = os.environ.copy()
+         if app_custom_folder != "":
+@@ -179,16 +209,22 @@ class ProcessExecutor(ClientExecutor):
+ 
+         print("training child process ID: {}".format(process.pid))
+ 
++        if allocated_resource:
++            resource_consumer.consume(allocated_resource)
++
+         client.multi_gpu = False
+ 
+         with self.lock:
+-            self.run_processes[run_number] = {RunProcessKey.LISTEN_PORT: listen_port,
+-                                              RunProcessKey.CONNECTION: None,
+-                                              RunProcessKey.CHILD_PROCESS: process,
+-                                              RunProcessKey.STATUS: ClientStatus.STARTED}
++            self.run_processes[run_number] = {
++                RunProcessKey.LISTEN_PORT: listen_port,
++                RunProcessKey.CONNECTION: None,
++                RunProcessKey.CHILD_PROCESS: process,
++                RunProcessKey.STATUS: ClientStatus.STARTED,
++            }
+ 
+         thread = threading.Thread(
+-            target=self.wait_training_process_finish, args=(client, run_number, args, app_root, app_custom_folder)
++            target=self.wait_training_process_finish,
++            args=(client, run_number, allocated_resource, token, resource_manager),
+         )
+         thread.start()
+ 
+@@ -312,7 +348,7 @@ class ProcessExecutor(ClientExecutor):
+                 conn_client.send(data)
+                 self.logger.debug("abort_task sent")
+ 
+-    def wait_training_process_finish(self, client, run_number, args, app_root, app_custom_folder):
++    def wait_training_process_finish(self, client, run_number, allocated_resource, token, resource_manager):
+         # wait for the listen_command thread to start, and send "start" message to wake up the connection.
+         start = time.time()
+         while True:
+@@ -332,6 +368,9 @@ class ProcessExecutor(ClientExecutor):
+         returncode = child_process.returncode
+         self.logger.info(f"process finished with execution code: {returncode}")
+ 
++        if allocated_resource:
++            resource_manager.free_resources(resources=allocated_resource, token=token, fl_ctx=FLContext())
++
+         with self.lock:
+             conn_client = self.get_conn_client(run_number)
+             if conn_client:
+diff --git a/nvflare/private/fed/client/scheduler_cmds.py b/nvflare/private/fed/client/scheduler_cmds.py
+new file mode 100644
+index 00000000..b0de49f3
+--- /dev/null
++++ b/nvflare/private/fed/client/scheduler_cmds.py
+@@ -0,0 +1,125 @@
++# Copyright (c) 2021-2022, NVIDIA CORPORATION.  All rights reserved.
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++import pickle
++from typing import List
++
++from nvflare.apis.fl_constant import ReturnCode, SystemComponents
++from nvflare.apis.fl_context import FLContext
++from nvflare.apis.resource_manager_spec import ResourceConsumerSpec, ResourceManagerSpec
++from nvflare.apis.scheduler_constants import ShareableHeader
++from nvflare.apis.shareable import Shareable
++from nvflare.private.admin_defs import Message
++from nvflare.private.defs import RequestHeader, TrainingTopic
++from nvflare.private.fed.client.admin import RequestProcessor
++from nvflare.private.fed.client.client_engine_internal_spec import ClientEngineInternalSpec
++
++
++class CheckResourceProcessor(RequestProcessor):
++    def get_topics(self) -> List[str]:
++        return [TrainingTopic.CHECK_RESOURCE]
++
++    def process(self, req: Message, app_ctx) -> Message:
++        engine = app_ctx
++        if not isinstance(engine, ClientEngineInternalSpec):
++            raise TypeError("engine must be ClientEngineInternalSpec, but got {}".format(type(engine)))
++
++        resource_manager = engine.get_component(SystemComponents.RESOURCE_MANAGER)
++        if not isinstance(resource_manager, ResourceManagerSpec):
++            raise RuntimeError(
++                f"resource_manager should be of type ResourceManagerSpec, but got {type(ResourceManagerSpec)}."
++            )
++        fl_ctx = FLContext()
++        result = Shareable()
++        try:
++            resource_spec = pickle.loads(req.body)
++            check_result, token = resource_manager.check_resources(resource_requirement=resource_spec, fl_ctx=fl_ctx)
++            result.set_header(ShareableHeader.CHECK_RESOURCE_RESULT, check_result)
++            result.set_header(ShareableHeader.RESOURCE_RESERVE_TOKEN, token)
++        except Exception:
++            result.set_return_code(ReturnCode.EXECUTION_EXCEPTION)
++
++        if not result:
++            result = "OK"
++        return Message(topic="reply_" + req.topic, body=pickle.dumps(result))
++
++
++class StartJobProcessor(RequestProcessor):
++    def get_topics(self) -> List[str]:
++        return [TrainingTopic.START_JOB]
++
++    def process(self, req: Message, app_ctx) -> Message:
++        engine = app_ctx
++        if not isinstance(engine, ClientEngineInternalSpec):
++            raise TypeError("engine must be ClientEngineInternalSpec, but got {}".format(type(engine)))
++
++        resource_manager = engine.get_component(SystemComponents.RESOURCE_MANAGER)
++        if not isinstance(resource_manager, ResourceManagerSpec):
++            raise RuntimeError(
++                f"resource_manager should be of type ResourceManagerSpec, but got {type(resource_manager)}."
++            )
++        resource_consumer = engine.get_component(SystemComponents.RESOURCE_CONSUMER)
++        if not isinstance(resource_consumer, ResourceConsumerSpec):
++            raise RuntimeError(
++                f"resource_consumer should be of type ResourceConsumerSpec, but got {type(resource_consumer)}."
++            )
++
++        resource_spec = pickle.loads(req.body)
++        run_number = req.get_header(RequestHeader.RUN_NUM)
++        token = req.get_header(ShareableHeader.RESOURCE_RESERVE_TOKEN)
++        allocated_resources = resource_manager.allocate_resources(
++            resource_requirement=resource_spec, token=token, fl_ctx=FLContext()
++        )
++        result = engine.start_app(
++            run_number,
++            allocated_resource=allocated_resources,
++            token=token,
++            resource_consumer=resource_consumer,
++            resource_manager=resource_manager,
++        )
++
++        resource_consumer.consume(allocated_resources)
++
++        if not result:
++            result = "OK"
++        return Message(topic="reply_" + req.topic, body=result)
++
++
++class CancelResourceProcessor(RequestProcessor):
++    def get_topics(self) -> List[str]:
++        return [TrainingTopic.CANCEL_RESOURCE]
++
++    def process(self, req: Message, app_ctx) -> Message:
++        engine = app_ctx
++        if not isinstance(engine, ClientEngineInternalSpec):
++            raise TypeError("engine must be ClientEngineInternalSpec, but got {}".format(type(engine)))
++
++        resource_manager = engine.get_component(SystemComponents.RESOURCE_MANAGER)
++        if not isinstance(resource_manager, ResourceManagerSpec):
++            raise RuntimeError(
++                f"resource_manager should be of type ResourceManagerSpec, but got {type(ResourceManagerSpec)}."
++            )
++        with engine.new_context() as fl_ctx:
++            result = Shareable()
++            try:
++                # resource_spec = req.get_header(ShareableHeader.RESOURCE_SPEC)
++                resource_spec = pickle.loads(req.body)
++                token = req.get_header(ShareableHeader.RESOURCE_RESERVE_TOKEN)
++                resource_manager.cancel_resources(resource_requirement=resource_spec, token=token, fl_ctx=fl_ctx)
++            except Exception:
++                result.set_return_code(ReturnCode.EXECUTION_EXCEPTION)
++
++        if not result:
++            result = "OK"
++        return Message(topic="reply_" + req.topic, body=pickle.dumps(result))
+diff --git a/nvflare/private/fed/server/job_runner.py b/nvflare/private/fed/server/job_runner.py
+new file mode 100644
+index 00000000..64c17fc4
+--- /dev/null
++++ b/nvflare/private/fed/server/job_runner.py
+@@ -0,0 +1,216 @@
++# Copyright (c) 2021-2022, NVIDIA CORPORATION.  All rights reserved.
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++import os.path
++import threading
++import time
++
++from nvflare.apis.event_type import EventType
++from nvflare.apis.fl_component import FLComponent
++from nvflare.apis.fl_constant import RunProcessKey, SystemComponents, WorkspaceConstants
++from nvflare.apis.fl_context import FLContext
++from nvflare.apis.job_def import Job, RunStatus
++from nvflare.private.admin_defs import Message
++from nvflare.private.defs import RequestHeader, TrainingTopic
++from nvflare.private.fed.utils.fed_utils import deploy_app
++
++
++class JobRunner(FLComponent):
++    def __init__(self, workspace_root: str) -> None:
++        super().__init__()
++        self.workspace_root = workspace_root
++        self.ask_to_stop = False
++        self.scheduler = None
++        self.running_jobs = {}
++        self.lock = threading.Lock()
++
++    def handle_event(self, event_type: str, fl_ctx: FLContext):
++        if event_type == EventType.SYSTEM_START:
++            engine = fl_ctx.get_engine()
++            self.scheduler = engine.get_component(SystemComponents.JOB_SCHEDULER)
++
++    def _deploy_job(self, job: Job, sites: list, fl_ctx: FLContext) -> str:
++        """deploy the application to the list of participants
++
++        Args:
++            job: job to be deployed
++            sites: participating sites
++            fl_ctx: FLContext
++
++        Returns:
++
++        """
++        engine = fl_ctx.get_engine()
++        run_number = job.job_id
++        workspace = os.path.join(self.workspace_root, WorkspaceConstants.WORKSPACE_PREFIX + run_number)
++        count = 1
++        while os.path.exists(workspace):
++            run_number = run_number + "_" + str(count)
++            workspace = os.path.join(self.workspace_root, WorkspaceConstants.WORKSPACE_PREFIX + run_number)
++            count += 1
++
++        for app_name, participants in job.get_deployment().items():
++            app_data = job.get_application(app_name, fl_ctx)
++
++            client_sites = []
++            for p in participants:
++                if p == "server":
++                    success = deploy_app(app_name=app_name, site_name="server", workspace=workspace, app_data=app_data)
++                    self.log_debug(
++                        fl_ctx, f"Application{app_name} deployed to the server for run:{run_number}", fire_event=False
++                    )
++                    if not success:
++                        raise RuntimeError("Failed to deploy the App to the server")
++                else:
++                    if p in sites:
++                        client_sites.append(p)
++
++            self._deploy_clients(app_data, app_name, run_number, client_sites, engine)
++            self.log_debug(
++                fl_ctx, f"Application{app_name} deployed to the clients for run:{run_number}", fire_event=False
++            )
++
++        self.fire_event(EventType.JOB_DEPLOYED, fl_ctx)
++        return run_number
++
++    def _deploy_clients(self, app_data, app_name, run_number, client_sites, engine):
++        # deploy app to all the client sites
++        admin_server = engine.server.admin_server
++        message = Message(topic=TrainingTopic.DEPLOY, body=app_data)
++        message.set_header(RequestHeader.RUN_NUM, run_number)
++        message.set_header(RequestHeader.APP_NAME, app_name)
++        replies = self._send_to_clients(admin_server, client_sites, engine, message)
++        if not replies:
++            raise RuntimeError("Failed to deploy the App to the clients")
++
++    def _send_to_clients(self, admin_server, client_sites, engine, message):
++        clients, invalid_inputs = engine.validate_clients(client_sites)
++        requests = {}
++        for c in clients:
++            requests.update({c.token: message})
++        replies = admin_server.send_requests(requests, timeout_secs=admin_server.timeout)
++        return replies
++
++    def _start_run(self, run_number, client_sites: list, fl_ctx: FLContext):
++        """Start the application
++
++        Args:
++            run_number: run_number
++            client_sites: participating sites
++            fl_ctx: FLContext
++
++        Returns:
++
++        """
++        engine = fl_ctx.get_engine()
++        err = engine.start_app_on_server(run_number)
++        if err:
++            raise RuntimeError("Could not start the server App.")
++
++        replies = engine.start_client_job(client_sites, run_number)
++        if not replies:
++            raise RuntimeError("Failed to start the App to the clients")
++
++        self.fire_event(EventType.JOB_STARTED, fl_ctx)
++
++    def _stop_run(self, run_number, fl_ctx: FLContext):
++        """Stop the application
++
++        Args:
++            run_number: run_number to be stopped
++            fl_ctx: FLContext
++
++        Returns:
++
++        """
++        engine = fl_ctx.get_engine()
++        run_process = engine.run_processes.get(run_number)
++        if run_process:
++            admin_server = engine.server.admin_server
++
++            client_sites = run_process.get(RunProcessKey.PARTICIPANTS)
++            message = Message(topic=TrainingTopic.ABORT, body="")
++            message.set_header(RequestHeader.RUN_NUM, str(run_number))
++            self.log_debug(fl_ctx, f"Send stop command to the site for run:{run_number}")
++            replies = self._send_to_clients(admin_server, client_sites, engine, message)
++            if not replies:
++                self.log_error(fl_ctx, f"Failed to send abort command to clients for run_{run_number}")
++
++            err = engine.abort_app_on_server(run_number)
++            if err:
++                self.log_error(fl_ctx, f"Failed to abort the server for run_.{run_number}")
++
++    def _job_complete_process(self, fl_ctx: FLContext):
++        engine = fl_ctx.get_engine()
++        job_manager = engine.get_component(SystemComponents.JOB_MANAGER)
++        while not self.ask_to_stop:
++            for run_number in list(self.running_jobs.keys()):
++                if run_number not in engine.run_processes.keys():
++                    with self.lock:
++                        job = self.running_jobs.get(run_number)
++                        if job:
++                            job_manager.set_status(job.job_id, RunStatus.FINISHED_COMPLETED, fl_ctx)
++                            del self.running_jobs[run_number]
++                            self.scheduler.remove_job(job)
++                            self.fire_event(EventType.JOB_COMPLETED, fl_ctx)
++                            self.log_debug(fl_ctx, f"Finished running job:{job.job_id}")
++            time.sleep(1.0)
++
++    def run(self, fl_ctx: FLContext):
++        engine = fl_ctx.get_engine()
++
++        threading.Thread(target=self._job_complete_process, args=[fl_ctx]).start()
++
++        job_manager = engine.get_component(SystemComponents.JOB_MANAGER)
++        while not self.ask_to_stop:
++            if job_manager:
++                # approved_jobs = job_manager.get_jobs_by_status(RunStatus.APPROVED, fl_ctx)
++                approved_jobs = job_manager.get_jobs_by_status(RunStatus.SUBMITTED, fl_ctx)
++                if self.scheduler:
++                    (ready_job, sites) = self.scheduler.schedule_job(job_candidates=approved_jobs, fl_ctx=fl_ctx)
++
++                    if ready_job:
++                        try:
++                            self.log_info(fl_ctx, f"Got the job:{ready_job.job_id} from the scheduler to run")
++                            run_number = self._deploy_job(ready_job, sites, fl_ctx)
++                            job_manager.set_status(ready_job.job_id, RunStatus.DISPATCHED, fl_ctx)
++                            self._start_run(run_number, sites, fl_ctx)
++                            with self.lock:
++                                self.running_jobs[run_number] = ready_job
++                            job_manager.set_status(ready_job.job_id, RunStatus.RUNNING, fl_ctx)
++                        except:
++                            self.log_error(fl_ctx, f"Failed to run the Job ID: {ready_job.job_id}")
++
++            time.sleep(1.0)
++
++    def stop_run(self, run_number: str, fl_ctx: FLContext):
++        engine = fl_ctx.get_engine()
++        job_manager = engine.get_component(SystemComponents.JOB_MANAGER)
++        with self.lock:
++            self._stop_run(run_number, fl_ctx)
++            job = self.running_jobs.get(run_number)
++            if job:
++                self.log_info(fl_ctx, f"Stop the job run:{run_number}")
++                job_manager.set_status(job.job_id, RunStatus.FINISHED_ABORTED, fl_ctx)
++                del self.running_jobs[run_number]
++                self.scheduler.remove_job(job)
++                self.fire_event(EventType.JOB_ABORTED, fl_ctx)
++
++    def stop_all_runs(self, fl_ctx: FLContext):
++        engine = fl_ctx.get_engine()
++        for run_number in engine.run_processes.keys():
++            self.stop_run(run_number, fl_ctx)
++
++        self.log_info(fl_ctx, "Stop all the running jobs.")
++        self.ask_to_stop = True
+diff --git a/nvflare/private/fed/server/server_engine.py b/nvflare/private/fed/server/server_engine.py
+index 713c77d0..289d594f 100644
+--- a/nvflare/private/fed/server/server_engine.py
++++ b/nvflare/private/fed/server/server_engine.py
+@@ -40,22 +40,25 @@ from nvflare.apis.fl_constant import (
+     ServerCommandKey,
+     ServerCommandNames,
+     SnapshotKey,
++    WorkspaceConstants,
+ )
+-from nvflare.apis.fl_context import FLContext
++from nvflare.apis.fl_context import FLContext, FLContextManager
+ from nvflare.apis.fl_snapshot import FLSnapshot, RunSnapshot
+-from nvflare.apis.impl.job_def_manager import SimpleJobDefManager
++from nvflare.apis.impl.job_def_manager import JobDefManagerSpec
++from nvflare.apis.scheduler_constants import ShareableHeader
+ from nvflare.apis.shareable import Shareable, make_reply
+ from nvflare.apis.utils.common_utils import get_open_ports
+ from nvflare.apis.utils.fl_context_utils import get_serializable_data
+ from nvflare.apis.workspace import Workspace
+ from nvflare.fuel.hci.zip_utils import zip_directory_to_bytes
+ from nvflare.private.admin_defs import Message
+-from nvflare.private.defs import RequestHeader, WorkspaceConstants
++from nvflare.private.defs import RequestHeader, TrainingTopic
+ from nvflare.private.fed.server.server_json_config import ServerJsonConfigurator
+ from nvflare.widgets.info_collector import InfoCollector
+ from nvflare.widgets.widget import Widget, WidgetID
+ 
+ from .client_manager import ClientManager
++from .job_runner import JobRunner
+ from .run_manager import RunManager
+ from .server_engine_internal_spec import EngineInfo, RunInfo, ServerEngineInternalSpec
+ from .server_status import ServerStatus
+@@ -94,19 +97,18 @@ class ServerEngine(ServerEngineInternalSpec):
+         self.lock = Lock()
+         self.logger = logging.getLogger(self.__class__.__name__)
+ 
+-        # TODO:: need to figure out how to initialize job manager with inputs
+-        self.job_def_manager = SimpleJobDefManager()
+-
+         self.asked_to_stop = False
+         self.snapshot_persistor = snapshot_persistor
+         self.parent_conn = None
+         self.parent_conn_lock = Lock()
++        self.job_runner = None
++        self.job_def_manager = None
+ 
+     def _get_server_app_folder(self):
+-        return "app_server"
++        return WorkspaceConstants.APP_PREFIX + "server"
+ 
+     def _get_client_app_folder(self, client_name):
+-        return "app_" + client_name
++        return WorkspaceConstants.APP_PREFIX + client_name
+ 
+     def _get_run_folder(self, run_number):
+         return os.path.join(self.args.workspace, WorkspaceConstants.WORKSPACE_PREFIX + str(run_number))
+@@ -306,7 +308,7 @@ class ServerEngine(ServerEngineInternalSpec):
+ 
+         self.logger.info("Abort the server app run.")
+         # self.server.stop_training()
+-        self.server.shutdown = True
++        # self.server.shutdown = True
+         # self.server.abort_run()
+ 
+         try:
+@@ -371,7 +373,7 @@ class ServerEngine(ServerEngineInternalSpec):
+     def get_all_clients(self):
+         return list(self.server.client_manager.clients.keys())
+ 
+-    def _get_client_from_name(self, client_name):
++    def get_client_from_name(self, client_name):
+         for c in self.get_clients():
+             if client_name == c.name:
+                 return c
+@@ -387,7 +389,7 @@ class ServerEngine(ServerEngineInternalSpec):
+             if client:
+                 clients.append(client)
+             else:
+-                client = self._get_client_from_name(item)
++                client = self.get_client_from_name(item)
+                 if client:
+                     clients.append(client)
+                 else:
+@@ -427,6 +429,10 @@ class ServerEngine(ServerEngineInternalSpec):
+         for _, widget in self.widgets.items():
+             self.run_manager.add_handler(widget)
+ 
++    def set_job_runner(self, job_runner: JobRunner, job_manager: JobDefManagerSpec):
++        self.job_runner = job_runner
++        self.job_def_manager = job_manager
++
+     def set_configurator(self, conf: ServerJsonConfigurator):
+         if not isinstance(conf, ServerJsonConfigurator):
+             raise TypeError("conf must be ServerJsonConfigurator but got {}".format(type(conf)))
+@@ -439,7 +445,10 @@ class ServerEngine(ServerEngineInternalSpec):
+         if self.run_manager:
+             return self.run_manager.new_context()
+         else:
+-            return FLContext()
++            # return FLContext()
++            return FLContextManager(
++                engine=self, identity_name=self.server.project_name, run_num="", public_stickers={}, private_stickers={}
++            ).new_context()
+ 
+     def get_component(self, component_id: str) -> object:
+         return self.run_manager.get_component(component_id)
+@@ -450,11 +459,11 @@ class ServerEngine(ServerEngineInternalSpec):
+     def get_staging_path_of_app(self, app_name: str) -> str:
+         return os.path.join(self.server.admin_server.file_upload_dir, app_name)
+ 
+-    def deploy_app_to_server(self, run_number: str, app_name: str, app_staging_path: str) -> str:
+-        return self.deploy_app(run_number, app_name, "app_server")
++    def deploy_app_to_server(self, run_destination: str, app_name: str, app_staging_path: str) -> str:
++        return self.deploy_app(run_destination, app_name, WorkspaceConstants.APP_PREFIX + "server")
+ 
+     def prepare_deploy_app_to_client(self, app_name: str, app_staging_path: str, client_name: str) -> str:
+-        return self.deploy_app(app_name, "app_" + client_name)
++        return self.deploy_app(app_name, WorkspaceConstants.APP_PREFIX + client_name)
+ 
+     def get_workspace(self) -> Workspace:
+         return self.run_manager.get_workspace()
+@@ -642,6 +651,68 @@ class ServerEngine(ServerEngineInternalSpec):
+ 
+         return stats
+ 
++    def send_admin_requests(self, requests):
++        return self.server.admin_server.send_requests(requests, timeout_secs=self.server.admin_server.timeout)
++
++    def check_client_resources(self, resource_reqs):
++        requests = {}
++        result = {}
++        for site_name, resource_requirements in resource_reqs.items():
++            # assume server resource is unlimited
++            if site_name == "server":
++                continue
++            request = Message(topic=TrainingTopic.CHECK_RESOURCE, body=pickle.dumps(resource_requirements))
++            # request.set_header(ShareableHeader.RESOURCE_SPEC, resource_requirements)
++            client = self.get_client_from_name(site_name)
++            if client:
++                requests.update({client.token: request})
++        replies = []
++        if requests:
++            replies = self.send_admin_requests(requests)
++        return replies, result
++
++    def cancel_client_resources(self, resource_check_results, resource_reqs):
++        requests = {}
++        for site_name, result in resource_check_results.items():
++            check_result, token = result
++            if check_result:
++                resource_requirements = resource_reqs[site_name]
++                request = Message(topic=TrainingTopic.CANCEL_RESOURCE, body=pickle.dumps(resource_requirements))
++                request.set_header(ShareableHeader.RESOURCE_RESERVE_TOKEN, token)
++                # request.set_header(ShareableHeader.RESOURCE_SPEC, resource_requirements)
++                client = self.get_client_from_name(site_name)
++                if client:
++                    requests.update({client.token: request})
++        if requests:
++            replies = self.send_admin_requests(requests)
++
++    def start_client_job(self, client_sites, run_number):
++        requests = {}
++        for site, dispatch_info in client_sites.items():
++            resource_requirement = dispatch_info.resource_requirements
++            token = dispatch_info.token
++            request = Message(topic=TrainingTopic.START_JOB, body=pickle.dumps(resource_requirement))
++            request.set_header(RequestHeader.RUN_NUM, run_number)
++            request.set_header(ShareableHeader.RESOURCE_RESERVE_TOKEN, token)
++            # request.set_header(ShareableHeader.RESOURCE_SPEC, resource_requirements)
++            client = self.get_client_from_name(site)
++            if client:
++                requests.update({client.token: request})
++        replies = []
++        if requests:
++            replies = self.send_admin_requests(requests)
++        return replies
++
++        # admin_server = engine.server.admin_server
++        # message = Message(topic=TrainingTopic.START_JOB, body="")
++        # message.set_header(RequestHeader.RUN_NUM, run_number)
++        # replies = self._send_to_clients(admin_server, client_sites, engine, message)
++        # return replies
++
++    def stop_all_jobs(self):
++        fl_ctx = self.new_context()
++        self.job_runner.stop_all_runs(fl_ctx)
++
+     def close(self):
+         self.executor.shutdown()
+ 

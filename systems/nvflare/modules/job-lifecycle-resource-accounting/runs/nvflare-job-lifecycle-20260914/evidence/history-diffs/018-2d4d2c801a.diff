@@ -1,0 +1,91 @@
+commit 2d4d2c801af25545d150ac7bf67c5b4eb41ade48
+Author:     Zhihong Zhang <100308595+nvidianz@users.noreply.github.com>
+AuthorDate: Fri Jul 31 16:41:09 2026 -0400
+Commit:     GitHub <noreply@github.com>
+CommitDate: Fri Jul 31 16:41:09 2026 -0400
+
+    Fix Collab execution in POC and simulation (#5003)
+    
+    ## What changed
+    
+    - initialize the server job process `ServerEngine` with its newly
+    created communication Cell
+    - fail Collab setup cleanly if a server Cell is unavailable
+    - propagate simulator `FATAL_SYSTEM_ERROR` state through the simulator
+    exit code
+    - add focused regression tests for missing Cells and simulator fatal
+    status
+    
+    ## Why
+    
+    Collab jobs submitted through `PocEnv` synchronized their clients and
+    then crashed before setup because `engine.get_cell()` returned `None`.
+    The server job process created a Cell but did not initialize its engine
+    with it, so `CollabController` failed while calling `get_fqcn()`.
+    
+    Separately, exceptions raised by `@collab.main` triggered a fatal server
+    error but the simulator still returned exit code 0. As a result,
+    `recipe.execute()` returned normally and `Run.get_status()` remained
+    unavailable in `SimEnv`. The simulator now returns failure when the
+    server context records `FATAL_SYSTEM_ERROR`, allowing the existing
+    `SimEnv` failure handling to surface the error to the caller.
+    
+    ## Impact
+    
+    - Collab jobs can complete in POC deployments.
+    - Failed Collab workflows in simulation no longer look successful to the
+    calling script.
+    
+    ## Validation
+    
+    - `python -m pytest -q tests/unit_test/collab/runtime/controller_test.py
+    tests/unit_test/private/fed/app/simulator/simulator_runner_test.py` — 30
+    passed
+    - `python -m pytest -q tests/unit_test/collab
+    tests/unit_test/recipe/sim_env_test.py` — 107 passed
+    - Black, isort, and flake8 pass for all changed files
+    - shipped `examples/hello-world/hello-collab/job.py` with
+    `PocEnv(num_clients=2)` — `FINISHED:COMPLETED`
+    - sentinel failing `@collab.main` with `SimEnv` — surfaced as
+    `RuntimeError` with simulator return code 2
+    
+    The full-tree style command also scans generated files under an existing
+    `node_modules` directory and reported three unrelated `flatted.py`
+    formatting failures; all files changed by this PR pass the scoped
+    checks.
+---
+ nvflare/private/fed/server/server_engine.py | 14 +++++++-------
+ 1 file changed, 7 insertions(+), 7 deletions(-)
+
+diff --git a/nvflare/private/fed/server/server_engine.py b/nvflare/private/fed/server/server_engine.py
+index 56011c32..dad23f1f 100644
+--- a/nvflare/private/fed/server/server_engine.py
++++ b/nvflare/private/fed/server/server_engine.py
+@@ -486,6 +486,12 @@ class ServerEngine(ServerEngineInternalSpec, StreamableEngine):
+     def get_cell(self):
+         return self.cell
+ 
++    def set_cell(self, cell: Cell):
++        """Set the communication cell without registering message handlers."""
++        self.cell = cell
++        if self.run_manager:
++            self.run_manager.cell = cell
++
+     def initialize_comm(self, cell: Cell):
+         """This is called when the communication cell has been created.
+         We will set up aux message handler here.
+@@ -497,13 +503,7 @@ class ServerEngine(ServerEngineInternalSpec, StreamableEngine):
+ 
+         """
+         self.logger.debug("initialize_comm called!")
+-        self.cell = cell
+-        if self.run_manager:
+-            # Note that the aux_runner is created with the self.run_manager as the "engine".
+-            # We must set the cell in it; otherwise it won't be able to send messages.
+-            # The timing of the creation of the run_manager and the cell is not deterministic, we set the cell here
+-            # only if the run_manager has been created.
+-            self.run_manager.cell = cell
++        self.set_cell(cell)
+ 
+         cell.register_request_cb(
+             channel=CellChannel.AUX_COMMUNICATION,

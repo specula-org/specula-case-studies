@@ -1,0 +1,56 @@
+commit 71fbcaae2d878d5b927568d45f434833bf164b85
+Author:     Peter Cnudde <pcnudde@nvidia.com>
+AuthorDate: Thu Aug 6 16:10:31 2026 -0700
+Commit:     GitHub <noreply@github.com>
+CommitDate: Thu Aug 6 23:10:31 2026 +0000
+
+    Fix K8s child failure propagation (#5047)
+    
+    ## What changed
+    
+    - Force `MainProcessMonitor` to terminate with the computed process
+    return code even when the RC file cannot be written.
+    - Preserve deliberate NVFlare child exit codes (`EXCEPTION`,
+    `UNSAFE_COMPONENT`, and `CONFIG_ERROR`) from the selected K8s job
+    container.
+    - Keep SIGKILL/OOM/eviction and other pod failures on the existing
+    `ABORTED` path.
+    - Add focused regressions for RC-file loss and K8s exit-code
+    propagation.
+    
+    ## Why
+    
+    In no-shared-PVC K8s jobs, result-publication failure can remove the run
+    directory before shutdown. The RC-file write then fails and previously
+    skipped the force-exit call; in a container, self-SIGKILL is also not a
+    reliable PID 1 shutdown mechanism. Once the pod did terminate, the K8s
+    launcher flattened every failed pod to `ABORTED`, discarding deliberate
+    child process codes and changing the terminal job classification
+    relative to subprocess and shared-workspace modes.
+    
+    This change makes the child exit reliably and carries deliberate NVFlare
+    failure codes through the K8s job handle so the existing parent
+    lifecycle can classify them correctly.
+    
+    ## Scope
+    
+    This fixes the server-side hang and K8s exit-code propagation covered by
+    FLARE-3094. It does not redesign the separate client-side timing issue
+    where result-publication failure can be reported after the server has
+    already finalized the job.
+---
+ nvflare/private/fed/server/job_runner.py | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/nvflare/private/fed/server/job_runner.py b/nvflare/private/fed/server/job_runner.py
+index 6935b2be..3bf086ac 100644
+--- a/nvflare/private/fed/server/job_runner.py
++++ b/nvflare/private/fed/server/job_runner.py
+@@ -472,6 +472,7 @@ class JobRunner(FLComponent):
+             elif process_return_code in (
+                 ProcessExitCode.CONFIG_ERROR,
+                 ProcessExitCode.EXCEPTION,
++                ProcessExitCode.UNSAFE_COMPONENT,
+                 JobReturnCode.EXECUTION_ERROR,
+             ):
+                 # An external failure (e.g. launcher resource timeout) marked

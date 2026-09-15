@@ -1,0 +1,124 @@
+commit 52c966d1ed2bce31ef5fd2c2e62beabebc6dd12c
+Author:     Yuan-Ting Hsieh (謝沅廷) <yuantingh@nvidia.com>
+AuthorDate: Thu Aug 27 07:56:44 2026 -0700
+Commit:     GitHub <noreply@github.com>
+CommitDate: Thu Aug 27 07:56:44 2026 -0700
+
+    Report active client process exit failures (#5194)
+    
+    ## Summary
+    
+    - classify generic client-worker exit code `1` as
+    `ProcessExitCode.EXCEPTION` only when the worker previously checked in
+    as `STARTED` and no parent-side abort was requested
+    - preserve the existing `STARTING + 1` infrastructure-failure
+    classification
+    - leave post-`STOPPED` teardown errors, launcher `UNKNOWN`, and explicit
+    abort paths unchanged
+    
+    ## Why
+    
+    An in-process Client API trainer runs inside the client job worker. If
+    it terminates the process unexpectedly with exit code `1`, the client
+    parent observes a generic `JobReturnCode.EXECUTION_ERROR` while the
+    worker is still recorded as `STARTED`.
+    
+    Since #4595, that generic code is not an authoritative server-side
+    failure. Both affected clients can disappear without failing the server
+    job, leaving it `RUNNING` until an external timeout or dead-client
+    fallback intervenes.
+    
+    This patch restores bounded failure only at the active-worker boundary.
+    It does not make all generic launcher errors reportable:
+    
+    | Parent observation | Effective outcome |
+    | --- | --- |
+    | `STARTING + EXECUTION_ERROR`, no abort | `INFRASTRUCTURE_ERROR`
+    (existing behavior) |
+    | `STARTED + EXECUTION_ERROR`, no abort | `EXCEPTION` |
+    | `STOPPED + EXECUTION_ERROR` | unchanged, non-reportable teardown
+    result |
+    | explicit parent abort + `EXECUTION_ERROR` | unchanged, not promoted to
+    an application exception |
+    | launcher `UNKNOWN` | unchanged |
+    | canonical process failure or `ABORTED` | unchanged |
+    
+    ## Scope
+    
+    The change is intentionally parent-side and limited to the reported
+    regression. It does not change `ClientRunner`, worker shutdown,
+    process-RC markers, workspace publication or extraction, Client API
+    backends, job launchers, or server failure mapping.
+    
+    Client status notifications remain best effort. If a completed worker
+    loses its `STOPPED` notification and later exits with code `1`, the
+    parent can still observe stale `STARTED` state. A reliable completion
+    handshake is a separate lifecycle problem; this patch chooses bounded
+    failure for an apparently active worker rather than broadening the 2.9
+    fix into a new completion protocol.
+    
+    ## Testing
+    
+    - exact two-client in-process reproduction: job reached
+    `FINISHED:EXECUTION_EXCEPTION` in 11.9 seconds instead of timing out
+    - focused client/server regression suite: `146 passed`
+    - full style check: `./runtest.sh -s --skip-install`
+    - `git diff --check`
+    
+    Co-authored-by: Chester Chen <512707+chesterxgchen@users.noreply.github.com>
+---
+ nvflare/private/fed/client/client_executor.py | 20 +++++++++++++++++---
+ 1 file changed, 17 insertions(+), 3 deletions(-)
+
+diff --git a/nvflare/private/fed/client/client_executor.py b/nvflare/private/fed/client/client_executor.py
+index aa3de295..aff148a3 100644
+--- a/nvflare/private/fed/client/client_executor.py
++++ b/nvflare/private/fed/client/client_executor.py
+@@ -46,6 +46,8 @@ REPORTABLE_JOB_FAILURES = {
+     JobReturnCode.ABORTED: "aborted",
+ }
+ 
++_ABORT_REQUESTED_KEY = "_abort_requested"
++
+ 
+ class _PendingJobHandle(JobHandleSpec):
+     """Hold an abort request until a launcher returns the real job handle."""
+@@ -301,6 +303,7 @@ class JobExecutor(ClientExecutor):
+             self.run_processes[job_id] = {
+                 RunProcessKey.JOB_HANDLE: pending_handle,
+                 RunProcessKey.STATUS: ClientStatus.STARTING,
++                _ABORT_REQUESTED_KEY: False,
+             }
+         try:
+             job_handle = job_launcher.launch_job(job_meta, fl_ctx)
+@@ -493,6 +496,8 @@ class JobExecutor(ClientExecutor):
+         while retry >= 0:
+             with self.lock:
+                 process = self.run_processes.get(job_id)
++                if process:
++                    process[_ABORT_REQUESTED_KEY] = True
+                 process_status = (
+                     process.get(RunProcessKey.STATUS, ClientStatus.NOT_STARTED) if process else ClientStatus.NOT_STARTED
+                 )
+@@ -624,9 +629,18 @@ class JobExecutor(ClientExecutor):
+ 
+             return_code = get_return_code(job_handle, job_id, workspace, self.logger)
+ 
+-            process_status = self.run_processes.get(job_id, {}).get(RunProcessKey.STATUS)
+-            if return_code == JobReturnCode.EXECUTION_ERROR and process_status == ClientStatus.STARTING:
+-                return_code = ProcessExitCode.INFRASTRUCTURE_ERROR
++            with self.lock:
++                process = self.run_processes.get(job_id, {})
++                process_status = process.get(RunProcessKey.STATUS)
++                abort_requested = process.get(_ABORT_REQUESTED_KEY, False)
++            # A generic RC 1 is actionable only while a checked-in worker is still active.
++            # STARTING remains an infrastructure failure, while STOPPED teardown noise and
++            # launcher UNKNOWN retain their existing non-reportable behavior.
++            if return_code == JobReturnCode.EXECUTION_ERROR and not abort_requested:
++                if process_status == ClientStatus.STARTING:
++                    return_code = ProcessExitCode.INFRASTRUCTURE_ERROR
++                elif process_status == ClientStatus.STARTED:
++                    return_code = ProcessExitCode.EXCEPTION
+ 
+             self.logger.info(f"run ({job_id}): child worker process finished with RC {return_code}")
+ 

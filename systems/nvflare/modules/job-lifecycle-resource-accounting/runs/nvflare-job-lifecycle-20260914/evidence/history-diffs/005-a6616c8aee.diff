@@ -1,0 +1,69 @@
+commit a6616c8aeed8f76318d9f40f39b3b64ad82379d3
+Author:     Peter Cnudde <pcnudde@nvidia.com>
+AuthorDate: Mon Aug 17 18:54:56 2026 -0700
+Commit:     GitHub <noreply@github.com>
+CommitDate: Tue Aug 18 01:54:56 2026 +0000
+
+    Harden resource admission failure handling (#5149)
+    
+    ## Description
+    
+    - tolerate resource managers returning no reservation token for a
+    required-site rejection
+    - keep the normal cancellation, scheduling-history, retry-backoff, and
+    maximum-attempt path intact
+    - remove the unused return code from the resource-check response body
+    - strengthen the existing required-site test so it cannot pass through
+    the scheduler's broad exception handler
+    
+    ## Root cause
+    
+    The required-site error message concatenated the reservation token
+    without handling `None`. A resource manager returning `(False, None)`
+    raised `TypeError` before cancellation and scheduling bookkeeping could
+    run. Separately, the client set a return code inside the response
+    `Shareable`, but the server reads only the outer admin message return
+    code and the resource token.
+    
+    ## Impact
+    
+    Required-site resource rejection now follows the intended no-resource
+    path even when no token is returned. Resource-manager exception details
+    remain site-local, and the cross-site diagnostic behavior introduced in
+    #5148 is unchanged.
+    
+    ## Validation
+    
+    - `22 passed`: focused scheduler and client resource-check unit tests
+    - `./runtest.sh -s`
+    - `git diff --check`
+---
+ nvflare/app_common/job_schedulers/job_scheduler.py | 2 +-
+ nvflare/private/fed/client/scheduler_cmds.py       | 1 -
+ 2 files changed, 1 insertion(+), 2 deletions(-)
+
+diff --git a/nvflare/app_common/job_schedulers/job_scheduler.py b/nvflare/app_common/job_schedulers/job_scheduler.py
+index d842751b..2aee620d 100644
+--- a/nvflare/app_common/job_schedulers/job_scheduler.py
++++ b/nvflare/app_common/job_schedulers/job_scheduler.py
+@@ -206,7 +206,7 @@ class DefaultJobScheduler(JobSchedulerSpec, FLComponent):
+                     required_sites_not_enough_resource.remove(site_name)
+             else:
+                 if site_name in required_sites:
+-                    no_resource_message += site_name + ":" + token + ";"
++                    no_resource_message += site_name + ":" + (token or "") + ";"
+                 if token:
+                     resource_failure_details.append(f"{site_name}: {token}")
+ 
+diff --git a/nvflare/private/fed/client/scheduler_cmds.py b/nvflare/private/fed/client/scheduler_cmds.py
+index ad8d4ead..33cee17f 100644
+--- a/nvflare/private/fed/client/scheduler_cmds.py
++++ b/nvflare/private/fed/client/scheduler_cmds.py
+@@ -86,7 +86,6 @@ class CheckResourceProcessor(RequestProcessor):
+             except Exception as e:
+                 logger.error(f"Job {job_id}: resource check failed: {secure_format_exception(e)}")
+                 token = "resource manager raised an exception; see site log"
+-                result.set_return_code(ReturnCode.EXECUTION_EXCEPTION)
+ 
+         result.set_header(ShareableHeader.IS_RESOURCE_ENOUGH, is_resource_enough)
+         result.set_header(ShareableHeader.RESOURCE_RESERVE_TOKEN, token)

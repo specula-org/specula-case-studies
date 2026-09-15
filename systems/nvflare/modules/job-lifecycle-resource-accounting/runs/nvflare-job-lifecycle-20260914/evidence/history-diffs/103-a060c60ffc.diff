@@ -1,0 +1,113 @@
+commit a060c60ffc706d67a5aae36abc9a6de56f33bec6
+Author:     Yuhong Wen <yuhongw@nvidia.com>
+AuthorDate: Thu Nov 9 18:10:09 2023 -0500
+Commit:     GitHub <noreply@github.com>
+CommitDate: Thu Nov 9 15:10:09 2023 -0800
+
+    enhance the rc handling for MPM. (#1985)
+    
+    * enhance the rc handling for MPM.
+    
+    * consolidate the version_ckeck() to a single function.
+    
+    * fixed a variable name error.
+    
+    * Added rc enahncement for client_exxecutor.
+    
+    * extract the common function for get_return_code().
+    
+    * Removed the no used import.
+    
+    * codestyle fix.
+    
+    * codestyle fixes, and addressed a simulator_runner run_processs() exception handling.
+    
+    * Added enahcements for get_return_code().
+    
+    ---------
+    
+    Co-authored-by: Yuan-Ting Hsieh (謝沅廷) <yuantingh@nvidia.com>
+---
+ nvflare/private/fed/client/client_executor.py | 9 ++++++---
+ nvflare/private/fed/server/server_engine.py   | 8 ++++----
+ 2 files changed, 10 insertions(+), 7 deletions(-)
+
+diff --git a/nvflare/private/fed/client/client_executor.py b/nvflare/private/fed/client/client_executor.py
+index c4b4f364..3727fb38 100644
+--- a/nvflare/private/fed/client/client_executor.py
++++ b/nvflare/private/fed/client/client_executor.py
+@@ -27,6 +27,7 @@ from nvflare.fuel.common.exit_codes import PROCESS_EXIT_REASON, ProcessExitCode
+ from nvflare.fuel.f3.cellnet.core_cell import FQCN
+ from nvflare.fuel.f3.cellnet.defs import MessageHeaderKey, ReturnCode
+ from nvflare.private.defs import CellChannel, CellChannelTopic, JobFailureMsgKey, new_cell_message
++from nvflare.private.fed.utils.fed_utils import get_return_code
+ from nvflare.security.logging import secure_format_exception, secure_log_traceback
+ 
+ from .client_status import ClientStatus, get_status_message
+@@ -204,7 +205,7 @@ class ProcessExecutor(ClientExecutor):
+ 
+         thread = threading.Thread(
+             target=self._wait_child_process_finish,
+-            args=(client, job_id, allocated_resource, token, resource_manager),
++            args=(client, job_id, allocated_resource, token, resource_manager, args.workspace),
+         )
+         thread.start()
+ 
+@@ -423,13 +424,15 @@ class ProcessExecutor(ClientExecutor):
+                 )
+                 self.logger.debug("abort_task sent")
+ 
+-    def _wait_child_process_finish(self, client, job_id, allocated_resource, token, resource_manager):
++    def _wait_child_process_finish(self, client, job_id, allocated_resource, token, resource_manager, workspace):
+         self.logger.info(f"run ({job_id}): waiting for child worker process to finish.")
+         with self.lock:
+             child_process = self.run_processes.get(job_id, {}).get(RunProcessKey.CHILD_PROCESS)
+         if child_process:
+             child_process.wait()
+-            return_code = child_process.returncode
++
++            return_code = get_return_code(child_process, job_id, workspace)
++
+             self.logger.info(f"run ({job_id}): child worker process finished with RC {return_code}")
+             if return_code in [ProcessExitCode.UNSAFE_COMPONENT, ProcessExitCode.CONFIG_ERROR]:
+                 request = new_cell_message(
+diff --git a/nvflare/private/fed/server/server_engine.py b/nvflare/private/fed/server/server_engine.py
+index 5a33cb6f..d9466ad8 100644
+--- a/nvflare/private/fed/server/server_engine.py
++++ b/nvflare/private/fed/server/server_engine.py
+@@ -56,7 +56,7 @@ from nvflare.private.admin_defs import Message, MsgHeader
+ from nvflare.private.defs import CellChannel, CellMessageHeaderKeys, RequestHeader, TrainingTopic, new_cell_message
+ from nvflare.private.fed.server.server_json_config import ServerJsonConfigurator
+ from nvflare.private.fed.server.server_state import ServerState
+-from nvflare.private.fed.utils.fed_utils import security_close, set_message_security_data
++from nvflare.private.fed.utils.fed_utils import get_return_code, security_close, set_message_security_data
+ from nvflare.private.scheduler_constants import ShareableHeader
+ from nvflare.security.logging import secure_format_exception
+ from nvflare.widgets.info_collector import InfoCollector
+@@ -195,7 +195,7 @@ class ServerEngine(ServerEngineInternalSpec):
+             if job_id in self.exception_run_processes:
+                 self.exception_run_processes.pop(job_id)
+ 
+-    def wait_for_complete(self, job_id, process):
++    def wait_for_complete(self, workspace, job_id, process):
+         process.wait()
+         run_process_info = self.run_processes.get(job_id)
+         if run_process_info:
+@@ -211,7 +211,7 @@ class ServerEngine(ServerEngineInternalSpec):
+                     break
+                 time.sleep(0.1)
+             with self.lock:
+-                return_code = process.poll()
++                return_code = get_return_code(process, job_id, workspace)
+                 # if process exit but with Execution exception
+                 if return_code and return_code != 0:
+                     self.logger.info(f"Job: {job_id} child process exit with return code {return_code}")
+@@ -290,7 +290,7 @@ class ServerEngine(ServerEngineInternalSpec):
+                 RunProcessKey.PARTICIPANTS: job_clients,
+             }
+ 
+-        threading.Thread(target=self.wait_for_complete, args=[run_number, process]).start()
++        threading.Thread(target=self.wait_for_complete, args=[args.workspace, run_number, process]).start()
+         return process
+ 
+     def get_job_clients(self, client_sites):

@@ -1,0 +1,221 @@
+commit 46cfc5170976baf34cd961646bb8989a0b342d46
+Author:     Peter Cnudde <pcnudde@nvidia.com>
+AuthorDate: Wed Aug 12 14:52:55 2026 -0700
+Commit:     GitHub <noreply@github.com>
+CommitDate: Wed Aug 12 21:52:55 2026 +0000
+
+    Wait for client terminal outcomes before finalizing jobs (#5072)
+    
+    ## Summary
+    
+    - have each client report its terminal child-process outcome, including
+    success, through the existing server topic
+    - wait for active client outcomes before publishing the server terminal
+    job status
+    - apply reported failures before releasing the reporting client from the
+    completion barrier
+    - bound that wait with a configurable grace, then warn about unresolved
+    clients and finalize from the server known outcome
+    - resolve missing client outcomes conservatively through existing
+    heartbeat and dead-client handling
+    
+    ## Root cause
+    
+    Server-side process exit was treated as sufficient evidence that the
+    distributed job had completed. A client could detect result-publication
+    failure only afterward, when the server had already published and cached
+    `FINISHED:COMPLETED`. The existing fire-and-forget path reported only
+    selected failure exit codes and did not participate in terminal-status
+    ordering.
+    
+    ## Repair
+    
+    This reuses the existing terminal-outcome message and adds one
+    pending-client set per job. Each client makes one acknowledged
+    terminal-outcome report. `JobRunner` defers finalization until the set
+    is empty, and the server applies failure or abort classification before
+    removing the reporting client. Admin abort bypasses the barrier, missing
+    or dead clients are resolved through existing reconciliation paths, and
+    authenticated late or duplicate reports receive an idempotent `OK`.
+    
+    When the server process has exited but outcomes remain pending,
+    `JobRunner` starts an in-memory per-job deadline.
+    `client_outcome_wait_timeout` is configurable in the application
+    configuration and defaults to 900 seconds. On expiry, the server logs
+    the unresolved client names, releases the barrier, and runs the existing
+    server-side status calculation; expiry does not synthesize a failure.
+    
+    The change adds no client retry policy, persisted deadline, or new
+    protocol abstraction.
+    
+    ## Validation
+    
+    - 103 focused client/server lifecycle tests passed
+    - full `./runtest.sh -s` style gate passed
+    - no fresh live Kubernetes E2E was run; QA MR !185 remains the
+    deployment-shaped validation boundary
+---
+ nvflare/private/fed/client/client_executor.py | 14 ++++---
+ nvflare/private/fed/server/job_runner.py      | 56 +++++++++++++++++++++++++--
+ 2 files changed, 62 insertions(+), 8 deletions(-)
+
+diff --git a/nvflare/private/fed/client/client_executor.py b/nvflare/private/fed/client/client_executor.py
+index 9d87a0ea..a16b8482 100644
+--- a/nvflare/private/fed/client/client_executor.py
++++ b/nvflare/private/fed/client/client_executor.py
+@@ -621,7 +621,7 @@ class JobExecutor(ClientExecutor):
+             self.logger.info(f"run ({job_id}): child worker process finished with RC {return_code}")
+ 
+             failure_reason = REPORTABLE_JOB_FAILURES.get(return_code)
+-            if failure_reason:
++            try:
+                 request = new_cell_message(
+                     headers={},
+                     payload={
+@@ -630,14 +630,18 @@ class JobExecutor(ClientExecutor):
+                         JobFailureMsgKey.REASON: failure_reason,
+                     },
+                 )
+-                self.client.cell.fire_and_forget(
+-                    targets=[FQCN.ROOT_SERVER],
++                reply = self.client.cell.send_request(
++                    target=FQCN.ROOT_SERVER,
+                     channel=CellChannel.SERVER_MAIN,
+                     topic=CellChannelTopic.REPORT_JOB_FAILURE,
+-                    message=request,
++                    request=request,
++                    timeout=self.job_query_timeout,
+                     optional=True,
+                 )
+-                self.logger.info(f"reported failure of job {job_id} to server!")
++                if reply.get_header(MessageHeaderKey.RETURN_CODE) != ReturnCode.OK:
++                    self.logger.error(f"could not report terminal outcome of job {job_id}")
++            except Exception as e:
++                self.logger.error(f"could not report terminal outcome of job {job_id}: {secure_format_exception(e)}")
+ 
+         if allocated_resource:
+             resource_manager.free_resources(
+diff --git a/nvflare/private/fed/server/job_runner.py b/nvflare/private/fed/server/job_runner.py
+index 71d98ce7..0f883695 100644
+--- a/nvflare/private/fed/server/job_runner.py
++++ b/nvflare/private/fed/server/job_runner.py
+@@ -104,8 +104,27 @@ class JobRunner(FLComponent):
+         self.scheduler = None
+         self.running_jobs = {}
+         self._finished_job_states = {}
++        self._pending_client_outcomes = {}
++        self._client_outcome_deadlines = {}
++        self.client_outcome_wait_timeout = ConfigService.get_float_var(
++            name=ConfigVarName.CLIENT_OUTCOME_WAIT_TIMEOUT, conf=SystemConfigs.APPLICATION_CONF, default=900.0
++        )
+         self.lock = threading.Lock()
+ 
++    def is_client_outcome_pending(self, job_id: str, client_name: str) -> bool:
++        with self.lock:
++            return client_name in self._pending_client_outcomes.get(job_id, set())
++
++    def resolve_client_outcome(self, job_id: str, client_name: str):
++        with self.lock:
++            self._pending_client_outcomes.get(job_id, set()).discard(client_name)
++
++    def get_client_outcome_jobs(self, client_name: str = None) -> set:
++        with self.lock:
++            if client_name is None:
++                return set(self._pending_client_outcomes)
++            return {job_id for job_id, clients in self._pending_client_outcomes.items() if client_name in clients}
++
+     def handle_event(self, event_type: str, fl_ctx: FLContext):
+         if event_type == EventType.SYSTEM_START:
+             engine = fl_ctx.get_engine()
+@@ -286,6 +305,8 @@ class JobRunner(FLComponent):
+         if err:
+             raise RuntimeError(f"Could not start the server App for job: {job_id}.")
+ 
++        with self.lock:
++            self._pending_client_outcomes[job_id] = set(client_sites)
+         replies = engine.start_client_job(job, client_sites, fl_ctx)
+         all_client_sites = list(client_sites.keys())
+         active_client_sites = list(all_client_sites)
+@@ -335,6 +356,8 @@ class JobRunner(FLComponent):
+         active_sites = set(active_client_sites)
+         participating_clients = [c.to_dict() for c in job_clients.values() if c.name in active_sites]
+         job.meta[JobMetaKey.JOB_CLIENTS] = participating_clients
++        with self.lock:
++            self._pending_client_outcomes[job_id].intersection_update(active_client_sites)
+         display_sites = ",".join(active_client_sites)
+ 
+         self.log_info(fl_ctx, f"Started run: {job_id} for clients: {display_sites}")
+@@ -414,6 +437,24 @@ class JobRunner(FLComponent):
+                 if job_id not in engine.run_processes.keys():
+                     job = self.running_jobs.get(job_id)
+                     if job:
++                        with self.lock:
++                            pending = self._pending_client_outcomes.get(job_id)
++                            if pending and not job.run_aborted:
++                                now = time.monotonic()
++                                deadline = self._client_outcome_deadlines.setdefault(
++                                    job_id, now + self.client_outcome_wait_timeout
++                                )
++                                if now < deadline:
++                                    continue
++                                unresolved = sorted(pending)
++                                pending.clear()
++                            else:
++                                unresolved = None
++                        if unresolved:
++                            self.logger.warning(
++                                f"Timed out after {self.client_outcome_wait_timeout} seconds waiting for client outcomes "
++                                f"for job ({job_id}): {unresolved}. Finalizing from the server outcome."
++                            )
+                         with engine.new_context() as completion_ctx:
+                             completion_ctx.set_prop(FLContextKey.CURRENT_JOB_ID, job.job_id)
+                             finished_state = self._finished_job_states.get(job.job_id)
+@@ -466,6 +507,8 @@ class JobRunner(FLComponent):
+                             with self.lock:
+                                 del self.running_jobs[job_id]
+                                 self._finished_job_states.pop(job_id, None)
++                                self._pending_client_outcomes.pop(job_id, None)
++                                self._client_outcome_deadlines.pop(job_id, None)
+                             if status == RunStatus.FINISHED_ABORTED:
+                                 self.fire_event(EventType.JOB_ABORTED, completion_ctx)
+                             self.fire_event(EventType.JOB_COMPLETED, completion_ctx)
+@@ -644,9 +687,10 @@ class JobRunner(FLComponent):
+                             self.log_info(fl_ctx, f"Job: {job_id} started to run, status changed to RUNNING.")
+                         except Exception as e:
+                             if job_id:
+-                                if job_id in self.running_jobs:
+-                                    with self.lock:
++                                with self.lock:
++                                    if job_id in self.running_jobs:
+                                         del self.running_jobs[job_id]
++                                    self._pending_client_outcomes.pop(job_id, None)
+                                 self._stop_run(job_id, fl_ctx)
+                             job_manager.set_status(ready_job.job_id, RunStatus.FAILED_TO_RUN, fl_ctx)
+ 
+@@ -683,6 +727,7 @@ class JobRunner(FLComponent):
+                 raise RuntimeError(f"Could not restore the server App for job: {job_id}.")
+             with self.lock:
+                 self.running_jobs[job_id] = job
++                self._pending_client_outcomes[job_id] = {c.name for c in job_clients.values()}
+             self.scheduler.restore_scheduled_job(job_id)
+         except Exception as e:
+             self.log_error(
+@@ -750,7 +795,10 @@ class JobRunner(FLComponent):
+                 run_process = engine.run_processes.get(job_id)
+             if run_process is None:
+                 run_process = {RunProcessKey.PARTICIPANTS: {}}
+-            if run_process.get(RunProcessKey.PROCESS_RETURN_CODE) != ProcessExitCode.INFRASTRUCTURE_ERROR:
++            existing_code = run_process.get(RunProcessKey.PROCESS_RETURN_CODE)
++            if existing_code != ProcessExitCode.INFRASTRUCTURE_ERROR and (
++                existing_code is None or process_return_code != JobReturnCode.ABORTED
++            ):
+                 run_process[RunProcessKey.PROCESS_RETURN_CODE] = process_return_code
+             engine.exception_run_processes[job_id] = run_process
+         self._stop_run(job_id, fl_ctx)
+@@ -777,4 +825,6 @@ class JobRunner(FLComponent):
+         with self.lock:
+             if job_id in self.running_jobs:
+                 del self.running_jobs[job_id]
++            self._pending_client_outcomes.pop(job_id, None)
++            self._client_outcome_deadlines.pop(job_id, None)
+         self.scheduler.remove_scheduled_job(job_id)

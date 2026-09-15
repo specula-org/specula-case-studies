@@ -1,0 +1,151 @@
+commit 4e090892baa795362dca6ea6d142224d7778ec78
+Author:     Zhihong Zhang <100308595+nvidianz@users.noreply.github.com>
+AuthorDate: Fri May 1 20:41:38 2026 -0400
+Commit:     GitHub <noreply@github.com>
+CommitDate: Sat May 2 08:41:38 2026 +0800
+
+    Remove HA/Overseer (#4503)
+    
+    ## Summary
+    
+    Strip the residual HA/Overseer infrastructure left after PR #3898.
+    
+    - Delete `nvflare/ha/` (DummyOverseerAgent) and
+    `nvflare/apis/overseer_spec.py` (SP, OverseerAgent).
+    - Drop the `overseer_agent` parameter and lifecycle hooks
+    (`start_overseer_agent`, `overseer_callback`, `set_primary_sp`,
+    `_init_agent`, `_check_server_state`, `_turn_to_hot`/`_turn_to_cold`,
+    `_switch_ssid`) from `FedServer`/`FedClient`/`SimulatorServer` and their
+    deployers. The client now connects via a single
+    `connect_to_server(target, scheme)` call sourced directly from the
+    configured endpoint.
+    - Collapse `server_state.py` to `ServerState` + `HotState`; remove
+    `ColdState`, `Cold2HotState`, `Hot2ColdState`, `ShutdownState` and their
+    fobs registrations.
+    - Drop `--ha_mode`, `JobProcessArgs.HA_MODE`,
+    `FLContextKey.SP_END_POINT`, the `sp_end_point`/overseer regex patterns,
+    `validate_sp_string`, `OverseerRole`, `PropKey.OVERSEER_END_POINT`,
+    `ProvFileName.{DEPLOYMENT,SERVICE}_OVERSEER_YAML`,
+    `TemplateSectionKey.HELM_CHART_*_OVERSEER`, `FLARE_OVERSEER`, the
+    dashboard `/api/v1/overseer/blob` endpoint,
+    `DockerBuilder._build_overseer`, and the
+    `__overseer__`/`helm_chart_*_overseer` template sections.
+    - Remove the `overseer_agent` block from fed_server / fed_client
+    templates and add a plain `target` field; drop `ha_mode` from
+    `start_svr_sh`.
+    - Strip the `overseer_agent` block from 21 example/test `project.yml`
+    files; update tests to assert `servers[0].service.target` instead of
+    `overseer_agent.args.sp_end_point`.
+    - Make `persist_components` a no-op (HA-only path); the xgboost
+    executor's overseer-based fallback is removed.
+    
+    ## Backward compatibility
+    
+    - An `overseer_agent` block in old `fed_server.json` / `fed_client.json`
+    now logs a warning (`"obsolete and will be ignored"`) and is skipped
+    instead of being instantiated.
+    - An `overseer_agent` kwarg on `StaticFileBuilder` logs a warning and is
+    ignored (unblocks old `project.yml` builders).
+    - An `overseer` participant in old `project.yml` prints a warning and is
+    dropped (previously raised `ValueError`).
+    
+    `ssid` is intentionally retained; it is now the server-session
+    identifier for cell-message authentication, no longer HA-only.
+    
+    ## Test plan
+    
+    - [x] `python3 -m pytest tests/unit_test/lighter tests/unit_test/tool
+    tests/unit_test/private/fed tests/unit_test/apis` — 2208 passed
+    - [x] Full `python3 -m pytest tests/unit_test --numprocesses=8` outside
+    sandbox — 4869 passed (1 unrelated flaky test, 5 errors from missing
+    optional `xgboost`/`pytorch_lightning` dependencies)
+    - [x] `black --check`, `isort --check`, `flake8` on `nvflare` and
+    `tests` — all clean
+    - [ ] Integration smoke test: run a simulator job and verify
+    client/server start without overseer config
+    - [ ] Verify provisioning with a `project.yml` containing an obsolete
+    `overseer` participant logs the deprecation warning and proceeds
+    
+    🤖 Generated with [Claude Code](https://claude.com/claude-code)
+---
+ nvflare/private/fed/server/server_engine.py | 53 +++--------------------------
+ 1 file changed, 4 insertions(+), 49 deletions(-)
+
+diff --git a/nvflare/private/fed/server/server_engine.py b/nvflare/private/fed/server/server_engine.py
+index 58d4fb1e..7cfd1716 100644
+--- a/nvflare/private/fed/server/server_engine.py
++++ b/nvflare/private/fed/server/server_engine.py
+@@ -44,7 +44,7 @@ from nvflare.apis.job_def import Job
+ from nvflare.apis.job_launcher_spec import JobLauncherSpec, JobProcessArgs
+ from nvflare.apis.shareable import ReturnCode, Shareable, make_reply
+ from nvflare.apis.streaming import ConsumerFactory, ObjectProducer, StreamableEngine, StreamContext
+-from nvflare.apis.utils.fl_context_utils import gen_new_peer_ctx, get_serializable_data
++from nvflare.apis.utils.fl_context_utils import gen_new_peer_ctx
+ from nvflare.apis.workspace import Workspace
+ from nvflare.fuel.f3.cellnet.cell import Cell
+ from nvflare.fuel.f3.cellnet.defs import MessageHeaderKey
+@@ -268,7 +268,6 @@ class ServerEngine(ServerEngineInternalSpec, StreamableEngine):
+             JobProcessArgs.WORKSPACE: ("-m", args.workspace),
+             JobProcessArgs.STARTUP_CONFIG_FILE: ("-s", "fed_server.json"),
+             JobProcessArgs.APP_ROOT: ("-r", app_root),
+-            JobProcessArgs.HA_MODE: ("--ha_mode", server.ha_mode),
+             JobProcessArgs.AUTH_TOKEN: ("-t", token),
+             JobProcessArgs.TOKEN_SIGNATURE: ("-ts", signature),
+             JobProcessArgs.PARENT_URL: ("-p", str(cell.get_internal_listener_url())),
+@@ -879,53 +878,9 @@ class ServerEngine(ServerEngineInternalSpec, StreamableEngine):
+         return result
+ 
+     def persist_components(self, fl_ctx: FLContext, completed: bool):
+-        if not self.server.ha_mode:
+-            return
+-
+-        self.logger.info("Start saving snapshot on server.")
+-
+-        # Call the State Persistor to persist all the component states
+-        # 1. call every component to generate the component states data
+-        #    Make sure to include the current round number
+-        # 2. call persistence API to save the component states
+-
+-        try:
+-            job_id = fl_ctx.get_job_id()
+-            snapshot = RunSnapshot(job_id)
+-            for component_id, component in self.run_manager.components.items():
+-                if isinstance(component, FLComponent):
+-                    snapshot.set_component_snapshot(
+-                        component_id=component_id, component_state=component.get_persist_state(fl_ctx)
+-                    )
+-
+-            snapshot.set_component_snapshot(
+-                component_id=SnapshotKey.FL_CONTEXT, component_state=copy.deepcopy(get_serializable_data(fl_ctx).props)
+-            )
+-
+-            workspace = fl_ctx.get_prop(FLContextKey.WORKSPACE_OBJECT)
+-            data = zip_directory_to_bytes(workspace.get_run_dir(fl_ctx.get_prop(FLContextKey.CURRENT_RUN)), "")
+-            snapshot.set_component_snapshot(component_id=SnapshotKey.WORKSPACE, component_state={"content": data})
+-
+-            job_info = fl_ctx.get_prop(FLContextKey.JOB_INFO)
+-            if not job_info:
+-                job_clients = self.get_participating_clients()
+-                fl_ctx.set_prop(FLContextKey.JOB_INFO, (job_id, job_clients))
+-            else:
+-                (job_id, job_clients) = job_info
+-            snapshot.set_component_snapshot(
+-                component_id=SnapshotKey.JOB_INFO,
+-                component_state={SnapshotKey.JOB_CLIENTS: job_clients, SnapshotKey.JOB_ID: job_id},
+-            )
+-
+-            snapshot.completed = completed
+-
+-            self.server.snapshot_location = self.snapshot_persistor.save(snapshot=snapshot)
+-            if not completed:
+-                self.logger.info(f"persist the snapshot to: {self.server.snapshot_location}")
+-            else:
+-                self.logger.info(f"The snapshot: {self.server.snapshot_location} has been removed.")
+-        except Exception as e:
+-            self.logger.error(f"Failed to persist the components. {secure_format_exception(e)}")
++        # Component snapshot persistence has been removed; keep this as a no-op
++        # so existing callers do not have to be changed.
++        return
+ 
+     def restore_components(self, snapshot: RunSnapshot, fl_ctx: FLContext):
+         for component_id, component in self.run_manager.components.items():

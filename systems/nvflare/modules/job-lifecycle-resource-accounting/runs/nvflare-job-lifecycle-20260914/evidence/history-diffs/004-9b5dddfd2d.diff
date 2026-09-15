@@ -1,0 +1,309 @@
+commit 9b5dddfd2d24cfd013c16ea3fabca5e4dd482f46
+Author:     Yuan-Ting Hsieh (謝沅廷) <yuantingh@nvidia.com>
+AuthorDate: Wed Aug 19 12:04:42 2026 -0700
+Commit:     GitHub <noreply@github.com>
+CommitDate: Wed Aug 19 19:04:42 2026 +0000
+
+    Harden Client API and Swarm abort cleanup (#5097)
+    
+    ## Summary
+    
+    Fix #5099.
+    
+    - Bound live accepted-result cleanup to the END_RUN acknowledgement
+    interval instead of the longer streaming timeout.
+    - Force-stop every still-owned trainer process group after that bound
+    without adding a second termination grace.
+    - Pass the owning Client Job PID to launched trainers and monitor it so
+    abrupt CJ exit cannot orphan the trainer process group.
+    - Propagate graceful job abort to an external backend even after
+    `execute()` returned an accepted lazy result, so aborted teardown does
+    not preserve a live result source.
+    - Fail a job promptly when an owned external trainer dies after its lazy
+    result was accepted, interrupting the exact receiver download instead of
+    entering the 600-second retry path.
+    - Preserve user-abort precedence so late process exits cannot reclassify
+    `FINISHED:ABORTED` as an execution failure.
+    - Order result archival, terminal failure reporting, F3 shutdown, and
+    process cleanup so terminal state is authenticated and authoritative.
+    - Make active CCWF work abort at `ABOUT_TO_END_RUN`, including work not
+    represented in `ClientRunner.running_tasks`.
+    - Carry the run abort signal into Swarm's explicit lazy-reference
+    decode, cancel active disk tensor consumers under the job-scoped root,
+    serialize cleanup with chunk writes, and reject writes after cleanup.
+    - Add a capability-negotiated receiver cancellation handshake so an
+    abandoned download settles the producer's accepted result transaction
+    promptly, including all sibling refs for that receiver.
+    - Keep Attach mode exempt from owned-process monitoring because its
+    trainer process is externally owned.
+    
+    ## Change structure and scope
+    
+    The accepted-result-source contract is Client API-specific, while part
+    of the implementation hardens shared job-process lifecycle
+    infrastructure that is used by every CJ and SJ:
+    
+    1. **Client API-specific source lifecycle.** The Client API protocol and
+    backends track an accepted lazy result source until receiver settlement,
+    detect owned trainer exit/disconnect, notify the exact DownloadService
+    receiver, interrupt the affected reference without entering
+    `DOWNLOAD_RETRY`, distinguish explicit run abort from source failure,
+    and clean active and retired `launch_once=false` trainer groups. Attach
+    sessions close without killing their externally owned trainer.
+    2. **Shared CJ/SJ lifecycle prerequisites.** Generic command-callback
+    admission and the job-process teardown pipeline reject new callbacks,
+    archive while F3 is still available, stop F3/Cell, drain admitted
+    callbacks, and close audit/security state in that order. Generic
+    child-outcome delivery reports an authoritative process result before
+    logout, and a logically `STOPPED` but still-live child remains
+    reclaimable. These races predate Client API, but the accepted-source
+    fatal path exercises them deterministically; removing this cluster
+    breaks the failure contract above.
+    3. **Generic server completion hardening.** Workflow submission
+    admission is serialized with server-runner completion so late
+    task/result callbacks cannot enter already-finalized state.
+    
+    The deliberate behavior change is that loss of an already accepted lazy
+    source is run-fatal: it reaches `FINISHED:EXECUTION_EXCEPTION` even when
+    controller response thresholds might otherwise tolerate a missing
+    client. A user-requested abort remains authoritative and reaches
+    `FINISHED:ABORTED`.
+    
+    Crash-safe tensor scratch reclamation after abrupt SJ/CJ death is not
+    implemented here. This PR guarantees owned trainer-process-group cleanup
+    after abrupt CJ death, but not reclamation of a tensor offload directory
+    owned only by a killed job process. The removed parent-tempdir discovery
+    approach was local-launcher-only, could not cross Docker/Kubernetes
+    mount namespaces, and tied reclamation to one parent PID. The P0
+    follow-up will use launcher-provisioned, parent-owned job scratch whose
+    cleanup capability survives process/container boundaries and parent
+    restart.
+    
+    ## Problems
+    
+    ### Late accepted Client API results
+    
+    For `launch_once=false`, a trainer that publishes a late result can
+    outlive its owning Client Job process when the server has already
+    accepted enough responses. The result-source reaper could wait longer
+    than the outer CJ teardown budget, allowing the CJ to exit first and
+    leave the trainer process group orphaned.
+    
+    If an owned trainer crashes or is OOM-killed after `RESULT_READY` is
+    accepted, its lazy source can disappear while FedAvg or Swarm is still
+    downloading tensors. Previously the receiver kept retrying the
+    permanently unavailable source for the normal streaming timeout, leaving
+    the workflow RUNNING. This PR propagates the exact accepted-source loss
+    through DownloadService and the workflow's existing error path,
+    producing a bounded `FINISHED:EXECUTION_EXCEPTION` result.
+    
+    ### Graceful Swarm abort during tensor offload
+    
+    A graceful abort can arrive while a remote multi-GB contribution is
+    being materialized under the aggregation client's tensor disk-offload
+    root. Swarm performs that terminal materialization through an explicit
+    FOBS round trip outside `Cell.decode_payload()`; its fresh decode
+    context did not carry the run abort signal. Cleanup waited only for
+    controller-owned learning/aggregation threads, while the active download
+    could be writing from an AUX/streaming handler thread.
+    
+    An external trainer whose lazy result had already been accepted can also
+    outlive the nested workflow task that originally launched it. In that
+    state `ABORT_TASK` may no longer reach the backend, and stopping only
+    the receiver leaves the producer waiting for its ordinary
+    accepted-source drain. The receiver therefore needs a transaction-level
+    way to report that it abandoned an acquired download.
+    
+    ## Lifecycle contract
+    
+    Normal END_RUN gives an accepted live result source one short
+    acknowledged SHUTDOWN interval so truthful publication can settle, then
+    force-cleans every still-owned process group.
+    
+    Graceful abort propagates to the active workflow, lazy tensor download,
+    disk consumer, and external trainer. Once a receiver has learned that
+    its producer supports cancellation, abandoning the download sends
+    terminal receiver failure back to the producer. The producer applies
+    that failure to every ref for the same receiver in the transaction,
+    allowing the accepted source to settle without the normal drain timeout.
+    Cancellation is identity- and acquisition-checked; mixed-version peers
+    retain the existing bounded timeout fallback.
+    
+    An accepted-source loss is run-fatal: it interrupts the matching
+    download and uses the controller's failure path even when a controller
+    could otherwise tolerate fewer responses. A user-requested run abort
+    remains authoritative over a racing process failure.
+    
+    Root deletion occurs only after active consumers are cancelled and
+    in-flight chunk writes leave their serialized critical section.
+    Source-loss panic follows normal workflow teardown, so live
+    server/client job processes remove their own roots before exit.
+    
+    ## Validation
+    
+    - Current PR head: signed `36e5ff529283d0c3c827c010f443256e8cf4132b`
+    (tree `a1d21aa33abf339c1d3114b39381d63af3bf984e`).
+    - GitHub CI is green on the current head, including Linux unit matrices
+    for Python 3.10 through 3.14 on Ubuntu 22.04 and 24.04, coverage, style,
+    CodeQL, wheel build, documentation links, skill validation, and
+    maintained Hugging Face compatibility checks.
+    - Current split: 46 focused lifecycle/offload regressions passed.
+    - Current affected-area suite on the merged head: 1,140 passed, 1
+    skipped.
+    - Full repository Black, isort, flake8, and agent-skill checks passed.
+    - Unit coverage includes duplicate/idempotent cancellation,
+    multi-receiver and sibling-ref accounting, cancellation racing an
+    in-flight serve, first-reply and pipelined aborts, source connection
+    loss, consumer I/O failure, failed cancel delivery, normal completion
+    without cancellation, SIGKILL of an accepted-result trainer,
+    authoritative RC-file preservation, bounded STOPPED-worker cleanup
+    grace, and source-loss panic reaching END_RUN/root removal.
+    - Current-head GPU system qualification is still in progress. The
+    unchanged maintained `client_api` manifest has one observed failure in
+    `lightning-scaffold-client-api`: both DDP rank-1 processes receive
+    `api=None` during `flare.init()`. The same failure reproduced on
+    predecessor PR head `5db3b3b2`; an unchanged comparison on merged-main
+    parent `be2c91b733440aeb0eebe3191b10932e2d18a3e9` is queued to classify
+    whether it is pre-existing or introduced by this PR. This item is not
+    claimed as passed.
+    - Exact signed predecessor-head lifecycle E2E: trainer SIGKILL after
+    accepted lazy result and active disk download reached
+    `FINISHED:EXECUTION_EXCEPTION` in 9.31 seconds, preserved/consumed
+    RC101, emitted the authenticated failure report, interrupted the exact
+    download without `DOWNLOAD_RETRY`, fired all END_RUN events, and removed
+    job processes and roots.
+    - Prior exact signed-head E2E: graceful active-transfer abort reached
+    `FINISHED:ABORTED` with all required END_RUN events and no process,
+    root, descriptor, socket, or GPU residue through delayed audits.
+    - Exact signed predecessor-head normal-control E2E: full six-round Swarm
+    completion and a separate subsequent canary both reached
+    `FINISHED:COMPLETED` and cleaned resources.
+    - Abrupt SJ/CJ scratch-directory reclamation and cross-launcher scratch
+    ownership are explicitly out of scope for this PR and must be qualified
+    in the launcher-owned scratch follow-up.
+    
+    Fixes #5099.
+---
+ nvflare/private/fed/client/client_engine.py   |  6 +++-
+ nvflare/private/fed/client/client_executor.py | 40 +++++++++++++++++++--------
+ nvflare/private/fed/server/job_runner.py      |  7 +++++
+ 3 files changed, 40 insertions(+), 13 deletions(-)
+
+diff --git a/nvflare/private/fed/client/client_engine.py b/nvflare/private/fed/client/client_engine.py
+index ef87d962..894e1769 100644
+--- a/nvflare/private/fed/client/client_engine.py
++++ b/nvflare/private/fed/client/client_engine.py
+@@ -389,7 +389,11 @@ class ClientEngine(ClientEngineInternalSpec, StreamableEngine):
+ 
+     def abort_app(self, job_id: str, heartbeat_cleanup: bool = False) -> str:
+         status = self.client_executor.get_status(job_id)
+-        if status == ClientStatus.STOPPED:
++        # A CJ reports STOPPED after its runner returns, before process-local
++        # archival and communication teardown finish.  Keep treating it as a
++        # live job while the executor still owns its handle so a server-side
++        # failure can reclaim a CJ that hangs in that final teardown window.
++        if status == ClientStatus.STOPPED and job_id not in self.client_executor.get_run_processes_keys():
+             return "Client app already stopped."
+ 
+         if status == ClientStatus.NOT_STARTED:
+diff --git a/nvflare/private/fed/client/client_executor.py b/nvflare/private/fed/client/client_executor.py
+index a16b8482..aa3de295 100644
+--- a/nvflare/private/fed/client/client_executor.py
++++ b/nvflare/private/fed/client/client_executor.py
+@@ -491,19 +491,30 @@ class JobExecutor(ClientExecutor):
+         # Use retry to avoid print out the error stack trace.
+         retry = 1
+         while retry >= 0:
+-            process_status = self.run_processes.get(job_id, {}).get(RunProcessKey.STATUS, ClientStatus.NOT_STARTED)
+-            if process_status in (ClientStatus.STARTING, ClientStatus.STARTED):
++            with self.lock:
++                process = self.run_processes.get(job_id)
++                process_status = (
++                    process.get(RunProcessKey.STATUS, ClientStatus.NOT_STARTED) if process else ClientStatus.NOT_STARTED
++                )
++                job_handle = process.get(RunProcessKey.JOB_HANDLE) if process else None
++            if process_status in (ClientStatus.STARTING, ClientStatus.STARTED, ClientStatus.STOPPED):
+                 try:
+-                    with self.lock:
+-                        job_handle = self.run_processes[job_id][RunProcessKey.JOB_HANDLE]
+                     if process_status == ClientStatus.STARTING:
+                         if heartbeat_cleanup:
+                             job_handle.terminate(heartbeat_cleanup=True)
+                         else:
+                             job_handle.terminate()
+                         break
+-                    data = {}
+-                    request = new_cell_message({}, data)
++                    if process_status == ClientStatus.STOPPED:
++                        # STOPPED means the runner returned, not that the OS
++                        # process exited. Give archival and process-local teardown
++                        # the normal bounded grace period before reclaiming the
++                        # still-registered owned process.
++                        t = threading.Thread(target=self._terminate_job, args=[job_handle, job_id, heartbeat_cleanup])
++                        t.start()
++                        t.join()
++                        break
++                    request = new_cell_message({}, {})
+                     self.client.cell.fire_and_forget(
+                         targets=self._job_fqcn(job_id),
+                         channel=CellChannel.CLIENT_COMMAND,
+@@ -564,14 +575,13 @@ class JobExecutor(ClientExecutor):
+ 
+     def _terminate_job(self, job_handle, job_id, heartbeat_cleanup=False):
+         max_wait = 10.0
+-        done = False
+         start = time.time()
+         while True:
+-            process = self.run_processes.get(job_id)
++            with self.lock:
++                process = self.run_processes.get(job_id)
+             if not process:
+                 # already finished gracefully
+-                done = True
+-                break
++                return
+ 
+             if time.time() - start > max_wait:
+                 # waited enough
+@@ -630,7 +640,7 @@ class JobExecutor(ClientExecutor):
+                         JobFailureMsgKey.REASON: failure_reason,
+                     },
+                 )
+-                reply = self.client.cell.send_request(
++                reply = self.client.send_request_before_shutdown(
+                     target=FQCN.ROOT_SERVER,
+                     channel=CellChannel.SERVER_MAIN,
+                     topic=CellChannelTopic.REPORT_JOB_FAILURE,
+@@ -638,7 +648,13 @@ class JobExecutor(ClientExecutor):
+                     timeout=self.job_query_timeout,
+                     optional=True,
+                 )
+-                if reply.get_header(MessageHeaderKey.RETURN_CODE) != ReturnCode.OK:
++                if reply is None:
++                    # Shutdown invalidates the site token. The server's client-quit/dead-client
++                    # path resolves any outcome still pending after communication stops.
++                    self.logger.info(
++                        f"not reporting terminal outcome of job {job_id}: client communication has stopped"
++                    )
++                elif reply.get_header(MessageHeaderKey.RETURN_CODE) != ReturnCode.OK:
+                     self.logger.error(f"could not report terminal outcome of job {job_id}")
+             except Exception as e:
+                 self.logger.error(f"could not report terminal outcome of job {job_id}: {secure_format_exception(e)}")
+diff --git a/nvflare/private/fed/server/job_runner.py b/nvflare/private/fed/server/job_runner.py
+index 2ebace10..94efc27d 100644
+--- a/nvflare/private/fed/server/job_runner.py
++++ b/nvflare/private/fed/server/job_runner.py
+@@ -801,6 +801,13 @@ class JobRunner(FLComponent):
+             ):
+                 run_process[RunProcessKey.PROCESS_RETURN_CODE] = process_return_code
+             engine.exception_run_processes[job_id] = run_process
++        # fail_run establishes an authoritative terminal failure. Remaining
++        # client reports cannot change that status and must not hold terminal
++        # publication behind the normal outcome grace period (900 seconds by
++        # default); _stop_run below drives their cleanup independently.
++        with self.lock:
++            self._pending_client_outcomes.pop(job_id, None)
++            self._client_outcome_deadlines.pop(job_id, None)
+         self._stop_run(job_id, fl_ctx)
+ 
+         job = self.running_jobs.get(job_id)

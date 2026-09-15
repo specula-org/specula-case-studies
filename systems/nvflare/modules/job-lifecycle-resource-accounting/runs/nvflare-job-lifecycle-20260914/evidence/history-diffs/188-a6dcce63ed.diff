@@ -1,0 +1,132 @@
+commit a6dcce63ed6f41cf8540f54c552d766a29f894b9
+Author:     Yuhong Wen <yh_wen@hotmail.com>
+AuthorDate: Sun May 29 12:51:54 2022 -0400
+Commit:     GitHub <noreply@github.com>
+CommitDate: Sun May 29 09:51:54 2022 -0700
+
+    fixed jobs run race condition issue. (#624)
+---
+ nvflare/private/fed/client/client_engine.py   |  2 +-
+ nvflare/private/fed/client/client_executor.py | 15 ++++++++++
+ nvflare/private/fed/server/job_runner.py      | 40 +++++++++++++--------------
+ 3 files changed, 36 insertions(+), 21 deletions(-)
+
+diff --git a/nvflare/private/fed/client/client_engine.py b/nvflare/private/fed/client/client_engine.py
+index 372b44bd..69fa0ff1 100644
+--- a/nvflare/private/fed/client/client_engine.py
++++ b/nvflare/private/fed/client/client_engine.py
+@@ -145,7 +145,6 @@ class ClientEngine(ClientEngineInternalSpec):
+         self.logger.info("Starting client app. rank: {}".format(self.rank))
+ 
+         open_port = get_open_ports(1)[0]
+-        self._write_token_file(run_number, open_port)
+ 
+         self.client_executor.start_train(
+             self.client,
+@@ -158,6 +157,7 @@ class ClientEngine(ClientEngineInternalSpec):
+             token,
+             resource_consumer,
+             resource_manager,
++            list(self.client.servers.values())[0]["target"],
+         )
+ 
+         return "Start the client app..."
+diff --git a/nvflare/private/fed/client/client_executor.py b/nvflare/private/fed/client/client_executor.py
+index cfdb14f7..03c6bc51 100644
+--- a/nvflare/private/fed/client/client_executor.py
++++ b/nvflare/private/fed/client/client_executor.py
+@@ -56,6 +56,7 @@ class ClientExecutor(object):
+         token,
+         resource_consumer,
+         resource_manager,
++        target: str,
+     ):
+         """start_train method to start the FL client training.
+ 
+@@ -70,6 +71,7 @@ class ClientExecutor(object):
+             token: token from resource manager
+             resource_consumer: resource consumer
+             resource_manager: resource manager
++            target: SP target location
+ 
+         """
+         pass
+@@ -185,6 +187,7 @@ class ProcessExecutor(ClientExecutor):
+         token,
+         resource_consumer: ResourceConsumerSpec,
+         resource_manager: ResourceManagerSpec,
++        target: str,
+     ):
+         if allocated_resource:
+             resource_consumer.consume(allocated_resource)
+@@ -201,6 +204,18 @@ class ProcessExecutor(ClientExecutor):
+             + args.workspace
+             + " -w "
+             + self.startup
++            + " -t "
++            + client.token
++            + " -d "
++            + client.ssid
++            + " -n "
++            + run_number
++            + " -c "
++            + client.client_name
++            + " -p "
++            + str(listen_port)
++            + " -g "
++            + target
+             + " -s fed_client.json "
+             " --set" + command_options + " print_conf=True"
+         )
+diff --git a/nvflare/private/fed/server/job_runner.py b/nvflare/private/fed/server/job_runner.py
+index 502bdcf7..c155baa7 100644
+--- a/nvflare/private/fed/server/job_runner.py
++++ b/nvflare/private/fed/server/job_runner.py
+@@ -243,27 +243,27 @@ class JobRunner(FLComponent):
+                 if self.scheduler:
+                     (ready_job, sites) = self.scheduler.schedule_job(job_candidates=approved_jobs, fl_ctx=fl_ctx)
+                     if ready_job:
+-                        client_sites = {k: v for k, v in sites.items() if k != "server"}
+-                        try:
+-                            self.log_info(fl_ctx, f"Got the job:{ready_job.job_id} from the scheduler to run")
+-                            fl_ctx.set_prop(FLContextKey.CURRENT_JOB_ID, ready_job.job_id)
+-                            run_number = self._deploy_job(ready_job, sites, fl_ctx)
+-                            job_manager.set_status(ready_job.job_id, RunStatus.DISPATCHED, fl_ctx)
+-                            self._start_run(
+-                                run_number=run_number,
+-                                job=ready_job,
+-                                client_sites=client_sites,
+-                                fl_ctx=fl_ctx,
+-                            )
+-                            with self.lock:
++                        with self.lock:
++                            client_sites = {k: v for k, v in sites.items() if k != "server"}
++                            try:
++                                self.log_info(fl_ctx, f"Got the job:{ready_job.job_id} from the scheduler to run")
++                                fl_ctx.set_prop(FLContextKey.CURRENT_JOB_ID, ready_job.job_id)
++                                run_number = self._deploy_job(ready_job, sites, fl_ctx)
++                                job_manager.set_status(ready_job.job_id, RunStatus.DISPATCHED, fl_ctx)
++                                self._start_run(
++                                    run_number=run_number,
++                                    job=ready_job,
++                                    client_sites=client_sites,
++                                    fl_ctx=fl_ctx,
++                                )
+                                 self.running_jobs[run_number] = ready_job
+-                            job_manager.set_status(ready_job.job_id, RunStatus.RUNNING, fl_ctx)
+-                        except Exception as e:
+-                            run_number = fl_ctx.get_prop(FLContextKey.JOB_RUN_NUMBER)
+-                            if run_number:
+-                                self._delete_run(run_number, list(client_sites.keys()), fl_ctx)
+-                            job_manager.set_status(ready_job.job_id, RunStatus.FAILED_TO_RUN, fl_ctx)
+-                            self.log_error(fl_ctx, f"Failed to run the Job ({ready_job.job_id}): {e}")
++                                job_manager.set_status(ready_job.job_id, RunStatus.RUNNING, fl_ctx)
++                            except Exception as e:
++                                run_number = fl_ctx.get_prop(FLContextKey.JOB_RUN_NUMBER)
++                                if run_number:
++                                    self._delete_run(run_number, list(client_sites.keys()), fl_ctx)
++                                job_manager.set_status(ready_job.job_id, RunStatus.FAILED_TO_RUN, fl_ctx)
++                                self.log_error(fl_ctx, f"Failed to run the Job ({ready_job.job_id}): {e}")
+ 
+                 time.sleep(1.0)
+         else:

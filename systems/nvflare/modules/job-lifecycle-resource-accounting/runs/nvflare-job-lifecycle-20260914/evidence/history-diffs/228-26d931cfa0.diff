@@ -1,0 +1,95 @@
+commit 26d931cfa082fa1e2b596b09611c140baad591ec
+Author:     Yuhong Wen <yh_wen@hotmail.com>
+AuthorDate: Mon Apr 18 10:35:23 2022 -0400
+Commit:     GitHub <noreply@github.com>
+CommitDate: Mon Apr 18 10:35:23 2022 -0400
+
+    keep running clients for job. (#417)
+---
+ nvflare/private/fed/server/job_runner.py    |  4 ++--
+ nvflare/private/fed/server/server_engine.py | 21 +++++++++++++++------
+ 2 files changed, 17 insertions(+), 8 deletions(-)
+
+diff --git a/nvflare/private/fed/server/job_runner.py b/nvflare/private/fed/server/job_runner.py
+index 64c17fc4..154d249f 100644
+--- a/nvflare/private/fed/server/job_runner.py
++++ b/nvflare/private/fed/server/job_runner.py
+@@ -114,11 +114,11 @@ class JobRunner(FLComponent):
+ 
+         """
+         engine = fl_ctx.get_engine()
+-        err = engine.start_app_on_server(run_number)
++        err = engine.start_app_on_server(run_number, client_sites=client_sites)
+         if err:
+             raise RuntimeError("Could not start the server App.")
+ 
+-        replies = engine.start_client_job(client_sites, run_number)
++        replies = engine.start_client_job(run_number, client_sites)
+         if not replies:
+             raise RuntimeError("Failed to start the App to the clients")
+ 
+diff --git a/nvflare/private/fed/server/server_engine.py b/nvflare/private/fed/server/server_engine.py
+index 77227adf..364c2fb4 100644
+--- a/nvflare/private/fed/server/server_engine.py
++++ b/nvflare/private/fed/server/server_engine.py
+@@ -172,7 +172,7 @@ class ServerEngine(ServerEngineInternalSpec):
+     def validate_clients(self, client_names: List[str]) -> Tuple[List[Client], List[str]]:
+         return self._get_all_clients_from_inputs(client_names)
+ 
+-    def start_app_on_server(self, run_number: str, snapshot=None) -> str:
++    def start_app_on_server(self, run_number: str, client_sites=None, snapshot=None) -> str:
+         if run_number in self.run_processes.keys():
+             return f"Server run_{run_number} already started."
+         else:
+@@ -187,7 +187,8 @@ class ServerEngine(ServerEngineInternalSpec):
+                 app_custom_folder = os.path.join(app_root, "custom")
+ 
+             open_ports = get_open_ports(2)
+-            self._start_runner_process(self.args, app_root, run_number, app_custom_folder, open_ports, snapshot)
++            self._start_runner_process(self.args, app_root, run_number, app_custom_folder,
++                                       open_ports, client_sites, snapshot)
+ 
+             threading.Thread(target=self._listen_command, args=(open_ports[0], run_number)).start()
+ 
+@@ -238,7 +239,7 @@ class ServerEngine(ServerEngineInternalSpec):
+                 self.engine_info.status = MachineStatus.STOPPED
+                 break
+ 
+-    def _start_runner_process(self, args, app_root, run_number, app_custom_folder, open_ports, snapshot):
++    def _start_runner_process(self, args, app_root, run_number, app_custom_folder, open_ports, client_sites, snapshot):
+         new_env = os.environ.copy()
+         if app_custom_folder != "":
+             new_env["PYTHONPATH"] = new_env["PYTHONPATH"] + ":" + app_custom_folder
+@@ -275,13 +276,21 @@ class ServerEngine(ServerEngineInternalSpec):
+ 
+         threading.Thread(target=self.wait_for_complete, args=[run_number]).start()
+ 
++        job_clients = {}
++        if client_sites:
++            for site, dispatch_info in client_sites.items():
++                client = self.get_client_from_name(site)
++                if client:
++                    job_clients[client.token] = client
++        if not job_clients:
++            job_clients = self.client_manager.clients
++
+         with self.lock:
+             self.run_processes[run_number] = {
+                 RunProcessKey.LISTEN_PORT: listen_port,
+                 RunProcessKey.CONNECTION: None,
+                 RunProcessKey.CHILD_PROCESS: process,
+-                # TODO: each run will have its own participants. Use all clients for now.
+-                RunProcessKey.PARTICIPANTS: self.client_manager.clients,
++                RunProcessKey.PARTICIPANTS: job_clients,
+             }
+         return process
+ 
+@@ -686,7 +695,7 @@ class ServerEngine(ServerEngineInternalSpec):
+         if requests:
+             replies = self._send_admin_requests(requests)
+ 
+-    def start_client_job(self, client_sites, run_number):
++    def start_client_job(self, run_number, client_sites):
+         requests = {}
+         for site, dispatch_info in client_sites.items():
+             resource_requirement = dispatch_info.resource_requirements

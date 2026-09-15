@@ -1,0 +1,159 @@
+commit c6f2521876ff537af09835f1bcb6a782262d04a4
+Author:     Yuhong Wen <yuhongw@nvidia.com>
+AuthorDate: Wed Dec 4 15:28:44 2024 -0500
+Commit:     GitHub <noreply@github.com>
+CommitDate: Wed Dec 4 15:28:44 2024 -0500
+
+    Docker job launcher (#3072)
+    
+    * Added ClientDockerJobLauncher.
+    
+    * Added ServerDockerJobLauncher, replaced "server" with const.
+    
+    * extract generate_run_command() for sharing the same method between ProcessJobLauncher and DockerJobLauncher.
+    
+    * rename methods.
+    
+    * Moved the shared functions to job_launcher_utils. Removed the improper inheritence.
+    
+    * refactored ProcessJobLauncher.
+    
+    * merged from main codes.
+    
+    * Revert "merged from main codes."
+    
+    This reverts commit 09cac6d96ca47a558088a16b1dc8f0f72439b247.
+    
+    * refactored.
+    
+    * removed the docker workspace requirement for DockerJobLauncher.
+    
+    * removed no use imports.
+    
+    * renamed the GET_JOB_LAUNCHER to BEFORE_JOB_LAUNCH.
+    
+    ---------
+    
+    Co-authored-by: Chester Chen <512707+chesterxgchen@users.noreply.github.com>
+---
+ nvflare/private/fed/client/client_executor.py |  2 +-
+ nvflare/private/fed/server/job_runner.py      | 10 +++++-----
+ nvflare/private/fed/server/server_engine.py   | 11 ++++++-----
+ 3 files changed, 12 insertions(+), 11 deletions(-)
+
+diff --git a/nvflare/private/fed/client/client_executor.py b/nvflare/private/fed/client/client_executor.py
+index ac67006d..7cef9903 100644
+--- a/nvflare/private/fed/client/client_executor.py
++++ b/nvflare/private/fed/client/client_executor.py
+@@ -186,7 +186,7 @@ class JobExecutor(ClientExecutor):
+     def _get_job_launcher(self, job_meta: dict, fl_ctx: FLContext) -> JobLauncherSpec:
+         engine = fl_ctx.get_engine()
+         fl_ctx.set_prop(FLContextKey.JOB_META, job_meta, private=True, sticky=False)
+-        engine.fire_event(EventType.GET_JOB_LAUNCHER, fl_ctx)
++        engine.fire_event(EventType.BEFORE_JOB_LAUNCH, fl_ctx)
+ 
+         job_launcher = fl_ctx.get_prop(FLContextKey.JOB_LAUNCHER)
+         if not (job_launcher and isinstance(job_launcher, list)):
+diff --git a/nvflare/private/fed/server/job_runner.py b/nvflare/private/fed/server/job_runner.py
+index 4b8e79a5..579982eb 100644
+--- a/nvflare/private/fed/server/job_runner.py
++++ b/nvflare/private/fed/server/job_runner.py
+@@ -22,7 +22,7 @@ from typing import Dict, List, Tuple
+ from nvflare.apis.client import Client
+ from nvflare.apis.event_type import EventType
+ from nvflare.apis.fl_component import FLComponent
+-from nvflare.apis.fl_constant import AdminCommandNames, FLContextKey, RunProcessKey, SystemComponents
++from nvflare.apis.fl_constant import AdminCommandNames, FLContextKey, RunProcessKey, SiteType, SystemComponents
+ from nvflare.apis.fl_context import FLContext
+ from nvflare.apis.job_def import ALL_SITES, Job, JobMetaKey, RunStatus
+ from nvflare.apis.job_scheduler_spec import DispatchInfo
+@@ -121,7 +121,7 @@ class JobRunner(FLComponent):
+         engine = fl_ctx.get_engine()
+         run_number = job.job_id
+         fl_ctx.set_prop(FLContextKey.JOB_RUN_NUMBER, run_number)
+-        workspace = Workspace(root_dir=self.workspace_root, site_name="server")
++        workspace = Workspace(root_dir=self.workspace_root, site_name=SiteType.SERVER)
+ 
+         client_deploy_requests = {}
+         client_token_to_name = {}
+@@ -134,12 +134,12 @@ class JobRunner(FLComponent):
+             participants = extract_participants(participants)
+ 
+             if len(participants) == 1 and participants[0].upper() == ALL_SITES:
+-                participants = ["server"]
++                participants = [SiteType.SERVER]
+                 participants.extend([client.name for client in engine.get_clients()])
+ 
+             client_sites = []
+             for p in participants:
+-                if p == "server":
++                if p == SiteType.SERVER:
+                     self.fire_event(EventType.DEPLOY_JOB_TO_SERVER, fl_ctx)
+                     app_deployer = AppDeployer()
+                     err = app_deployer.deploy(
+@@ -419,7 +419,7 @@ class JobRunner(FLComponent):
+                         if self._check_job_status(job_manager, ready_job.job_id, RunStatus.SUBMITTED, fl_ctx):
+                             self.log_info(fl_ctx, f"Job: {ready_job.job_id} is not in SUBMITTED. It won't be deployed.")
+                             continue
+-                        client_sites = {k: v for k, v in sites.items() if k != "server"}
++                        client_sites = {k: v for k, v in sites.items() if k != SiteType.SERVER}
+                         job_id = None
+                         try:
+                             self.log_info(fl_ctx, f"Got the job: {ready_job.job_id} from the scheduler to run")
+diff --git a/nvflare/private/fed/server/server_engine.py b/nvflare/private/fed/server/server_engine.py
+index f9b11833..b13cb62c 100644
+--- a/nvflare/private/fed/server/server_engine.py
++++ b/nvflare/private/fed/server/server_engine.py
+@@ -33,6 +33,7 @@ from nvflare.apis.fl_constant import (
+     RunProcessKey,
+     ServerCommandKey,
+     ServerCommandNames,
++    SiteType,
+     SnapshotKey,
+     WorkspaceConstants,
+ )
+@@ -119,7 +120,7 @@ class ServerEngine(ServerEngineInternalSpec, StreamableEngine):
+         self.kv_list = parse_vars(args.set)
+ 
+     def _get_server_app_folder(self):
+-        return WorkspaceConstants.APP_PREFIX + "server"
++        return WorkspaceConstants.APP_PREFIX + SiteType.SERVER
+ 
+     def _get_client_app_folder(self, client_name):
+         return WorkspaceConstants.APP_PREFIX + client_name
+@@ -171,7 +172,7 @@ class ServerEngine(ServerEngineInternalSpec, StreamableEngine):
+         if job.job_id in self.run_processes.keys():
+             return f"Server run: {job.job_id} already started."
+         else:
+-            workspace = Workspace(root_dir=self.args.workspace, site_name="server")
++            workspace = Workspace(root_dir=self.args.workspace, site_name=SiteType.SERVER)
+             app_root = workspace.get_app_dir(job.job_id)
+             if not os.path.exists(app_root):
+                 return "Server app does not exist. Please deploy the server app before starting."
+@@ -469,7 +470,7 @@ class ServerEngine(ServerEngineInternalSpec, StreamableEngine):
+         return os.path.join(self.server.admin_server.file_upload_dir, app_name)
+ 
+     def deploy_app_to_server(self, run_destination: str, app_name: str, app_staging_path: str) -> str:
+-        return self.deploy_app(run_destination, app_name, WorkspaceConstants.APP_PREFIX + "server")
++        return self.deploy_app(run_destination, app_name, WorkspaceConstants.APP_PREFIX + SiteType.SERVER)
+ 
+     def get_workspace(self) -> Workspace:
+         return self.run_manager.get_workspace()
+@@ -556,7 +557,7 @@ class ServerEngine(ServerEngineInternalSpec, StreamableEngine):
+         )
+ 
+     def _get_aux_msg_target(self, name: str):
+-        if name.lower() == "server":
++        if name.lower() == SiteType.SERVER:
+             return AuxMsgTarget.server_target()
+ 
+         c = self.get_client_from_name(name)
+@@ -867,7 +868,7 @@ class ServerEngine(ServerEngineInternalSpec, StreamableEngine):
+         requests = {}
+         for site_name, resource_requirements in resource_reqs.items():
+             # assume server resource is unlimited
+-            if site_name == "server":
++            if site_name == SiteType.SERVER:
+                 continue
+             request = self._make_message_for_check_resource(job, resource_requirements, fl_ctx)
+ 

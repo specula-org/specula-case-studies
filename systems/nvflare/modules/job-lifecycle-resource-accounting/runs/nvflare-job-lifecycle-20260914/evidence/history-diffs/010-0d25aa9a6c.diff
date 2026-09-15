@@ -1,0 +1,92 @@
+commit 0d25aa9a6c420028c2411d251e7f22fa44bd7a11
+Author:     Peter Cnudde <pcnudde@nvidia.com>
+AuthorDate: Wed Aug 12 15:43:28 2026 -0700
+Commit:     GitHub <noreply@github.com>
+CommitDate: Wed Aug 12 22:43:28 2026 +0000
+
+    Add portable CPU and memory job resources (#5092)
+    
+    ## Summary
+    
+    - add portable `num_of_cpus` and host `memory` requirements alongside
+    `num_of_gpus`
+    - add `resource_spec["@default"]` with shallow per-site overrides
+    - use the same resolved requirements for scheduling, dispatch,
+    cancellation, and launcher enforcement
+    - translate the portable fields to Docker, Kubernetes, and Slurm while
+    preserving legacy resource specifications
+    
+    ## Backend mappings
+    
+    | Field | Docker | Kubernetes | Slurm |
+    |---|---|---|---|
+    | `num_of_gpus` | GPU device requests | `nvidia.com/gpu` request and
+    limit | `--gres` |
+    | `num_of_cpus` | `nano_cpus` | CPU request and limit |
+    `--cpus-per-task` |
+    | `memory` | `mem_limit` in bytes | memory request and limit | `--mem`
+    in MiB |
+    
+    GPU memory and other backend-specific topology or policy remain outside
+    the portable contract.
+    
+    ## Validation
+    
+    - `557 passed` across the focused scheduler, validator, utility, Docker,
+    Kubernetes, and Slurm tests
+    - `./runtest.sh -s`
+    - `git diff --check`
+    
+    Closes #5083
+---
+ nvflare/app_common/job_schedulers/job_scheduler.py | 16 +++++++---------
+ 1 file changed, 7 insertions(+), 9 deletions(-)
+
+diff --git a/nvflare/app_common/job_schedulers/job_scheduler.py b/nvflare/app_common/job_schedulers/job_scheduler.py
+index 1814c6e6..8ef2456f 100644
+--- a/nvflare/app_common/job_schedulers/job_scheduler.py
++++ b/nvflare/app_common/job_schedulers/job_scheduler.py
+@@ -27,7 +27,7 @@ from nvflare.apis.job_scheduler_spec import DispatchInfo, JobSchedulerSpec
+ from nvflare.apis.server_engine_spec import ServerEngineSpec
+ from nvflare.private.fed.utils.fed_utils import extract_participants
+ from nvflare.security.study_registry import StudyRegistryService
+-from nvflare.utils.job_launcher_utils import get_site_launcher_spec
++from nvflare.utils.job_launcher_utils import get_resource_manager_spec
+ 
+ SCHEDULE_RESULT_OK = 0  # the job is scheduled
+ SCHEDULE_RESULT_NO_RESOURCE = 1  # job is not scheduled due to lack of resources
+@@ -160,12 +160,10 @@ class DefaultJobScheduler(JobSchedulerSpec, FLComponent):
+             )
+ 
+         # we are assuming server resource is sufficient
+-        resource_reqs = {}
+-        for site_name in applicable_sites:
+-            if site_name in job.resource_spec:
+-                resource_reqs[site_name] = get_site_launcher_spec(job.resource_spec[site_name], "process")
+-            else:
+-                resource_reqs[site_name] = {}
++        resource_meta = {**job.meta, JobMetaKey.RESOURCE_SPEC.value: job.resource_spec}
++        resource_reqs = {
++            site_name: get_resource_manager_spec(resource_meta, site_name) for site_name in applicable_sites
++        }
+ 
+         job_participants = [fl_ctx.get_identity_name(default=SERVER_SITE_NAME)]
+         job_participants.extend(applicable_sites)
+@@ -212,7 +210,7 @@ class DefaultJobScheduler(JobSchedulerSpec, FLComponent):
+         if num_sites_ok < job.min_sites:
+             self.log_debug(fl_ctx, f"Job {job.job_id} can't be scheduled: not enough sites have enough resources.")
+             self._cancel_resources(
+-                resource_reqs=job.resource_spec, resource_check_results=resource_check_results, fl_ctx=fl_ctx
++                resource_reqs=resource_reqs, resource_check_results=resource_check_results, fl_ctx=fl_ctx
+             )
+             return (
+                 SCHEDULE_RESULT_NO_RESOURCE,
+@@ -227,7 +225,7 @@ class DefaultJobScheduler(JobSchedulerSpec, FLComponent):
+                 f" don't have enough resources.",
+             )
+             self._cancel_resources(
+-                resource_reqs=job.resource_spec, resource_check_results=resource_check_results, fl_ctx=fl_ctx
++                resource_reqs=resource_reqs, resource_check_results=resource_check_results, fl_ctx=fl_ctx
+             )
+ 
+             return (

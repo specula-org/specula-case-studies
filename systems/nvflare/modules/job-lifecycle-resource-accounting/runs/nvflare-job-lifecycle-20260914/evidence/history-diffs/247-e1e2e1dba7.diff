@@ -1,0 +1,1303 @@
+commit e1e2e1dba738ba651f5c9b0cfae074360a6df8bf
+Author:     Isaac Yang <isaacy@nvidia.com>
+AuthorDate: Tue Nov 23 07:13:44 2021 -0800
+Commit:     Isaac Yang <isaacy@nvidia.com>
+CommitDate: Tue Nov 23 14:56:17 2021 -0800
+
+    Initial commit for 2.0
+---
+ nvflare/private/fed/client/client_engine.py   | 311 ++++++++++++++++
+ nvflare/private/fed/client/client_executor.py | 472 +++++++++++++++++++++++++
+ nvflare/private/fed/server/server_engine.py   | 489 ++++++++++++++++++++++++++
+ 3 files changed, 1272 insertions(+)
+
+diff --git a/nvflare/private/fed/client/client_engine.py b/nvflare/private/fed/client/client_engine.py
+new file mode 100644
+index 00000000..3f5d0902
+--- /dev/null
++++ b/nvflare/private/fed/client/client_engine.py
+@@ -0,0 +1,311 @@
++# Copyright (c) 2021, NVIDIA CORPORATION.
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++import logging
++import os
++import re
++import shutil
++import sys
++import time
++import traceback
++from concurrent.futures import ThreadPoolExecutor
++
++from nvflare.apis.fl_constant import MachineStatus
++from nvflare.apis.shareable import Shareable
++from nvflare.fuel.hci.zip_utils import unzip_all_from_bytes
++from nvflare.private.admin_defs import Message
++from nvflare.private.defs import ClientStatusKey
++
++from .client_engine_internal_spec import ClientEngineInternalSpec
++from .client_executor import ProcessExecutor
++from .client_run_manager import ClientRunInfo
++from .client_status import ClientStatus
++
++
++class ClientEngine(ClientEngineInternalSpec):
++    """
++    ClientEngine runs in the client parent process.
++    """
++    def __init__(self, client, client_name, sender, args, rank, workers=5):
++        self.client = client
++        self.client_name = client_name
++        self.sender = sender
++        self.args = args
++        self.rank = rank
++        self.client.process = None
++        self.client_executor = ProcessExecutor(client.client_name)
++
++        self.run_number = -1
++        self.status = MachineStatus.STOPPED
++
++        assert workers >= 1, "workers must >= 1"
++        self.executor = ThreadPoolExecutor(max_workers=workers)
++
++        self.logger = logging.getLogger(self.__class__.__name__)
++
++    def set_agent(self, admin_agent):
++        self.admin_agent = admin_agent
++
++    def _get_open_port(self):
++        import socket
++
++        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
++        s.bind(("", 0))
++        s.listen(1)
++        port = s.getsockname()[1]
++        s.close()
++        return port
++
++    def do_validate(self, req: Message):
++        self.logger.info("starting cross site validation.")
++        future = self.executor.submit(lambda p: _do_validate(*p), [self.sender, req])
++        # thread = threading.Thread(target=_do_validate, args=(self.sender, req))
++        # thread.start()
++
++        return "validate process started."
++
++    # def client_status(self):
++    #     if self.rank == 0:
++    #         self.logger.info("check client status.")
++    #         client_name = self.client.uid
++    #         token = self.client.token
++    #         message = "client name: {}".format(client_name)
++    #         message += "\ttoken: {}".format(token)
++    #
++    #         message += "\tstatus: {}".format(self.client_executor.check_status(self.client))
++    #         # if self.client.status == ClientStatus.TRAINING_STOPPED:
++    #         #     message += '\tlocal epochs: {}'.format(self.client.model_manager.fitter.num_epochs)
++    #
++    #         return message
++    #     else:
++    #         return ""
++
++    def get_engine_status(self):
++        app_name = "?"
++        if self.run_number == -1:
++            run_number = "?"
++        else:
++            run_number = str(self.run_number)
++            run_folder = os.path.join(self.args.workspace, "run_" + str(run_number))
++            app_file = os.path.join(run_folder, "fl_app.txt")
++            if os.path.exists(app_file):
++                with open(app_file, "r") as f:
++                    app_name = f.readline().strip()
++
++        result = {
++            ClientStatusKey.APP_NAME: app_name,
++            ClientStatusKey.RUN_NUM: run_number,
++            ClientStatusKey.STATUS: self.client_executor.check_status(self.client),
++        }
++        return result
++
++    def start_app(self, run_number: int) -> str:
++        status = self.client.status
++        if status == ClientStatus.STARTING or status == ClientStatus.STARTED:
++            return "Client app already started."
++
++        app_root = os.path.join(self.args.workspace, "run_" + str(run_number), "app_" + self.client.client_name)
++        if not os.path.exists(app_root):
++            return "Client app does not exist. Please deploy it before starting client."
++
++        if self.client.enable_byoc:
++            app_custom_folder = os.path.join(app_root, "custom")
++            try:
++                sys.path.index(app_custom_folder)
++            except ValueError:
++                self.remove_custom_path()
++                sys.path.append(app_custom_folder)
++        else:
++            app_custom_folder = ""
++
++        self.logger.info("Starting client app. rank: {}".format(self.rank))
++
++        open_port = self._get_open_port()
++        self._write_token_file(run_number, open_port)
++        self.run_number = run_number
++
++        self.client_executor.start_train(self.client, self.args, app_root, app_custom_folder, open_port)
++
++        return "Start the client app..."
++
++    def set_run_number(self, run_number: int) -> str:
++        self.run_number = run_number
++        return ""
++
++    def get_client_name(self):
++        return self.client.client_name
++
++    # def wait_training_process_finish(self):
++    #     self.client.process.join()
++    #
++    #     # _cross_validation(self.client, self.args)
++    #     self.client.status = ClientStatus.STOPPED
++
++    # def start_mgpu_client(self, run_number, gpu_number):
++    #     status = self.client.status
++    #     if status == ClientStatus.STARTING or status == ClientStatus.STARTED:
++    #         return "Client already in training."
++    #
++    #     app_root = os.path.join(self.args.app, "run_" + str(run_number), "app_" + self.client.uid)
++    #     if not os.path.exists(app_root):
++    #         return "Client app does not exist. Please deploy it before start client."
++    #
++    #     app_custom_folder = os.path.join(app_root, "custom")
++    #     try:
++    #         sys.path.index(app_custom_folder)
++    #     except ValueError:
++    #         self.remove_custom_path()
++    #         sys.path.append(app_custom_folder)
++    #
++    #     self.logger.info("Starting client training. rank: {}".format(self.rank))
++    #
++    #     open_port = self._get_open_port()
++    #     self._write_token_file(run_number, open_port)
++    #
++    #     self.client_executor.start_mgpu_train(
++    #         self.client, self.args, app_root, gpu_number, app_custom_folder, open_port
++    #     )
++    #
++    #     return "Start the client..."
++
++    def _write_token_file(self, run_number, open_port):
++        token_file = os.path.join(self.args.workspace, "client_token.txt")
++        if os.path.exists(token_file):
++            os.remove(token_file)
++        with open(token_file, "wt") as f:
++            f.write("%s\n%s\n%s\n%s\n" % (self.client.token, run_number, self.client.client_name, open_port))
++
++    def wait_process_complete(self):
++        self.client.process.wait()
++
++        # self.client.cross_validation()
++        self.client.status = ClientStatus.STOPPED
++
++    def remove_custom_path(self):
++        regex = re.compile(".*/run_.*/custom")
++        custom_paths = list(filter(regex.search, sys.path))
++        for path in custom_paths:
++            sys.path.remove(path)
++
++    def abort_app(self, run_number: int) -> str:
++        status = self.client.status
++        if status == ClientStatus.STOPPED:
++            return "Client app already stopped."
++
++        if status == ClientStatus.NOT_STARTED:
++            return "Client app has not started."
++
++        if status == ClientStatus.STARTING:
++            return "Client app is starting, please wait for client to have started before abort."
++
++        self.client_executor.abort_train(self.client)
++        # self.run_number = -1
++
++        return "Abort signal has been sent to the client App."
++
++    def abort_task(self, run_number: int) -> str:
++        status = self.client.status
++        if status == ClientStatus.NOT_STARTED:
++            return "Client app has not started."
++
++        if status == ClientStatus.STARTING:
++            return "Client app is starting, please wait for started before abort_task."
++
++        self.client_executor.abort_task(self.client)
++        # self.run_number = -1
++
++        return "Abort signal has been sent to the current task. "
++
++    def shutdown(self) -> str:
++        self.logger.info("Client shutdown...")
++        touch_file = os.path.join(self.args.workspace, "shutdown.fl")
++        self.client_executor.close()
++        future = self.executor.submit(lambda p: _shutdown_client(*p), [self.client, self.admin_agent, touch_file])
++
++        return "Shutdown the client..."
++
++    def restart(self) -> str:
++        self.logger.info("Client shutdown...")
++        touch_file = os.path.join(self.args.workspace, "restart.fl")
++        self.client_executor.close()
++        future = self.executor.submit(lambda p: _shutdown_client(*p), [self.client, self.admin_agent, touch_file])
++
++        return "Restart the client..."
++
++    def deploy_app(self, app_name: str, run_num: int, client_name: str, app_data) -> str:
++        # if not os.path.exists('/tmp/tmp'):
++        #     os.makedirs('/tmp/tmp')
++        dest = os.path.join(self.args.workspace, "run_" + str(run_num), "app_" + client_name)
++        # Remove the previous deployed app.
++        if os.path.exists(dest):
++            shutil.rmtree(dest)
++
++        if not os.path.exists(dest):
++            os.makedirs(dest)
++        unzip_all_from_bytes(app_data, dest)
++
++        app_file = os.path.join(self.args.workspace, "run_" + str(run_num), "fl_app.txt")
++        if os.path.exists(app_file):
++            os.remove(app_file)
++        with open(app_file, "wt") as f:
++            f.write(f"{app_name}")
++
++        return ""
++
++    def delete_run(self, run_num: int) -> str:
++        run_number_folder = os.path.join(self.args.workspace, "run_" + str(run_num))
++        if os.path.exists(run_number_folder):
++            shutil.rmtree(run_number_folder)
++        return "Delete run folder: {}".format(run_number_folder)
++
++    def get_current_run_info(self) -> ClientRunInfo:
++        return self.client_executor.get_run_info()
++
++    def get_errors(self):
++        return self.client_executor.get_errors()
++
++    def reset_errors(self):
++        self.client_executor.reset_errors()
++
++    def send_aux_command(self, shareable: Shareable):
++        return self.client_executor.send_aux_command(shareable)
++
++
++def _do_validate(sender, message):
++    print("starting the validate process .....")
++    time.sleep(60)
++    print("Generating processing result ......")
++    reply = Message(topic=message.topic, body="")
++    sender.send_result(reply)
++    pass
++
++
++def _shutdown_client(client, admin_agent, touch_file):
++    with open(touch_file, "a"):
++        os.utime(touch_file, None)
++
++    try:
++        print("About to shutdown the client...")
++        client.communicator.heartbeat_done = True
++        time.sleep(3)
++        client.close()
++
++        if client.process:
++            client.process.terminate()
++
++        admin_agent.shutdown()
++    except BaseException as e:
++        traceback.print_exc()
++        print("FL client execution exception: " + str(e))
++        # client.status = ClientStatus.TRAINING_EXCEPTION
+diff --git a/nvflare/private/fed/client/client_executor.py b/nvflare/private/fed/client/client_executor.py
+new file mode 100644
+index 00000000..45dbdb67
+--- /dev/null
++++ b/nvflare/private/fed/client/client_executor.py
+@@ -0,0 +1,472 @@
++# Copyright (c) 2021, NVIDIA CORPORATION.
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++import logging
++import math
++import os
++import shlex
++import subprocess
++import sys
++import threading
++import time
++from multiprocessing.connection import Client
++
++from nvflare.apis.fl_constant import AdminCommandNames, ReturnCode
++from nvflare.apis.shareable import Shareable, make_reply
++from nvflare.fuel.utils.pipe.file_pipe import FilePipe
++from .client_status import ClientStatus, get_status_message
++
++
++class ClientExecutor(object):
++    def __init__(self, uid) -> None:
++        pipe_path = "/tmp/fl/" + uid + "/comm"
++        if not os.path.exists(pipe_path):
++            os.makedirs(pipe_path)
++
++        self.pipe = FilePipe(root_path=pipe_path, name="training")
++        self.logger = logging.getLogger(self.__class__.__name__)
++
++    def start_train(self, client, args, app_root, app_custom_folder, listen_port):
++        """
++        start_train method to start the FL client training.
++        :param client: the FL client object.
++        :param args: admin command arguments for starting the FL client training.
++        :param app_root: the root folder of the running APP.
++        :return:
++        """
++        pass
++
++    def start_mgpu_train(self, client, args, app_root, gpu_number, app_custom_folder, listen_port):
++        """
++        start the FL client training using multi-GPU.
++        :param client: the FL client object.
++        :param args: admin command arguments for starting the FL client training.
++        :param app_root: the root folder of the running APP.
++        :param gpu_number: number of GPUs to run FL training
++        :return:
++        """
++        pass
++
++    def check_status(self, client):
++        """
++        check the status of the running client.
++        :param client: the FL client object.
++        :return: running FL client status message.
++        """
++        pass
++
++    def abort_train(self, client):
++        """
++        To abort the running client.
++        :param client: the FL client object.
++        :return: N/A
++        """
++        pass
++
++    def abort_task(self, client):
++        """
++        To abort the client executing task.
++        :param client: the FL client object.
++        :return: N/A
++        """
++        pass
++
++    def get_run_info(self):
++        """
++        To get the run_info from the InfoCollector.
++        Returns:
++
++        """
++        pass
++
++    def get_errors(self):
++        """
++        To get the error_info from the InfoCollector.
++        Returns:
++
++        """
++        pass
++
++    def reset_errors(self):
++        """
++        To reset the error_info for the InfoCollector.
++        Returns:
++
++        """
++        pass
++
++    def send_aux_command(self, shareable: Shareable):
++        """
++        To send the aux command to child process.
++        Returns:
++
++        """
++        pass
++
++    def cleanup(self):
++        self.pipe.clear()
++
++
++class ProcessExecutor(ClientExecutor):
++    """
++    Run the Client executor in a child process.
++    """
++    def __init__(self, uid):
++        ClientExecutor.__init__(self, uid)
++        # self.client = client
++
++        self.conn_client = None
++        # self.pool = None
++
++        self.listen_port = 6000
++
++        self.lock = threading.Lock()
++
++    def get_conn_client(self):
++        if not self.conn_client:
++            try:
++                address = ("localhost", self.listen_port)
++                self.conn_client = Client(address, authkey="client process secret password".encode())
++            except Exception as e:
++                pass
++
++    def create_pipe(self):
++        """Create pipe to communicate between child (training) and main (logic) thread."""
++        pipe = FilePipe(root_path="/fl/server", name="training")
++
++        return pipe
++
++    def start_train(self, client, args, app_root, app_custom_folder, listen_port):
++        # self.pool = multiprocessing.Pool(processes=1)
++        # result = self.pool.apply_async(_start_client, (client, args, app_root))
++
++        # self.conn_client, child_conn = mp.Pipe()
++        # process = multiprocessing.Process(target=_start_client, args=(client, args, app_root, child_conn, self.pipe))
++        # # process = multiprocessing.Process(target=_start_new)
++        # process.start()
++
++        self.listen_port = listen_port
++
++        new_env = os.environ.copy()
++        if app_custom_folder != "":
++            new_env["PYTHONPATH"] = new_env["PYTHONPATH"] + ":" + app_custom_folder
++
++        # self.retrieve_cross_validate_setting(client, app_root)
++
++        command_options = ""
++        for t in args.set:
++            command_options += " " + t
++        command = (
++            f"{sys.executable} -m nvflare.private.fed.app.client.worker_process -m "
++            + args.workspace
++            + " -s fed_client.json "
++            " --set" + command_options + " print_conf=True"
++        )
++        # use os.setsid to create new process group ID
++        process = subprocess.Popen(shlex.split(command, " "), preexec_fn=os.setsid, env=new_env)
++
++        print("training child process ID: {}".format(process.pid))
++
++        client.process = process
++        client.multi_gpu = False
++
++        client.status = ClientStatus.STARTED
++        thread = threading.Thread(
++            target=self.wait_training_process_finish, args=(client, args, app_root, app_custom_folder)
++        )
++        thread.start()
++
++    # def retrieve_cross_validate_setting(self, client, app_root):
++    #     if client.config_folder == "":
++    #         client_config = "config_fed_client.json"
++    #     else:
++    #         client_config = client.config_folder + "/config_fed_client.json"
++    #     client_config = os.path.join(app_root, client_config)
++    #     conf = Configurator(
++    #         app_root=app_root,
++    #         cmd_vars={},
++    #         env_config={},
++    #         wf_config_file_name=client_config,
++    #         base_pkgs=[],
++    #         module_names=[],
++    #     )
++    #     conf.configure()
++    #     client.cross_site_validate = conf.wf_config_data.get("cross_validate", False)
++
++    # def start_mgpu_train(self, client, args, app_root, gpu_number, app_custom_folder, listen_port):
++    #     self.listen_port = listen_port
++    #
++    #     new_env = os.environ.copy()
++    #     new_env["PYTHONPATH"] = new_env["PYTHONPATH"] + ":" + app_custom_folder
++    #
++    #     # self.retrieve_cross_validate_setting(client, app_root)
++    #
++    #     if client.platform == "PT":
++    #         command = (
++    #             f"{sys.executable} -m torch.distributed.launch --nproc_per_node="
++    #             + str(gpu_number)
++    #             + " --nnodes=1 --node_rank=0 "
++    #             + '--master_addr="localhost" --master_port=1234 '
++    #             + "-m nvflare.private.fed.app.client.worker_process -m "
++    #             + args.workspace
++    #             + " -s fed_client.json "
++    #             " --set secure_train="
++    #             + str(client.secure_train)
++    #             + " print_conf=True use_gpu=True multi_gpu=True uid="
++    #             + client.client_name
++    #             + " config_folder="
++    #             + client.config_folder
++    #         )
++    #         # use os.setsid to create new process group ID
++    #         process = subprocess.Popen(shlex.split(command, " "), preexec_fn=os.setsid, env=new_env)
++    #     else:
++    #         command = (
++    #             "mpirun -np "
++    #             + str(gpu_number)
++    #             + " -H localhost:"
++    #             + str(gpu_number)
++    #             + " -bind-to none -map-by slot -x NCCL_DEBUG=DEBUG -x LD_LIBRARY_PATH -x PATH "
++    #             "-mca pml ob1 -mca btl ^openib --allow-run-as-root "
++    #             f"{sys.executable} -u -m nvmidl.apps.fed_learn.client.worker_process -m "
++    #             + args.workspace
++    #             + " -s fed_client.json --set secure_train="
++    #             + str(client.secure_train)
++    #             + " multi_gpu=true uid="
++    #             + client.client_name
++    #             + " config_folder="
++    #             + client.config_folder
++    #         )
++    #         process = subprocess.Popen(shlex.split(command, " "), env=new_env)
++    #     client.process = process
++    #     client.multi_gpu = True
++    #     # self.pool = multiprocessing.Pool(processes=1)
++    #     # result = self.pool.apply_async(self.call_mpirun, (client, args, app_root))
++    #
++    #     client.status = ClientStatus.STARTED
++    #     thread = threading.Thread(
++    #         target=self.wait_training_process_finish, args=(client, args, app_root, app_custom_folder)
++    #     )
++    #     thread.start()
++
++    def check_status(self, client):
++        try:
++            self.get_conn_client()
++
++            if self.conn_client:
++                data = {"command": AdminCommandNames.CHECK_STATUS, "data": {}}
++                self.conn_client.send(data)
++                status_message = self.conn_client.recv()
++                print("check status from process listener......")
++                return status_message
++            else:
++                return get_status_message(client.status)
++        except:
++            self.logger.error("Check_status execution exception.")
++            return "execution exception. Please try again."
++
++    def get_run_info(self):
++        try:
++            self.get_conn_client()
++
++            if self.conn_client:
++                data = {"command": AdminCommandNames.SHOW_STATS, "data": {}}
++                self.conn_client.send(data)
++                run_info = self.conn_client.recv()
++                return run_info
++            else:
++                return {}
++        except:
++            self.logger.error("get_run_info() execution exception.")
++            return {"error": "no info collector. Please try again."}
++
++    def get_errors(self):
++        try:
++            self.get_conn_client()
++
++            if self.conn_client:
++                data = {"command": AdminCommandNames.SHOW_ERRORS, "data": {}}
++                self.conn_client.send(data)
++                errors_info = self.conn_client.recv()
++                return errors_info
++            else:
++                return None
++        except:
++            self.logger.error("get_errors() execution exception.")
++            return None
++
++    def reset_errors(self):
++        try:
++            self.get_conn_client()
++
++            if self.conn_client:
++                data = {"command": AdminCommandNames.RESET_ERRORS, "data": {}}
++                self.conn_client.send(data)
++        except:
++            self.logger.error("reset_errors() execution exception.")
++
++    def send_aux_command(self, shareable: Shareable):
++        try:
++            self.get_conn_client()
++            if self.conn_client:
++                data = {"command": AdminCommandNames.AUX_COMMAND, "data": shareable}
++                self.conn_client.send(data)
++                reply = self.conn_client.recv()
++                return reply
++            else:
++                return make_reply(ReturnCode.EXECUTION_EXCEPTION)
++        except:
++            return make_reply(ReturnCode.EXECUTION_EXCEPTION)
++
++    def abort_train(self, client):
++        # if client.status == ClientStatus.CROSS_SITE_VALIDATION:
++        #     # Only aborts cross site validation.
++        #     client.abort()
++        # elif client.status == ClientStatus.TRAINING_STARTED:
++        if client.status == ClientStatus.STARTED:
++            with self.lock:
++                if client.process:
++                    # if client.platform == 'PT' and client.multi_gpu:
++                    #     # kill the sub-process group directly
++                    #     os.killpg(os.getpgid(client.process.pid), 9)
++                    # else:
++                    #     client.process.terminate()
++
++                    # kill the sub-process group directly
++                    if self.conn_client:
++                        data = {"command": AdminCommandNames.ABORT, "data": {}}
++                        self.conn_client.send(data)
++                        self.logger.debug("abort sent")
++                        # wait for client to handle abort
++                        time.sleep(2.0)
++
++                    # kill the sub-process group directly
++                    try:
++                        os.killpg(os.getpgid(client.process.pid), 9)
++                        self.logger.debug("kill signal sent")
++                    except Exception as e:
++                        pass
++                    client.process.terminate()
++                    self.logger.debug("terminated")
++
++                # if self.pool:
++                #     self.pool.terminate()
++                if self.conn_client:
++                    self.conn_client.close()
++                self.conn_client = None
++                self.cleanup()
++
++        self.logger.info("Client training was terminated.")
++
++    def abort_task(self, client):
++        if client.status == ClientStatus.STARTED:
++            if self.conn_client:
++                data = {"command": AdminCommandNames.ABORT_TASK, "data": {}}
++                self.conn_client.send(data)
++                self.logger.debug("abort_task sent")
++
++    def wait_training_process_finish(self, client, args, app_root, app_custom_folder):
++        # wait for the listen_command thread to start, and send "start" message to wake up the connection.
++        start = time.time()
++        while True:
++            self.get_conn_client()
++            if self.conn_client:
++                data = {"command": AdminCommandNames.START_APP, "data": {}}
++                self.conn_client.send(data)
++                break
++            time.sleep(1.0)
++            if time.time() - start > 15:
++                break
++
++        self.logger.info("waiting for process to finish")
++        client.process.wait()
++        returncode = client.process.returncode
++        self.logger.info(f"process finished with execution code: {returncode}")
++
++        with self.lock:
++            client.process = None
++
++            if self.conn_client:
++                self.conn_client.close()
++            self.conn_client = None
++
++        # # result.get()
++        # self.pool.close()
++        # self.pool.join()
++        # self.pool.terminate()
++
++        # Not to run cross_validation in a new process any more.
++        client.cross_site_validate = False
++
++        client.status = ClientStatus.STOPPED
++
++    def close(self):
++        if self.conn_client:
++            data = {"command": AdminCommandNames.SHUTDOWN, "data": {}}
++            self.conn_client.send(data)
++            self.conn_client = None
++        self.cleanup()
++
++
++# class ThreadExecutor(ClientExecutor):
++#     def __init__(self, client, executor):
++#         self.client = client
++#         self.executor = executor
++
++#     def start_train(self, client, args, app_root, app_custom_folder, listen_port):
++#         future = self.executor.submit(lambda p: _start_client(*p), [client, args, app_root])
++
++#     def start_mgpu_train(self, client, args, app_root, gpu_number, app_custom_folder, listen_port):
++#         self.start_train(client, args, app_root)
++
++#     def check_status(self, client):
++#         return get_status_message(self.client.status)
++
++#     def abort_train(self, client):
++#         self.client.train_end = True
++#         self.client.fitter.train_ctx.ask_to_stop_immediately()
++#         self.client.fitter.train_ctx.set_prop("early_end", True)
++#         # self.client.model_manager.close()
++#         # self.client.status = ClientStatus.TRAINING_STOPPED
++#         return "Aborting the client..."
++
++
++def update_client_properties(client, trainer):
++    # servers = [{t['name']: t['service']} for t in trainer.server_config]
++    retry_timeout = 30
++    # if trainer.client_config['retry_timeout']:
++    #     retry_timeout = trainer.client_config['retry_timeout']
++    client.client_args = trainer.client_config
++    # client.servers = sorted(servers)[0]
++    # client.model_manager.federated_meta = {task_name: list() for task_name in tuple(client.servers)}
++    exclude_vars = trainer.client_config.get("exclude_vars", "dummy")
++    # client.model_manager.exclude_vars = re.compile(exclude_vars) if exclude_vars else None
++    # client.model_manager.privacy_policy = trainer.privacy
++    # client.model_manager.model_reader_writer = trainer.model_reader_writer
++    # client.model_manager.model_validator = trainer.model_validator
++    # client.pool = ThreadPool(len(client.servers))
++    # client.communicator.ssl_args = trainer.client_config
++    # client.communicator.secure_train = trainer.secure_train
++    # client.communicator.model_manager = client.model_manager
++    client.communicator.should_stop = False
++    client.communicator.retry = int(math.ceil(float(retry_timeout) / 5))
++    # client.communicator.outbound_filters = trainer.outbound_filters
++    # client.communicator.inbound_filters = trainer.inbound_filters
++    client.handlers = trainer.handlers
++    # client.inbound_filters = trainer.inbound_filters
++    client.executors = trainer.executors
++    # client.task_inbound_filters = trainer.task_inbound_filters
++    # client.task_outbound_filters = trainer.task_outbound_filters
++    # client.secure_train = trainer.secure_train
++    client.heartbeat_done = False
++    # client.fl_ctx = FLContext()
+diff --git a/nvflare/private/fed/server/server_engine.py b/nvflare/private/fed/server/server_engine.py
+new file mode 100644
+index 00000000..0f457d15
+--- /dev/null
++++ b/nvflare/private/fed/server/server_engine.py
+@@ -0,0 +1,489 @@
++# Copyright (c) 2021, NVIDIA CORPORATION.
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++import gc
++import logging
++import os
++import pickle
++import re
++import shutil
++import sys
++import time
++import traceback
++from concurrent.futures import ThreadPoolExecutor
++from threading import Lock
++from typing import List, Tuple
++
++from nvflare.apis.client import Client
++from nvflare.apis.fl_constant import MachineStatus, ReservedTopic, ReturnCode
++from nvflare.apis.fl_context import FLContext
++from nvflare.apis.shareable import Shareable, make_reply
++from nvflare.apis.workspace import Workspace
++from nvflare.fuel.hci.zip_utils import zip_directory_to_bytes
++from nvflare.private.admin_defs import Message
++from nvflare.private.fed.server.server_json_config import ServerJsonConfigurator
++from nvflare.widgets.info_collector import InfoCollector
++from nvflare.widgets.widget import Widget, WidgetID
++
++from .run_manager import RunManager
++from .server_engine_internal_spec import EngineInfo, RunInfo, ServerEngineInternalSpec
++from .server_status import ServerStatus
++
++
++class ServerEngine(ServerEngineInternalSpec):
++    def __init__(self, server, args, client_manager, workers=3):
++        self.server = server
++        self.args = args
++        self.run_number = -1
++        self.run_manager = None
++        self.conf = None
++        self.client_manager = client_manager
++
++        self.widgets = {
++            WidgetID.INFO_COLLECTOR: InfoCollector(),
++            # WidgetID.FED_EVENT_RUNNER: ServerFedEventRunner()
++        }
++
++        self.engine_info = EngineInfo()
++
++        assert workers >= 1, "workers must >= 1"
++        self.executor = ThreadPoolExecutor(max_workers=workers)
++        self.lock = Lock()
++        self.logger = logging.getLogger(self.__class__.__name__)
++
++        self.asked_to_stop = False
++
++    def _get_server_app_folder(self):
++        return "app_server"
++
++    def _get_client_app_folder(self, client_name):
++        return "app_" + client_name
++
++    def _get_run_folder(self):
++        return os.path.join(self.args.workspace, "run_" + str(self.run_number))
++
++    def get_engine_info(self) -> EngineInfo:
++        if self.run_number > 0:
++            run_folder = os.path.join(self.args.workspace, "run_" + str(self.run_number))
++            app_file = os.path.join(run_folder, "fl_app.txt")
++            if os.path.exists(app_file):
++                with open(app_file, "r") as f:
++                    self.engine_info.app_name = f.readline().strip()
++            else:
++                self.engine_info.app_name = "?"
++
++        return self.engine_info
++
++    def get_run_info(self) -> RunInfo:
++        if self.run_manager:
++            return self.run_manager.get_run_info()
++        else:
++            return None
++
++    def set_run_number(self, num):
++        # status = self.server.status
++        status = self.engine_info.status
++        if status == MachineStatus.STARTING or status == MachineStatus.STARTED:
++            return "run_number can not be changed during the FL app running."
++
++        run_folder = os.path.join(self.args.workspace, "run_" + str(num))
++        if os.path.exists(run_folder):
++            self.run_number = num
++            return "run number already exists. Set the FL run number to {}.".format(num)
++        else:
++            self.run_number = num
++            os.makedirs(run_folder)
++            return "Created a new run folder: run_{}".format(num)
++
++    def delete_run_number(self, num):
++        run_number_folder = os.path.join(self.args.workspace, "run_" + str(num))
++        if os.path.exists(run_number_folder):
++            shutil.rmtree(run_number_folder)
++        return ""
++
++    def get_run_number(self):
++        return self.run_number
++
++    def get_clients(self) -> [Client]:
++        return list(self.client_manager.clients.values())
++
++    def validate_clients(self, client_names: List[str]) -> Tuple[List[Client], List[str]]:
++        return self._get_all_clients_from_inputs(client_names)
++
++    def start_app_on_server(self) -> str:
++        if self.run_number == -1:
++            return "Please set a run number."
++
++        status = self.engine_info.status
++        if status == MachineStatus.STARTING or status == MachineStatus.STARTED:
++            return "Server already starting or started."
++        else:
++            app_root = os.path.join(self._get_run_folder(), self._get_server_app_folder())
++            if not os.path.exists(app_root):
++                return "Server app does not exist. Please deploy the server app before starting."
++
++            self.engine_info.status = MachineStatus.STARTING
++            if self.server.enable_byoc:
++                app_custom_folder = os.path.join(app_root, "custom")
++                try:
++                    sys.path.index(app_custom_folder)
++                except ValueError:
++                    self.remove_custom_path()
++                    sys.path.append(app_custom_folder)
++
++            # future = self.executor.submit(start_server_training, (self.server))
++            future = self.executor.submit(
++                lambda p: start_server_training(*p), [self.server, self.args, app_root, self.run_number]
++            )
++
++            start = time.time()
++            # Wait for the server App to start properly
++            while self.engine_info.status == MachineStatus.STARTING:
++                time.sleep(0.3)
++                if time.time() - start > 300.0:
++                    return "Could not start the server app."
++
++            if self.engine_info.status != MachineStatus.STARTED:
++                return f"Failed to start server app: {self.engine_info.status}"
++
++            return ""
++
++    def remove_custom_path(self):
++        regex = re.compile(".*/run_.*/custom")
++        custom_paths = list(filter(regex.search, sys.path))
++        for path in custom_paths:
++            sys.path.remove(path)
++
++    def abort_app_on_clients(self, clients: List[str]) -> str:
++        status = self.engine_info.status
++        if status == MachineStatus.STOPPED:
++            return "Server app has not started."
++        if status == MachineStatus.STARTING:
++            return "Server app is starting, please wait for started before abort."
++        return ""
++
++    def abort_app_on_server(self) -> str:
++        status = self.engine_info.status
++        if status == MachineStatus.STOPPED:
++            return "Server app has not started."
++        if status == MachineStatus.STARTING:
++            return "Server app is starting, please wait for started before abort."
++
++        self.logger.info("Abort the server app run.")
++        # self.server.stop_training()
++        self.server.shutdown = True
++        self.server.abort_run()
++        return ""
++
++    def check_app_start_readiness(self) -> str:
++        status = self.engine_info.status
++        if status != MachineStatus.STARTING and status != MachineStatus.STARTED:
++            return "Server app has not started."
++        return ""
++
++    def shutdown_server(self) -> str:
++        status = self.server.status
++        if status == ServerStatus.STARTING:
++            return "Server app is starting, please wait for started before shutdown."
++
++        self.logger.info("FL server shutdown.")
++        # self.server.fl_shutdown()
++        # future = self.executor.submit(server_shutdown, (self.server))
++
++        touch_file = os.path.join(self.args.workspace, "shutdown.fl")
++        future = self.executor.submit(lambda p: server_shutdown(*p), [self.server, touch_file])
++        return ""
++
++    def restart_server(self) -> str:
++        status = self.server.status
++        if status == ServerStatus.STARTING:
++            return "Server is starting, please wait for started before restart."
++
++        self.logger.info("FL server restart.")
++
++        touch_file = os.path.join(self.args.workspace, "restart.fl")
++        future = self.executor.submit(lambda p: server_shutdown(*p), [self.server, touch_file])
++        return ""
++
++    def get_widget(self, widget_id: str) -> Widget:
++        return self.widgets.get(widget_id)
++
++    def get_client_name_from_token(self, token: str) -> str:
++        client = self.server.client_manager.clients.get(token)
++        if client:
++            return client.name
++        else:
++            return ""
++
++    def get_all_clients(self):
++        return list(self.server.client_manager.clients.keys())
++
++    def _get_client_from_name(self, client_name):
++        for c in self.get_clients():
++            if client_name == c.name:
++                return c
++        return None
++
++    def _get_all_clients_from_inputs(self, inputs):
++        clients = []
++        invalid_inputs = []
++        all_clients = self.get_clients()
++        for item in inputs:
++            client = self.client_manager.clients.get(item)
++            # if item in self.get_all_clients():
++            if client:
++                clients.append(client)
++            else:
++                client = self._get_client_from_name(item)
++                if client:
++                    clients.append(client)
++                else:
++                    invalid_inputs.append(item)
++        return clients, invalid_inputs
++
++    def get_all_taskname(self) -> str:
++        return self.server.server_name
++
++    def get_app_data(self, app_name: str) -> Tuple[str, object]:
++        if self.run_number == -1:
++            return "Please set a FL run number.", None
++
++        # folder = self._get_run_folder()
++        # data = zip_directory_to_bytes(folder, self._get_client_app_folder(client_name))
++        fullpath_src = os.path.join(self.server.admin_server.file_upload_dir, app_name)
++        if not os.path.exists(fullpath_src):
++            return f"App folder '{app_name}' does not exist in staging area.", None
++
++        # folder = self.args.workspace
++        # data = zip_directory_to_bytes(
++        #     folder, os.path.join("run_" + str(self.run_number), self._get_client_app_folder(client_name))
++        # )
++        data = zip_directory_to_bytes(fullpath_src, "")
++        return "", data
++
++    def set_run_manager(self, run_manager: RunManager):
++        self.run_manager = run_manager
++        for _, widget in self.widgets.items():
++            self.run_manager.add_handler(widget)
++
++    def set_configurator(self, conf: ServerJsonConfigurator):
++        if not isinstance(conf, ServerJsonConfigurator):
++            raise TypeError("Must be a type of ServerJsonConfigurator.")
++        self.conf = conf
++
++    def build_component(self, config_dict):
++        return self.conf.build_component(config_dict)
++
++    def new_context(self) -> FLContext:
++        if self.run_manager:
++            return self.run_manager.new_context()
++        else:
++            return FLContext()
++
++    def get_component(self, component_id: str) -> object:
++        return self.run_manager.get_component(component_id)
++
++    def fire_event(self, event_type: str, fl_ctx: FLContext):
++        self.run_manager.fire_event(event_type, fl_ctx)
++
++    def get_staging_path_of_app(self, app_name: str) -> str:
++        return os.path.join(self.server.admin_server.file_upload_dir, app_name)
++
++    def deploy_app_to_server(self, app_name: str, app_staging_path: str) -> str:
++        return self.deploy_app(app_name, "app_server")
++
++    def prepare_deploy_app_to_client(self, app_name: str, app_staging_path: str, client_name: str) -> str:
++        return self.deploy_app(app_name, "app_" + client_name)
++
++    def get_workspace(self) -> Workspace:
++        return self.run_manager.get_workspace()
++
++    def ask_to_stop(self):
++        self.asked_to_stop = True
++
++    def deploy_app(self, src, dest):
++        if self.run_number == -1:
++            return "Please set a run number."
++
++        fullpath_src = os.path.join(self.server.admin_server.file_upload_dir, src)
++        fullpath_dest = os.path.join(self._get_run_folder(), dest)
++        if not os.path.exists(fullpath_src):
++            return f"App folder '{src}' does not exist in staging area."
++        if os.path.exists(fullpath_dest):
++            shutil.rmtree(fullpath_dest)
++        shutil.copytree(fullpath_src, fullpath_dest)
++
++        app_file = os.path.join(self._get_run_folder(), "fl_app.txt")
++        if os.path.exists(app_file):
++            os.remove(app_file)
++        with open(app_file, "wt") as f:
++            f.write(f"{src}")
++
++        return ""
++
++    def remove_clients(self, clients: List[str]) -> str:
++        for client in clients:
++            self._remove_dead_client(client)
++        return ""
++
++    def _remove_dead_client(self, token):
++        client = self.server.client_manager.remove_client(token)
++        # self.tokens.pop(token, None)
++        self.server.remove_client_data(token)
++        if self.server.admin_server:
++            self.server.admin_server.client_dead(client.name)
++
++    def register_aux_message_handler(self, topic: str, message_handle_func):
++        self.run_manager.aux_runner.register_aux_message_handler(topic, message_handle_func)
++
++    def send_aux_request(self, targets: [], topic: str, request: Shareable, timeout: float, fl_ctx: FLContext) -> dict:
++        if not targets:
++            targets = []
++            for t in self.get_clients():
++                targets.append(t.name)
++        if targets:
++            return self.run_manager.aux_runner.send_aux_request(
++                targets=targets, topic=topic, request=request, timeout=timeout, fl_ctx=fl_ctx
++            )
++        else:
++            return {}
++
++    def aux_send(self, targets: [], topic: str, request: Shareable, timeout: float, fl_ctx: FLContext) -> dict:
++        # Send the aux messages through admin_server
++        request.set_peer_props(fl_ctx.get_all_public_props())
++
++        message = Message(topic=ReservedTopic.AUX_COMMAND, body=pickle.dumps(request))
++        requests = {}
++        for n in targets:
++            requests.update({n: message})
++
++        replies = self.server.admin_server.send_requests(requests, timeout_secs=timeout)
++        results = {}
++        for r in replies:
++            client_name = self.get_client_name_from_token(r.client_token)
++            if r.reply:
++                try:
++                    results[client_name] = pickle.loads(r.reply.body)
++                except BaseException:
++                    results[client_name] = make_reply(ReturnCode.COMMUNICATION_ERROR)
++                    self.logger.error(
++                        f"Received unexpected reply from client: {client_name}, "
++                        f"message body:{r.reply.body} processing topic:{topic}"
++                    )
++            else:
++                results[client_name] = None
++
++        return results
++
++    def dispatch(self, topic: str, request: Shareable, fl_ctx: FLContext) -> Shareable:
++        return self.run_manager.aux_runner.dispatch(topic=topic, request=request, fl_ctx=fl_ctx)
++
++    def close(self):
++        self.executor.shutdown()
++
++
++def start_server_training(server, args, app_root, run_number):
++
++    restart_file = os.path.join(args.workspace, "restart.fl")
++    if os.path.exists(restart_file):
++        os.remove(restart_file)
++
++    if os.path.exists(os.path.join(app_root, args.env)):
++        env_config = args.env
++    else:
++        env_config = "/tmp/fl_server/environment.json"
++    try:
++        server_config_file_name = os.path.join(app_root, args.server_config)
++
++        conf = ServerJsonConfigurator(
++            config_file_name=server_config_file_name,
++        )
++        conf.configure()
++
++        set_up_run_config(server, conf)
++
++        server.start_run(run_number, app_root, conf, args)
++    except BaseException as e:
++        traceback.print_exc()
++        logging.getLogger().warning("FL server execution exception: " + str(e))
++    finally:
++        server.status = ServerStatus.STOPPED
++        server.engine.engine_info.status = MachineStatus.STOPPED
++        server.stop_training()
++        # if trainer:
++        #     trainer.close()
++
++        # Force garbage collection
++        gc.collect()
++
++    # return server.start()
++
++
++def server_shutdown(server, touch_file):
++    with open(touch_file, "a"):
++        os.utime(touch_file, None)
++
++    try:
++        server.fl_shutdown()
++        server.admin_server.stop()
++    finally:
++        sys.exit(2)
++
++
++def copy_new_server_properties(server, new_server):
++    # server.model_manager = new_server.model_manager
++    # server.model_saver = new_server.model_saver
++    server.builder = new_server.builder
++
++    server.wait_after_min_clients = new_server.wait_after_min_clients
++
++    server.outbound_filters = new_server.outbound_filters
++    server.inbound_filters = new_server.inbound_filters
++    server.cmd_modules = new_server.cmd_modules
++    server.processors = new_server.processors
++
++    # server.task_name = new_server.task_name
++    server.min_num_clients = new_server.min_num_clients
++    server.max_num_clients = new_server.max_num_clients
++    server.current_round = new_server.current_round
++    server.num_rounds = new_server.num_rounds
++    server.start_round = new_server.start_round
++
++    # server.heart_beat_timeout = new_server.heart_beat_timeout
++    # server.handlers = new_server.handlers
++
++    # clients = server.client_manager.clients
++    # server.client_manager = new_server.client_manager
++    # server.client_manager.clients = clients
++    server.client_manager.min_num_clients = new_server.client_manager.min_num_clients
++    server.client_manager.max_num_clients = new_server.client_manager.max_num_clients
++    server.client_manager.logger = new_server.client_manager.logger
++    server.client_manager.logger.disabled = False
++
++    server.reset_tokens()
++    server.contributed_clients.clear()
++    # server.accumulator.clear()
++
++    server.fl_ctx = new_server.fl_ctx
++
++    server.controller = new_server.controller
++    # server.model_aggregator = new_server.model_aggregator
++    # server.model_saver = new_server.model_saver
++    # server.shareable_generator = new_server.shareable_generator
++
++
++def set_up_run_config(server, conf):
++    server.heart_beat_timeout = conf.heartbeat_timeout
++    server.runner_config = conf.runner_config
++    server.handlers = conf.handlers

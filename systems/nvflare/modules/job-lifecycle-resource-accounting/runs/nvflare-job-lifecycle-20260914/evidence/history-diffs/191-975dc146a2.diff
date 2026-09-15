@@ -1,0 +1,313 @@
+commit 975dc146a214776b2c29a8129735fe3cc59f1bb1
+Author:     Yuan-Ting Hsieh (謝沅廷) <yuantinghsieh@gmail.com>
+AuthorDate: Fri May 27 12:39:19 2022 -0700
+Commit:     GitHub <noreply@github.com>
+CommitDate: Fri May 27 12:39:19 2022 -0700
+
+    Fix resource manager clean up thread calling (#613)
+    
+    * Fix resource manager clean up thread calling
+    
+    * Fix job runner
+    
+    * Fix job runner
+    
+    * Add checks to start client app
+    
+    * Use ERROR_MSG_PREFIX to check for errors
+---
+ nvflare/private/fed/client/client_engine.py  | 26 +++++------
+ nvflare/private/fed/client/scheduler_cmds.py |  8 +---
+ nvflare/private/fed/server/job_runner.py     | 66 ++++++++++++++++------------
+ nvflare/private/fed/server/server_engine.py  |  9 +---
+ 4 files changed, 54 insertions(+), 55 deletions(-)
+
+diff --git a/nvflare/private/fed/client/client_engine.py b/nvflare/private/fed/client/client_engine.py
+index d0464c3a..372b44bd 100644
+--- a/nvflare/private/fed/client/client_engine.py
++++ b/nvflare/private/fed/client/client_engine.py
+@@ -28,7 +28,7 @@ from nvflare.apis.fl_context import FLContext, FLContextManager
+ from nvflare.apis.shareable import Shareable
+ from nvflare.apis.utils.common_utils import get_open_ports
+ from nvflare.private.admin_defs import Message
+-from nvflare.private.defs import ClientStatusKey, EngineConstant
++from nvflare.private.defs import ERROR_MSG_PREFIX, ClientStatusKey, EngineConstant
+ from nvflare.private.event import fire_event
+ from nvflare.private.fed.utils.fed_utils import deploy_app
+ 
+@@ -71,7 +71,7 @@ class ClientEngine(ClientEngineInternalSpec):
+             raise ValueError("workers must >= 1")
+         self.executor = ThreadPoolExecutor(max_workers=workers)
+         self.logger = logging.getLogger(self.__class__.__name__)
+-        self.fl_components = [x for x in self.client.components if isinstance(x, FLComponent)]
++        self.fl_components = [x for x in self.client.components.values() if isinstance(x, FLComponent)]
+ 
+     def fire_event(self, event_type: str, fl_ctx: FLContext):
+         fire_event(event=event_type, handlers=self.fl_components, ctx=fl_ctx)
+@@ -122,7 +122,7 @@ class ClientEngine(ClientEngineInternalSpec):
+     ) -> str:
+         status = self.client_executor.get_status(run_number)
+         if status == ClientStatus.STARTED:
+-            return "Client app already started."
++            return f"{ERROR_MSG_PREFIX}: Client app already started."
+ 
+         app_root = os.path.join(
+             self.args.workspace,
+@@ -130,7 +130,7 @@ class ClientEngine(ClientEngineInternalSpec):
+             WorkspaceConstants.APP_PREFIX + self.client.client_name,
+         )
+         if not os.path.exists(app_root):
+-            return "Client app does not exist. Please deploy it before starting client."
++            return f"{ERROR_MSG_PREFIX}: Client app does not exist. Please deploy it before starting client."
+ 
+         if self.client.enable_byoc:
+             app_custom_folder = os.path.join(app_root, "custom")
+@@ -191,13 +191,13 @@ class ClientEngine(ClientEngineInternalSpec):
+     def abort_app(self, run_number: str) -> str:
+         status = self.client_executor.get_status(run_number)
+         if status == ClientStatus.STOPPED:
+-            return "Client app already stopped."
++            return f"{ERROR_MSG_PREFIX}: Client app already stopped."
+ 
+         if status == ClientStatus.NOT_STARTED:
+-            return "Client app has not started."
++            return f"{ERROR_MSG_PREFIX}: Client app has not started."
+ 
+         if status == ClientStatus.STARTING:
+-            return "Client app is starting, please wait for client to have started before abort."
++            return f"{ERROR_MSG_PREFIX}: Client app is starting, please wait for client to have started before abort."
+ 
+         self.client_executor.abort_train(self.client, run_number)
+ 
+@@ -206,14 +206,14 @@ class ClientEngine(ClientEngineInternalSpec):
+     def abort_task(self, run_number: str) -> str:
+         status = self.client_executor.get_status(run_number)
+         if status == ClientStatus.NOT_STARTED:
+-            return "Client app has not started."
++            return f"{ERROR_MSG_PREFIX}: Client app has not started."
+ 
+         if status == ClientStatus.STARTING:
+-            return "Client app is starting, please wait for started before abort_task."
++            return f"{ERROR_MSG_PREFIX}: Client app is starting, please wait for started before abort_task."
+ 
+         self.client_executor.abort_task(self.client, run_number)
+ 
+-        return "Abort signal has been sent to the current task. "
++        return "Abort signal has been sent to the current task."
+ 
+     def shutdown(self) -> str:
+         self.logger.info("Client shutdown...")
+@@ -239,15 +239,15 @@ class ClientEngine(ClientEngineInternalSpec):
+         workspace = os.path.join(self.args.workspace, WorkspaceConstants.WORKSPACE_PREFIX + str(run_num))
+ 
+         if deploy_app(app_name, client_name, workspace, app_data):
+-            return ""
++            return f"Deployed app {app_name} to {client_name}"
+         else:
+-            return "Failed to deploy_app"
++            return f"{ERROR_MSG_PREFIX}: Failed to deploy_app"
+ 
+     def delete_run(self, run_num: int) -> str:
+         run_number_folder = os.path.join(self.args.workspace, WorkspaceConstants.WORKSPACE_PREFIX + str(run_num))
+         if os.path.exists(run_number_folder):
+             shutil.rmtree(run_number_folder)
+-        return "Delete run folder: {}".format(run_number_folder)
++        return f"Delete run folder: {run_number_folder}."
+ 
+     def get_current_run_info(self, run_number) -> ClientRunInfo:
+         return self.client_executor.get_run_info(run_number)
+diff --git a/nvflare/private/fed/client/scheduler_cmds.py b/nvflare/private/fed/client/scheduler_cmds.py
+index 0c315391..3e9ffb2d 100644
+--- a/nvflare/private/fed/client/scheduler_cmds.py
++++ b/nvflare/private/fed/client/scheduler_cmds.py
+@@ -19,7 +19,7 @@ from nvflare.apis.fl_constant import ReturnCode, SystemComponents
+ from nvflare.apis.resource_manager_spec import ResourceConsumerSpec, ResourceManagerSpec
+ from nvflare.apis.shareable import Shareable
+ from nvflare.private.admin_defs import Message
+-from nvflare.private.defs import RequestHeader, TrainingTopic
++from nvflare.private.defs import ERROR_MSG_PREFIX, RequestHeader, TrainingTopic
+ from nvflare.private.fed.client.admin import RequestProcessor
+ from nvflare.private.fed.client.client_engine_internal_spec import ClientEngineInternalSpec
+ from nvflare.private.scheduler_constants import ShareableHeader
+@@ -51,8 +51,6 @@ class CheckResourceProcessor(RequestProcessor):
+             except Exception:
+                 result.set_return_code(ReturnCode.EXECUTION_EXCEPTION)
+ 
+-        if not result:
+-            result = "OK"
+         return Message(topic="reply_" + req.topic, body=pickle.dumps(result))
+ 
+ 
+@@ -92,7 +90,7 @@ class StartJobProcessor(RequestProcessor):
+                 resource_manager=resource_manager,
+             )
+         except Exception as e:
+-            result = f"Execution exception: {e}."
++            result = f"{ERROR_MSG_PREFIX}: Execution exception: {e}."
+ 
+         if not result:
+             result = "OK"
+@@ -123,6 +121,4 @@ class CancelResourceProcessor(RequestProcessor):
+             except Exception:
+                 result.set_return_code(ReturnCode.EXECUTION_EXCEPTION)
+ 
+-        if not result:
+-            result = "OK"
+         return Message(topic="reply_" + req.topic, body=pickle.dumps(result))
+diff --git a/nvflare/private/fed/server/job_runner.py b/nvflare/private/fed/server/job_runner.py
+index c2f9f4b2..0bd8ca5e 100644
+--- a/nvflare/private/fed/server/job_runner.py
++++ b/nvflare/private/fed/server/job_runner.py
+@@ -23,7 +23,26 @@ from nvflare.apis.fl_context import FLContext
+ from nvflare.apis.job_def import ALL_SITES, Job, RunStatus
+ from nvflare.private.admin_defs import Message
+ from nvflare.private.defs import RequestHeader, TrainingTopic
+-from nvflare.private.fed.utils.fed_utils import deploy_app
++from nvflare.private.fed.utils.fed_utils import check_client_replies, deploy_app
++
++
++def _send_to_clients(admin_server, client_sites, engine, message):
++    clients, invalid_inputs = engine.validate_clients(client_sites)
++    requests = {}
++    for c in clients:
++        requests.update({c.token: message})
++    replies = admin_server.send_requests(requests, timeout_secs=admin_server.timeout)
++    return replies
++
++
++def _deploy_clients(app_data, app_name, run_number, client_sites, engine):
++    # deploy app to all the client sites
++    admin_server = engine.server.admin_server
++    message = Message(topic=TrainingTopic.DEPLOY, body=app_data)
++    message.set_header(RequestHeader.RUN_NUM, run_number)
++    message.set_header(RequestHeader.APP_NAME, app_name)
++    replies = _send_to_clients(admin_server, client_sites, engine, message)
++    check_client_replies(replies=replies, client_sites=client_sites, command="deploy the App")
+ 
+ 
+ class JobRunner(FLComponent):
+@@ -83,7 +102,7 @@ class JobRunner(FLComponent):
+                         client_sites.append(p)
+ 
+             if client_sites:
+-                self._deploy_clients(app_data, app_name, run_number, client_sites, engine)
++                _deploy_clients(app_data, app_name, run_number, client_sites, engine)
+                 display_sites = ",".join(client_sites)
+                 self.log_info(
+                     fl_ctx,
+@@ -94,25 +113,6 @@ class JobRunner(FLComponent):
+         self.fire_event(EventType.JOB_DEPLOYED, fl_ctx)
+         return run_number
+ 
+-    def _deploy_clients(self, app_data, app_name, run_number, client_sites, engine):
+-        # deploy app to all the client sites
+-        admin_server = engine.server.admin_server
+-        message = Message(topic=TrainingTopic.DEPLOY, body=app_data)
+-        message.set_header(RequestHeader.RUN_NUM, run_number)
+-        message.set_header(RequestHeader.APP_NAME, app_name)
+-        replies = self._send_to_clients(admin_server, client_sites, engine, message)
+-        if not replies:
+-            display_sites = ",".join(client_sites)
+-            raise RuntimeError(f"Failed to deploy the App to the clients: {display_sites}")
+-
+-    def _send_to_clients(self, admin_server, client_sites, engine, message):
+-        clients, invalid_inputs = engine.validate_clients(client_sites)
+-        requests = {}
+-        for c in clients:
+-            requests.update({c.token: message})
+-        replies = admin_server.send_requests(requests, timeout_secs=admin_server.timeout)
+-        return replies
+-
+     def _start_run(self, run_number, job: Job, client_sites: dict, fl_ctx: FLContext):
+         """Start the application
+ 
+@@ -177,7 +177,8 @@ class JobRunner(FLComponent):
+         message = Message(topic=TrainingTopic.ABORT, body="")
+         message.set_header(RequestHeader.RUN_NUM, str(run_number))
+         self.log_debug(fl_ctx, f"Send abort command to the site for run: {run_number}")
+-        replies = self._send_to_clients(admin_server, client_sites, engine, message)
++        replies = _send_to_clients(admin_server, client_sites, engine, message)
++        check_client_replies(replies=replies, client_sites=client_sites, command="abort the run")
+         return replies
+ 
+     def _delete_run(self, run_number, sites: dict, fl_ctx: FLContext):
+@@ -198,13 +199,15 @@ class JobRunner(FLComponent):
+         message = Message(topic=TrainingTopic.DELETE_RUN, body="")
+         message.set_header(RequestHeader.RUN_NUM, str(run_number))
+         self.log_debug(fl_ctx, f"Send delete_run command to the site for run:{run_number}")
+-        replies = self._send_to_clients(admin_server, client_sites, engine, message)
+-        if not replies:
+-            self.log_error(fl_ctx, f"Failed to send delete_run command to clients for run_{run_number}")
++        replies = _send_to_clients(admin_server, client_sites, engine, message)
++        try:
++            check_client_replies(replies=replies, client_sites=client_sites, command="send delete_run command")
++        except RuntimeError as e:
++            self.log_error(fl_ctx, f"Failed to execute delete run ({run_number}) on the clients: {e}")
+ 
+         err = engine.delete_run_number(run_number)
+         if err:
+-            self.log_error(fl_ctx, f"Failed to delete_run the server for run_.{run_number}")
++            self.log_error(fl_ctx, f"Failed to delete_run the server for run: {run_number}")
+ 
+     def _job_complete_process(self, fl_ctx: FLContext):
+         engine = fl_ctx.get_engine()
+@@ -253,7 +256,12 @@ class JobRunner(FLComponent):
+                             fl_ctx.set_prop(FLContextKey.CURRENT_JOB_ID, ready_job.job_id)
+                             run_number = self._deploy_job(ready_job, sites, fl_ctx)
+                             job_manager.set_status(ready_job.job_id, RunStatus.DISPATCHED, fl_ctx)
+-                            self._start_run(run_number, ready_job, sites, fl_ctx)
++                            self._start_run(
++                                run_number=run_number,
++                                job=ready_job,
++                                client_sites={k: v for k, v in sites.items() if k != "server"},
++                                fl_ctx=fl_ctx,
++                            )
+                             with self.lock:
+                                 self.running_jobs[run_number] = ready_job
+                             job_manager.set_status(ready_job.job_id, RunStatus.RUNNING, fl_ctx)
+@@ -277,8 +285,8 @@ class JobRunner(FLComponent):
+             job = job_manager.get_job(jid=job_id, fl_ctx=fl_ctx)
+             with self.lock:
+                 self.running_jobs[run_number] = job
+-        except:
+-            self.log_error(fl_ctx, f"Failed to restore the job:{job_id} to the running job table.")
++        except Exception as e:
++            self.log_error(fl_ctx, f"Failed to restore the job: {job_id} to the running job table: {e}.")
+ 
+     def stop_run(self, run_number: str, fl_ctx: FLContext):
+         engine = fl_ctx.get_engine()
+diff --git a/nvflare/private/fed/server/server_engine.py b/nvflare/private/fed/server/server_engine.py
+index bb49f984..7849c025 100644
+--- a/nvflare/private/fed/server/server_engine.py
++++ b/nvflare/private/fed/server/server_engine.py
+@@ -55,6 +55,7 @@ from nvflare.fuel.hci.zip_utils import zip_directory_to_bytes
+ from nvflare.private.admin_defs import Message
+ from nvflare.private.defs import RequestHeader, TrainingTopic
+ from nvflare.private.fed.server.server_json_config import ServerJsonConfigurator
++from nvflare.private.fed.utils.fed_utils import check_client_replies
+ from nvflare.private.scheduler_constants import ShareableHeader
+ from nvflare.widgets.info_collector import InfoCollector
+ from nvflare.widgets.widget import Widget, WidgetID
+@@ -752,21 +753,15 @@ class ServerEngine(ServerEngineInternalSpec):
+             request = Message(topic=TrainingTopic.START_JOB, body=pickle.dumps(resource_requirement))
+             request.set_header(RequestHeader.RUN_NUM, run_number)
+             request.set_header(ShareableHeader.RESOURCE_RESERVE_TOKEN, token)
+-            # request.set_header(ShareableHeader.RESOURCE_SPEC, resource_requirements)
+             client = self.get_client_from_name(site)
+             if client:
+                 requests.update({client.token: request})
+         replies = []
+         if requests:
+             replies = self._send_admin_requests(requests)
++        check_client_replies(replies=replies, client_sites=client_sites, command=f"start job ({run_number})")
+         return replies
+ 
+-        # admin_server = engine.server.admin_server
+-        # message = Message(topic=TrainingTopic.START_JOB, body="")
+-        # message.set_header(RequestHeader.RUN_NUM, run_number)
+-        # replies = self._send_to_clients(admin_server, client_sites, engine, message)
+-        # return replies
+-
+     def stop_all_jobs(self):
+         fl_ctx = self.new_context()
+         self.job_runner.stop_all_runs(fl_ctx)

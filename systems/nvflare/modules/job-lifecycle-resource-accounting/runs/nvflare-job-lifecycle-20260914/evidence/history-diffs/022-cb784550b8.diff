@@ -1,0 +1,59 @@
+commit cb784550b8caaa60c01ab344eec201efb85c18fb
+Author:     Peter Cnudde <pcnudde@nvidia.com>
+AuthorDate: Tue Jul 14 16:23:50 2026 -0700
+Commit:     GitHub <noreply@github.com>
+CommitDate: Tue Jul 14 16:23:50 2026 -0700
+
+    Fix abort for registered STARTING jobs (#4904)
+    
+    ### Description
+    
+    Addresses FLARE-3039 by allowing a client abort request to proceed when
+    a launched job is registered in the `STARTING` state. In that state,
+    `JobExecutor` terminates the stored launcher handle immediately instead
+    of trying to send an in-band abort to a worker that has not reported
+    `STARTED`.
+    
+    The persisted `STARTING` state was introduced after the older abort
+    guards, so those guards acknowledged abort requests without acting on
+    them during this window. This change allows launcher-managed runtimes,
+    including queued jobs, to be canceled while preserving the existing
+    graceful shutdown path for `STARTED` jobs.
+---
+ nvflare/private/fed/client/client_engine.py   | 3 ---
+ nvflare/private/fed/client/client_executor.py | 5 ++++-
+ 2 files changed, 4 insertions(+), 4 deletions(-)
+
+diff --git a/nvflare/private/fed/client/client_engine.py b/nvflare/private/fed/client/client_engine.py
+index b5067f06..eb9baa9c 100644
+--- a/nvflare/private/fed/client/client_engine.py
++++ b/nvflare/private/fed/client/client_engine.py
+@@ -395,9 +395,6 @@ class ClientEngine(ClientEngineInternalSpec, StreamableEngine):
+         if status == ClientStatus.NOT_STARTED:
+             return "Client app has not started."
+ 
+-        if status == ClientStatus.STARTING:
+-            return "Client app is starting, please wait for client to have started before abort."
+-
+         self.client_executor.abort_app(job_id)
+ 
+         return "Abort signal has been sent to the client App."
+diff --git a/nvflare/private/fed/client/client_executor.py b/nvflare/private/fed/client/client_executor.py
+index 4cc57213..0ee00001 100644
+--- a/nvflare/private/fed/client/client_executor.py
++++ b/nvflare/private/fed/client/client_executor.py
+@@ -433,10 +433,13 @@ class JobExecutor(ClientExecutor):
+         retry = 1
+         while retry >= 0:
+             process_status = self.run_processes.get(job_id, {}).get(RunProcessKey.STATUS, ClientStatus.NOT_STARTED)
+-            if process_status == ClientStatus.STARTED:
++            if process_status in (ClientStatus.STARTING, ClientStatus.STARTED):
+                 try:
+                     with self.lock:
+                         job_handle = self.run_processes[job_id][RunProcessKey.JOB_HANDLE]
++                    if process_status == ClientStatus.STARTING:
++                        job_handle.terminate()
++                        break
+                     data = {}
+                     request = new_cell_message({}, data)
+                     self.client.cell.fire_and_forget(

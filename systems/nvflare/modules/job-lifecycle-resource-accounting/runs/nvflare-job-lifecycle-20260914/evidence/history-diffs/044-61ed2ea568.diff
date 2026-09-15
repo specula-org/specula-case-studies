@@ -1,0 +1,89 @@
+commit 61ed2ea56854186d89e8e4e6be742630327a0eec
+Author:     Peter Cnudde <pcnudde@nvidia.com>
+AuthorDate: Thu Apr 23 11:02:42 2026 -0700
+Commit:     GitHub <noreply@github.com>
+CommitDate: Thu Apr 23 11:02:42 2026 -0700
+
+    K8s launcher: use CellNet workspace transfer instead of a shared workspace PVC (#4469)
+    
+    This PR updates the Kubernetes job launcher to run launched jobs without
+    mounting the shared workspace PVC.
+    
+    Instead, launched jobs now:
+    - mount `startup/` from a Secret
+    - use an `emptyDir` as their writable workspace
+    - download `local/` and the job workspace over CellNet/F3 before startup
+    - upload job results back to the parent over the same path on shutdown
+    
+    This preserves `local/` workspace behavior while isolating each launched
+    job's writable workspace.
+---
+ nvflare/app_common/job_schedulers/job_scheduler.py |  3 ++-
+ nvflare/private/fed/client/client_executor.py      |  2 +-
+ nvflare/private/fed/server/server_engine.py        | 12 ++++++++++++
+ 3 files changed, 15 insertions(+), 2 deletions(-)
+
+diff --git a/nvflare/app_common/job_schedulers/job_scheduler.py b/nvflare/app_common/job_schedulers/job_scheduler.py
+index 101c7aa3..1814c6e6 100644
+--- a/nvflare/app_common/job_schedulers/job_scheduler.py
++++ b/nvflare/app_common/job_schedulers/job_scheduler.py
+@@ -27,6 +27,7 @@ from nvflare.apis.job_scheduler_spec import DispatchInfo, JobSchedulerSpec
+ from nvflare.apis.server_engine_spec import ServerEngineSpec
+ from nvflare.private.fed.utils.fed_utils import extract_participants
+ from nvflare.security.study_registry import StudyRegistryService
++from nvflare.utils.job_launcher_utils import get_site_launcher_spec
+ 
+ SCHEDULE_RESULT_OK = 0  # the job is scheduled
+ SCHEDULE_RESULT_NO_RESOURCE = 1  # job is not scheduled due to lack of resources
+@@ -162,7 +163,7 @@ class DefaultJobScheduler(JobSchedulerSpec, FLComponent):
+         resource_reqs = {}
+         for site_name in applicable_sites:
+             if site_name in job.resource_spec:
+-                resource_reqs[site_name] = job.resource_spec[site_name]
++                resource_reqs[site_name] = get_site_launcher_spec(job.resource_spec[site_name], "process")
+             else:
+                 resource_reqs[site_name] = {}
+ 
+diff --git a/nvflare/private/fed/client/client_executor.py b/nvflare/private/fed/client/client_executor.py
+index 684fa1c5..52acd43d 100644
+--- a/nvflare/private/fed/client/client_executor.py
++++ b/nvflare/private/fed/client/client_executor.py
+@@ -218,7 +218,7 @@ class JobExecutor(ClientExecutor):
+         if params:
+             parent_conn_sec = params.get(ConnPropKey.CONNECTION_SECURITY)
+             if parent_conn_sec:
+-                job_args[JobProcessArgs.PARENT_CONN_SEC] = ("-pcs", parent_conn_sec)
++                job_args[JobProcessArgs.PARENT_CONN_SEC] = ("--parent_conn_sec", parent_conn_sec)
+ 
+         fl_ctx.set_prop(key=FLContextKey.JOB_PROCESS_ARGS, value=job_args, private=True, sticky=False)
+         job_handle = job_launcher.launch_job(job_meta, fl_ctx)
+diff --git a/nvflare/private/fed/server/server_engine.py b/nvflare/private/fed/server/server_engine.py
+index b2187595..1e12023c 100644
+--- a/nvflare/private/fed/server/server_engine.py
++++ b/nvflare/private/fed/server/server_engine.py
+@@ -27,6 +27,7 @@ from nvflare.apis.client import Client
+ from nvflare.apis.fl_component import FLComponent
+ from nvflare.apis.fl_constant import (
+     AdminCommandNames,
++    ConnPropKey,
+     FLContextKey,
+     MachineStatus,
+     RunProcessKey,
+@@ -277,6 +278,17 @@ class ServerEngine(ServerEngineInternalSpec, StreamableEngine):
+             JobProcessArgs.SSID: ("--ssid", str(server_state.ssid)),
+             JobProcessArgs.OPTIONS: ("--set", command_options),
+         }
++
++        # Pass the parent's listener connection-security mode through to the
++        # launched runner so its short-lived bootstrap CellNet child can connect
++        # back with the same transport/security settings before the normal job
++        # cell is created.
++        params = cell.get_internal_listener_params()
++        if params:
++            parent_conn_sec = params.get(ConnPropKey.CONNECTION_SECURITY)
++            if parent_conn_sec:
++                job_args[JobProcessArgs.PARENT_CONN_SEC] = ("--parent_conn_sec", parent_conn_sec)
++
+         fl_ctx.set_prop(key=FLContextKey.JOB_PROCESS_ARGS, value=job_args, private=True, sticky=False)
+         job_handle = job_launcher.launch_job(job.meta, fl_ctx)
+         self.logger.info(f"Launch job_id: {job.job_id}  with job launcher: {type(job_launcher)} ")

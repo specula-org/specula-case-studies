@@ -1,0 +1,267 @@
+commit 1058e40c96971ee77b00b6fae263e7691effb903
+Author:     Yuan-Ting Hsieh (謝沅廷) <yuantinghsieh@gmail.com>
+AuthorDate: Tue May 10 12:33:16 2022 -0700
+Commit:     GitHub <noreply@github.com>
+CommitDate: Tue May 10 12:33:16 2022 -0700
+
+    Fix list resource manager and add tests (#485)
+    
+    * Update list resource manager and add unit tests
+    
+    * Add expiration to reserved resources
+    
+    * Add unit test
+    
+    * Move consume resource before app starts
+    
+    * Move consume up front
+    
+    * Move check all resource into a helper function
+---
+ .../resource_managers/list_resource_manager.py     | 124 +++++++++++++++++----
+ nvflare/private/fed/client/client_executor.py      |   7 +-
+ nvflare/private/fed/client/scheduler_cmds.py       |  31 +++---
+ 3 files changed, 119 insertions(+), 43 deletions(-)
+
+diff --git a/nvflare/app_common/resource_managers/list_resource_manager.py b/nvflare/app_common/resource_managers/list_resource_manager.py
+index 8bee9d25..204373fe 100644
+--- a/nvflare/app_common/resource_managers/list_resource_manager.py
++++ b/nvflare/app_common/resource_managers/list_resource_manager.py
+@@ -12,66 +12,142 @@
+ # See the License for the specific language governing permissions and
+ # limitations under the License.
+ 
++import time
+ import uuid
++from collections import deque
++from threading import Event, Lock, Thread
+ from typing import Dict, List, Optional
+ 
++from nvflare.apis.event_type import EventType
++from nvflare.apis.fl_component import FLComponent
+ from nvflare.apis.fl_context import FLContext
+ from nvflare.apis.resource_manager_spec import ResourceManagerSpec
+ 
+ 
+-class ListResourceManager(ResourceManagerSpec):
++class ListResourceManager(ResourceManagerSpec, FLComponent):
+     """Manage a list of resource units.
+ 
+     For example:
+ 
+-        - require 2, resource is [0, 1, 2, 3, 4, 5] -> check if things in list is available => return [0,1]
+-        - require 3 => return [2, 3, 4]
+-        - free 2, require 3 => return [0, 1, 5]
++        - require 2, current resources is [0, 1, 2, 3, 4, 5] => return [0,1]
++          after allocation the current resources become [2, 3, 4, 5]
++        - require 3, current resources [2, 3, 4, 5] => return [2, 3, 4]
+ 
+     """
+ 
+-    def __init__(self, resources: Dict[str, List]):
++    def __init__(self, resources: Dict[str, List], expiration_period: int = 600):
+         """Constructor
+ 
+         Args:
+             resources (dict): Specify the list of resources unit
++            expiration_period (int): Number of seconds to hold the resources reserved.
++                If check_resources is called but after "expiration_period" no allocate resource is called,
++                then the reserved resources will be released.
+         """
+         super().__init__()
+         if not isinstance(resources, dict):
+             raise TypeError(f"resources should be of type dict, but got {type(resources)}.")
++        if not isinstance(expiration_period, int):
++            raise TypeError(f"expiration_period should be of type int, but got {type(expiration_period)}.")
++        if expiration_period < 0:
++            raise ValueError("expiration_period should be greater than 0.")
++
+         self.resources = {}
+         for k in resources:
+             if not isinstance(resources[k], list):
+                 raise TypeError(f"item in resources should be of type list, but got {type(resources[k])}.")
+-            self.resources[k] = set(resources[k])
++            self.resources[k] = deque(list(dict.fromkeys(resources[k])))
+ 
+-    def check_resources(self, resource_requirement: dict, fl_ctx: FLContext) -> (bool, Optional[str]):
+-        if not isinstance(resource_requirement, dict):
+-            raise TypeError(f"resource_requirement should be of type dict, but got {type(resource_requirement)}.")
++        self.expiration_period = expiration_period
++        self.reserved_resources = {}
++        self.lock = Lock()
++        self.stop_event = Event()
++        self.cleanup_thread = Thread(target=self._check_expired)
++
++    def _check_expired(self):
++        while not self.stop_event.is_set():
++            time.sleep(1)
++            with self.lock:
++                tokens_to_remove = []
++                for k in self.reserved_resources:
++                    r, t = self.reserved_resources[k]
++                    t -= 1
++                    if t == 0:
++                        tokens_to_remove.append(k)
++                    else:
++                        self.reserved_resources[k] = r, t
++                for token in tokens_to_remove:
++                    reserved_resources, _ = self.reserved_resources.pop(token)
++                    for k in reserved_resources:
++                        for i in reserved_resources[k]:
++                            self.resources[k].append(i)
++
++    def handle_event(self, event_type: str, fl_ctx: FLContext):
++        if event_type == EventType.SYSTEM_START:
++            self.cleanup_thread.start()
++        elif event_type == EventType.SYSTEM_END:
++            self.stop_event.set()
++            if self.cleanup_thread:
++                self.cleanup_thread.join()
++                self.cleanup_thread = None
++
++    def _check_all_required_resource_available(self, resource_requirement: dict, fl_ctx: FLContext) -> bool:
+         check_result = True
+-        for k in resource_requirement:
+-            if k in self.resources:
+-                if len(self.resources[k]) < resource_requirement[k]:
++        with self.lock:
++            for k in resource_requirement:
++                if k in self.resources:
++                    if len(self.resources[k]) < resource_requirement[k]:
++                        check_result = False
++                        self.log_debug(fl_ctx, f"Resource {k} is not enough.")
++                        break
++                else:
+                     check_result = False
++                    self.log_debug(fl_ctx, f"Missing {k} in resources.")
+                     break
+-        return check_result, str(uuid.uuid4())
++        return check_result
++
++    def check_resources(self, resource_requirement: dict, fl_ctx: FLContext) -> (bool, Optional[str]):
++        if not isinstance(resource_requirement, dict):
++            raise TypeError(f"resource_requirement should be of type dict, but got {type(resource_requirement)}.")
++
++        check_result = self._check_all_required_resource_available(resource_requirement, fl_ctx)
++        token = None
++
++        # reserve resource only when check is True
++        if check_result:
++            token = str(uuid.uuid4())
++            reserved_resources = {}
++            with self.lock:
++                for k in resource_requirement:
++                    reserved_resource_units = []
++                    for i in range(resource_requirement[k]):
++                        reserved_resource_units.append(self.resources[k].popleft())
++                    reserved_resources[k] = reserved_resource_units
++                self.reserved_resources[token] = (reserved_resources, self.expiration_period)
++        return check_result, token
+ 
+     def cancel_resources(self, resource_requirement: dict, token: str, fl_ctx: FLContext):
++        with self.lock:
++            if token and token in self.reserved_resources:
++                reserved_resources, _ = self.reserved_resources.pop(token)
++                for k in reserved_resources:
++                    for i in reserved_resources[k]:
++                        self.resources[k].append(i)
++            else:
++                self.log_debug(fl_ctx, f"Token {token} is not related to any reserved resources.")
+         return None
+ 
+     def allocate_resources(self, resource_requirement: dict, token: str, fl_ctx: FLContext) -> dict:
+         result = {}
+-        for k in resource_requirement:
+-            if k in self.resources:
+-                result[k] = []
+-                if len(self.resources[k]) < resource_requirement[k]:
+-                    raise RuntimeError("Not enough resources.")
+-                for i in range(resource_requirement[k]):
+-                    result[k].append(self.resources[k].pop())
++        with self.lock:
++            if token and token in self.reserved_resources:
++                result, _ = self.reserved_resources.pop(token)
++            else:
++                raise RuntimeError(f"allocate_resources: No reserved resources for token {token}.")
+         return result
+ 
+     def free_resources(self, resources: dict, token: str, fl_ctx: FLContext):
+-        for k in resources:
+-            if k not in self.resources:
+-                raise RuntimeError(f"Key {k} is not in resource manager's resources.")
+-            self.resources[k].update(resources[k])
++        with self.lock:
++            for k in resources:
++                for i in resources[k]:
++                    self.resources[k].append(i)
+diff --git a/nvflare/private/fed/client/client_executor.py b/nvflare/private/fed/client/client_executor.py
+index c8aab004..e86e2608 100644
+--- a/nvflare/private/fed/client/client_executor.py
++++ b/nvflare/private/fed/client/client_executor.py
+@@ -188,6 +188,8 @@ class ProcessExecutor(ClientExecutor):
+         resource_consumer,
+         resource_manager,
+     ):
++        if allocated_resource:
++            resource_consumer.consume(allocated_resource)
+ 
+         new_env = os.environ.copy()
+         if app_custom_folder != "":
+@@ -205,13 +207,10 @@ class ProcessExecutor(ClientExecutor):
+             " --set" + command_options + " print_conf=True"
+         )
+         # use os.setsid to create new process group ID
+-        process = subprocess.Popen(shlex.split(command, " "), preexec_fn=os.setsid, env=new_env)
++        process = subprocess.Popen(shlex.split(command, True), preexec_fn=os.setsid, env=new_env)
+ 
+         print("training child process ID: {}".format(process.pid))
+ 
+-        if allocated_resource:
+-            resource_consumer.consume(allocated_resource)
+-
+         client.multi_gpu = False
+ 
+         with self.lock:
+diff --git a/nvflare/private/fed/client/scheduler_cmds.py b/nvflare/private/fed/client/scheduler_cmds.py
+index d6d96fed..0c315391 100644
+--- a/nvflare/private/fed/client/scheduler_cmds.py
++++ b/nvflare/private/fed/client/scheduler_cmds.py
+@@ -76,22 +76,23 @@ class StartJobProcessor(RequestProcessor):
+                 f"resource_consumer should be of type ResourceConsumerSpec, but got {type(resource_consumer)}."
+             )
+ 
+-        with engine.new_context() as fl_ctx:
+-            resource_spec = pickle.loads(req.body)
+-            run_number = req.get_header(RequestHeader.RUN_NUM)
+-            token = req.get_header(ShareableHeader.RESOURCE_RESERVE_TOKEN)
+-            allocated_resources = resource_manager.allocate_resources(
+-                resource_requirement=resource_spec, token=token, fl_ctx=fl_ctx
++        try:
++            with engine.new_context() as fl_ctx:
++                resource_spec = pickle.loads(req.body)
++                run_number = req.get_header(RequestHeader.RUN_NUM)
++                token = req.get_header(ShareableHeader.RESOURCE_RESERVE_TOKEN)
++                allocated_resources = resource_manager.allocate_resources(
++                    resource_requirement=resource_spec, token=token, fl_ctx=fl_ctx
++                )
++            result = engine.start_app(
++                run_number,
++                allocated_resource=allocated_resources,
++                token=token,
++                resource_consumer=resource_consumer,
++                resource_manager=resource_manager,
+             )
+-        result = engine.start_app(
+-            run_number,
+-            allocated_resource=allocated_resources,
+-            token=token,
+-            resource_consumer=resource_consumer,
+-            resource_manager=resource_manager,
+-        )
+-
+-        resource_consumer.consume(allocated_resources)
++        except Exception as e:
++            result = f"Execution exception: {e}."
+ 
+         if not result:
+             result = "OK"

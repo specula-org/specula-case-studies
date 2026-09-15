@@ -1,0 +1,106 @@
+commit 39c247d370860dce723262ca78e40f5beab313d5
+Author:     Yuan-Ting Hsieh (謝沅廷) <yuantinghsieh@gmail.com>
+AuthorDate: Wed May 25 17:54:31 2022 -0700
+Commit:     GitHub <noreply@github.com>
+CommitDate: Wed May 25 17:54:31 2022 -0700
+
+    Fix job schedule and deploy with @ALL (#607)
+    
+    * Fix job schedule and deploy with @ALL
+    
+    * Address comments
+    
+    * Fix unit test and integration test errors
+    
+    * Fix job runner
+---
+ nvflare/app_common/job_schedulers/job_scheduler.py | 36 +++++++++++++---------
+ nvflare/private/fed/server/job_runner.py           |  4 +--
+ 2 files changed, 24 insertions(+), 16 deletions(-)
+
+diff --git a/nvflare/app_common/job_schedulers/job_scheduler.py b/nvflare/app_common/job_schedulers/job_scheduler.py
+index 9efa5652..78f6c6f4 100644
+--- a/nvflare/app_common/job_schedulers/job_scheduler.py
++++ b/nvflare/app_common/job_schedulers/job_scheduler.py
+@@ -19,10 +19,12 @@ from nvflare.apis.event_type import EventType
+ from nvflare.apis.fl_component import FLComponent
+ from nvflare.apis.fl_constant import FLContextKey
+ from nvflare.apis.fl_context import FLContext
+-from nvflare.apis.job_def import Job, JobMetaKey
++from nvflare.apis.job_def import ALL_SITES, Job, JobMetaKey
+ from nvflare.apis.job_scheduler_spec import DispatchInfo, JobSchedulerSpec
+ from nvflare.apis.server_engine_spec import ServerEngineSpec
+ 
++SERVER_SITE_NAME = "server"
++
+ 
+ class DefaultJobScheduler(JobSchedulerSpec, FLComponent):
+     def __init__(
+@@ -80,19 +82,20 @@ class DefaultJobScheduler(JobSchedulerSpec, FLComponent):
+         if not job.deploy_map:
+             raise RuntimeError(f"Job ({job.job_id}) does not have deploy_map, can't be scheduled.")
+ 
+-        # deploy_map: {"app_name": []} will be treated as deploying to all online clients
+-        all_deploy_map_keys = list(job.deploy_map.keys())
+-        if len(all_deploy_map_keys) == 1 and len(job.deploy_map[all_deploy_map_keys[0]]) == 0:
+-            applicable_sites = online_site_names
+-            sites_to_app = {x: all_deploy_map_keys[0] for x in applicable_sites}
+-        else:
+-            applicable_sites = []
+-            sites_to_app = {}
+-            for app_name in job.deploy_map:
+-                for site_name in job.deploy_map[app_name]:
+-                    if site_name in online_site_names:
+-                        applicable_sites.append(site_name)
+-                        sites_to_app[site_name] = app_name
++        applicable_sites = []
++        sites_to_app = {}
++        for app_name in job.deploy_map:
++            for site_name in job.deploy_map[app_name]:
++                if site_name.upper() == ALL_SITES:
++                    # deploy_map: {"app_name": ["ALL_SITES"]} will be treated as deploying to all online clients
++                    applicable_sites = online_site_names
++                    sites_to_app = {x: app_name for x in online_site_names}
++                    sites_to_app[SERVER_SITE_NAME] = app_name
++                elif site_name in online_site_names:
++                    applicable_sites.append(site_name)
++                    sites_to_app[site_name] = app_name
++                elif site_name == SERVER_SITE_NAME:
++                    sites_to_app[SERVER_SITE_NAME] = app_name
+         self.log_debug(fl_ctx, f"Job {job.job_id} is checking against applicable sites: {applicable_sites}")
+ 
+         required_sites = job.required_sites if job.required_sites else []
+@@ -153,6 +156,11 @@ class DefaultJobScheduler(JobSchedulerSpec, FLComponent):
+                 resource_reqs=job.resource_spec, resource_check_results=resource_check_results, fl_ctx=fl_ctx
+             )
+ 
++        # add server dispatch info
++        sites_dispatch_info[SERVER_SITE_NAME] = DispatchInfo(
++            app_name=sites_to_app[SERVER_SITE_NAME], resource_requirements={}, token=None
++        )
++
+         return True, sites_dispatch_info
+ 
+     def _exceed_max_jobs(self, fl_ctx: FLContext) -> bool:
+diff --git a/nvflare/private/fed/server/job_runner.py b/nvflare/private/fed/server/job_runner.py
+index c2cb683d..c2f9f4b2 100644
+--- a/nvflare/private/fed/server/job_runner.py
++++ b/nvflare/private/fed/server/job_runner.py
+@@ -20,7 +20,7 @@ from nvflare.apis.event_type import EventType
+ from nvflare.apis.fl_component import FLComponent
+ from nvflare.apis.fl_constant import FLContextKey, RunProcessKey, SystemComponents, WorkspaceConstants
+ from nvflare.apis.fl_context import FLContext
+-from nvflare.apis.job_def import Job, RunStatus
++from nvflare.apis.job_def import ALL_SITES, Job, RunStatus
+ from nvflare.private.admin_defs import Message
+ from nvflare.private.defs import RequestHeader, TrainingTopic
+ from nvflare.private.fed.utils.fed_utils import deploy_app
+@@ -65,7 +65,7 @@ class JobRunner(FLComponent):
+         for app_name, participants in job.get_deployment().items():
+             app_data = job.get_application(app_name, fl_ctx)
+ 
+-            if not participants:
++            if len(participants) == 1 and participants[0].upper() == ALL_SITES:
+                 participants = ["server"]
+                 participants.extend([client.name for client in engine.get_clients()])
+ 

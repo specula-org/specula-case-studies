@@ -1,0 +1,878 @@
+--- a/nvflare/app_common/job_schedulers/job_scheduler.py
++++ b/nvflare/app_common/job_schedulers/job_scheduler.py
+@@ -12,6 +12,7 @@
+ # See the License for the specific language governing permissions and
+ # limitations under the License.
+ 
++from nvflare._lifecycle_probe import probe as _trace_probe, fault as _trace_fault
+ import datetime
+ import threading
+ import time
+@@ -98,11 +99,13 @@
+             raise RuntimeError(f"engine inside fl_ctx should be of type ServerEngineSpec, but got {type(engine)}.")
+ 
+         engine.cancel_client_resources(resource_check_results, resource_reqs, fl_ctx)
++        _trace_probe('DefaultJobSchedulerCancelReturned', locals())
+         self.log_debug(fl_ctx, f"cancel client resources using check results: {resource_check_results}")
+         return False, None
+ 
+     def _try_job(self, job: Job, fl_ctx: FLContext) -> (int, Optional[Dict[str, DispatchInfo]], str):
+         engine = fl_ctx.get_engine()
++        _trace_probe('DefaultJobSchedulerTryJob', locals())
+         online_clients = engine.get_clients()
+         online_site_names = [x.name for x in online_clients]
+         registry = StudyRegistryService.get_registry()
+@@ -197,6 +200,7 @@
+             return SCHEDULE_RESULT_NO_RESOURCE, None, block_reason
+ 
+         resource_check_results = self._check_client_resources(job=job, resource_reqs=resource_reqs, fl_ctx=fl_ctx)
++        _trace_fault("after_resource_results", locals())
+         fl_ctx.set_prop(FLContextKey.RESOURCE_CHECK_RESULT, resource_check_results, private=True, sticky=False)
+         self.fire_event(EventType.AFTER_CHECK_CLIENT_RESOURCES, fl_ctx)
+ 
+@@ -226,6 +230,7 @@
+                 if token:
+                     resource_failure_details.append(f"{site_name}: {token}")
+ 
++        _trace_probe('DefaultJobSchedulerEvaluateResources', locals())
+         if num_sites_ok < job.min_sites:
+             self.log_debug(fl_ctx, f"Job {job.job_id} can't be scheduled: not enough sites have enough resources.")
+             self._cancel_resources(
+@@ -278,11 +283,13 @@
+             with self.lock:
+                 if job_id not in self.scheduled_jobs:
+                     self.scheduled_jobs.append(job_id)
++                    _trace_probe('DefaultJobSchedulerJobStarted', locals())
+         elif event_type == EventType.JOB_COMPLETED or event_type == EventType.JOB_ABORTED:
+             job_id = get_event_job_id(fl_ctx)
+             with self.lock:
+                 if job_id in self.scheduled_jobs:
+                     self.scheduled_jobs.remove(job_id)
++                _trace_probe("SchedulerJobRemoved", locals())
+ 
+     def schedule_job(
+         self, job_manager: JobDefManagerSpec, job_candidates: List[Job], fl_ctx: FLContext
+@@ -294,6 +301,7 @@
+         except:
+             self.log_exception(fl_ctx, "error scheduling job")
+             ready_job, dispatch_info = None, None
++            _trace_probe('DefaultJobSchedulerAdmissionException', locals())
+ 
+         # process failed and blocked jobs
+         try:
+@@ -301,13 +309,16 @@
+                 # set the try count
+                 for job in failed_jobs:
+                     job_manager.refresh_meta(job, self._get_update_meta_keys(), fl_ctx)
++                    _trace_probe("DefaultJobSchedulerPersistFailed", locals())
+ 
+             if blocked_jobs:
+                 for job in blocked_jobs:
+                     job_manager.refresh_meta(job, self._get_update_meta_keys(), fl_ctx)
+                     job_manager.set_status(job.job_id, RunStatus.FINISHED_CANT_SCHEDULE, fl_ctx)
++                    _trace_probe('DefaultJobSchedulerPersistBlocked', locals())
+         except:
+             self.log_exception(fl_ctx, "error updating scheduling info in job store")
++        _trace_probe('DefaultJobSchedulerReturnPass', locals())
+         return ready_job, dispatch_info
+ 
+     def _get_update_meta_keys(self):
+@@ -331,6 +342,7 @@
+         schedule_count += 1
+         job.meta[JobMetaKey.SCHEDULE_COUNT.value] = schedule_count
+         job.meta[JobMetaKey.LAST_SCHEDULE_TIME.value] = time.time()
++        _trace_probe('ScheduleMetadataUpdated', locals())
+ 
+     def _do_schedule_job(
+         self, job_candidates: List[Job], fl_ctx: FLContext, failed_jobs: list, blocked_jobs: list
+@@ -342,6 +354,7 @@
+ 
+         # sort by submitted time
+         job_candidates.sort(key=lambda j: j.meta.get(JobMetaKey.SUBMIT_TIME.value, 0.0))
++        _trace_probe('DefaultJobSchedulerBeginPass', locals())
+         engine = fl_ctx.get_engine()
+         for job in job_candidates:
+             schedule_count = job.meta.get(JobMetaKey.SCHEDULE_COUNT.value, 0)
+@@ -351,6 +364,7 @@
+                 )
+                 blocked_jobs.append(job)
+                 self._update_schedule_history(job, f"exceeded max schedule count {self.max_schedule_count}", fl_ctx)
++                _trace_probe('DefaultJobSchedulerExhausted', locals())
+                 continue
+ 
+             last_schedule_time = job.meta.get(JobMetaKey.LAST_SCHEDULE_TIME.value, 0.0)
+@@ -358,9 +372,11 @@
+             n = 0 if schedule_count == 0 else schedule_count - 1
+             required_interval = min(self.max_schedule_interval, (2**n) * self.min_schedule_interval)
+             if time_since_last_schedule < required_interval:
++                _trace_probe('DefaultJobSchedulerSkipBackoff', locals())
+                 # do not schedule again too soon
+                 continue
+ 
++            _trace_probe('BackoffObservation', locals())
+             with engine.new_context() as ctx:
+                 rc, sites_dispatch_info, result = self._try_job(job, ctx)
+                 self.log_debug(ctx, f"Try to schedule job {job.job_id}, get result: {rc}, {sites_dispatch_info}.")
+@@ -368,12 +384,15 @@
+                     result = "scheduled"
+                 self._update_schedule_history(job, result, ctx)
+                 if rc == SCHEDULE_RESULT_OK:
++                    _trace_probe('DefaultJobSchedulerUpdateHistory', locals())
+                     return job, sites_dispatch_info
+                 elif rc == SCHEDULE_RESULT_NO_RESOURCE:
+                     failed_jobs.append(job)
++                    _trace_probe('DefaultJobSchedulerUpdateHistory', locals())
+                 else:
+                     blocked_jobs.append(job)
+ 
++        _trace_probe('DefaultJobSchedulerEndPass', locals())
+         self.log_debug(fl_ctx, "No job is scheduled.")
+         return None, None
+ 
+--- a/nvflare/app_common/resource_managers/auto_clean_resource_manager.py
++++ b/nvflare/app_common/resource_managers/auto_clean_resource_manager.py
+@@ -12,6 +12,7 @@
+ # See the License for the specific language governing permissions and
+ # limitations under the License.
+ 
++from nvflare._lifecycle_probe import probe as _trace_probe, fault as _trace_fault
+ import time
+ import uuid
+ from abc import ABC, abstractmethod
+@@ -111,9 +112,11 @@
+                         tokens_to_remove.append(k)
+                     else:
+                         self.reserved_resources[k] = r, t
++                _trace_probe('AutoCleanResourceManagerTick', locals())
+                 for token in tokens_to_remove:
+                     reserved_resources, _ = self.reserved_resources.pop(token)
+                     self._deallocate(resources=reserved_resources)
++                    _trace_probe('AutoCleanResourceManagerFinishExpiry', locals())
+                 self.logger.debug(f"current resources: {self.resources}, reserved_resources {self.reserved_resources}.")
+ 
+     def check_resources(self, resource_requirement: dict, fl_ctx: FLContext):
+@@ -129,12 +132,14 @@
+                 token = str(uuid.uuid4())
+                 reserved_resources = self._reserve_resource(resource_requirement)
+                 self.reserved_resources[token] = (reserved_resources, self.expiration_period)
++                _trace_probe('CheckResourceProcessorReserve', locals())
+                 self.log_debug(
+                     fl_ctx, f"reserving resources: {reserved_resources} for requirements {resource_requirement}."
+                 )
+                 self.log_debug(
+                     fl_ctx, f"current resources: {self.resources}, reserved_resources {self.reserved_resources}."
+                 )
++        _trace_probe('ResourceCheckReturned', locals())
+         return is_resource_enough, token
+ 
+     def cancel_resources(self, resource_requirement: dict, token: str, fl_ctx: FLContext):
+@@ -148,6 +153,7 @@
+                 )
+             else:
+                 self.log_debug(fl_ctx, f"Token {token} is not related to any reserved resources.")
++            _trace_probe("CancelResourceProcessorCancel", locals())
+         return None
+ 
+     def allocate_resources(self, resource_requirement: dict, token: str, fl_ctx: FLContext) -> dict:
+@@ -155,11 +161,13 @@
+         with self._lock:
+             if token and token in self.reserved_resources:
+                 result, _ = self.reserved_resources.pop(token)
++                _trace_probe('StartJobProcessorAllocate', locals())
+                 self.log_debug(fl_ctx, f"allocating resources: {result} for requirements: {resource_requirement}.")
+                 self.log_debug(
+                     fl_ctx, f"current resources: {self.resources}, reserved_resources {self.reserved_resources}."
+                 )
+             else:
++                _trace_probe('StartJobProcessorRejectToken', locals())
+                 raise RuntimeError(f"allocate_resources: No reserved resources for token {token}.")
+         return result
+ 
+@@ -170,6 +178,7 @@
+                 fl_ctx, f"current resources: {self.resources}, reserved_resources {self.reserved_resources}."
+             )
+             self._deallocate(resources=resources)
++            _trace_probe('ResourceFree', locals())
+ 
+     def report_resources(self, fl_ctx):
+         with self._lock:
+--- a/nvflare/private/fed/server/server_engine.py
++++ b/nvflare/private/fed/server/server_engine.py
+@@ -12,6 +12,7 @@
+ # See the License for the specific language governing permissions and
+ # limitations under the License.
+ 
++from nvflare._lifecycle_probe import probe as _trace_probe, fault as _trace_fault
+ import copy
+ import json
+ import os
+@@ -202,6 +203,7 @@
+ 
+     def wait_for_complete(self, workspace, job_id, process):
+         process.wait()
++        _trace_probe('ServerChildExitObserved', locals())
+         run_process_info = self.run_processes.get(job_id)
+         if run_process_info:
+             # Wait for the job process to finish UPDATE_RUN_STATUS process
+@@ -231,6 +233,7 @@
+                         run_process_info[RunProcessKey.PROCESS_RETURN_CODE] = return_code
+                         self.exception_run_processes[job_id] = run_process_info
+                 self.run_processes.pop(job_id, None)
++                _trace_probe('ServerEngineObserveExit', locals())
+         self.engine_info.status = MachineStatus.STOPPED
+ 
+     def _start_runner_process(self, job, job_clients, snapshot, fl_ctx: FLContext):
+@@ -313,6 +316,7 @@
+ 
+         fl_ctx.set_prop(key=FLContextKey.JOB_PROCESS_ARGS, value=job_args, private=True, sticky=False)
+         job_handle = job_launcher.launch_job(job_meta, fl_ctx)
++        _trace_probe('ServerEngineSpawnJob', locals())
+         self.logger.info(f"Launch job_id: {job.job_id}  with job launcher: {type(job_launcher)} ")
+ 
+         if not job_clients:
+@@ -324,8 +328,10 @@
+                 RunProcessKey.JOB_ID: job.job_id,
+                 RunProcessKey.PARTICIPANTS: job_clients,
+             }
++            _trace_probe("ServerEngineRegisterJob", locals())
+ 
+         threading.Thread(target=self.wait_for_complete, args=[args.workspace, job.job_id, job_handle]).start()
++        _trace_probe('ServerEngineInstallWaiter', locals())
+         return job_handle
+ 
+     def get_job_clients(self, client_sites):
+@@ -405,8 +411,10 @@
+                 self.logger.debug(f"job {job_id}: terminated job handle after abort cleanup")
+             except Exception as e:
+                 self.logger.error(f"job {job_id}: failed to terminate job handle: {secure_format_exception(e)}")
++        _trace_probe('ServerEngineTerminateObserved', locals())
+         with self.lock:
+             self.run_processes.pop(job_id, None)
++            _trace_probe("ServerEngineRemoveAfterTerminate", locals())
+ 
+     def check_app_start_readiness(self, job_id: str) -> str:
+         if job_id not in self.run_processes.keys():
+@@ -1020,6 +1028,7 @@
+                 requests.update({client.token: request})
+         replies = []
+         if requests:
++            _trace_probe('SendCheck', locals())
+             replies = self._send_admin_requests(requests, fl_ctx, 15)
+         result = {}
+         for r in replies:
+@@ -1062,6 +1071,7 @@
+                 client = self.get_client_from_name(site_name)
+                 if client:
+                     requests.update({client.token: request})
++        _trace_probe("SendCancel", locals())
+         if requests:
+             _ = self._send_admin_requests(requests, fl_ctx)
+ 
+@@ -1079,6 +1089,7 @@
+                 requests.update({client.token: request})
+         replies = []
+         if requests:
++            _trace_probe('SendStart', locals())
+             replies = self._send_admin_requests(requests, fl_ctx, timeout_secs=20)
+         return replies
+ 
+--- a/nvflare/private/fed/server/admin.py
++++ b/nvflare/private/fed/server/admin.py
+@@ -11,6 +11,7 @@
+ # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ # See the License for the specific language governing permissions and
+ # limitations under the License.
++from nvflare._lifecycle_probe import probe as _trace_probe, fault as _trace_fault
+ import threading
+ import time
+ from typing import List, Optional
+@@ -137,6 +138,7 @@
+                 error_msg += f"\t{client_name}: {r.reply.body}\n"
+ 
+     if error_msg:
++        _trace_probe('JobRunnerStartReplyError', locals())
+         raise RuntimeError(f"Failed to {command} to the following clients: \n{error_msg}")
+ 
+     return timed_out_clients
+@@ -301,6 +303,7 @@
+             with self.sai.new_context() as fl_ctx:
+                 replies = self.send_requests(requests, fl_ctx, timeout_secs=timeout_secs)
+                 for r in replies:
++                    _trace_probe('AdminReplyDictProjection', locals())
+                     result[r.client_token] = r.reply
+         return result
+ 
+--- a/nvflare/private/fed/server/message_send.py
++++ b/nvflare/private/fed/server/message_send.py
+@@ -12,6 +12,7 @@
+ # See the License for the specific language governing permissions and
+ # limitations under the License.
+ 
++from nvflare._lifecycle_probe import probe as _trace_probe, fault as _trace_fault
+ from nvflare.fuel.f3.cellnet.core_cell import FQCN
+ from nvflare.fuel.f3.cellnet.core_cell import Message as CellMessage
+ from nvflare.fuel.f3.cellnet.core_cell import TargetMessage
+@@ -84,7 +85,7 @@
+             channel = CellChannel.CLIENT_MAIN
+ 
+         target_msgs[fqcn] = TargetMessage(
+-            target=fqcn, channel=channel, topic=command, message=new_cell_message({}, req)
++            target=fqcn, channel=channel, topic=command, message=new_cell_message({"_specula_admin_id": req.id}, req)
+         )
+ 
+         fqcn_to_client[fqcn] = client
+@@ -99,7 +100,9 @@
+         return []
+     else:
+         result = []
++        _trace_probe('AdminWaitBegin', locals())
+         replies = cell.broadcast_multi_requests(target_msgs, timeout_secs, optional=optional)
++        _trace_probe('AdminWaitEnd', locals())
+         for fqcn, reply in replies.items():
+             assert isinstance(reply, CellMessage)
+             client = fqcn_to_client[fqcn]
+@@ -108,4 +111,6 @@
+                     client_token=client.token, client_name=client.name, req=fqcn_to_req[fqcn], reply=reply.payload
+                 )
+             )
++        for r in result:
++            _trace_probe("AdminReply", locals())
+         return result
+--- a/nvflare/private/fed/server/job_runner.py
++++ b/nvflare/private/fed/server/job_runner.py
+@@ -12,6 +12,7 @@
+ # See the License for the specific language governing permissions and
+ # limitations under the License.
+ 
++from nvflare._lifecycle_probe import probe as _trace_probe, fault as _trace_fault
+ import os
+ import shutil
+ import threading
+@@ -118,6 +119,7 @@
+     def resolve_client_outcome(self, job_id: str, client_name: str):
+         with self.lock:
+             self._pending_client_outcomes.get(job_id, set()).discard(client_name)
++            _trace_probe('ServerEngineReceiveOutcome', locals())
+ 
+     def get_client_outcome_jobs(self, client_name: str = None) -> set:
+         with self.lock:
+@@ -243,6 +245,7 @@
+         if client_deploy_requests:
+             engine = fl_ctx.get_engine()
+             admin_server = engine.server.admin_server
++            _trace_probe('SendDeploy', locals())
+             client_token_to_reply = admin_server.send_requests_and_get_reply_dict(
+                 client_deploy_requests, timeout_secs=admin_server.timeout
+             )
+@@ -278,6 +281,7 @@
+                             abort_job = True
+                             deploy_detail.append(f"failed to deploy to required client {c}")
+ 
++        _trace_probe('JobRunnerEvaluateDeployment', locals())
+         if abort_job:
+             raise RuntimeError("deploy failure", deploy_detail)
+ 
+@@ -307,6 +311,7 @@
+ 
+         with self.lock:
+             self._pending_client_outcomes[job_id] = set(client_sites)
++            _trace_probe('JobRunnerSetPendingOutcomes', locals())
+         replies = engine.start_client_job(job, client_sites, fl_ctx)
+         all_client_sites = list(client_sites.keys())
+         active_client_sites = list(all_client_sites)
+@@ -352,12 +357,14 @@
+                 if client_reply and client_reply.reply:
+                     active_client_sites.append(client_name)
+ 
++        _trace_probe('JobRunnerEvaluateStartReplies', locals())
+         # Set metadata once, after any timeout exclusion, so it always reflects active participants.
+         active_sites = set(active_client_sites)
+         participating_clients = [c.to_dict() for c in job_clients.values() if c.name in active_sites]
+         job.meta[JobMetaKey.JOB_CLIENTS] = participating_clients
+         with self.lock:
+             self._pending_client_outcomes[job_id].intersection_update(active_client_sites)
++            _trace_probe('JobRunnerFilterPendingOutcomes', locals())
+         display_sites = ",".join(active_client_sites)
+ 
+         self.log_info(fl_ctx, f"Started run: {job_id} for clients: {display_sites}")
+@@ -406,6 +413,7 @@
+         message.set_header(RequestHeader.JOB_ID, str(job_id))
+         self.log_debug(fl_ctx, f"Send abort command to the clients for run: {job_id}")
+         try:
++            _trace_probe('SendStop', locals())
+             _ = _send_to_clients(admin_server, client_sites, engine, message, timeout=2.0, optional=True)
+             # There isn't much we can do here if a client didn't get the message or send a reply
+             # check_client_replies(replies=replies, client_sites=client_sites, command="abort the run")
+@@ -469,6 +477,7 @@
+                                     job_id, now + self.client_outcome_wait_timeout
+                                 )
+                                 if now < deadline:
++                                    _trace_probe('JobRunnerCompletionWaiting', locals())
+                                     continue
+                                 unresolved = sorted(pending)
+                                 pending.clear()
+@@ -479,6 +488,7 @@
+                                 f"Timed out after {self.client_outcome_wait_timeout} seconds waiting for client outcomes "
+                                 f"for job ({job_id}): {unresolved}. Finalizing from the server outcome."
+                             )
++                        _trace_probe('JobRunnerCompletionReady', locals())
+                         with engine.new_context() as completion_ctx:
+                             completion_ctx.set_prop(FLContextKey.CURRENT_JOB_ID, job.job_id)
+                             finished_state = self._finished_job_states.get(job.job_id)
+@@ -489,6 +499,7 @@
+                                     status = self._get_finished_job_status(engine, job, completion_ctx)
+                                 finished_state = _FinishedJobState(status=status)
+                                 self._finished_job_states[job.job_id] = finished_state
++                                _trace_probe('JobRunnerClassifyCompletion', locals())
+                             status = finished_state.status
+                             # Publish terminal status only after artifacts are ready for download.
+                             if not finished_state.workspace_archival_complete:
+@@ -520,8 +531,10 @@
+                                             f"archived artifacts: {secure_format_exception(e)}",
+                                         )
+                                 finished_state.workspace_archival_complete = True
++                                _trace_probe('JobRunnerArchiveSuccess', locals())
+                             try:
+                                 job_manager.set_status(job.job_id, status, completion_ctx)
++                                _trace_probe('JobRunnerPublishTerminal', locals())
+                             except Exception as e:
+                                 self.log_exception(
+                                     completion_ctx,
+@@ -533,6 +546,7 @@
+                                 self._finished_job_states.pop(job_id, None)
+                                 self._pending_client_outcomes.pop(job_id, None)
+                                 self._client_outcome_deadlines.pop(job_id, None)
++                            _trace_probe('JobRunnerRemoveCompleted', locals())
+                             if status == RunStatus.FINISHED_ABORTED:
+                                 self._fire_job_lifecycle_event(EventType.JOB_ABORTED, job_id, completion_ctx)
+                             self._fire_job_lifecycle_event(EventType.JOB_COMPLETED, job_id, completion_ctx)
+@@ -634,6 +648,7 @@
+         """Starts job runner."""
+         engine = fl_ctx.get_engine()
+         job_manager = engine.get_component(SystemComponents.JOB_MANAGER)
++        _trace_fault("bootstrap_wait", locals())
+         if job_manager:
+             thread = threading.Thread(target=self._job_complete_process, args=[engine])
+             thread.start()
+@@ -668,6 +683,7 @@
+                             fl_ctx.set_prop(FLContextKey.CURRENT_JOB_ID, ready_job.job_id)
+                             job_id, failed_clients = self._deploy_job(ready_job, sites, fl_ctx)
+                             job_manager.set_status(ready_job.job_id, RunStatus.DISPATCHED, fl_ctx)
++                            _trace_probe('JobRunnerWriteDispatched', locals())
+ 
+                             deploy_detail = fl_ctx.get_prop(FLContextKey.JOB_DEPLOY_DETAIL)
+                             if deploy_detail:
+@@ -689,6 +705,7 @@
+                                 )
+                                 self.log_info(fl_ctx, f"Updated the schedule history of Job: {job_id}")
+ 
++                            _trace_probe('JobRunnerPersistDeploy', locals())
+                             if failed_clients:
+                                 deployable_clients = {k: v for k, v in client_sites.items() if k not in failed_clients}
+                             else:
+@@ -708,15 +725,20 @@
+                             )
+                             with self.lock:
+                                 self.running_jobs[job_id] = ready_job
++                                _trace_probe('JobRunnerRegisterRunning', locals())
+                             job_manager.set_status(ready_job.job_id, RunStatus.RUNNING, fl_ctx)
++                            _trace_probe('JobRunnerWriteRunning', locals())
+                             self.log_info(fl_ctx, f"Job: {job_id} started to run, status changed to RUNNING.")
+                         except Exception as e:
++                            _trace_probe('JobRunnerStartupException', locals())
+                             if job_id:
+                                 with self.lock:
+                                     if job_id in self.running_jobs:
+                                         del self.running_jobs[job_id]
+                                     self._pending_client_outcomes.pop(job_id, None)
++                                    _trace_probe('JobRunnerFailureRemove', locals())
+                                 self._stop_run(job_id, fl_ctx)
++                                _trace_probe('JobRunnerFailureStop', locals())
+                             job_manager.set_status(ready_job.job_id, RunStatus.FAILED_TO_RUN, fl_ctx)
+ 
+                             deploy_detail = fl_ctx.get_prop(FLContextKey.JOB_DEPLOY_DETAIL)
+@@ -725,6 +747,7 @@
+                                     ready_job.job_id, {JobMetaKey.JOB_DEPLOY_DETAIL.value: deploy_detail}, fl_ctx
+                                 )
+ 
++                            _trace_probe('JobRunnerFailureStatus', locals())
+                             self._fire_job_lifecycle_event(EventType.JOB_ABORTED, ready_job.job_id, fl_ctx)
+                             self.log_error(
+                                 fl_ctx, f"Failed to run the Job ({ready_job.job_id}): {secure_format_exception(e)}"
+@@ -736,6 +759,7 @@
+     @staticmethod
+     def _check_job_status(job_manager, job_id, job_run_status, fl_ctx: FLContext):
+         reload_job = job_manager.get_job(job_id, fl_ctx)
++        _trace_probe('JobRunnerCheckStatus', locals())
+         return reload_job.meta.get(JobMetaKey.STATUS) != job_run_status
+ 
+     def stop(self):
+@@ -797,6 +821,7 @@
+ 
+     def stop_run(self, job_id: str, fl_ctx: FLContext):
+         self._stop_run(job_id, fl_ctx)
++        _trace_probe("JobCommandAbortRunning", locals())
+         return self.mark_run_aborted(job_id, fl_ctx)
+ 
+     def mark_run_aborted(self, job_id: str, fl_ctx: FLContext):
+@@ -805,6 +830,7 @@
+             self.log_info(fl_ctx, f"Stop the job run: {job_id}")
+             fl_ctx.set_prop(FLContextKey.CURRENT_JOB_ID, job.job_id)
+             job.run_aborted = True
++            _trace_probe('JobRunnerMarkAborted', locals())
+             return ""
+         else:
+             self.log_info(fl_ctx, f"Job {job_id} is not running. It can not be stopped.")
+--- a/nvflare/private/fed/client/scheduler_cmds.py
++++ b/nvflare/private/fed/client/scheduler_cmds.py
+@@ -12,6 +12,7 @@
+ # See the License for the specific language governing permissions and
+ # limitations under the License.
+ 
++from nvflare._lifecycle_probe import probe as _trace_probe, fault as _trace_fault
+ import json
+ import logging
+ from typing import List
+@@ -113,6 +114,8 @@
+ 
+         try:
+             with engine.new_context() as fl_ctx:
++                _trace_probe('StartRequestBegin', locals())
++                _trace_fault("before_allocate", locals())
+                 allocated_resources = resource_manager.allocate_resources(
+                     resource_requirement=resource_spec, token=token, fl_ctx=fl_ctx
+                 )
+@@ -132,6 +135,7 @@
+                 with engine.new_context() as fl_ctx:
+                     resource_manager.free_resources(resources=allocated_resources, token=token, fl_ctx=fl_ctx)
+ 
++        _trace_probe('StartProcessorReply', locals())
+         if not result:
+             result = "OK"
+         return Message(topic="reply_" + req.topic, body=result)
+@@ -151,6 +155,7 @@
+                 resource_spec = req.body
+                 token = req.get_header(ShareableHeader.RESOURCE_RESERVE_TOKEN)
+                 resource_manager.cancel_resources(resource_requirement=resource_spec, token=token, fl_ctx=fl_ctx)
++                _trace_fault("cancel_reply", locals())
+             except Exception:
+                 result.set_return_code(ReturnCode.EXECUTION_EXCEPTION)
+ 
+--- a/nvflare/private/fed/client/training_cmds.py
++++ b/nvflare/private/fed/client/training_cmds.py
+@@ -12,6 +12,7 @@
+ # See the License for the specific language governing permissions and
+ # limitations under the License.
+ 
++from nvflare._lifecycle_probe import probe as _trace_probe, fault as _trace_fault
+ import json
+ import logging
+ import os
+@@ -135,8 +136,10 @@
+             app_name=app_name, job_id=job_id, job_meta=job_meta, client_name=client_name, app_data=req.body
+         )
+         if err:
++            _trace_probe("ClientDeployError", locals())
+             return error_reply(err)
+ 
++        _trace_probe('ClientDeploySuccess', locals())
+         return ok_reply(body=f"deployed {app_name} to {client_name}")
+ 
+ 
+--- a/nvflare/app_common/resource_consumers/list_resource_consumer.py
++++ b/nvflare/app_common/resource_consumers/list_resource_consumer.py
+@@ -12,6 +12,7 @@
+ # See the License for the specific language governing permissions and
+ # limitations under the License.
+ 
++from nvflare._lifecycle_probe import probe as _trace_probe, fault as _trace_fault
+ import os
+ from abc import ABC, abstractmethod
+ 
+@@ -35,6 +36,7 @@
+         """
+         gpu_numbers = [str(x) for x in resources]
+         os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(gpu_numbers)
++        _trace_probe('ListResourceConsumerConsume', locals())
+ 
+ 
+ class ListResourceConsumer(ResourceConsumerSpec):
+--- a/nvflare/private/fed/client/client_engine.py
++++ b/nvflare/private/fed/client/client_engine.py
+@@ -12,6 +12,7 @@
+ # See the License for the specific language governing permissions and
+ # limitations under the License.
+ 
++from nvflare._lifecycle_probe import probe as _trace_probe, fault as _trace_fault
+ import os
+ import re
+ import shutil
+@@ -368,6 +369,7 @@
+ 
+         self.logger.info("Starting client app. rank: {}".format(self.rank))
+ 
++        _trace_probe('ClientEngineStartAppCheck', locals())
+         self.client_executor.start_app(
+             self.client,
+             job_id,
+@@ -394,9 +396,11 @@
+         # live job while the executor still owns its handle so a server-side
+         # failure can reclaim a CJ that hangs in that final teardown window.
+         if status == ClientStatus.STOPPED and job_id not in self.client_executor.get_run_processes_keys():
++            _trace_probe('ClientEngineAbortApp', locals())
+             return "Client app already stopped."
+ 
+         if status == ClientStatus.NOT_STARTED:
++            _trace_probe("ClientEngineAbortApp", locals())
+             return "Client app has not started."
+ 
+         self.client_executor.abort_app(job_id, heartbeat_cleanup=heartbeat_cleanup)
+--- a/nvflare/private/fed/client/client_executor.py
++++ b/nvflare/private/fed/client/client_executor.py
+@@ -11,6 +11,7 @@
+ # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ # See the License for the specific language governing permissions and
+ # limitations under the License.
++from nvflare._lifecycle_probe import probe as _trace_probe, fault as _trace_fault
+ import copy
+ import json
+ import os
+@@ -218,6 +219,7 @@
+             resource_manager: resource manager
+             fl_ctx: FLContext
+         """
++        _trace_fault("prepare_start", locals())
+         # use a deep copy of the args for operation since its content will be changed!
+         args = copy.deepcopy(args)
+ 
+@@ -305,6 +307,7 @@
+                 RunProcessKey.STATUS: ClientStatus.STARTING,
+                 _ABORT_REQUESTED_KEY: False,
+             }
++            _trace_probe("JobExecutorRegisterPendingHandle", locals())
+         try:
+             job_handle = job_launcher.launch_job(job_meta, fl_ctx)
+             if job_handle is None:
+@@ -313,17 +316,21 @@
+             with self.lock:
+                 if self.run_processes.get(job_id, {}).get(RunProcessKey.JOB_HANDLE) is pending_handle:
+                     self.run_processes.pop(job_id, None)
++            _trace_probe('ProcessJobLauncherSpawnException', locals())
+             raise
+ 
+         heartbeat_cleanup = pending_handle.attach(job_handle)
++        _trace_probe('PendingJobHandleAttach', locals())
+         if heartbeat_cleanup is not None:
+             self.abort_app(job_id, heartbeat_cleanup=heartbeat_cleanup)
++            _trace_probe('JobExecutorApplyPendingAbort', locals())
+ 
+         self.logger.info(f"Launched job {job_id} with job launcher: {type(job_launcher)} ")
+ 
+         fl_ctx.set_prop(FLContextKey.JOB_META, job_meta, private=True, sticky=False)
+         engine = fl_ctx.get_engine()
+         engine.fire_event(EventType.AFTER_JOB_LAUNCH, fl_ctx)
++        _trace_probe('JobExecutorAfterJobLaunchEvent', locals())
+ 
+         client.multi_gpu = False
+ 
+@@ -332,6 +339,7 @@
+             args=(client, job_id, allocated_resource, token, resource_manager, args.workspace, fl_ctx),
+         )
+         thread.start()
++        _trace_probe("JobExecutorInstallCleanupWaiter", locals())
+ 
+     def _get_job_launcher(self, job_meta: dict, fl_ctx: FLContext) -> JobLauncherSpec:
+         engine = fl_ctx.get_engine()
+@@ -348,6 +356,7 @@
+         run_process = self.run_processes.get(job_id)
+         if run_process:
+             run_process[RunProcessKey.STATUS] = job_status
++            _trace_probe('JobExecutorNotifyStatus', locals())
+ 
+     def _job_fqcn(self, job_id: str):
+         return FQCN.join([self.client.cell.get_fqcn(), job_id])
+@@ -502,6 +511,7 @@
+                     process.get(RunProcessKey.STATUS, ClientStatus.NOT_STARTED) if process else ClientStatus.NOT_STARTED
+                 )
+                 job_handle = process.get(RunProcessKey.JOB_HANDLE) if process else None
++                _trace_probe('ClientEngineAbortApp', locals())
+             if process_status in (ClientStatus.STARTING, ClientStatus.STARTED, ClientStatus.STOPPED):
+                 try:
+                     if process_status == ClientStatus.STARTING:
+@@ -509,6 +519,7 @@
+                             job_handle.terminate(heartbeat_cleanup=True)
+                         else:
+                             job_handle.terminate()
++                        _trace_probe("JobExecutorAbortStarting", locals())
+                         break
+                     if process_status == ClientStatus.STOPPED:
+                         # STOPPED means the runner returned, not that the OS
+@@ -598,6 +609,7 @@
+             job_handle.terminate(heartbeat_cleanup=True)
+         else:
+             job_handle.terminate()
++        _trace_probe('JobExecutorTerminateAfterGrace', locals())
+         self.logger.info(f"run ({job_id}): child worker process terminated")
+ 
+     def abort_task(self, job_id):
+@@ -626,6 +638,7 @@
+         job_handle = self.run_processes.get(job_id, {}).get(RunProcessKey.JOB_HANDLE)
+         if job_handle:
+             job_handle.wait()
++            _trace_probe('ClientChildExitObserved', locals())
+ 
+             return_code = get_return_code(job_handle, job_id, workspace, self.logger)
+ 
+@@ -644,6 +657,7 @@
+ 
+             self.logger.info(f"run ({job_id}): child worker process finished with RC {return_code}")
+ 
++            _trace_probe('JobExecutorWaitChildExit', locals())
+             failure_reason = REPORTABLE_JOB_FAILURES.get(return_code)
+             try:
+                 request = new_cell_message(
+@@ -654,6 +668,7 @@
+                         JobFailureMsgKey.REASON: failure_reason,
+                     },
+                 )
++                _trace_probe('JobExecutorReportOutcome', locals())
+                 reply = self.client.send_request_before_shutdown(
+                     target=FQCN.ROOT_SERVER,
+                     channel=CellChannel.SERVER_MAIN,
+@@ -662,6 +677,7 @@
+                     timeout=self.job_query_timeout,
+                     optional=True,
+                 )
++                _trace_probe('JobExecutorOutcomeReportReturned', locals())
+                 if reply is None:
+                     # Shutdown invalidates the site token. The server's client-quit/dead-client
+                     # path resolves any outcome still pending after communication stops.
+@@ -671,6 +687,7 @@
+                 elif reply.get_header(MessageHeaderKey.RETURN_CODE) != ReturnCode.OK:
+                     self.logger.error(f"could not report terminal outcome of job {job_id}")
+             except Exception as e:
++                _trace_probe('JobExecutorOutcomeReportException', locals())
+                 self.logger.error(f"could not report terminal outcome of job {job_id}: {secure_format_exception(e)}")
+ 
+         if allocated_resource:
+@@ -679,12 +696,14 @@
+             )
+         with self.lock:
+             self.run_processes.pop(job_id, None)
++            _trace_probe("JobExecutorRemoveProcess", locals())
+         self.logger.debug(f"run ({job_id}): child worker resources freed.")
+ 
+         engine = fl_ctx.get_engine()
+         fl_ctx.set_prop(FLContextKey.CURRENT_JOB_ID, job_id, private=True, sticky=False)
+         fl_ctx.set_prop(FLContextKey.CLIENT_NAME, client.client_name, private=True, sticky=False)
+         engine.fire_event(EventType.JOB_COMPLETED, fl_ctx)
++        _trace_probe('JobExecutorJobCompletedEvent', locals())
+         self.logger.debug(f"Fired event JOB_COMPLETED {EventType.JOB_COMPLETED}")
+ 
+     def get_status(self, job_id):
+--- a/nvflare/app_common/job_launcher/process_launcher.py
++++ b/nvflare/app_common/job_launcher/process_launcher.py
+@@ -11,6 +11,7 @@
+ # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ # See the License for the specific language governing permissions and
+ # limitations under the License.
++from nvflare._lifecycle_probe import probe as _trace_probe, fault as _trace_fault
+ import logging
+ import os
+ import shlex
+@@ -66,6 +67,7 @@
+     def launch_job(self, job_meta: dict, fl_ctx: FLContext) -> JobHandleSpec:
+ 
+         new_env = os.environ.copy()
++        _trace_probe('ProcessJobLauncherSnapshotEnvironment', locals())
+         workspace_obj: Workspace = fl_ctx.get_prop(FLContextKey.WORKSPACE_OBJECT)
+         job_id = job_meta.get(JobConstants.JOB_ID)
+         app_custom_folder = workspace_obj.get_app_custom_dir(job_id)
+@@ -79,6 +81,7 @@
+ 
+         # Use the spawn_process utility which handles the choice between posix_spawn and subprocess
+         process_adapter = spawn_process(argv, new_env)
++        _trace_probe('ProcessJobLauncherSpawn', locals())
+ 
+         return ProcessHandle(process_adapter=process_adapter)
+ 
+--- a/nvflare/private/fed/server/job_cmds.py
++++ b/nvflare/private/fed/server/job_cmds.py
+@@ -12,6 +12,7 @@
+ # See the License for the specific language governing permissions and
+ # limitations under the License.
+ 
++from nvflare._lifecycle_probe import probe as _trace_probe, fault as _trace_fault
+ import datetime
+ import io
+ import json
+@@ -1058,13 +1059,17 @@
+                 job_manager = engine.job_def_manager
+                 job = job_manager.get_job(job_id, fl_ctx)
+                 job_status = job.meta.get(JobMetaKey.STATUS)
++                _trace_probe('JobCommandAbortRead', locals())
+                 if job_status in [RunStatus.SUBMITTED.value, RunStatus.DISPATCHED.value]:
+                     job_manager.set_status(job.job_id, RunStatus.FINISHED_ABORTED, fl_ctx)
++                    _trace_probe('JobCommandAbortPreRunWrite', locals())
+                     message = f"Aborted the job {job_id} before running it."
+                     conn.append_string(message)
+                     conn.append_success("", meta=make_meta(MetaStatusValue.OK, message))
++                    _trace_probe('JobCommandAbortPreRunAcknowledge', locals())
+                     return
+                 elif job_status and job_status.startswith("FINISHED:"):
++                    _trace_probe('JobCommandAbortAlreadyTerminal', locals())
+                     message = f"Job for {job_id} is already completed."
+                     conn.append_string(message)
+                     conn.append_success("", meta=make_meta(MetaStatusValue.OK, message))
+--- a/nvflare/fuel/f3/cellnet/core_cell.py
++++ b/nvflare/fuel/f3/cellnet/core_cell.py
+@@ -12,6 +12,7 @@
+ # See the License for the specific language governing permissions and
+ # limitations under the License.
+ 
++from nvflare._lifecycle_probe import probe as _trace_probe, fault as _trace_fault
+ import copy
+ import logging
+ import os
+@@ -1513,6 +1514,7 @@
+         if waiter.id in self.waiters:
+             raise RuntimeError("waiter not unique!")
+         self.waiters[waiter.id] = waiter
++        _trace_probe('CoreWaiterOpened', locals())
+         now = time.time()
+         if not timeout:
+             timeout = self.max_timeout
+@@ -1995,6 +1997,7 @@
+                     )
+                     return
+                 waiter.received_replies[req_destination] = message
++                _trace_probe('CoreReplyAccepted', locals())
+                 waiter.reply_time[req_destination] = now
+                 time_taken = now - waiter.send_time
+ 
+@@ -2025,6 +2028,7 @@
+                         )
+                     )
+             else:
++                _trace_probe('CoreLateReplyDiscarded', locals())
+                 self.log_warning(f"no waiter for req {rid} - the reply is too late", None)
+                 self.sent_msg_counter_pool.increment(
+                     category=self._stats_category(message), counter_name=_CounterName.LATE
+--- a/nvflare/private/fed/server/fed_server.py
++++ b/nvflare/private/fed/server/fed_server.py
+@@ -12,6 +12,7 @@
+ # See the License for the specific language governing permissions and
+ # limitations under the License.
+ 
++from nvflare._lifecycle_probe import probe as _trace_probe, fault as _trace_fault
+ import ipaddress
+ import json
+ import os
+@@ -936,6 +937,7 @@
+         client_name = registered_client.name
+         job_runner = self.engine.job_runner
+         if not job_runner.is_client_outcome_pending(job_id, client_name):
++            _trace_probe('ServerEngineIgnoreOutcome', locals())
+             self.logger.warning(f"Dropped terminal outcome for untracked job/client {job_id}/{client_name}")
+             return make_cellnet_reply(F3ReturnCode.OK, "", None)
+ 

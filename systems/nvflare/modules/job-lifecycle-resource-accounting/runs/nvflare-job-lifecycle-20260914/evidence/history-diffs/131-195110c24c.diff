@@ -1,0 +1,104 @@
+commit 195110c24ca0d84f6aa5532b15e51421376522f8
+Author:     Yuhong Wen <yuhongw@nvidia.com>
+AuthorDate: Thu Mar 30 20:38:43 2023 -0400
+Commit:     GitHub <noreply@github.com>
+CommitDate: Thu Mar 30 17:38:43 2023 -0700
+
+    Job status management enhancement (#1613)
+    
+    * job status enhancement. Added HA mode.
+    
+    * codestyle fix.
+    
+    * Added reviews.
+---
+ nvflare/private/fed/server/job_runner.py    | 31 +++++++++++++++++++++++++++++
+ nvflare/private/fed/server/server_engine.py |  5 +++++
+ 2 files changed, 36 insertions(+)
+
+diff --git a/nvflare/private/fed/server/job_runner.py b/nvflare/private/fed/server/job_runner.py
+index 98248a41..2affc023 100644
+--- a/nvflare/private/fed/server/job_runner.py
++++ b/nvflare/private/fed/server/job_runner.py
+@@ -385,6 +385,9 @@ class JobRunner(FLComponent):
+                     )
+ 
+                     if ready_job:
++                        if self._check_job_status(job_manager, ready_job.job_id, RunStatus.SUBMITTED, fl_ctx):
++                            self.log_info(fl_ctx, f"Job: {ready_job.job_id} is not in SUBMITTED. It won't be deployed.")
++                            continue
+                         client_sites = {k: v for k, v in sites.items() if k != "server"}
+                         job_id = None
+                         try:
+@@ -417,6 +420,12 @@ class JobRunner(FLComponent):
+                             else:
+                                 deployable_clients = client_sites
+ 
++                            if self._check_job_status(job_manager, ready_job.job_id, RunStatus.DISPATCHED, fl_ctx):
++                                self.log_info(
++                                    fl_ctx, f"Job: {ready_job.job_id} is not in DISPATCHED. It won't be start to run."
++                                )
++                                continue
++
+                             self._start_run(
+                                 job_id=job_id,
+                                 job=ready_job,
+@@ -451,6 +460,10 @@ class JobRunner(FLComponent):
+         else:
+             self.log_error(fl_ctx, "There's no Job Manager defined. Won't be able to run the jobs.")
+ 
++    def _check_job_status(self, job_manager, job_id, job_run_status, fl_ctx: FLContext):
++        reload_job = job_manager.get_job(job_id, fl_ctx)
++        return reload_job.meta.get(JobMetaKey.STATUS) != job_run_status
++
+     def stop(self):
+         self.ask_to_stop = True
+ 
+@@ -470,6 +483,24 @@ class JobRunner(FLComponent):
+                 fl_ctx, f"Failed to restore the job: {job_id} to the running job table: {secure_format_exception(e)}."
+             )
+ 
++    def update_unfinished_jobs(self, fl_ctx: FLContext):
++        engine = fl_ctx.get_engine()
++        job_manager = engine.get_component(SystemComponents.JOB_MANAGER)
++        all_jobs = []
++        dispatched_jobs = job_manager.get_jobs_by_status(RunStatus.DISPATCHED, fl_ctx)
++        all_jobs.extend(dispatched_jobs)
++        running_jobs = job_manager.get_jobs_by_status(RunStatus.RUNNING, fl_ctx)
++        all_jobs.extend(running_jobs)
++
++        for job in all_jobs:
++            try:
++                job_manager.set_status(job.job_id, RunStatus.ABANDONED, fl_ctx)
++                self.logger.info(f"Update the previous running job: {job.job_id} to ABANDONED.")
++            except Exception as e:
++                self.log_error(
++                    fl_ctx, f"Failed to update the job: {job.job_id} to ABANDONED: {secure_format_exception(e)}."
++                )
++
+     def stop_run(self, job_id: str, fl_ctx: FLContext):
+         engine = fl_ctx.get_engine()
+         job_manager = engine.get_component(SystemComponents.JOB_MANAGER)
+diff --git a/nvflare/private/fed/server/server_engine.py b/nvflare/private/fed/server/server_engine.py
+index ea889084..68f570ae 100644
+--- a/nvflare/private/fed/server/server_engine.py
++++ b/nvflare/private/fed/server/server_engine.py
+@@ -270,6 +270,8 @@ class ServerEngine(ServerEngineInternalSpec):
+             + str(server_state.service_port)
+             + " --ssid "
+             + str(server_state.ssid)
++            + " --ha_mode "
++            + str(self.server.ha_mode)
+             + " --set"
+             + command_options
+             + " print_conf=True restore_snapshot="
+@@ -600,6 +602,9 @@ class ServerEngine(ServerEngineInternalSpec):
+         return result
+ 
+     def persist_components(self, fl_ctx: FLContext, completed: bool):
++        if not self.server.ha_mode:
++            return
++
+         self.logger.info("Start saving snapshot on server.")
+ 
+         # Call the State Persistor to persist all the component states

@@ -1,0 +1,74 @@
+commit 1b009bdcc5215a254dcf5b9f61fc6bb2526d9805
+Author:     Peter Cnudde <pcnudde@nvidia.com>
+AuthorDate: Wed Apr 22 15:50:02 2026 -0700
+Commit:     GitHub <noreply@github.com>
+CommitDate: Thu Apr 23 06:50:02 2026 +0800
+
+    Fix JobRunner completion context race (#4471)
+    
+    ## Summary
+    This PR fixes a server-side race in JobRunner when completed jobs are
+    processed concurrently with scheduling.
+    
+    The completion thread was reusing the scheduling loop's FLContext, and
+    both paths mutate FLContextKey.CURRENT_JOB_ID. Under concurrent jobs,
+    that could fire JOB_COMPLETED with the wrong job id, leaving completed
+    jobs stuck in DefaultJobScheduler.scheduled_jobs and blocking later jobs
+    from being scheduled.
+    
+    ## Changes
+    - pass engine into the completion thread instead of the shared FLContext
+    - create a fresh engine.new_context() for each completed job before
+    firing JOB_COMPLETED
+    - add a regression test covering completion-event context isolation
+    
+    ## Validation
+    - tests/unit_test/private/fed/server/job_runner_test.py
+---
+ nvflare/private/fed/server/job_runner.py | 20 ++++++++++----------
+ 1 file changed, 10 insertions(+), 10 deletions(-)
+
+diff --git a/nvflare/private/fed/server/job_runner.py b/nvflare/private/fed/server/job_runner.py
+index 6af95904..72470585 100644
+--- a/nvflare/private/fed/server/job_runner.py
++++ b/nvflare/private/fed/server/job_runner.py
+@@ -394,21 +394,21 @@ class JobRunner(FLComponent):
+         if err:
+             self.log_error(fl_ctx, f"Failed to delete_run the server for run: {job_id}")
+ 
+-    def _job_complete_process(self, fl_ctx: FLContext):
+-        engine = fl_ctx.get_engine()
++    def _job_complete_process(self, engine):
+         job_manager = engine.get_component(SystemComponents.JOB_MANAGER)
+         while not self.ask_to_stop:
+             for job_id in list(self.running_jobs.keys()):
+                 if job_id not in engine.run_processes.keys():
+                     job = self.running_jobs.get(job_id)
+                     if job:
+-                        if not job.run_aborted:
+-                            self._update_job_status(engine, job, job_manager, fl_ctx)
+-                        with self.lock:
+-                            del self.running_jobs[job_id]
+-                        fl_ctx.set_prop(FLContextKey.CURRENT_JOB_ID, job.job_id)
+-                        self.fire_event(EventType.JOB_COMPLETED, fl_ctx)
+-                        self.log_debug(fl_ctx, f"Finished running job:{job.job_id}")
++                        with engine.new_context() as completion_ctx:
++                            if not job.run_aborted:
++                                self._update_job_status(engine, job, job_manager, completion_ctx)
++                            with self.lock:
++                                del self.running_jobs[job_id]
++                            completion_ctx.set_prop(FLContextKey.CURRENT_JOB_ID, job.job_id)
++                            self.fire_event(EventType.JOB_COMPLETED, completion_ctx)
++                            self.log_debug(completion_ctx, f"Finished running job:{job.job_id}")
+                     engine.remove_exception_process(job_id)
+             time.sleep(1.0)
+ 
+@@ -476,7 +476,7 @@ class JobRunner(FLComponent):
+         engine = fl_ctx.get_engine()
+         job_manager = engine.get_component(SystemComponents.JOB_MANAGER)
+         if job_manager:
+-            thread = threading.Thread(target=self._job_complete_process, args=[fl_ctx])
++            thread = threading.Thread(target=self._job_complete_process, args=[engine])
+             thread.start()
+ 
+             while not self.ask_to_stop:

@@ -1,0 +1,53 @@
+commit 508c7d232d067575ce7ed9ff09eb96bcb21910ac
+Author:     Yuhong Wen <yuhongw@nvidia.com>
+AuthorDate: Thu Mar 2 14:22:30 2023 -0500
+Commit:     GitHub <noreply@github.com>
+CommitDate: Thu Mar 2 14:22:30 2023 -0500
+
+    Fixed the issue job status not updated to exception when controller e… (#1447)
+    
+    * Fixed the issue job status not updated to exception when controller exception.
+    
+    * Added a job_id in runner_process check.
+    
+    * removed comment out codes.
+    
+    ---------
+    
+    Co-authored-by: Chester Chen <512707+chesterxgchen@users.noreply.github.com>
+---
+ nvflare/private/fed/server/server_engine.py | 21 ++++++++++++++-------
+ 1 file changed, 14 insertions(+), 7 deletions(-)
+
+diff --git a/nvflare/private/fed/server/server_engine.py b/nvflare/private/fed/server/server_engine.py
+index 4e308f1e..b4cc716e 100644
+--- a/nvflare/private/fed/server/server_engine.py
++++ b/nvflare/private/fed/server/server_engine.py
+@@ -206,13 +206,20 @@ class ServerEngine(ServerEngineInternalSpec):
+ 
+     def wait_for_complete(self, job_id, process):
+         process.wait()
+-        with self.lock:
+-            if job_id in self.run_processes:
+-                run_process_info = self.run_processes.pop(job_id)
+-                # return_code = run_process_info[RunProcessKey.CHILD_PROCESS].poll()
+-                # # if process exit but with Execution exception
+-                # if return_code and return_code != 0:
+-                #     self.exception_run_processes[job_id] = run_process_info
++        run_process_info = self.run_processes.get(job_id)
++        if run_process_info:
++            process_finished = run_process_info.get(RunProcessKey.PROCESS_FINISHED, False)
++            # Wait for the job process to finish UPDATE_RUN_STATUS process
++            start_time = time.time()
++            while not process_finished:
++                if time.time() - start_time > 5.0:
++                    self.logger.error(f"Job:{job_id} UPDATE_RUN_STATUS didn't finish fast enough.")
++                    break
++                time.sleep(0.1)
++
++            with self.lock:
++                if job_id in self.run_processes:
++                    run_process_info = self.run_processes.pop(job_id)
+         self.engine_info.status = MachineStatus.STOPPED
+ 
+     def _start_runner_process(

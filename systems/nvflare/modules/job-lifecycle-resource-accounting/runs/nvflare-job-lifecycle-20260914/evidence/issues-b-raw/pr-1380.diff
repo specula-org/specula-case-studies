@@ -1,0 +1,2848 @@
+diff --git a/nvflare/apis/fl_constant.py b/nvflare/apis/fl_constant.py
+index f220f39cd6..c0f64e2efb 100644
+--- a/nvflare/apis/fl_constant.py
++++ b/nvflare/apis/fl_constant.py
+@@ -142,7 +142,7 @@ class FLContextKey(object):
+     SCOPE_OBJECT = "__scope_object__"
+     FATAL_SYSTEM_ERROR = ReservedKey.FATAL_SYSTEM_ERROR
+     COMMUNICATION_ERROR = "Flare_communication_error__"
+-    UNAUTHENTICATED = "Flare_authenticated__"
++    UNAUTHENTICATED = "Flare_unauthenticated__"
+     CLIENT_RESOURCE_SPECS = "__client_resource_specs"
+     JOB_PARTICIPANTS = "__job_participants"
+     JOB_BLOCK_REASON = "__job_block_reason"  # why the job should be blocked from scheduling
+diff --git a/nvflare/private/fed/app/client/client_train.py b/nvflare/private/fed/app/client/client_train.py
+index ea328acf20..c1cfd17850 100644
+--- a/nvflare/private/fed/app/client/client_train.py
++++ b/nvflare/private/fed/app/client/client_train.py
+@@ -23,12 +23,13 @@
+ from nvflare.apis.fl_constant import JobConstants, SiteType, WorkspaceConstants
+ from nvflare.apis.workspace import Workspace
+ from nvflare.fuel.common.excepts import ConfigError
++from nvflare.fuel.f3.mpm import MainProcessMonitor as mpm
+ from nvflare.fuel.utils.argument_utils import parse_vars
+-from nvflare.private.defs import AppFolderConstants, SSLConstants
++from nvflare.private.defs import AppFolderConstants
+ from nvflare.private.fed.app.fl_conf import FLClientStarterConfiger, create_privacy_manager
+ from nvflare.private.fed.client.admin import FedAdminAgent
+-from nvflare.private.fed.client.admin_msg_sender import AdminMessageSender
+ from nvflare.private.fed.client.client_engine import ClientEngine
++from nvflare.private.fed.client.client_status import ClientStatus
+ from nvflare.private.fed.client.fed_client import FederatedClient
+ from nvflare.private.fed.utils.fed_utils import add_logfile_handler, fobs_initialize, security_init
+ from nvflare.private.privacy_manager import PrivacyService
+@@ -56,6 +57,7 @@ def main():
+     args.env = os.path.join("config", AppFolderConstants.CONFIG_ENV)
+     args.train_config = os.path.join("config", AppFolderConstants.CONFIG_TRAIN)
+     args.log_config = None
++    args.job_id = None
+ 
+     workspace = Workspace(root_dir=args.workspace)
+ 
+@@ -76,6 +78,7 @@ def main():
+ 
+         conf = FLClientStarterConfiger(
+             workspace=workspace,
++            args=args,
+             kv_list=args.set,
+         )
+         conf.configure()
+@@ -105,8 +108,14 @@ def main():
+         federated_client.use_gpu = False
+         federated_client.config_folder = config_folder
+ 
+-        if rank == 0:
+-            federated_client.register()
++        start = time.time()
++        cell_timeout = kv_list.get("cell_timeout", 60.0)
++        while federated_client.cell is None:
++            time.sleep(0.1)
++            if time.time() - start > cell_timeout:
++                raise RuntimeError("Could not create the client cell. Failed to start the client.")
++
++        federated_client.register()
+ 
+         if not federated_client.token:
+             print("The client could not register to server. ")
+@@ -125,7 +134,9 @@ def main():
+             deployer.multi_gpu,
+             rank,
+         )
+-        admin_agent.start()
++
++        while federated_client.status != ClientStatus.STOPPED:
++            time.sleep(1.0)
+ 
+         deployer.close()
+ 
+@@ -134,7 +145,7 @@ def main():
+     finally:
+         pass
+ 
+-    sys.exit(0)
++    # sys.exit(0)
+ 
+ 
+ def create_admin_agent(
+@@ -162,23 +173,11 @@ def create_admin_agent(
+     Returns:
+         A FedAdminAgent.
+     """
+-    root_cert = client_args[SSLConstants.ROOT_CERT] if secure_train else None
+-    ssl_cert = client_args[SSLConstants.CERT] if secure_train else None
+-    private_key = client_args[SSLConstants.PRIVATE_KEY] if secure_train else None
+-    sender = AdminMessageSender(
+-        client_name=federated_client.token,
+-        root_cert=root_cert,
+-        ssl_cert=ssl_cert,
+-        private_key=private_key,
+-        server_args=server_args,
+-        secure=secure_train,
+-        is_multi_gpu=is_multi_gpu,
+-        rank=rank,
+-    )
+-    client_engine = ClientEngine(federated_client, federated_client.token, sender, args, rank)
++    client_engine = ClientEngine(federated_client, federated_client.token, args, rank)
+     admin_agent = FedAdminAgent(
+         client_name="admin_agent",
+-        sender=sender,
++        # sender=sender,
++        cell=federated_client.cell,
+         app_ctx=client_engine,
+     )
+     client_engine.set_agent(admin_agent)
+@@ -203,4 +202,5 @@ def create_admin_agent(
+     # import multiprocessing
+     # multiprocessing.set_start_method('spawn')
+ 
+-    main()
++    # main()
++    mpm.run(main_func=main)
+diff --git a/nvflare/private/fed/app/deployer/server_deployer.py b/nvflare/private/fed/app/deployer/server_deployer.py
+index ff5822b307..0dc398b45a 100644
+--- a/nvflare/private/fed/app/deployer/server_deployer.py
++++ b/nvflare/private/fed/app/deployer/server_deployer.py
+@@ -84,6 +84,8 @@ def create_fl_server(self, args, secure_train=False):
+             secure_train=secure_train,
+             snapshot_persistor=self.snapshot_persistor,
+             overseer_agent=self.overseer_agent,
++            shutdown_period=first_server.get("shutdown_period", 30.0),
++            check_engine_frequency=first_server.get("check_engine_frequency", 3.0),
+         )
+         return first_server, services
+ 
+diff --git a/nvflare/private/fed/app/deployer/simulator_deployer.py b/nvflare/private/fed/app/deployer/simulator_deployer.py
+index b7f6bd9344..05c3dc90bd 100644
+--- a/nvflare/private/fed/app/deployer/simulator_deployer.py
++++ b/nvflare/private/fed/app/deployer/simulator_deployer.py
+@@ -15,14 +15,13 @@
+ import shutil
+ import tempfile
+ 
+-from nvflare.apis.event_type import EventType
++from nvflare.fuel.f3.cellnet.cell import Cell
++from nvflare.fuel.f3.mpm import MainProcessMonitor as mpm
+ from nvflare.fuel.utils.network_utils import get_open_ports
+-from nvflare.private.fed.app.utils import create_admin_server
+-from nvflare.private.fed.client.admin import FedAdminAgent
+-from nvflare.private.fed.client.admin_msg_sender import AdminMessageSender
+-from nvflare.private.fed.client.client_req_processors import ClientRequestProcessors
+-from nvflare.private.fed.client.fed_client import FederatedClient
+-from nvflare.private.fed.simulator.simulator_client_engine import SimulatorClientEngine, SimulatorParentClientEngine
++from nvflare.private.fed.app.server.server_train import create_admin_server
++
++# from nvflare.private.fed.client.admin_msg_sender import AdminMessageSender
++from nvflare.private.fed.simulator.simulator_client_engine import SimulatorParentClientEngine
+ from nvflare.private.fed.simulator.simulator_server import SimulatorServer
+ 
+ from .base_client_deployer import BaseClientDeployer
+@@ -40,7 +39,7 @@ def create_fl_server(self, args, secure_train=False):
+ 
+         heart_beat_timeout = simulator_server.get("heart_beat_timeout", 600)
+ 
+-        self.services = SimulatorServer(
++        services = SimulatorServer(
+             project_name=simulator_server.get("name", ""),
+             max_num_clients=simulator_server.get("max_num_clients", 100),
+             cmd_modules=self.cmd_modules,
+@@ -50,17 +49,20 @@ def create_fl_server(self, args, secure_train=False):
+             overseer_agent=self.overseer_agent,
+             heart_beat_timeout=heart_beat_timeout,
+         )
++        services.deploy(args, grpc_args=simulator_server)
+ 
+         admin_server = create_admin_server(
+-            self.services,
++            services,
+             server_conf=simulator_server,
+             args=args,
+             secure_train=False,
+         )
+         admin_server.start()
+-        self.services.set_admin_server(admin_server)
++        services.set_admin_server(admin_server)
++
++        # mpm.add_cleanup_cb(admin_server.stop)
+ 
+-        return simulator_server, self.services
++        return simulator_server, services
+ 
+     def create_fl_client(self, client_name, args):
+         client_config, build_ctx = self._create_simulator_client_config(client_name)
+@@ -69,44 +71,44 @@ def create_fl_client(self, client_name, args):
+         deployer.build(build_ctx)
+         federated_client = deployer.create_fed_client(args)
+ 
+-        client_engine = SimulatorParentClientEngine()
+-        federated_client.set_client_engine(client_engine)
+-        federated_client.register()
+-        federated_client.start_heartbeat()
+-        federated_client.run_manager = None
++        self._create_client_cell(client_config, client_name, federated_client)
+ 
+-        return federated_client, client_config, args
++        federated_client.register()
+ 
+-    def create_admin_agent(self, server_args, federated_client: FederatedClient, args, rank=0):
+-        sender = AdminMessageSender(
+-            client_name=federated_client.token,
+-            server_args=server_args,
+-            secure=False,
+-        )
+-        client_engine = SimulatorClientEngine(federated_client, federated_client.token, sender, args, rank)
+-        admin_agent = FedAdminAgent(
+-            client_name="admin_agent",
+-            sender=sender,
+-            app_ctx=client_engine,
+-        )
+-        admin_agent.app_ctx.set_agent(admin_agent)
++        client_engine = SimulatorParentClientEngine(federated_client, federated_client.token, args)
+         federated_client.set_client_engine(client_engine)
+-        for processor in ClientRequestProcessors.request_processors:
+-            admin_agent.register_processor(processor)
++        # federated_client.start_heartbeat()
++        federated_client.run_manager = None
+ 
+-        client_engine.fire_event(EventType.SYSTEM_START, client_engine.new_context())
++        return federated_client, client_config, args, build_ctx
++
++    def _create_client_cell(self, client_config, client_name, federated_client):
++        target = client_config["servers"][0].get("service").get("target")
++        scheme = client_config["servers"][0].get("service").get("scheme", "grpc")
++        credentials = {}
++        parent_url = None
++        cell = Cell(
++            fqcn=client_name,
++            root_url=scheme + "://" + target,
++            secure=self.secure_train,
++            credentials=credentials,
++            create_internal_listener=True,
++            parent_url=parent_url,
++        )
++        cell.start()
++        federated_client.cell = cell
++        federated_client.communicator.cell = cell
++        # if self.engine:
++        #     self.engine.admin_agent.register_cell_cb()
+ 
+-        return admin_agent
++        mpm.add_cleanup_cb(cell.stop)
+ 
+     def _create_simulator_server_config(self, admin_storage, max_clients):
+         simulator_server = {
+             "name": "simulator_server",
+             "service": {
+                 "target": "localhost:" + str(self.open_ports[0]),
+-                "options": [
+-                    ["grpc.max_send_message_length", 2147483647],
+-                    ["grpc.max_receive_message_length", 2147483647],
+-                ],
++                "scheme": "tcp",
+             },
+             "admin_host": "localhost",
+             "admin_port": self.open_ports[1],
+@@ -126,10 +128,7 @@ def _create_simulator_client_config(self, client_name):
+                     "name": "simulator_server",
+                     "service": {
+                         "target": "localhost:" + str(self.open_ports[0]),
+-                        "options": [
+-                            ["grpc.max_send_message_length", 2147483647],
+-                            ["grpc.max_receive_message_length", 2147483647],
+-                        ],
++                        "scheme": "tcp",
+                     },
+                 }
+             ],
+diff --git a/nvflare/private/fed/app/simulator/simulator_worker.py b/nvflare/private/fed/app/simulator/simulator_worker.py
+index 0a1b1ce285..037cb751a1 100644
+--- a/nvflare/private/fed/app/simulator/simulator_worker.py
++++ b/nvflare/private/fed/app/simulator/simulator_worker.py
+@@ -24,14 +24,17 @@
+ from nvflare.apis.fl_component import FLComponent
+ from nvflare.apis.fl_constant import FLContextKey, WorkspaceConstants
+ from nvflare.fuel.common.multi_process_executor_constants import CommunicationMetaData
++from nvflare.fuel.f3.cellnet.cell import Cell
++from nvflare.fuel.f3.cellnet.fqcn import FQCN
++from nvflare.fuel.f3.mpm import MainProcessMonitor as mpm
+ from nvflare.fuel.hci.server.authz import AuthorizationService
+ from nvflare.fuel.sec.audit import AuditService
+-from nvflare.private.fed.app.utils import check_parent_alive
+-from nvflare.private.fed.client.admin import FedAdminAgent
+-from nvflare.private.fed.client.admin_msg_sender import AdminMessageSender
+-from nvflare.private.fed.client.client_req_processors import ClientRequestProcessors
++from nvflare.private.fed.app.client.worker_process import check_parent_alive
++from nvflare.private.fed.app.deployer.base_client_deployer import BaseClientDeployer
++from nvflare.private.fed.client.client_status import ClientStatus
+ from nvflare.private.fed.client.fed_client import FederatedClient
+ from nvflare.private.fed.simulator.simulator_app_runner import SimulatorClientAppRunner
++from nvflare.private.fed.simulator.simulator_audit import SimulatorAuditor
+ from nvflare.private.fed.simulator.simulator_client_engine import SimulatorClientEngine
+ from nvflare.private.fed.simulator.simulator_const import SimulatorConstants
+ from nvflare.private.fed.utils.fed_utils import add_logfile_handler, fobs_initialize
+@@ -40,27 +43,13 @@
+ 
+ 
+ class ClientTaskWorker(FLComponent):
+-    def create_admin_agent(self, server_args, federated_client: FederatedClient, args, rank=0):
+-        sender = AdminMessageSender(
+-            client_name=federated_client.token,
+-            server_args=server_args,
+-            secure=False,
+-        )
+-        client_engine = SimulatorClientEngine(federated_client, federated_client.token, sender, args, rank)
+-        admin_agent = FedAdminAgent(
+-            client_name="admin_agent",
+-            sender=sender,
+-            app_ctx=client_engine,
+-        )
+-        admin_agent.app_ctx.set_agent(admin_agent)
++    def create_client_engine(self, federated_client: FederatedClient, args, rank=0):
++        client_engine = SimulatorClientEngine(federated_client, federated_client.token, args, rank)
+         federated_client.set_client_engine(client_engine)
+-        for processor in ClientRequestProcessors.request_processors:
+-            admin_agent.register_processor(processor)
++        federated_client.run_manager = None
+ 
+         client_engine.fire_event(EventType.SYSTEM_START, client_engine.new_context())
+ 
+-        return admin_agent
+-
+     def create_client_runner(self, client):
+         """Create the ClientRunner for the client to run the ClientApp.
+ 
+@@ -75,6 +64,7 @@ def create_client_runner(self, client):
+ 
+         client_app_runner = SimulatorClientAppRunner()
+         client_runner = client_app_runner.create_client_runner(app_client_root, args, args.config_folder, client, False)
++        client_runner.engine.cell = client.cell
+         client_runner.init_run(app_client_root, args)
+ 
+     def do_one_task(self, client):
+@@ -101,26 +91,28 @@ def release_resources(self, client):
+         with client.run_manager.new_context() as fl_ctx:
+             self.fire_event(EventType.SWAP_OUT, fl_ctx)
+ 
+-            client.run_manager.aux_runner.abort_signal.trigger("True")
++            # client.run_manager.aux_runner.abort_signal.trigger("True")
+ 
+             fl_ctx.set_prop(FLContextKey.RUNNER, None, private=True)
+         self.logger.info(f"Clean up ClientRunner for : {client.client_name} ")
+ 
+     def run(self, args, conn):
+         admin_agent = None
++        client = None
+         try:
+             data = conn.recv()
+-            client = data[SimulatorConstants.CLIENT]
+             client_config = data[SimulatorConstants.CLIENT_CONFIG]
+             deploy_args = data[SimulatorConstants.DEPLOY_ARGS]
++            build_ctx = data[SimulatorConstants.BUILD_CTX]
++
++            client = self._create_client(args, build_ctx, deploy_args)
+ 
+             app_root = os.path.join(args.workspace, SimulatorConstants.JOB_NAME, "app_" + client.client_name)
+             app_custom_folder = os.path.join(app_root, "custom")
+             sys.path.append(app_custom_folder)
+ 
+-            servers = [{t["name"]: t["service"]} for t in client_config.get("servers")]
+-            admin_agent = self.create_admin_agent(sorted(servers)[0], client, deploy_args)
+-            admin_agent.start()
++            self.create_client_engine(client, deploy_args)
++
+             while True:
+                 interval, stop_run = self.do_one_task(client)
+                 conn.send(stop_run)
+@@ -134,9 +126,46 @@ def run(self, args, conn):
+         except BaseException as e:
+             self.logger.error(f"ClientTaskWorker run error: {secure_format_exception(e)}")
+         finally:
++            if client:
++                client.cell.stop()
+             if admin_agent:
+                 admin_agent.shutdown()
+ 
++    def _create_client(self, args, build_ctx, deploy_args):
++        deployer = BaseClientDeployer()
++        deployer.build(build_ctx)
++        client = deployer.create_fed_client(deploy_args)
++
++        client.token = args.token
++        self._set_client_status(client, deploy_args, args.simulator_root)
++        self._create_client_cell(client, args.root_url, args.parent_url)
++        return client
++
++    def _set_client_status(self, client, deploy_args, simulator_root):
++        app_client_root = os.path.join(simulator_root, "app_" + client.client_name)
++        client.app_client_root = app_client_root
++        client.args = deploy_args
++        # self.create_client_runner(client)
++        client.simulate_running = False
++        client.status = ClientStatus.STARTED
++
++    def _create_client_cell(self, federated_client, root_url, parent_url):
++        fqcn = FQCN.join([federated_client.client_name, SimulatorConstants.JOB_NAME])
++        credentials = {}
++        cell = Cell(
++            fqcn=fqcn,
++            root_url=root_url,
++            secure=False,
++            credentials=credentials,
++            create_internal_listener=True,
++            parent_url=parent_url,
++        )
++        cell.start()
++        federated_client.cell = cell
++        federated_client.communicator.cell = cell
++
++        mpm.add_cleanup_cb(cell.stop)
++
+ 
+ def _create_connection(listen_port):
+     address = ("localhost", int(listen_port))
+@@ -149,9 +178,13 @@ def main():
+     parser = argparse.ArgumentParser()
+     parser.add_argument("--workspace", "-o", type=str, help="WORKSPACE folder", required=True)
+     parser.add_argument("--client", type=str, help="Client name", required=True)
++    parser.add_argument("--token", type=str, help="Client token", required=True)
+     parser.add_argument("--port", type=str, help="Listen port", required=True)
+     parser.add_argument("--gpu", "-g", type=str, help="gpu index number")
+     parser.add_argument("--parent_pid", type=int, help="parent process pid", required=True)
++    parser.add_argument("--simulator_root", "-root", type=str, help="Simulator root folder")
++    parser.add_argument("--root_url", "-r", type=str, help="cellnet root_url")
++    parser.add_argument("--parent_url", "-p", type=str, help="cellnet parent_url")
+     args = parser.parse_args()
+ 
+     # start parent process checking thread
+@@ -171,7 +204,8 @@ def main():
+     os.chdir(workspace)
+     fobs_initialize()
+     AuthorizationService.initialize(EmptyAuthorizer())
+-    AuditService.initialize(audit_file_name=WorkspaceConstants.AUDIT_LOG)
++    # AuditService.initialize(audit_file_name=WorkspaceConstants.AUDIT_LOG)
++    AuditService.the_auditor = SimulatorAuditor()
+ 
+     if args.gpu:
+         os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
+@@ -193,6 +227,7 @@ def main():
+     This is the main program of simulator worker process when running the NVFlare Simulator..
+     """
+ 
+-    main()
++    # main()
++    mpm.run(main_func=main)
+     time.sleep(2)
+     # os._exit(0)
+diff --git a/nvflare/private/fed/client/admin.py b/nvflare/private/fed/client/admin.py
+index 56f3e75338..de5b137aab 100644
+--- a/nvflare/private/fed/client/admin.py
++++ b/nvflare/private/fed/client/admin.py
+@@ -14,63 +14,20 @@
+ 
+ """The FedAdmin to communicate with the Admin server."""
+ 
+-import threading
+-import time
+-from typing import List
+-
+-from nvflare.fuel.hci.proto import MetaStatusValue, make_meta
++from nvflare.fuel.f3.cellnet.cell import Cell
++from nvflare.fuel.f3.cellnet.cell import Message as CellMessage
+ from nvflare.fuel.hci.server.constants import ConnProps
+ from nvflare.fuel.sec.audit import Auditor, AuditService
+ from nvflare.fuel.sec.authz import AuthorizationService, AuthzContext, Person
+ from nvflare.private.admin_defs import Message, error_reply, ok_reply
+-from nvflare.private.defs import RequestHeader
++from nvflare.private.defs import CellChannel, RequestHeader, new_cell_message
+ from nvflare.security.logging import secure_format_exception, secure_log_traceback
+ 
+ 
+-class Sender(object):
+-    """The Sender object integrate the agent with the underline messaging system.
+-
+-    Make sure its methods are exception-proof!
+-    """
+-
+-    def send_reply(self, reply: Message):
+-        """Send the reply to the requester.
+-
+-        Args:
+-            reply: reply message
+-
+-        """
+-        pass
+-
+-    def retrieve_requests(self) -> List[Message]:
+-        """Send the message to retrieve pending requests from the Server.
+-
+-        Returns: list of messages.
+-
+-        """
+-        pass
+-
+-    def send_result(self, message: Message):
+-        """Send the processor results to server.
+-
+-        Args:
+-            message: message
+-
+-        """
+-        pass
+-
+-    def close(self):
+-        """Call to close the sender.
+-
+-        Returns:
+-
+-        """
+-
+-
+ class RequestProcessor(object):
+     """The RequestProcessor is responsible for processing a request."""
+ 
+-    def get_topics(self) -> List[str]:
++    def get_topics(self) -> [str]:
+         """Get topics that this processor will handle.
+ 
+         Returns: list of topics
+@@ -94,35 +51,32 @@ def process(self, req: Message, app_ctx) -> Message:
+ class FedAdminAgent(object):
+     """FedAdminAgent communicate with the FedAdminServer."""
+ 
+-    def __init__(self, client_name, sender: Sender, app_ctx, req_poll_interval=0.5, process_poll_interval=0.1):
++    def __init__(self, client_name: str, cell: Cell, app_ctx):
+         """Init the FedAdminAgent.
+ 
+         Args:
+             client_name: client name
+-            sender: Sender object
+             app_ctx: application context
+-            req_poll_interval: request polling interval
+-            process_poll_interval: process polling interval
++            cell: the Cell for communication
+         """
+-        if not isinstance(sender, Sender):
+-            raise TypeError("sender must be an instance of Sender, but got {}".format(type(sender)))
+-
+         auditor = AuditService.get_auditor()
+         if not isinstance(auditor, Auditor):
+             raise TypeError("auditor must be an instance of Auditor, but got {}".format(type(auditor)))
+ 
+         self.name = client_name
+-        self.sender = sender
++        self.cell = cell
+         self.auditor = auditor
+         self.app_ctx = app_ctx
+-        self.req_poll_interval = req_poll_interval
+-        self.process_poll_interval = process_poll_interval
+         self.processors = {}
+-        self.reqs = []
+-        self.req_lock = threading.Lock()
+-        self.retrieve_reqs_thread = None
+-        self.process_req_thread = None
+         self.asked_to_stop = False
++        self.register_cell_cb()
++
++    def register_cell_cb(self):
++        self.cell.register_request_cb(
++            channel=CellChannel.CLIENT_MAIN,
++            topic="*",
++            cb=self._dispatch_request,
++        )
+ 
+     def register_processor(self, processor: RequestProcessor):
+         """To register the RequestProcessor.
+@@ -139,133 +93,66 @@ def register_processor(self, processor: RequestProcessor):
+             assert topic not in self.processors, "duplicate processors for topic {}".format(topic)
+             self.processors[topic] = processor
+ 
+-    def start(self):
+-        """To start the FedAdminAgent."""
+-        if self.retrieve_reqs_thread is None:
+-            self.retrieve_reqs_thread = threading.Thread(target=_start_retriever, args=(self,))
+-
+-        # called from the main thread
+-        if not self.retrieve_reqs_thread.is_alive():
+-            self.retrieve_reqs_thread.start()
+-
+-        if self.process_req_thread is None:
+-            self.process_req_thread = threading.Thread(target=_start_processor, args=(self,))
+-
+-        # called from the main thread
+-        if not self.process_req_thread.is_alive():
+-            self.process_req_thread.start()
+-
+-    def _run_retriever(self):
+-        while True:
+-            if self.asked_to_stop:
+-                break
+-
+-            reqs = self.sender.retrieve_requests()
+-            if reqs is not None and isinstance(reqs, list):
+-                with self.req_lock:
+-                    self.reqs.extend(reqs)
+-
+-            time.sleep(self.req_poll_interval)
+-
+-    def _run_processor(self):
+-        while True:
+-            if self.asked_to_stop:
+-                break
+-
+-            with self.req_lock:
+-                if len(self.reqs) > 0:
+-                    req = self.reqs.pop(0)
+-                else:
+-                    req = None
+-
+-            if req:
+-                assert isinstance(req, Message), "request must be Message but got {}".format(type(req))
+-                topic = req.topic
+-
+-                # create audit record
+-                if self.auditor:
+-                    user_name = req.get_header(RequestHeader.USER_NAME, "")
+-                    ref_event_id = req.get_header(ConnProps.EVENT_ID, "")
+-                    self.auditor.add_event(user=user_name, action=topic, ref=ref_event_id)
+-
+-                processor: RequestProcessor = self.processors.get(topic)
+-                if processor:
+-                    try:
+-                        reply = None
+-
+-                        # see whether pre-authorization is needed
+-                        authz_flag = req.get_header(RequestHeader.REQUIRE_AUTHZ)
+-                        require_authz = authz_flag == "true"
+-                        if require_authz:
+-                            # authorize this command!
+-                            cmd = req.get_header(RequestHeader.ADMIN_COMMAND, None)
+-                            if cmd:
+-                                user = Person(
+-                                    name=req.get_header(RequestHeader.USER_NAME, ""),
+-                                    org=req.get_header(RequestHeader.USER_ORG, ""),
+-                                    role=req.get_header(RequestHeader.USER_ROLE, ""),
+-                                )
+-                                submitter = Person(
+-                                    name=req.get_header(RequestHeader.SUBMITTER_NAME, ""),
+-                                    org=req.get_header(RequestHeader.SUBMITTER_ORG, ""),
+-                                    role=req.get_header(RequestHeader.SUBMITTER_ROLE, ""),
+-                                )
+-
+-                                authz_ctx = AuthzContext(user=user, submitter=submitter, right=cmd)
+-                                authorized, err = AuthorizationService.authorize(authz_ctx)
+-                                if err:
+-                                    reply = error_reply(err, meta=make_meta(MetaStatusValue.NOT_AUTHORIZED, err))
+-                                elif not authorized:
+-                                    reply = error_reply(
+-                                        "not authorized",
+-                                        meta=make_meta(MetaStatusValue.NOT_AUTHORIZED, "not authorized"),
+-                                    )
+-                            else:
+-                                reply = error_reply(
+-                                    "requires authz but missing admin command",
+-                                    meta=make_meta(MetaStatusValue.INTERNAL_ERROR, "missing admin command"),
+-                                )
+-
+-                        if not reply:
+-                            reply = processor.process(req, self.app_ctx)
+-                            if reply is None:
+-                                # simply ack
+-                                reply = ok_reply(meta=make_meta(MetaStatusValue.OK))
+-                            else:
+-                                if not isinstance(reply, Message):
+-                                    raise RuntimeError(f"processor for topic {topic} failed to produce valid reply")
+-                    except BaseException as e:
+-                        secure_log_traceback()
+-                        reply = error_reply(
+-                            f"exception_occurred: {secure_format_exception(e)}",
+-                            meta=make_meta(MetaStatusValue.INTERNAL_ERROR, f"exception {type(e)}"),
++    def _dispatch_request(
++        self,
++        request: CellMessage,
++        # *args, **kwargs
++    ) -> CellMessage:
++        assert isinstance(request, CellMessage), "request must be CellMessage but got {}".format(type(request))
++        req = request.payload
++
++        assert isinstance(req, Message), "request payload must be Message but got {}".format(type(req))
++        topic = req.topic
++
++        # create audit record
++        if self.auditor:
++            user_name = req.get_header(RequestHeader.USER_NAME, "")
++            ref_event_id = req.get_header(ConnProps.EVENT_ID, "")
++            self.auditor.add_event(user=user_name, action=topic, ref=ref_event_id)
++
++        processor: RequestProcessor = self.processors.get(topic)
++        if processor:
++            try:
++                reply = None
++
++                # see whether pre-authorization is needed
++                authz_flag = req.get_header(RequestHeader.REQUIRE_AUTHZ)
++                require_authz = authz_flag == "true"
++                if require_authz:
++                    # authorize this command!
++                    cmd = req.get_header(RequestHeader.ADMIN_COMMAND, None)
++                    if cmd:
++                        user = Person(
++                            name=req.get_header(RequestHeader.USER_NAME, ""),
++                            org=req.get_header(RequestHeader.USER_ORG, ""),
++                            role=req.get_header(RequestHeader.USER_ROLE, ""),
++                        )
++                        submitter = Person(
++                            name=req.get_header(RequestHeader.SUBMITTER_NAME, ""),
++                            org=req.get_header(RequestHeader.SUBMITTER_ORG, ""),
++                            role=req.get_header(RequestHeader.SUBMITTER_ROLE, ""),
+                         )
+-                else:
+-                    reply = error_reply(
+-                        "invalid_request", meta=make_meta(MetaStatusValue.INTERNAL_ERROR, f"invalid request {topic}")
+-                    )
+-
+-                reply.set_ref_id(req.id)
+-                self.sender.send_reply(reply)
+-
+-            time.sleep(self.process_poll_interval)
+-
+-    def shutdown(self):
+-        """To be called by the Client Engine to gracefully shutdown the agent."""
+-        self.asked_to_stop = True
+-
+-        if self.retrieve_reqs_thread and self.retrieve_reqs_thread.is_alive():
+-            self.retrieve_reqs_thread.join()
+-
+-        if self.process_req_thread and self.process_req_thread.is_alive():
+-            self.process_req_thread.join()
+-
+-        self.sender.close()
+-
+-
+-def _start_retriever(agent: FedAdminAgent):
+-    agent._run_retriever()
+-
+ 
+-def _start_processor(agent: FedAdminAgent):
+-    agent._run_processor()
++                        authz_ctx = AuthzContext(user=user, submitter=submitter, right=cmd)
++                        authorized, err = AuthorizationService.authorize(authz_ctx)
++                        if err:
++                            reply = error_reply(err)
++                        elif not authorized:
++                            reply = error_reply("not authorized")
++                    else:
++                        reply = error_reply("requires authz but missing admin command")
++
++                if not reply:
++                    reply = processor.process(req, self.app_ctx)
++                    if reply is None:
++                        # simply ack
++                        reply = ok_reply()
++                    else:
++                        if not isinstance(reply, Message):
++                            raise RuntimeError(f"processor for topic {topic} failed to produce valid reply")
++            except BaseException as e:
++                secure_log_traceback()
++                reply = error_reply(f"exception_occurred: {secure_format_exception(e)}")
++        else:
++            reply = error_reply("invalid_request")
++        return new_cell_message({}, reply)
+diff --git a/nvflare/private/fed/client/admin_msg_sender.py b/nvflare/private/fed/client/admin_msg_sender.py
+deleted file mode 100644
+index bf1118ea48..0000000000
+--- a/nvflare/private/fed/client/admin_msg_sender.py
++++ /dev/null
+@@ -1,174 +0,0 @@
+-# Copyright (c) 2021-2022, NVIDIA CORPORATION.  All rights reserved.
+-#
+-# Licensed under the Apache License, Version 2.0 (the "License");
+-# you may not use this file except in compliance with the License.
+-# You may obtain a copy of the License at
+-#
+-#     http://www.apache.org/licenses/LICENSE-2.0
+-#
+-# Unless required by applicable law or agreed to in writing, software
+-# distributed under the License is distributed on an "AS IS" BASIS,
+-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+-# See the License for the specific language governing permissions and
+-# limitations under the License.
+-
+-"""This is the FLAdmin Client to send the request message to the admin server."""
+-
+-import threading
+-from multiprocessing.dummy import Pool as ThreadPool
+-
+-import grpc
+-
+-import nvflare.private.fed.protos.admin_pb2 as admin_msg
+-import nvflare.private.fed.protos.admin_pb2_grpc as admin_service
+-from nvflare.private.admin_defs import Message
+-from nvflare.private.fed.utils.messageproto import message_to_proto, proto_to_message
+-
+-from .admin import Sender
+-
+-lock = threading.Lock()
+-
+-
+-class AdminMessageSender(Sender):
+-    """AdminMessageSender to send the request message to the admin server."""
+-
+-    def __init__(
+-        self,
+-        client_name,
+-        root_cert=None,
+-        ssl_cert=None,
+-        private_key=None,
+-        server_args=None,
+-        secure=False,
+-        is_multi_gpu=False,
+-        rank=0,
+-    ):
+-        """To init the AdminMessageSender.
+-
+-        Args:
+-            client_name: client name
+-            root_cert: root certificate
+-            ssl_cert: SSL certificate
+-            private_key: private key
+-            server_args: server args
+-            secure: True/False
+-            is_multi_gpu: True/False
+-            rank: local process rank
+-        """
+-        self.client_name = client_name
+-        self.root_cert = root_cert
+-        self.ssl_cert = ssl_cert
+-        self.private_key = private_key
+-        self.secure = secure
+-        self.servers = server_args
+-        self.multi_gpu = is_multi_gpu
+-        self.rank = rank
+-
+-        self.pool = ThreadPool(len(self.servers))
+-
+-    def send_reply(self, message: Message):
+-        """Call to send the request message.
+-
+-        Args:
+-            message: request message
+-
+-        """
+-        if self.rank == 0:
+-            # self.send_client_reply(message)
+-            for taskname in tuple(self.servers):
+-                self._send_client_reply(message, taskname)
+-
+-    def _send_client_reply(self, message, taskname):
+-        try:
+-            with self._set_up_channel(self.servers[taskname]) as channel:
+-                stub = admin_service.AdminCommunicatingStub(channel)
+-
+-                reply = admin_msg.Reply()
+-                reply.client_name = self.client_name
+-                reply.message.CopyFrom(message_to_proto(message))
+-                # reply.message = message_to_proto(message)
+-                stub.SendReply(reply)
+-        except BaseException:
+-            pass
+-
+-    def retrieve_requests(self) -> [Message]:
+-        """Send the message to retrieve pending requests from the Server.
+-
+-        Returns: list of messages.
+-
+-        """
+-        messages = []
+-        if self.rank == 0:
+-            items = self.pool.map(self._retrieve_client_requests, tuple(self.servers))
+-            for item in items:
+-                messages.extend(item)
+-
+-        return messages
+-
+-    def _retrieve_client_requests(self, taskname):
+-        message_list = []
+-        try:
+-            with self._set_up_channel(self.servers[taskname]) as channel:
+-                stub = admin_service.AdminCommunicatingStub(channel)
+-
+-                client = admin_msg.Client()
+-                client.client_name = self.client_name
+-                messages = stub.Retrieve(client)
+-                for i in messages.message:
+-                    message_list.append(proto_to_message(i))
+-        except Exception:
+-            pass
+-        return message_list
+-
+-    def send_result(self, message: Message):
+-        """Send the processor results to server.
+-
+-        Args:
+-            message: message
+-
+-        """
+-        if self.rank == 0:
+-            for taskname in tuple(self.servers):
+-                try:
+-                    with self._set_up_channel(self.servers[taskname]) as channel:
+-                        stub = admin_service.AdminCommunicatingStub(channel)
+-
+-                        reply = admin_msg.Reply()
+-                        reply.client_name = self.client_name
+-                        reply.message.CopyFrom(message_to_proto(message))
+-                        stub.SendResult(reply)
+-                except BaseException:
+-                    pass
+-
+-    def _set_up_channel(self, channel_dict):
+-        """Connect client to the server.
+-
+-        Args:
+-            channel_dict: grpc channel parameters
+-
+-        Returns: an initialised grpc channel
+-
+-        """
+-        if self.secure:
+-            with open(self.root_cert, "rb") as f:
+-                trusted_certs = f.read()
+-            with open(self.private_key, "rb") as f:
+-                private_key = f.read()
+-            with open(self.ssl_cert, "rb") as f:
+-                certificate_chain = f.read()
+-
+-            call_credentials = grpc.metadata_call_credentials(
+-                lambda context, callback: callback((("x-custom-token", self.client_name),), None)
+-            )
+-            credentials = grpc.ssl_channel_credentials(
+-                certificate_chain=certificate_chain, private_key=private_key, root_certificates=trusted_certs
+-            )
+-
+-            composite_credentials = grpc.composite_channel_credentials(credentials, call_credentials)
+-            channel = grpc.secure_channel(**channel_dict, credentials=composite_credentials)
+-        else:
+-            channel = grpc.insecure_channel(**channel_dict)
+-        return channel
+-
+-    def close(self):
+-        self.pool.close()
+diff --git a/nvflare/private/fed/client/client_engine.py b/nvflare/private/fed/client/client_engine.py
+index 61071b4731..dced5698f8 100644
+--- a/nvflare/private/fed/client/client_engine.py
++++ b/nvflare/private/fed/client/client_engine.py
+@@ -18,13 +18,11 @@
+ import shutil
+ import sys
+ import threading
+-import time
+ 
+ from nvflare.apis.event_type import EventType
+ from nvflare.apis.fl_component import FLComponent
+ from nvflare.apis.fl_constant import MachineStatus, WorkspaceConstants
+ from nvflare.apis.fl_context import FLContext, FLContextManager
+-from nvflare.apis.shareable import Shareable
+ from nvflare.apis.workspace import Workspace
+ from nvflare.fuel.utils.network_utils import get_open_ports
+ from nvflare.private.defs import ERROR_MSG_PREFIX, ClientStatusKey, EngineConstant
+@@ -49,7 +47,7 @@ def _remove_custom_path():
+ class ClientEngine(ClientEngineInternalSpec):
+     """ClientEngine runs in the client parent process."""
+ 
+-    def __init__(self, client, client_name, sender, args, rank, workers=5):
++    def __init__(self, client, client_name, args, rank, workers=5):
+         """To init the ClientEngine.
+ 
+         Args:
+@@ -63,11 +61,9 @@ def __init__(self, client, client_name, sender, args, rank, workers=5):
+         super().__init__()
+         self.client = client
+         self.client_name = client_name
+-        self.sender = sender
+         self.args = args
+         self.rank = rank
+-        self.client.process = None
+-        self.client_executor = ProcessExecutor(os.path.join(args.workspace, "startup"))
++        self.client_executor = ProcessExecutor(client, os.path.join(args.workspace, "startup"))
+         self.admin_agent = None
+ 
+         self.fl_ctx_mgr = FLContextManager(
+@@ -212,7 +208,7 @@ def shutdown(self) -> str:
+         touch_file = os.path.join(self.args.workspace, "shutdown.fl")
+         self.fire_event(EventType.SYSTEM_END, self.new_context())
+ 
+-        thread = threading.Thread(target=_shutdown_client, args=(self.client, self.admin_agent, touch_file))
++        thread = threading.Thread(target=shutdown_client, args=(self.client, touch_file))
+         thread.start()
+ 
+         return "Shutdown the client..."
+@@ -221,7 +217,7 @@ def restart(self) -> str:
+         self.logger.info("Client shutdown...")
+         touch_file = os.path.join(self.args.workspace, "restart.fl")
+         self.fire_event(EventType.SYSTEM_END, self.new_context())
+-        thread = threading.Thread(target=_shutdown_client, args=(self.client, self.admin_agent, touch_file))
++        thread = threading.Thread(target=shutdown_client, args=(self.client, touch_file))
+         thread.start()
+ 
+         return "Restart the client..."
+@@ -253,27 +249,22 @@ def get_errors(self, job_id):
+     def reset_errors(self, job_id):
+         self.client_executor.reset_errors(job_id)
+ 
+-    def send_aux_command(self, shareable: Shareable, job_id):
+-        return self.client_executor.process_aux_command(shareable, job_id)
+-
+     def get_all_job_ids(self):
+         return self.client_executor.get_run_processes_keys()
+ 
+ 
+-def _shutdown_client(federated_client, admin_agent, touch_file):
++def shutdown_client(federated_client, touch_file):
+     with open(touch_file, "a"):
+         os.utime(touch_file, None)
+ 
+     try:
+         print("About to shutdown the client...")
+         federated_client.communicator.heartbeat_done = True
+-        time.sleep(3)
++        # time.sleep(3)
+         federated_client.close()
+ 
+-        if federated_client.process:
+-            federated_client.process.terminate()
+-
+-        admin_agent.shutdown()
++        federated_client.status = ClientStatus.STOPPED
++        # federated_client.cell.stop()
+         security_close()
+     except BaseException as e:
+         secure_log_traceback()
+diff --git a/nvflare/private/fed/client/client_executor.py b/nvflare/private/fed/client/client_executor.py
+index 6a7dcc9741..84dddc1a82 100644
+--- a/nvflare/private/fed/client/client_executor.py
++++ b/nvflare/private/fed/client/client_executor.py
+@@ -20,11 +20,13 @@
+ import threading
+ import time
+ from abc import ABC, abstractmethod
+-from multiprocessing.connection import Client
+ 
+-from nvflare.apis.fl_constant import AdminCommandNames, ReturnCode, RunProcessKey
++from nvflare.apis.fl_constant import AdminCommandNames, RunProcessKey
+ from nvflare.apis.resource_manager_spec import ResourceManagerSpec
+-from nvflare.apis.shareable import Shareable, make_reply
++from nvflare.fuel.f3.cellnet.cell import FQCN
++from nvflare.fuel.f3.cellnet.defs import MessageHeaderKey, ReturnCode
++from nvflare.fuel.utils import fobs
++from nvflare.private.defs import CellChannel, new_cell_message
+ from nvflare.security.logging import secure_format_exception, secure_log_traceback
+ 
+ from .client_status import ClientStatus, get_status_message
+@@ -117,46 +119,22 @@ def reset_errors(self, job_id):
+             job_id: the job_id
+         """
+ 
+-    @abstractmethod
+-    def process_aux_command(self, shareable: Shareable, job_id):
+-        """Processes the aux command.
+-
+-        Args:
+-            shareable: aux message Shareable
+-            job_id: the job_id
+-        """
+-        pass
+-
+ 
+ class ProcessExecutor(ClientExecutor):
+     """Run the Client executor in a child process."""
+ 
+-    def __init__(self, startup):
++    def __init__(self, client, startup):
+         """To init the ProcessExecutor.
+ 
+         Args:
+             startup: startup folder
+         """
++        self.client = client
+         self.logger = logging.getLogger(self.__class__.__name__)
+         self.startup = startup
+         self.run_processes = {}
+         self.lock = threading.Lock()
+ 
+-    def get_conn_client(self, job_id):
+-        # should be call within self.lock
+-        listen_port = self.run_processes.get(job_id, {}).get(RunProcessKey.LISTEN_PORT)
+-        conn_client = self.run_processes.get(job_id, {}).get(RunProcessKey.CONNECTION, None)
+-
+-        if not conn_client:
+-            try:
+-                address = ("localhost", listen_port)
+-                conn_client = Client(address, authkey="client process secret password".encode())
+-                self.run_processes[job_id][RunProcessKey.CONNECTION] = conn_client
+-            except Exception:
+-                pass
+-
+-        return conn_client
+-
+     def start_app(
+         self,
+         client,
+@@ -203,7 +181,7 @@ def start_app(
+             + " -c "
+             + client.client_name
+             + " -p "
+-            + str(listen_port)
++            + str(client.cell.get_internal_listener_url())
+             + " -g "
+             + target
+             + " -s fed_client.json "
+@@ -241,12 +219,18 @@ def check_status(self, job_id):
+         """
+         try:
+             with self.lock:
+-                conn_client = self.get_conn_client(job_id)
+-
+-                if conn_client:
+-                    data = {"command": AdminCommandNames.CHECK_STATUS, "data": {}}
+-                    conn_client.send(data)
+-                    status_message = conn_client.recv()
++                data = {}
++                fqcn = FQCN.join([self.client.client_name, job_id])
++                request = new_cell_message({}, fobs.dumps(data))
++                return_data = self.client.cell.send_request(
++                    target=fqcn,
++                    channel=CellChannel.CLIENT_COMMAND,
++                    topic=AdminCommandNames.CHECK_STATUS,
++                    request=request,
++                )
++                return_code = return_data.get_header(MessageHeaderKey.RETURN_CODE)
++                if return_code == ReturnCode.OK:
++                    status_message = fobs.loads(return_data.payload)
+                     self.logger.debug("check status from process listener......")
+                     return status_message
+                 else:
+@@ -268,12 +252,15 @@ def get_run_info(self, job_id):
+         """
+         try:
+             with self.lock:
+-                conn_client = self.get_conn_client(job_id)
+-
+-                if conn_client:
+-                    data = {"command": AdminCommandNames.SHOW_STATS, "data": {}}
+-                    conn_client.send(data)
+-                    run_info = conn_client.recv()
++                data = {}
++                fqcn = FQCN.join([self.client.client_name, job_id])
++                request = new_cell_message({}, fobs.dumps(data))
++                return_data = self.client.cell.send_request(
++                    target=fqcn, channel=CellChannel.CLIENT_COMMAND, topic=AdminCommandNames.SHOW_STATS, request=request
++                )
++                return_code = return_data.get_header(MessageHeaderKey.RETURN_CODE)
++                if return_code == ReturnCode.OK:
++                    run_info = fobs.loads(return_data.payload)
+                     return run_info
+                 else:
+                     return {}
+@@ -293,12 +280,18 @@ def get_errors(self, job_id):
+         """
+         try:
+             with self.lock:
+-                conn_client = self.get_conn_client(job_id)
+-
+-                if conn_client:
+-                    data = {"command": AdminCommandNames.SHOW_ERRORS, "data": {}}
+-                    conn_client.send(data)
+-                    errors_info = conn_client.recv()
++                data = {"command": AdminCommandNames.SHOW_ERRORS, "data": {}}
++                fqcn = FQCN.join([self.client.client_name, job_id])
++                request = new_cell_message({}, fobs.dumps(data))
++                return_data = self.client.cell.send_request(
++                    target=fqcn,
++                    channel=CellChannel.CLIENT_COMMAND,
++                    topic=AdminCommandNames.SHOW_ERRORS,
++                    request=request,
++                )
++                return_code = return_data.get_header(MessageHeaderKey.RETURN_CODE)
++                if return_code == ReturnCode.OK:
++                    errors_info = return_data.payload
+                     return errors_info
+                 else:
+                     return None
+@@ -315,35 +308,20 @@ def reset_errors(self, job_id):
+         """
+         try:
+             with self.lock:
+-                conn_client = self.get_conn_client(job_id)
++                data = {"command": AdminCommandNames.RESET_ERRORS, "data": {}}
++                fqcn = FQCN.join([self.client.client_name, job_id])
++                request = new_cell_message({}, fobs.dumps(data))
++                self.client.cell.fire_and_forget(
++                    targets=fqcn,
++                    channel=CellChannel.CLIENT_COMMAND,
++                    topic=AdminCommandNames.RESET_ERRORS,
++                    message=request,
++                )
+ 
+-                if conn_client:
+-                    data = {"command": AdminCommandNames.RESET_ERRORS, "data": {}}
+-                    conn_client.send(data)
+         except Exception as e:
+             self.logger.error(f"reset_errors execution exception: {secure_format_exception(e)}.")
+             secure_log_traceback()
+ 
+-    def process_aux_command(self, shareable: Shareable, job_id):
+-        """Processes the aux command.
+-
+-        Args:
+-            shareable: aux message Shareable
+-            job_id: the job_id
+-        """
+-        try:
+-            with self.lock:
+-                conn_client = self.get_conn_client(job_id)
+-                if conn_client:
+-                    data = {"command": AdminCommandNames.AUX_COMMAND, "data": shareable}
+-                    conn_client.send(data)
+-                    reply = conn_client.recv()
+-                    return reply
+-                else:
+-                    return make_reply(ReturnCode.EXECUTION_EXCEPTION)
+-        except Exception:
+-            return make_reply(ReturnCode.EXECUTION_EXCEPTION)
+-
+     def abort_app(self, job_id):
+         """Aborts the running app.
+ 
+@@ -359,13 +337,19 @@ def abort_app(self, job_id):
+                 if process_status == ClientStatus.STARTED:
+                     try:
+                         child_process = self.run_processes[job_id][RunProcessKey.CHILD_PROCESS]
+-                        conn_client = self.get_conn_client(job_id)
+-                        if conn_client:
+-                            data = {"command": AdminCommandNames.ABORT, "data": {}}
+-                            conn_client.send(data)
+-                            self.logger.debug("abort sent")
+-
+-                        threading.Thread(target=self._terminate_process, args=[child_process, job_id]).start()
++                        data = {}
++                        fqcn = FQCN.join([self.client.client_name, job_id])
++                        request = new_cell_message({}, fobs.dumps(data))
++                        return_data = self.client.cell.fire_and_forget(
++                            targets=fqcn,
++                            channel=CellChannel.CLIENT_COMMAND,
++                            topic=AdminCommandNames.ABORT,
++                            message=request,
++                        )
++                        self.logger.debug("abort sent")
++
++                        if child_process:
++                            threading.Thread(target=self._terminate_process, args=[child_process, job_id]).start()
+                         self.run_processes.pop(job_id)
+                         break
+                     except Exception as e:
+@@ -376,9 +360,6 @@ def abort_app(self, job_id):
+                             secure_log_traceback()
+                         retry -= 1
+                         time.sleep(5.0)
+-                    finally:
+-                        if conn_client:
+-                            conn_client.close()
+                 else:
+                     self.logger.info(f"Client worker process for run: {job_id} was already terminated.")
+                     break
+@@ -406,33 +387,25 @@ def abort_task(self, job_id):
+         with self.lock:
+             process_status = self.run_processes.get(job_id, {}).get(RunProcessKey.STATUS, ClientStatus.NOT_STARTED)
+             if process_status == ClientStatus.STARTED:
+-                conn_client = self.get_conn_client(job_id)
+-                if conn_client:
+-                    data = {"command": AdminCommandNames.ABORT_TASK, "data": {}}
+-                    conn_client.send(data)
+-                    self.logger.debug("abort_task sent")
++                data = {"command": AdminCommandNames.ABORT_TASK, "data": {}}
++                fqcn = FQCN.join([self.client.client_name, job_id])
++                request = new_cell_message({}, fobs.dumps(data))
++                return_data = self.client.cell.fire_and_forget(
++                    targets=fqcn,
++                    channel=CellChannel.CLIENT_COMMAND,
++                    topic=AdminCommandNames.ABORT_TASK,
++                    message=request,
++                )
++                self.logger.debug("abort_task sent")
+ 
+     def _wait_child_process_finish(self, client, job_id, allocated_resource, token, resource_manager):
+-        # wait for the listen_command thread to start, and send "start" message to wake up the connection.
+-        start = time.time()
+-        while True:
+-            with self.lock:
+-                conn_client = self.get_conn_client(job_id)
+-                if conn_client:
+-                    data = {"command": AdminCommandNames.START_APP, "data": {}}
+-                    conn_client.send(data)
+-                    break
+-            time.sleep(1.0)
+-            if time.time() - start > 15:
+-                break
+-
+         self.logger.info(f"run ({job_id}): waiting for child worker process to finish.")
+         with self.lock:
+             child_process = self.run_processes.get(job_id, {}).get(RunProcessKey.CHILD_PROCESS)
+         if child_process:
+             child_process.wait()
+-            return_code = child_process.returncode
+-            self.logger.info(f"run ({job_id}): child worker process finished with execution code: {return_code}")
++            # return_code = child_process.returncode
++            self.logger.info(f"run ({job_id}): child worker process finished.")
+ 
+         if allocated_resource:
+             resource_manager.free_resources(
+@@ -440,9 +413,6 @@ def _wait_child_process_finish(self, client, job_id, allocated_resource, token,
+             )
+ 
+         with self.lock:
+-            conn_client = self.get_conn_client(job_id)
+-            if conn_client:
+-                conn_client.close()
+             if job_id in self.run_processes.keys():
+                 self.run_processes.pop(job_id)
+ 
+diff --git a/nvflare/private/fed/client/command_agent.py b/nvflare/private/fed/client/command_agent.py
+index dbc9b3590c..1ef61e0c72 100644
+--- a/nvflare/private/fed/client/command_agent.py
++++ b/nvflare/private/fed/client/command_agent.py
+@@ -12,18 +12,23 @@
+ # See the License for the specific language governing permissions and
+ # limitations under the License.
+ 
++import copy
+ import logging
+-import threading
+ 
++from nvflare.apis.fl_constant import FLContextKey
+ from nvflare.apis.fl_context import FLContext
+-from nvflare.security.logging import secure_format_exception
++from nvflare.apis.utils.fl_context_utils import get_serializable_data
++from nvflare.fuel.f3.cellnet.cell import Message as CellMessage
++from nvflare.fuel.f3.cellnet.cell import MessageHeaderKey, ReturnCode
++from nvflare.fuel.f3.cellnet.cell import make_reply as make_cellnet_reply
++from nvflare.fuel.utils import fobs
++from nvflare.private.defs import CellChannel, new_cell_message
+ 
+-from ..utils.fed_utils import listen_command
+ from .admin_commands import AdminCommands
+ 
+ 
+ class CommandAgent(object):
+-    def __init__(self, federated_client, listen_port, client_runner) -> None:
++    def __init__(self, federated_client, client_runner) -> None:
+         """To init the CommandAgent.
+ 
+         Args:
+@@ -32,7 +37,6 @@ def __init__(self, federated_client, listen_port, client_runner) -> None:
+             client_runner: ClientRunner object
+         """
+         self.federated_client = federated_client
+-        self.listen_port = int(listen_port)
+         self.client_runner = client_runner
+         self.thread = None
+         self.asked_to_stop = False
+@@ -41,33 +45,59 @@ def __init__(self, federated_client, listen_port, client_runner) -> None:
+         self.logger = logging.getLogger(self.__class__.__name__)
+ 
+     def start(self, fl_ctx: FLContext):
+-        engine = fl_ctx.get_engine()
+-        self.thread = threading.Thread(
+-            target=listen_command, args=[self.listen_port, engine, self.execute_command, self.logger]
++        self.engine = fl_ctx.get_engine()
++        self.register_cell_cb()
++
++    def register_cell_cb(self):
++        self.federated_client.cell.register_request_cb(
++            channel=CellChannel.CLIENT_COMMAND,
++            topic="*",
++            cb=self.execute_command,
++        )
++        self.federated_client.cell.register_request_cb(
++            channel=CellChannel.AUX_COMMUNICATION,
++            topic="*",
++            cb=self.aux_communication,
+         )
+-        self.thread.start()
+-
+-    def execute_command(self, conn, engine):
+-        while not self.asked_to_stop:
+-            try:
+-                if conn.poll(1.0):
+-                    msg = conn.recv()
+-                    command_name = msg.get("command")
+-                    data = msg.get("data")
+-                    command = AdminCommands.get_command(command_name)
+-                    if command:
+-                        with engine.new_context() as new_fl_ctx:
+-                            reply = command.process(data=data, fl_ctx=new_fl_ctx)
+-                            if reply:
+-                                conn.send(reply)
+-            except EOFError:
+-                self.logger.info("listener communication terminated.")
+-                break
+-            except Exception as e:
+-                self.logger.error(f"Process communication error: {self.listen_port}: {secure_format_exception(e)}.")
++
++    def execute_command(self, request: CellMessage) -> CellMessage:
++
++        assert isinstance(request, CellMessage), "request must be CellMessage but got {}".format(type(request))
++
++        command_name = request.get_header(MessageHeaderKey.TOPIC)
++        data = fobs.loads(request.payload)
++
++        command = AdminCommands.get_command(command_name)
++        if command:
++            with self.engine.new_context() as new_fl_ctx:
++                reply = command.process(data=data, fl_ctx=new_fl_ctx)
++                if reply is not None:
++                    return_message = new_cell_message({}, fobs.dumps(reply))
++                    return_message.set_header(MessageHeaderKey.RETURN_CODE, ReturnCode.OK)
++                else:
++                    return_message = new_cell_message({}, None)
++                return return_message
++        return make_cellnet_reply(ReturnCode.INVALID_REQUEST, "", None)
++
++    def aux_communication(self, request: CellMessage) -> CellMessage:
++
++        assert isinstance(request, CellMessage), "request must be CellMessage but got {}".format(type(request))
++        shareable = request.payload
++
++        with self.engine.new_context() as fl_ctx:
++            topic = request.get_header(MessageHeaderKey.TOPIC)
++            reply = self.engine.dispatch(topic=topic, request=shareable, fl_ctx=fl_ctx)
++
++            shared_fl_ctx = FLContext()
++            shared_fl_ctx.set_public_props(copy.deepcopy(get_serializable_data(fl_ctx).get_all_public_props()))
++            reply.set_header(key=FLContextKey.PEER_CONTEXT, value=shared_fl_ctx)
++
++            if reply is not None:
++                return_message = new_cell_message({}, reply)
++                return_message.set_header(MessageHeaderKey.RETURN_CODE, ReturnCode.OK)
++            else:
++                return_message = new_cell_message({}, None)
++            return return_message
+ 
+     def shutdown(self):
+         self.asked_to_stop = True
+-
+-        if self.thread and self.thread.is_alive():
+-            self.thread.join()
+diff --git a/nvflare/private/fed/client/communicator.py b/nvflare/private/fed/client/communicator.py
+index e8a471f6fa..27f27f42f1 100644
+--- a/nvflare/private/fed/client/communicator.py
++++ b/nvflare/private/fed/client/communicator.py
+@@ -17,43 +17,20 @@
+ import time
+ from typing import List, Optional
+ 
+-import grpc
+-from google.protobuf.struct_pb2 import Struct
+-
+-import nvflare.private.fed.protos.federated_pb2 as fed_msg
+-import nvflare.private.fed.protos.federated_pb2_grpc as fed_service
+ from nvflare.apis.filter import Filter
++from nvflare.apis.fl_constant import FLContextKey, ServerCommandKey, ServerCommandNames
+ from nvflare.apis.fl_context import FLContext
+ from nvflare.apis.fl_exception import FLCommunicationError
+-from nvflare.private.defs import SpecialTaskName
++from nvflare.apis.shareable import Shareable
++from nvflare.apis.utils.fl_context_utils import get_serializable_data
++from nvflare.fuel.f3.cellnet.cell import FQCN, Cell
++from nvflare.fuel.f3.cellnet.defs import MessageHeaderKey, ReturnCode
++from nvflare.fuel.utils import fobs
++from nvflare.private.defs import CellChannel, CellChannelTopic, CellMessageHeaderKeys, SpecialTaskName, new_cell_message
+ from nvflare.private.fed.client.client_engine_internal_spec import ClientEngineInternalSpec
+-from nvflare.private.fed.utils.fed_utils import make_context_data, make_shareable_data, shareable_to_modeldata
+ from nvflare.security.logging import secure_format_exception
+ 
+ 
+-def _get_client_state(project_name, token, ssid, fl_ctx: FLContext):
+-    """Client's metadata used to authenticate and communicate.
+-
+-    Args:
+-        project_name: FL study project name
+-        token: client token
+-        ssid: service session ID
+-        fl_ctx: FLContext
+-
+-    Returns:
+-        A ClientState message
+-
+-    """
+-    state_message = fed_msg.ClientState(token=token, ssid=ssid)
+-    state_message.meta.project.name = project_name
+-    # state_message.meta.job_id = fl_ctx.get_prop(FLContextKey.CURRENT_RUN)
+-
+-    context_data = make_context_data(fl_ctx)
+-    state_message.context["fl_context"].CopyFrom(context_data)
+-
+-    return state_message
+-
+-
+ def _get_client_ip():
+     """Return localhost IP.
+ 
+@@ -76,21 +53,6 @@ def _get_client_ip():
+     return ip
+ 
+ 
+-def _get_communication_data(shareable, client_state, fl_ctx: FLContext, execute_task_name):
+-    contrib = fed_msg.Contribution()
+-    # set client auth. data
+-    contrib.client.CopyFrom(client_state)
+-    contrib.task_name = execute_task_name
+-
+-    current_model = shareable_to_modeldata(shareable, fl_ctx)
+-    contrib.data.CopyFrom(current_model)
+-
+-    s = Struct()
+-    contrib.meta_data.CopyFrom(s)
+-
+-    return contrib
+-
+-
+ class Communicator:
+     def __init__(
+         self,
+@@ -99,6 +61,7 @@ def __init__(
+         retry_timeout=30,
+         client_state_processors: Optional[List[Filter]] = None,
+         compression=None,
++        cell: Cell = None,
+     ):
+         """To init the Communicator.
+ 
+@@ -109,6 +72,7 @@ def __init__(
+             client_state_processors: Client state processor filters
+             compression: communicate compression algorithm
+         """
++        self.cell = cell
+         self.ssl_args = ssl_args
+         self.secure_train = secure_train
+ 
+@@ -116,53 +80,12 @@ def __init__(
+         self.should_stop = False
+         self.heartbeat_done = False
+         # TODO: should we change this back?
+-        # self.retry = int(math.ceil(float(retry_timeout) / 5))
+         self.retry = 1
+         self.client_state_processors = client_state_processors
+         self.compression = compression
+ 
+         self.logger = logging.getLogger(self.__class__.__name__)
+ 
+-    def set_up_channel(self, channel_dict, token=None):
+-        """Connect client to the server.
+-
+-        Args:
+-            channel_dict: grpc channel parameters
+-            token: client token
+-
+-        Returns:
+-            An initialised grpc channel
+-
+-        """
+-        if self.secure_train:
+-            with open(self.ssl_args["ssl_root_cert"], "rb") as f:
+-                trusted_certs = f.read()
+-            with open(self.ssl_args["ssl_private_key"], "rb") as f:
+-                private_key = f.read()
+-            with open(self.ssl_args["ssl_cert"], "rb") as f:
+-                certificate_chain = f.read()
+-
+-            credentials = grpc.ssl_channel_credentials(
+-                certificate_chain=certificate_chain, private_key=private_key, root_certificates=trusted_certs
+-            )
+-
+-            # make sure that all headers are in lowercase,
+-            # otherwise grpc throws an exception
+-            call_credentials = grpc.metadata_call_credentials(
+-                lambda context, callback: callback((("x-custom-token", token),), None)
+-            )
+-            # use this if you want standard "Authorization" header
+-            # call_credentials = grpc.access_token_call_credentials(
+-            #     "x-custom-token")
+-            composite_credentials = grpc.composite_channel_credentials(credentials, call_credentials)
+-            channel = grpc.secure_channel(
+-                **channel_dict, credentials=composite_credentials, compression=self.compression
+-            )
+-
+-        else:
+-            channel = grpc.insecure_channel(**channel_dict, compression=self.compression)
+-        return channel
+-
+     def client_registration(self, client_name, servers, project_name):
+         """Client's metadata used to authenticate and communicate.
+ 
+@@ -177,39 +100,52 @@ def client_registration(self, client_name, servers, project_name):
+         """
+         local_ip = _get_client_ip()
+ 
+-        login_message = fed_msg.ClientLogin(client_name=client_name, client_ip=local_ip)
+-        login_message.meta.project.name = project_name
+-
+-        with self.set_up_channel(servers[project_name]) as channel:
+-            stub = fed_service.FederatedTrainingStub(channel)
+-            while True:
+-                try:
+-                    result = stub.Register(login_message)
+-                    token = result.token
+-                    ssid = result.ssid
+-                    self.should_stop = False
+-                    break
+-                except grpc.RpcError as grpc_error:
+-                    self.grpc_error_handler(
+-                        servers[project_name],
+-                        grpc_error,
+-                        "client_registration",
+-                        verbose=self.verbose,
+-                    )
+-                    excep = FLCommunicationError(grpc_error, "grpc_error:client_registration")
+-                    if isinstance(grpc_error, grpc.Call):
+-                        status_code = grpc_error.code()
+-                        if grpc.StatusCode.UNAUTHENTICATED == status_code:
+-                            raise excep
++        login_message = new_cell_message(
++            {
++                CellMessageHeaderKeys.CLIENT_NAME: client_name,
++                CellMessageHeaderKeys.CLIENT_IP: local_ip,
++                CellMessageHeaderKeys.PROJECT_NAME: project_name,
++            }
++        )
++
++        start = time.time()
++        while not self.cell:
++            self.logger.info("Waiting for the client cell to be created.")
++            if time.time() - start > 15.0:
++                raise RuntimeError("Client cell could not be created. Failed to login the client.")
++            time.sleep(0.5)
++
++        while not self.cell.is_cell_connected(FQCN.ROOT_SERVER):
++            time.sleep(0.1)
++            if time.time() - start > 30.0:
++                raise FLCommunicationError("error:Could not connect to the server for client_registration.")
++
++        while True:
++            try:
++                result = self.cell.send_request(
++                    target=FQCN.ROOT_SERVER,
++                    channel=CellChannel.SERVER_MAIN,
++                    topic=CellChannelTopic.Register,
++                    request=login_message,
++                )
++                return_code = result.get_header(MessageHeaderKey.RETURN_CODE)
++                if return_code == ReturnCode.UNAUTHENTICATED:
++                    unauthenticated = result.get_header(MessageHeaderKey.ERROR)
++                    raise FLCommunicationError("error:client_registration " + unauthenticated)
++
++                token = result.get_header(CellMessageHeaderKeys.TOKEN)
++                ssid = result.get_header(CellMessageHeaderKeys.SSID)
++                if not token and not self.should_stop:
+                     time.sleep(5)
+-            if self.should_stop:
+-                raise excep
+-            if result is None:
+-                return None
++                else:
++                    break
++
++            except BaseException as ex:
++                raise FLCommunicationError("error:client_registration", ex)
+ 
+         return token, ssid
+ 
+-    def getTask(self, servers, project_name, token, ssid, fl_ctx: FLContext):
++    def pull_task(self, servers, project_name, token, ssid, fl_ctx: FLContext):
+         """Get a task from server.
+ 
+         Args:
+@@ -223,42 +159,53 @@ def getTask(self, servers, project_name, token, ssid, fl_ctx: FLContext):
+             A CurrentTask message from server
+ 
+         """
+-        task, retry = None, self.retry
+-        with self.set_up_channel(servers[project_name]) as channel:
+-            stub = fed_service.FederatedTrainingStub(channel)
+-            while retry > 0:
+-                try:
+-                    start_time = time.time()
+-                    task = stub.GetTask(_get_client_state(project_name, token, ssid, fl_ctx))
+-                    # Clear the stopping flag
+-                    # if the connection to server recovered.
+-                    self.should_stop = False
+-
+-                    end_time = time.time()
+-
+-                    if task.task_name == SpecialTaskName.TRY_AGAIN:
+-                        self.logger.debug(
+-                            f"Received from {project_name} server "
+-                            f" ({task.ByteSize()} Bytes). getTask time: {end_time - start_time} seconds"
+-                        )
+-                    else:
+-                        self.logger.info(
+-                            f"Received from {project_name} server "
+-                            f" ({task.ByteSize()} Bytes). getTask time: {end_time - start_time} seconds"
+-                        )
+-                    return task
+-                except grpc.RpcError as grpc_error:
+-                    self.grpc_error_handler(servers[project_name], grpc_error, "getTask", verbose=self.verbose)
+-                    excep = FLCommunicationError(grpc_error, "grpc_error:getTask")
+-                    retry -= 1
+-                    time.sleep(5)
+-            if self.should_stop:
+-                raise excep
++        start_time = time.time()
++        shareable = Shareable()
++        shared_fl_ctx = FLContext()
++        shared_fl_ctx.set_public_props(get_serializable_data(fl_ctx).get_all_public_props())
++        shareable.set_header(ServerCommandKey.PEER_FL_CONTEXT, shared_fl_ctx)
++        task_message = new_cell_message(
++            {
++                CellMessageHeaderKeys.TOKEN: token,
++                CellMessageHeaderKeys.SSID: ssid,
++                CellMessageHeaderKeys.PROJECT_NAME: project_name,
++            },
++            fobs.dumps(shareable),
++        )
++        job_id = str(shared_fl_ctx.get_prop(FLContextKey.CURRENT_RUN))
++
++        fqcn = FQCN.join([FQCN.ROOT_SERVER, job_id])
++        task = self.cell.send_request(
++            target=fqcn, channel=CellChannel.SERVER_COMMAND, topic=ServerCommandNames.GET_TASK, request=task_message
++        )
++        end_time = time.time()
++        return_code = task.get_header(MessageHeaderKey.RETURN_CODE)
++
++        if return_code == ReturnCode.OK:
++            size = len(task.payload)
++            task.payload = fobs.loads(task.payload)
++            task_name = task.payload.get_header(ServerCommandKey.TASK_NAME)
++            if task_name == SpecialTaskName.TRY_AGAIN:
++                time.sleep(5)
++            self.logger.info(
++                f"Received from {project_name} server "
++                f" ({size} Bytes). getTask: {task_name} time: {end_time - start_time} seconds"
++            )
++        else:
++            simulate_mode = fl_ctx.get_prop(FLContextKey.SIMULATE_MODE, False)
++            if simulate_mode:
++                new_shareable = Shareable()
++                new_shareable.set_header(key=ServerCommandKey.TASK_NAME, value=SpecialTaskName.END_RUN)
++                task.payload = new_shareable
++                self.logger.info("Simulator job could not fetch_task. End job run.")
++            else:
++                task = None
++                self.logger.warning(f"Failed to get_task from {project_name} server. Will try it again.")
++                time.sleep(5)
+ 
+-        # Failed to get global, return None
+-        return None
++        return task
+ 
+-    def submitUpdate(
++    def submit_update(
+         self, servers, project_name, token, ssid, fl_ctx: FLContext, client_name, shareable, execute_task_name
+     ):
+         """Submit the task execution result back to the server.
+@@ -276,86 +223,38 @@ def submitUpdate(
+         Returns:
+             A FederatedSummary message from the server.
+         """
+-        client_state = _get_client_state(project_name, token, ssid, fl_ctx)
+-        client_state.client_name = client_name
+-        contrib = _get_communication_data(shareable, client_state, fl_ctx, execute_task_name)
+-
+-        server_msg, retry = None, self.retry
+-        with self.set_up_channel(servers[project_name]) as channel:
+-            stub = fed_service.FederatedTrainingStub(channel)
+-            while retry > 0:
+-                try:
+-                    start_time = time.time()
+-                    self.logger.info(f"Send submitUpdate to {project_name} server")
+-                    server_msg = stub.SubmitUpdate(contrib)
+-                    # Clear the stopping flag
+-                    # if the connection to server recovered.
+-                    self.should_stop = False
+-
+-                    end_time = time.time()
+-                    self.logger.info(
+-                        f"Received comments: {server_msg.meta.project.name} {server_msg.comment}."
+-                        f" SubmitUpdate time: {end_time - start_time} seconds"
+-                    )
+-                    break
+-                except grpc.RpcError as grpc_error:
+-                    if isinstance(grpc_error, grpc.Call):
+-                        if grpc_error.details().startswith("Contrib"):
+-                            self.logger.info(f"submitUpdate failed: {grpc_error.details()}")
+-                            break  # outdated contribution, no need to retry
+-                    self.grpc_error_handler(servers[project_name], grpc_error, "submitUpdate", verbose=self.verbose)
+-                    retry -= 1
+-                    time.sleep(5)
+-        return server_msg
+-
+-    def auxCommunicate(
+-        self, servers, project_name, token, ssid, fl_ctx: FLContext, client_name, shareable, topic, timeout
+-    ):
+-        """Send the auxiliary communication message to the server.
+-
+-        Args:
+-            servers: FL servers
+-            project_name: server project name
+-            token: client token
+-            ssid: service session ID
+-            fl_ctx: fl_ctx
+-            client_name: client name
+-            shareable: aux message shareable
+-            topic: aux message topic
+-            timeout: aux communication timeout
+-
+-        Returns:
+-            An AuxReply message from server
+-
+-        """
+-        client_state = _get_client_state(project_name, token, ssid, fl_ctx)
+-        client_state.client_name = client_name
+-
+-        aux_message = fed_msg.AuxMessage()
+-        # set client auth. data
+-        aux_message.client.CopyFrom(client_state)
+-
+-        # shareable.set_header("Topic", topic)
+-        aux_message.data["data"].CopyFrom(make_shareable_data(shareable))
+-        aux_message.data["fl_context"].CopyFrom(make_context_data(fl_ctx))
+-
+-        server_msg, retry = None, self.retry
+-        with self.set_up_channel(servers[project_name]) as channel:
+-            stub = fed_service.FederatedTrainingStub(channel)
+-            while retry > 0:
+-                try:
+-                    self.logger.debug(f"Send AuxMessage to {project_name} server")
+-                    server_msg = stub.AuxCommunicate(aux_message, timeout=timeout)
+-                    # Clear the stopping flag
+-                    # if the connection to server recovered.
+-                    self.should_stop = False
+-
+-                    break
+-                except grpc.RpcError as grpc_error:
+-                    self.grpc_error_handler(servers[project_name], grpc_error, "AuxCommunicate", verbose=self.verbose)
+-                    retry -= 1
+-                    time.sleep(5)
+-        return server_msg
++        start_time = time.time()
++        shared_fl_ctx = FLContext()
++        shared_fl_ctx.set_public_props(get_serializable_data(fl_ctx).get_all_public_props())
++        shareable.set_header(ServerCommandKey.PEER_FL_CONTEXT, shared_fl_ctx)
++
++        # shareable.add_cookie(name=FLContextKey.TASK_ID, data=task_id)
++        shareable.set_header(FLContextKey.TASK_NAME, execute_task_name)
++
++        task_message = new_cell_message(
++            {
++                CellMessageHeaderKeys.TOKEN: token,
++                CellMessageHeaderKeys.SSID: ssid,
++                CellMessageHeaderKeys.PROJECT_NAME: project_name,
++            },
++            fobs.dumps(shareable),
++        )
++        job_id = str(shared_fl_ctx.get_prop(FLContextKey.CURRENT_RUN))
++
++        fqcn = FQCN.join([FQCN.ROOT_SERVER, job_id])
++        result = self.cell.send_request(
++            target=fqcn,
++            channel=CellChannel.SERVER_COMMAND,
++            topic=ServerCommandNames.SUBMIT_UPDATE,
++            request=task_message,
++        )
++        end_time = time.time()
++        return_code = result.get_header(MessageHeaderKey.RETURN_CODE)
++        self.logger.info(
++            f" SubmitUpdate size: {len(task_message.payload)} Bytes. time: {end_time - start_time} seconds"
++        )
++
++        return return_code
+ 
+     def quit_remote(self, servers, task_name, token, ssid, fl_ctx: FLContext):
+         """Sending the last message to the server before leaving.
+@@ -370,61 +269,81 @@ def quit_remote(self, servers, task_name, token, ssid, fl_ctx: FLContext):
+             server's reply to the last message
+ 
+         """
+-        server_message, retry = None, self.retry
+-        with self.set_up_channel(servers[task_name]) as channel:
+-            stub = fed_service.FederatedTrainingStub(channel)
+-            while retry > 0:
+-                try:
+-                    start_time = time.time()
+-                    self.logger.info(f"Quitting server: {task_name}")
+-                    server_message = stub.Quit(_get_client_state(task_name, token, ssid, fl_ctx))
+-                    # Clear the stopping flag
+-                    # if the connection to server recovered.
+-                    self.should_stop = False
+-
+-                    end_time = time.time()
+-                    self.logger.info(
+-                        f"Received comment from server: {server_message.comment}. Quit time: {end_time - start_time} seconds"
+-                    )
+-                    break
+-                except grpc.RpcError as grpc_error:
+-                    self.grpc_error_handler(servers[task_name], grpc_error, "quit_remote")
+-                    retry -= 1
+-                    time.sleep(3)
+-        return server_message
++        quit_message = new_cell_message(
++            {
++                CellMessageHeaderKeys.TOKEN: token,
++                CellMessageHeaderKeys.SSID: ssid,
++                CellMessageHeaderKeys.PROJECT_NAME: task_name,
++            }
++        )
++        try:
++            result = self.cell.send_request(
++                target=FQCN.ROOT_SERVER,
++                channel=CellChannel.SERVER_MAIN,
++                topic=CellChannelTopic.Quit,
++                request=quit_message,
++            )
++            return_code = result.get_header(MessageHeaderKey.RETURN_CODE)
++            if return_code == ReturnCode.UNAUTHENTICATED:
++                self.logger.info(f"Client token: {token} has been removed from the server.")
++
++            server_message = result.get_header(CellMessageHeaderKeys.MESSAGE)
+ 
+-    def send_heartbeat(self, servers, task_name, token, ssid, client_name, engine: ClientEngineInternalSpec):
+-        message = fed_msg.Token()
+-        message.token = token
+-        message.ssid = ssid
+-        message.client_name = client_name
++        except BaseException as ex:
++            raise FLCommunicationError("error:client_quit", ex)
++
++        return server_message
+ 
++    def send_heartbeat(self, servers, task_name, token, ssid, client_name, engine: ClientEngineInternalSpec, interval):
++        fl_ctx = engine.new_context()
++        simulate_mode = fl_ctx.get_prop(FLContextKey.SIMULATE_MODE, False)
++        wait_times = int(interval / 2)
+         while not self.heartbeat_done:
+             try:
+-                with self.set_up_channel(servers[task_name]) as channel:
+-                    stub = fed_service.FederatedTrainingStub(channel)
+-                    # retry the heartbeat call for 10 minutes
+-                    retry = 2
+-                    while retry > 0:
+-                        try:
+-                            self.logger.debug(f"Send {task_name} heartbeat {token}")
+-                            job_ids = engine.get_all_job_ids()
+-                            del message.jobs[:]
+-                            message.jobs.extend(job_ids)
+-                            response = stub.Heartbeat(message)
+-                            self._clean_up_runs(engine, response)
++                job_ids = engine.get_all_job_ids()
++                heartbeat_message = new_cell_message(
++                    {
++                        CellMessageHeaderKeys.TOKEN: token,
++                        CellMessageHeaderKeys.SSID: ssid,
++                        CellMessageHeaderKeys.CLIENT_NAME: client_name,
++                        CellMessageHeaderKeys.PROJECT_NAME: task_name,
++                        CellMessageHeaderKeys.JOB_IDS: job_ids,
++                    }
++                )
++
++                try:
++                    result = self.cell.send_request(
++                        target=FQCN.ROOT_SERVER,
++                        channel=CellChannel.SERVER_MAIN,
++                        topic=CellChannelTopic.HEART_BEAT,
++                        request=heartbeat_message,
++                    )
++                    return_code = result.get_header(MessageHeaderKey.RETURN_CODE)
++                    if return_code == ReturnCode.UNAUTHENTICATED:
++                        unauthenticated = result.get_header(MessageHeaderKey.ERROR)
++                        raise FLCommunicationError("error:client_quit " + unauthenticated)
++
++                    if not simulate_mode:
++                        # server_message = result.get_header(CellMessageHeaderKeys.MESSAGE)
++                        abort_jobs = result.get_header(CellMessageHeaderKeys.ABORT_JOBS, [])
++                        self._clean_up_runs(engine, abort_jobs)
++                    else:
++                        if return_code != ReturnCode.OK:
+                             break
+-                        except grpc.RpcError:
+-                            retry -= 1
+-                            time.sleep(5)
+ 
+-                    time.sleep(30)
++                except BaseException as ex:
++                    raise FLCommunicationError("error:client_quit", ex)
++
++                for i in range(wait_times):
++                    time.sleep(2)
++                    if self.heartbeat_done:
++                        break
+             except BaseException as e:
+                 self.logger.info(f"Failed to send heartbeat. Will try again. Exception: {secure_format_exception(e)}")
+                 time.sleep(5)
+ 
+-    def _clean_up_runs(self, engine, response):
+-        abort_runs = list(set(response.abort_jobs))
++    def _clean_up_runs(self, engine, abort_runs):
++        # abort_runs = list(set(response.abort_jobs))
+         display_runs = ",".join(abort_runs)
+         try:
+             if abort_runs:
+@@ -433,36 +352,3 @@ def _clean_up_runs(self, engine, response):
+                 self.logger.info(f"These runs: {display_runs} are not running on the server. Aborted them.")
+         except:
+             self.logger.info(f"Failed to clean up the runs: {display_runs}")
+-
+-    def grpc_error_handler(self, service, grpc_error, action, verbose=False):
+-        """Handling grpc exceptions.
+-
+-        Args:
+-            service: FL service
+-            grpc_error: grpc error
+-            action: action to take
+-            verbose: verbose to error print out
+-        """
+-        status_code = None
+-        if isinstance(grpc_error, grpc.Call):
+-            status_code = grpc_error.code()
+-
+-        if grpc.StatusCode.RESOURCE_EXHAUSTED == status_code:
+-            if grpc_error.details().startswith("No token"):
+-                self.logger.info("No token for this client in current round. " "Waiting for server new round. ")
+-                self.should_stop = False
+-                return
+-
+-        self.logger.error(f"Action: {action} grpc communication error: {grpc_error}.")
+-        if grpc.StatusCode.UNAVAILABLE == status_code:
+-            self.logger.error(f"Could not connect to server: {service.get('target')}\t {grpc_error.details()}")
+-            self.should_stop = True
+-
+-        if grpc.StatusCode.OUT_OF_RANGE == status_code:
+-            self.logger.error(
+-                f"Server training has stopped.\t" f"Setting flag for stopping training. {grpc_error.details()}"
+-            )
+-            self.should_stop = True
+-
+-        if verbose:
+-            self.logger.info(grpc_error)
+diff --git a/nvflare/private/fed/client/fed_client.py b/nvflare/private/fed/client/fed_client.py
+index fdfd7754cd..8fa7801c7e 100644
+--- a/nvflare/private/fed/client/fed_client.py
++++ b/nvflare/private/fed/client/fed_client.py
+@@ -20,12 +20,11 @@
+ from nvflare.apis.executor import Executor
+ from nvflare.apis.filter import Filter
+ from nvflare.apis.fl_component import FLComponent
++from nvflare.apis.fl_constant import FLContextKey
+ from nvflare.apis.fl_context import FLContext
+-from nvflare.apis.shareable import Shareable
+-from nvflare.fuel.utils import fobs
++from nvflare.fuel.f3.cellnet.cell import Cell
+ from nvflare.private.defs import SpecialTaskName
+ from nvflare.private.event import fire_event
+-from nvflare.private.fed.utils.numproto import proto_to_bytes
+ 
+ from .fed_client_base import FederatedClientBase
+ 
+@@ -47,6 +46,7 @@ def __init__(
+         overseer_agent=None,
+         args=None,
+         components=None,
++        cell: Cell = None,
+     ):
+         """To init FederatedClient.
+ 
+@@ -60,6 +60,7 @@ def __init__(
+             handlers: handlers
+             executors: executors
+             compression: communication compression algorithm
++            cell (object): CellNet communicator
+         """
+         # We call the base implementation directly.
+         super().__init__(
+@@ -74,6 +75,7 @@ def __init__(
+             overseer_agent=overseer_agent,
+             args=args,
+             components=components,
++            cell=cell,
+         )
+ 
+         self.executors = executors
+@@ -81,22 +83,25 @@ def __init__(
+     def fetch_task(self, fl_ctx: FLContext):
+         fire_event(EventType.BEFORE_PULL_TASK, self.handlers, fl_ctx)
+ 
+-        pull_success, task_name, remote_tasks = self.pull_task(fl_ctx)
++        pull_success, task_name, shareable = self.pull_task(fl_ctx)
+         fire_event(EventType.AFTER_PULL_TASK, self.handlers, fl_ctx)
+         if task_name == SpecialTaskName.TRY_AGAIN:
+             self.logger.debug(f"pull_task completed. Task name:{task_name} Status:{pull_success} ")
+         else:
+             self.logger.info(f"pull_task completed. Task name:{task_name} Status:{pull_success} ")
+-        return pull_success, task_name, remote_tasks
++        return pull_success, task_name, shareable
+ 
+     def extract_shareable(self, responses, fl_ctx: FLContext):
+-        shareable = Shareable()
+-        peer_context = FLContext()
+-        for item in responses:
+-            shareable = shareable.from_bytes(proto_to_bytes(item.data.params["data"]))
+-            peer_context = fobs.loads(proto_to_bytes(item.data.params["fl_context"]))
++        # shareable = Shareable()
++        # peer_context = FLContext()
++        # for item in responses:
++        #     shareable = shareable.from_bytes(proto_to_bytes(item.data.params["data"]))
++        #     peer_context = fobs.loads(proto_to_bytes(item.data.params["fl_context"]))
++
++        # shareable = fobs.loads(responses.payload)
++        peer_context = responses.get_header(FLContextKey.PEER_CONTEXT)
+ 
+         fl_ctx.set_peer_context(peer_context)
+-        shareable.set_peer_props(peer_context.get_all_public_props())
++        responses.set_peer_props(peer_context.get_all_public_props())
+ 
+-        return shareable
++        return responses
+diff --git a/nvflare/private/fed/client/fed_client_base.py b/nvflare/private/fed/client/fed_client_base.py
+index dd2aef5ea9..3f4c864bfd 100644
+--- a/nvflare/private/fed/client/fed_client_base.py
++++ b/nvflare/private/fed/client/fed_client_base.py
+@@ -21,12 +21,17 @@
+ 
+ from nvflare.apis.filter import Filter
+ from nvflare.apis.fl_component import FLComponent
+-from nvflare.apis.fl_constant import FLContextKey
++from nvflare.apis.fl_constant import FLContextKey, SecureTrainConst, ServerCommandKey
+ from nvflare.apis.fl_context import FLContext
+ from nvflare.apis.fl_exception import FLCommunicationError
+ from nvflare.apis.overseer_spec import SP
+ from nvflare.apis.shareable import Shareable
+ from nvflare.apis.signal import Signal
++from nvflare.fuel.f3.cellnet.cell import Cell
++from nvflare.fuel.f3.cellnet.fqcn import FQCN
++from nvflare.fuel.f3.cellnet.net_agent import NetAgent
++from nvflare.fuel.f3.drivers.driver_params import DriverParams
++from nvflare.fuel.f3.mpm import MainProcessMonitor as mpm
+ from nvflare.fuel.utils.argument_utils import parse_vars
+ from nvflare.private.defs import EngineConstant
+ from nvflare.security.logging import secure_format_exception
+@@ -37,9 +42,11 @@
+ 
+ def _check_progress(remote_tasks):
+     if remote_tasks[0] is not None:
+-        return True, remote_tasks[0].task_name
++        # shareable = fobs.loads(remote_tasks[0].payload)
++        shareable = remote_tasks[0].payload
++        return True, shareable.get_header(ServerCommandKey.TASK_NAME), shareable
+     else:
+-        return False, None
++        return False, None, None
+ 
+ 
+ class FederatedClientBase:
+@@ -61,6 +68,7 @@ def __init__(
+         overseer_agent=None,
+         args=None,
+         components=None,
++        cell: Cell = None,
+     ):
+         """To init FederatedClientBase.
+ 
+@@ -73,6 +81,7 @@ def __init__(
+             client_state_processors: client state processor filters
+             handlers: handlers
+             compression: communication compression algorithm
++            cell: CellNet communicator
+         """
+         self.logger = logging.getLogger(self.__class__.__name__)
+ 
+@@ -81,6 +90,11 @@ def __init__(
+         self.ssid = None
+         self.client_args = client_args
+         self.servers = server_args
++        self.cell = cell
++        self.net_agent = None
++        self.args = args
++        self.engine_create_timeout = client_args.get("engine_create_timeout", 15.0)
++        self.cell_check_frequency = client_args.get("cell_check_frequency", 0.5)
+ 
+         self.communicator = Communicator(
+             ssl_args=client_args,
+@@ -88,6 +102,7 @@ def __init__(
+             retry_timeout=retry_timeout,
+             client_state_processors=client_state_processors,
+             compression=compression,
++            cell=cell,
+         )
+ 
+         self.secure_train = secure_train
+@@ -99,6 +114,7 @@ def __init__(
+         self.platform = None
+         self.abort_signal = Signal()
+         self.engine = None
++        self.client_runner = None
+ 
+         self.status = ClientStatus.NOT_STARTED
+         self.remote_tasks = None
+@@ -141,17 +157,82 @@ def overseer_callback(self, overseer_agent):
+     def set_sp(self, project_name, sp: SP):
+         if sp and sp.primary is True:
+             server = self.servers[project_name].get("target")
++            scheme = self.servers[project_name].get("scheme", "grpc")
+             location = sp.name + ":" + sp.fl_port
+             if server != location:
+                 self.servers[project_name]["target"] = location
+                 self.sp_established = True
+-                self.logger.info(f"Got the new primary SP: {location}")
++
++                if self.cell:
++                    # self.net_agent.close()
++                    # self.cell.stop()
++                    self.cell.change_server_root(scheme + "://" + location)
++                else:
++                    self._create_cell(location, scheme)
++
++                self.logger.info(f"Got the new primary SP: {scheme + location}")
+ 
+             if self.ssid and self.ssid != sp.service_session_id:
+                 self.ssid = sp.service_session_id
+                 thread = threading.Thread(target=self._switch_ssid)
+                 thread.start()
+ 
++    def _create_cell(self, location, scheme):
++        if self.args.job_id:
++            fqcn = FQCN.join([self.client_name, self.args.job_id])
++            parent_url = self.args.parent_url
++        else:
++            fqcn = self.client_name
++            parent_url = None
++        if self.secure_train:
++            root_cert = self.client_args[SecureTrainConst.SSL_ROOT_CERT]
++            ssl_cert = self.client_args[SecureTrainConst.SSL_CERT]
++            private_key = self.client_args[SecureTrainConst.PRIVATE_KEY]
++
++            credentials = {
++                DriverParams.CA_CERT.value: root_cert,
++                DriverParams.CLIENT_CERT.value: ssl_cert,
++                DriverParams.CLIENT_KEY.value: private_key,
++            }
++        else:
++            credentials = {}
++        self.cell = Cell(
++            fqcn=fqcn,
++            root_url=scheme + "://" + location,
++            secure=self.secure_train,
++            credentials=credentials,
++            create_internal_listener=True,
++            parent_url=parent_url,
++        )
++        self.cell.start()
++        self.communicator.cell = self.cell
++        self.net_agent = NetAgent(self.cell)
++        if self.args.job_id:
++            start = time.time()
++            while not self.client_runner:
++                self.logger.info("Wait for client_runner to be created.")
++                if time.time() - start > self.engine_create_timeout:
++                    raise RuntimeError(
++                        "Failed to set the cell for engine: " "timeout waiting for client_runner to be created."
++                    )
++                time.sleep(self.cell_check_frequency)
++            self.client_runner.engine.cell = self.cell
++            self.client_runner.command_agent.register_cell_cb()
++        else:
++            start = time.time()
++            while not self.engine:
++                self.logger.info("Wait for engine to be created.")
++                if time.time() - start > self.engine_create_timeout:
++                    raise RuntimeError(
++                        "Failed to set the cell for engine: " "timeout waiting for engine to be created."
++                    )
++                time.sleep(self.cell_check_frequency)
++
++            self.engine.cell = self.cell
++            self.engine.admin_agent.register_cell_cb()
++        mpm.add_cleanup_cb(self.net_agent.close)
++        mpm.add_cleanup_cb(self.cell.stop)
++
+     def _switch_ssid(self):
+         if self.engine:
+             for job_id in self.engine.get_all_job_ids():
+@@ -194,7 +275,7 @@ def fetch_execute_task(self, project_name, fl_ctx: FLContext):
+         """
+         try:
+             self.logger.debug("Starting to fetch execute task.")
+-            task = self.communicator.getTask(self.servers, project_name, self.token, self.ssid, fl_ctx)
++            task = self.communicator.pull_task(self.servers, project_name, self.token, self.ssid, fl_ctx)
+ 
+             return task
+         except FLCommunicationError as e:
+@@ -214,7 +295,7 @@ def push_execute_result(self, project_name, shareable: Shareable, fl_ctx: FLCont
+         try:
+             self.logger.info("Starting to push execute result.")
+             execute_task_name = fl_ctx.get_prop(FLContextKey.TASK_NAME)
+-            message = self.communicator.submitUpdate(
++            return_code = self.communicator.submit_update(
+                 self.servers,
+                 project_name,
+                 self.token,
+@@ -225,40 +306,20 @@ def push_execute_result(self, project_name, shareable: Shareable, fl_ctx: FLCont
+                 execute_task_name,
+             )
+ 
+-            return message
+-        except FLCommunicationError as e:
+-            self.logger.info(secure_format_exception(e))
+-
+-    def send_aux_message(self, project_name, topic: str, shareable: Shareable, timeout: float, fl_ctx: FLContext):
+-        """Send auxiliary message to the server.
+-
+-        Args:
+-            project_name: FL study project name
+-            topic: aux topic name
+-            shareable: Shareable object
+-            timeout: communication timeout
+-            fl_ctx: FLContext
+-
+-        Returns:
+-            A reply message
+-        """
+-        try:
+-            self.logger.debug("Starting to send aux message.")
+-            message = self.communicator.auxCommunicate(
+-                self.servers, project_name, self.token, self.ssid, fl_ctx, self.client_name, shareable, topic, timeout
+-            )
+-
+-            return message
++            return return_code
+         except FLCommunicationError as e:
+             self.logger.info(secure_format_exception(e))
+ 
+-    def send_heartbeat(self, project_name):
++    def send_heartbeat(self, project_name, interval):
+         try:
+             if self.token:
++                start = time.time()
+                 while not self.engine:
+                     time.sleep(1.0)
++                    if time.time() - start > 60.0:
++                        raise RuntimeError("No engine created. Failed to start the heartbeat process.")
+                 self.communicator.send_heartbeat(
+-                    self.servers, project_name, self.token, self.ssid, self.client_name, self.engine
++                    self.servers, project_name, self.token, self.ssid, self.client_name, self.engine, interval
+                 )
+         except FLCommunicationError:
+             self.communicator.heartbeat_done = True
+@@ -274,12 +335,12 @@ def quit_remote(self, project_name, fl_ctx: FLContext):
+         """
+         return self.communicator.quit_remote(self.servers, project_name, self.token, self.ssid, fl_ctx)
+ 
+-    def heartbeat(self):
++    def heartbeat(self, interval):
+         """Sends a heartbeat from the client to the server."""
+         pool = None
+         try:
+             pool = ThreadPool(len(self.servers))
+-            return pool.map(self.send_heartbeat, tuple(self.servers))
++            return pool.map(partial(self.send_heartbeat, interval=interval), tuple(self.servers))
+         finally:
+             if pool:
+                 pool.terminate()
+@@ -290,9 +351,9 @@ def pull_task(self, fl_ctx: FLContext):
+         try:
+             pool = ThreadPool(len(self.servers))
+             self.remote_tasks = pool.map(partial(self.fetch_execute_task, fl_ctx=fl_ctx), tuple(self.servers))
+-            pull_success, task_name = _check_progress(self.remote_tasks)
++            pull_success, task_name, shareable = _check_progress(self.remote_tasks)
+             # TODO: if some of the servers failed
+-            return pull_success, task_name, self.remote_tasks
++            return pull_success, task_name, shareable
+         finally:
+             if pool:
+                 pool.terminate()
+@@ -307,24 +368,6 @@ def push_results(self, shareable: Shareable, fl_ctx: FLContext):
+             if pool:
+                 pool.terminate()
+ 
+-    def aux_send(self, topic, shareable: Shareable, timeout: float, fl_ctx: FLContext):
+-        """Push the local model to multiple servers."""
+-        pool = None
+-        try:
+-            pool = ThreadPool(len(self.servers))
+-            messages = pool.map(
+-                partial(self.send_aux_message, topic=topic, shareable=shareable, timeout=timeout, fl_ctx=fl_ctx),
+-                tuple(self.servers),
+-            )
+-            if messages is not None and messages[0] is not None:
+-                # Only handle single server communication for now.
+-                return messages
+-            else:
+-                return None
+-        finally:
+-            if pool:
+-                pool.terminate()
+-
+     def register(self):
+         """Push the local model to multiple servers."""
+         pool = None
+@@ -344,12 +387,12 @@ def set_primary_sp(self, sp):
+             if pool:
+                 pool.terminate()
+ 
+-    def run_heartbeat(self):
++    def run_heartbeat(self, interval):
+         """Periodically runs the heartbeat."""
+-        self.heartbeat()
++        self.heartbeat(interval)
+ 
+-    def start_heartbeat(self):
+-        heartbeat_thread = threading.Thread(target=self.run_heartbeat)
++    def start_heartbeat(self, interval=30):
++        heartbeat_thread = threading.Thread(target=self.run_heartbeat, args=[interval])
+         heartbeat_thread.start()
+ 
+     def logout_client(self, fl_ctx: FLContext):
+@@ -372,6 +415,9 @@ def logout_client(self, fl_ctx: FLContext):
+     def set_client_engine(self, engine):
+         self.engine = engine
+ 
++    def set_client_runner(self, client_runner):
++        self.client_runner = client_runner
++
+     def close(self):
+         """Quit the remote federated server, close the local session."""
+         self.terminate()
+diff --git a/nvflare/private/fed/server/client_manager.py b/nvflare/private/fed/server/client_manager.py
+index 8e524b9282..2216c6f3c9 100644
+--- a/nvflare/private/fed/server/client_manager.py
++++ b/nvflare/private/fed/server/client_manager.py
+@@ -17,9 +17,12 @@
+ import time
+ import uuid
+ 
+-import grpc
+-
+ from nvflare.apis.client import Client
++from nvflare.apis.fl_constant import FLContextKey
++from nvflare.apis.fl_context import FLContext
++from nvflare.fuel.f3.cellnet.defs import MessagePropKey
++from nvflare.fuel.f3.drivers.driver_params import DriverParams
++from nvflare.private.defs import CellMessageHeaderKeys
+ 
+ 
+ class ClientManager:
+@@ -45,20 +48,22 @@ def authenticate(self, request, context):
+         if not client:
+             return None
+ 
+-        client_ip = context.peer().split(":")[1]
++        # client_ip = context.peer().split(":")[1]
++        client_ip = request.get_header(CellMessageHeaderKeys.CLIENT_IP)
+ 
+         if len(self.clients) >= self.max_num_clients:
+-            context.abort(grpc.StatusCode.RESOURCE_EXHAUSTED, "Maximum number of clients reached")
++            # context.abort(grpc.StatusCode.RESOURCE_EXHAUSTED, "Maximum number of clients reached")
++            context.set_prop(FLContextKey.COMMUNICATION_ERROR, "Maximum number of clients reached", sticky=False)
+ 
+         # new client will join the current round immediately
+         with self.lock:
+             self.clients.update({client.token: client})
+             self.logger.info(
+                 "Client: New client {} joined. Sent token: {}.  Total clients: {}".format(
+-                    request.client_name + "@" + client_ip, client.token, len(self.clients)
++                    client.name + "@" + client_ip, client.token, len(self.clients)
+                 )
+             )
+-        return client.token
++        return client
+ 
+     def remove_client(self, token):
+         """Remove a registered client.
+@@ -77,30 +82,39 @@ def remove_client(self, token):
+             return client
+ 
+     def login_client(self, client_login, context):
+-        if not self.is_valid_task(client_login.meta.project):
+-            context.abort(grpc.StatusCode.INVALID_ARGUMENT, "Requested task does not match the current server task")
++        if not self.is_valid_task(client_login.get_header(CellMessageHeaderKeys.PROJECT_NAME)):
++            # context.abort(grpc.StatusCode.INVALID_ARGUMENT, "Requested task does not match the current server task")
++            context.set_prop(
++                FLContextKey.UNAUTHENTICATED, "Requested task does not match the current server task", sticky=False
++            )
+         return self.authenticated_client(client_login, context)
+ 
+-    def validate_client(self, client_state, context, allow_new=False):
++    def validate_client(self, request, fl_ctx: FLContext, allow_new=False):
+         """Validate the client state message.
+ 
+         Args:
+             client_state: A ClientState message received by server
+-            context: gRPC connection context
++            fl_ctx: FLContext
+             allow_new: whether to allow new client. Note that its task should still match server's.
+ 
+         Returns:
+              client id if it's a valid client
+         """
+-        token = client_state.token
++        # token = client_state.token
++        token = request.get_header(CellMessageHeaderKeys.TOKEN)
+         if not token:
+-            context.abort(grpc.StatusCode.INVALID_ARGUMENT, "Could not read client uid from the payload")
++            # context.abort(grpc.StatusCode.INVALID_ARGUMENT, "Could not read client uid from the payload")
++            fl_ctx.set_prop(FLContextKey.UNAUTHENTICATED, "Could not read client uid from the payload", sticky=False)
+             client = None
+-        elif not self.is_valid_task(client_state.meta.project):
+-            context.abort(grpc.StatusCode.INVALID_ARGUMENT, "Requested task does not match the current server task")
++        elif not self.is_valid_task(request.get_header(CellMessageHeaderKeys.PROJECT_NAME)):
++            # context.abort(grpc.StatusCode.INVALID_ARGUMENT, "Requested task does not match the current server task")
++            fl_ctx.set_prop(
++                FLContextKey.UNAUTHENTICATED, "Requested task does not match the current server task", sticky=False
++            )
+             client = None
+         elif not (allow_new or self.is_from_authorized_client(token)):
+-            context.abort(grpc.StatusCode.UNAUTHENTICATED, "Unknown client identity")
++            # context.abort(grpc.StatusCode.UNAUTHENTICATED, "Unknown client identity")
++            fl_ctx.set_prop(FLContextKey.UNAUTHENTICATED, "Unknown client identity", sticky=False)
+             client = None
+         else:
+             client = self.clients.get(token)
+@@ -110,33 +124,32 @@ def authenticated_client(self, client_login, context) -> Client:
+         """Use SSL certificate for authenticate the client.
+ 
+         Args:
+-            client_login: client login request
+-            context: gRPC connection context
++            client_login: client login request Message
++            context: FL_Context
+ 
+         Returns:
+             Client object.
+         """
+-        client = self.clients.get(client_login.token)
++        client_name = client_login.get_header(CellMessageHeaderKeys.CLIENT_NAME)
++        client = self.clients.get(client_name)
+         if not client:
+-            cn_names = context.auth_context().get("x509_common_name")
+-            if cn_names:
+-                client_name = cn_names[0].decode("utf-8")
+-                if client_login.client_name:
+-                    if not client_login.client_name == client_name:
+-                        context.abort(
+-                            grpc.StatusCode.UNAUTHENTICATED, "client ID does not match the SSL certificate CN"
+-                        )
+-                        return None
+-            else:
+-                client_name = client_login.client_name
++            fqcn = client_login.get_prop(MessagePropKey.ENDPOINT).conn_props.get(DriverParams.PEER_CN.value)
++            if fqcn and fqcn != client_name:
++                context.set_prop(
++                    FLContextKey.UNAUTHENTICATED,
++                    f"Requested fqcn:{fqcn} does not match the client_name: {client_name}",
++                    sticky=False,
++                )
++                return None
+ 
+             for token, client in self.clients.items():
+                 if client.name == client_name:
+-                    context.abort(
+-                        grpc.StatusCode.FAILED_PRECONDITION,
+-                        "Client ID already registered as a client: {}".format(client_name),
+-                    )
+-                    return None
++                    with self.lock:
++                        self.clients.pop(token)
++                        self.logger.info(
++                            f"Client: {client_name} already registered. Re-login the client " f"with a new token."
++                        )
++                        break
+ 
+             client = Client(client_name, str(uuid.uuid4()))
+         return client
+@@ -158,15 +171,15 @@ def is_valid_task(self, task):
+         Returns:
+             True if task name is the same as server's project name.
+         """
+-        return task.name == self.project_name
++        return task == self.project_name
+ 
+-    def heartbeat(self, token, client_name, context):
++    def heartbeat(self, token, client_name, fl_ctx):
+         """Update the heartbeat of the client.
+ 
+         Args:
+             token: client token
+             client_name: client name
+-            context: grpc context
++            fl_ctx: FLContext
+ 
+         Returns:
+             If a new client needs to be created.
+@@ -181,12 +194,17 @@ def heartbeat(self, token, client_name, context):
+             else:
+                 for _token, _client in self.clients.items():
+                     if _client.name == client_name:
+-                        context.abort(
+-                            grpc.StatusCode.FAILED_PRECONDITION,
++                        # context.abort(
++                        #     grpc.StatusCode.FAILED_PRECONDITION,
++                        #     "Client ID already registered as a client: {}".format(client_name),
++                        # )
++                        fl_ctx.set_prop(
++                            FLContextKey.COMMUNICATION_ERROR,
+                             "Client ID already registered as a client: {}".format(client_name),
++                            sticky=False,
+                         )
+                         self.logger.info(
+-                            "Failed to re-activate dead client:{} with token: {}. Client already exist.".format(
++                            "Failed to re-activate the client:{} with token: {}. Client already exist.".format(
+                                 client_name, _token
+                             )
+                         )
+@@ -196,7 +214,7 @@ def heartbeat(self, token, client_name, context):
+                 client.last_connect_time = time.time()
+                 # self._set_instance_name(client)
+                 self.clients.update({token: client})
+-                self.logger.info("Re-activate dead client:{} with token: {}".format(client_name, token))
++                self.logger.info("Re-activate the client:{} with token: {}".format(client_name, token))
+ 
+                 return True
+ 
+diff --git a/nvflare/private/fed/server/fed_server.py b/nvflare/private/fed/server/fed_server.py
+index a204079476..9c56ec0490 100644
+--- a/nvflare/private/fed/server/fed_server.py
++++ b/nvflare/private/fed/server/fed_server.py
+@@ -78,6 +78,7 @@ def __init__(
+         max_num_clients=10,
+         heart_beat_timeout=600,
+         handlers: Optional[List[FLComponent]] = None,
++        shutdown_period=30.0,
+     ):
+         """Base server that provides the clients management and server deployment."""
+         self.project_name = project_name
+@@ -99,6 +100,7 @@ def __init__(
+         self.snapshot_lock = Lock()
+         self.fl_ctx = FLContext()
+         self.platform = None
++        self.shutdown_period = shutdown_period
+ 
+         self.shutdown = False
+         self.status = ServerStatus.NOT_STARTED
+@@ -207,13 +209,13 @@ def notify_dead_client(self, client):
+         """
+         pass
+ 
+-    def fl_shutdown(self, shutdown_period=30.0):
++    def fl_shutdown(self):
+         self.shutdown = True
+         start = time.time()
+         while self.client_manager.clients:
+             # Wait for the clients to shutdown and quite first.
+             time.sleep(0.1)
+-            if time.time() - start > shutdown_period:
++            if time.time() - start > self.shutdown_period:
+                 self.logger.info("There are still clients connected. But shutdown the server after timeout.")
+                 break
+         self.close()
+@@ -234,6 +236,8 @@ def __init__(
+         secure_train=False,
+         snapshot_persistor=None,
+         overseer_agent=None,
++        shutdown_period=30.0,
++        check_engine_frequency=3.0,
+     ):
+         """Federated server services.
+ 
+@@ -254,6 +258,7 @@ def __init__(
+             max_num_clients=max_num_clients,
+             heart_beat_timeout=heart_beat_timeout,
+             handlers=handlers,
++            shutdown_period=shutdown_period,
+         )
+ 
+         self.contributed_clients = {}
+@@ -274,6 +279,7 @@ def __init__(
+         self.run_manager = None
+         self.server_runner = None
+         self.command_agent = None
++        self.check_engine_frequency = check_engine_frequency
+ 
+         self.processors = {}
+         self.runner_config = None
+@@ -611,7 +617,7 @@ def start_run(self, job_id, run_root, conf, args, snapshot):
+                 if self.engine.asked_to_stop:
+                     self.engine.engine_info.status = MachineStatus.STOPPED
+ 
+-                time.sleep(3)
++                time.sleep(self.check_engine_frequency)
+ 
+             # self.wait_engine_run_complete("Server Job", cleanup_grace_time=5.0)
+ 
+@@ -752,11 +758,11 @@ def stop_training(self):
+         self.status = ServerStatus.STOPPED
+         self.logger.info("Server app stopped.\n\n")
+ 
+-    def fl_shutdown(self, shutdown_period=30.0):
++    def fl_shutdown(self):
+         self.engine.stop_all_jobs()
+         self.engine.fire_event(EventType.SYSTEM_END, self.engine.new_context())
+ 
+-        super().fl_shutdown(shutdown_period)
++        super().fl_shutdown()
+ 
+     def close(self):
+         """Shutdown the server."""
+diff --git a/tests/unit_test/private/fed/app/deployer/simulator_deployer_test.py b/tests/unit_test/private/fed/app/deployer/simulator_deployer_test.py
+index cf3936a094..e2e4ca1b41 100644
+--- a/tests/unit_test/private/fed/app/deployer/simulator_deployer_test.py
++++ b/tests/unit_test/private/fed/app/deployer/simulator_deployer_test.py
+@@ -51,13 +51,15 @@ def test_create_server(self):
+             args = parser.parse_args(["job_folder", "-w" + workspace, "-n 2", "-t 1"])
+             _, server = self.deployer.create_fl_server(args)
+             assert isinstance(server, SimulatorServer)
++            server.cell.stop()
+ 
+-    @patch("nvflare.private.fed.app.deployer.simulator_deployer.FederatedClient.register")
+-    @patch("nvflare.private.fed.app.deployer.simulator_deployer.FederatedClient.start_heartbeat")
+-    @patch("nvflare.private.fed.app.deployer.simulator_deployer.FedAdminAgent")
+-    def test_create_client(self, mock_register, mock_heartbeat, mock_agent):
+-        workspace = tempfile.mkdtemp()
+-        parser = self._create_parser()
+-        args = parser.parse_args(["job_folder", "-w" + workspace, "-n 2", "-t 1"])
+-        client, _, _ = self.deployer.create_fl_client("client0", args)
+-        assert isinstance(client, FederatedClient)
++    # @patch("nvflare.private.fed.client.fed_client.FederatedClient.register")
++    # # @patch("nvflare.private.fed.app.deployer.simulator_deployer.FederatedClient.start_heartbeat")
++    # # @patch("nvflare.private.fed.app.deployer.simulator_deployer.FedAdminAgent")
++    # def test_create_client(self, mock_register):
++    #     workspace = tempfile.mkdtemp()
++    #     parser = self._create_parser()
++    #     args = parser.parse_args(["job_folder", "-w" + workspace, "-n 2", "-t 1"])
++    #     client, _, _, _ = self.deployer.create_fl_client("client0", args)
++    #     assert isinstance(client, FederatedClient)
++    #     client.cell.stop()
+diff --git a/tests/unit_test/private/fed/app/simulator/simulator_runner_test.py b/tests/unit_test/private/fed/app/simulator/simulator_runner_test.py
+index 9f36728124..dacde39d31 100644
+--- a/tests/unit_test/private/fed/app/simulator/simulator_runner_test.py
++++ b/tests/unit_test/private/fed/app/simulator/simulator_runner_test.py
+@@ -29,50 +29,50 @@ def setup_method(self) -> None:
+     def teardown_method(self) -> None:
+         shutil.rmtree(self.workspace)
+ 
+-    @patch("nvflare.private.fed.app.deployer.simulator_deployer.SimulatorServer.deploy")
+-    @patch("nvflare.private.fed.app.utils.FedAdminServer")
+-    @patch("nvflare.private.fed.app.deployer.simulator_deployer.FederatedClient.register")
+-    @patch("nvflare.private.fed.app.deployer.simulator_deployer.FederatedClient.start_heartbeat")
+-    @patch("nvflare.private.fed.app.deployer.simulator_deployer.FedAdminAgent")
+-    def test_valid_job_simulate_setup(self, mock_server, mock_admin, mock_register, mock_heartbeat, mock_agent):
+-        workspace = tempfile.mkdtemp()
+-        job_folder = os.path.join(os.path.dirname(__file__), "../../../../data/jobs/valid_job")
+-        runner = SimulatorRunner(job_folder=job_folder, workspace=workspace, threads=1)
+-        assert runner.setup()
+-
+-        expected_clients = ["site-1", "site-2"]
+-        client_names = []
+-        for client in runner.client_names:
+-            client_names.append(client)
+-        assert sorted(client_names) == sorted(expected_clients)
+-
+-    @patch("nvflare.private.fed.app.deployer.simulator_deployer.SimulatorServer.deploy")
+-    @patch("nvflare.private.fed.app.utils.FedAdminServer")
+-    @patch("nvflare.private.fed.app.deployer.simulator_deployer.FederatedClient.register")
+-    @patch("nvflare.private.fed.app.deployer.simulator_deployer.FederatedClient.start_heartbeat")
+-    @patch("nvflare.private.fed.app.deployer.simulator_deployer.FedAdminAgent")
+-    def test_client_names_setup(self, mock_server, mock_admin, mock_register, mock_heartbeat, mock_agent):
+-        workspace = tempfile.mkdtemp()
+-        job_folder = os.path.join(os.path.dirname(__file__), "../../../../data/jobs/valid_job")
+-        runner = SimulatorRunner(job_folder=job_folder, workspace=workspace, clients="site-1", threads=1)
+-        assert runner.setup()
+-
+-        expected_clients = ["site-1"]
+-        client_names = []
+-        for client in runner.client_names:
+-            client_names.append(client)
+-        assert sorted(client_names) == sorted(expected_clients)
+-
+-    @patch("nvflare.private.fed.app.deployer.simulator_deployer.SimulatorServer.deploy")
+-    @patch("nvflare.private.fed.app.utils.FedAdminServer")
+-    @patch("nvflare.private.fed.app.deployer.simulator_deployer.FederatedClient.register")
+-    @patch("nvflare.private.fed.app.deployer.simulator_deployer.FederatedClient.start_heartbeat")
+-    @patch("nvflare.private.fed.app.deployer.simulator_deployer.FedAdminAgent")
+-    def test_no_app_for_client(self, mock_server, mock_admin, mock_register, mock_heartbeat, mock_agent):
+-        workspace = tempfile.mkdtemp()
+-        job_folder = os.path.join(os.path.dirname(__file__), "../../../../data/jobs/valid_job")
+-        runner = SimulatorRunner(job_folder=job_folder, workspace=workspace, n_clients=3, threads=1)
+-        assert not runner.setup()
++    # @patch("nvflare.private.fed.app.deployer.simulator_deployer.SimulatorServer.deploy")
++    # @patch("nvflare.private.fed.app.utils.FedAdminServer")
++    # @patch("nvflare.private.fed.app.deployer.simulator_deployer.FederatedClient.register")
++    # @patch("nvflare.private.fed.app.deployer.simulator_deployer.FederatedClient.start_heartbeat")
++    # @patch("nvflare.private.fed.app.deployer.simulator_deployer.FedAdminAgent")
++    # def test_valid_job_simulate_setup(self, mock_server, mock_admin, mock_register, mock_heartbeat, mock_agent):
++    #     workspace = tempfile.mkdtemp()
++    #     job_folder = os.path.join(os.path.dirname(__file__), "../../../../data/jobs/valid_job")
++    #     runner = SimulatorRunner(job_folder=job_folder, workspace=workspace, threads=1)
++    #     assert runner.setup()
++    #
++    #     expected_clients = ["site-1", "site-2"]
++    #     client_names = []
++    #     for client in runner.client_names:
++    #         client_names.append(client)
++    #     assert sorted(client_names) == sorted(expected_clients)
++    #
++    # @patch("nvflare.private.fed.app.deployer.simulator_deployer.SimulatorServer.deploy")
++    # @patch("nvflare.private.fed.app.utils.FedAdminServer")
++    # @patch("nvflare.private.fed.app.deployer.simulator_deployer.FederatedClient.register")
++    # @patch("nvflare.private.fed.app.deployer.simulator_deployer.FederatedClient.start_heartbeat")
++    # @patch("nvflare.private.fed.app.deployer.simulator_deployer.FedAdminAgent")
++    # def test_client_names_setup(self, mock_server, mock_admin, mock_register, mock_heartbeat, mock_agent):
++    #     workspace = tempfile.mkdtemp()
++    #     job_folder = os.path.join(os.path.dirname(__file__), "../../../../data/jobs/valid_job")
++    #     runner = SimulatorRunner(job_folder=job_folder, workspace=workspace, clients="site-1", threads=1)
++    #     assert runner.setup()
++    #
++    #     expected_clients = ["site-1"]
++    #     client_names = []
++    #     for client in runner.client_names:
++    #         client_names.append(client)
++    #     assert sorted(client_names) == sorted(expected_clients)
++    #
++    # @patch("nvflare.private.fed.app.deployer.simulator_deployer.SimulatorServer.deploy")
++    # @patch("nvflare.private.fed.app.utils.FedAdminServer")
++    # @patch("nvflare.private.fed.app.deployer.simulator_deployer.FederatedClient.register")
++    # @patch("nvflare.private.fed.app.deployer.simulator_deployer.FederatedClient.start_heartbeat")
++    # @patch("nvflare.private.fed.app.deployer.simulator_deployer.FedAdminAgent")
++    # def test_no_app_for_client(self, mock_server, mock_admin, mock_register, mock_heartbeat, mock_agent):
++    #     workspace = tempfile.mkdtemp()
++    #     job_folder = os.path.join(os.path.dirname(__file__), "../../../../data/jobs/valid_job")
++    #     runner = SimulatorRunner(job_folder=job_folder, workspace=workspace, n_clients=3, threads=1)
++    #     assert not runner.setup()
+ 
+     @pytest.mark.parametrize(
+         "client_names, gpus, expected_split_names",

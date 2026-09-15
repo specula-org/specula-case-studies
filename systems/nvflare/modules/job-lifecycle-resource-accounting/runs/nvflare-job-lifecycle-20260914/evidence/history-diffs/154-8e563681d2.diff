@@ -1,0 +1,37 @@
+commit 8e563681d29b79ff893046c292644247dd5a5319
+Author:     Yuhong Wen <yuhongw@nvidia.com>
+AuthorDate: Wed Oct 26 09:24:22 2022 -0400
+Commit:     GitHub <noreply@github.com>
+CommitDate: Wed Oct 26 09:24:22 2022 -0400
+
+    Fixed the abort_job HA failed to remove snapshot issue. (#1091)
+---
+ nvflare/private/fed/server/server_engine.py | 11 ++++++++---
+ 1 file changed, 8 insertions(+), 3 deletions(-)
+
+diff --git a/nvflare/private/fed/server/server_engine.py b/nvflare/private/fed/server/server_engine.py
+index 4ea21fd6..9f4176c2 100644
+--- a/nvflare/private/fed/server/server_engine.py
++++ b/nvflare/private/fed/server/server_engine.py
+@@ -370,13 +370,18 @@ class ServerEngine(ServerEngineInternalSpec):
+                 if child_process:
+                     child_process.terminate()
+         finally:
+-            with self.lock:
+-                if job_id in self.run_processes:
+-                    self.run_processes.pop(job_id)
++            threading.Thread(target=self._remove_run_processes, args=[job_id]).start()
+ 
+         self.engine_info.status = MachineStatus.STOPPED
+         return ""
+ 
++    def _remove_run_processes(self, job_id):
++        # wait for the run process to gracefully terminated, and ensure to remove from run_processes.
++        time.sleep(60.0)
++        if job_id in self.run_processes:
++            with self.lock:
++                self.run_processes.pop(job_id)
++
+     def check_app_start_readiness(self, job_id: str) -> str:
+         if job_id not in self.run_processes.keys():
+             return f"Server app run: {job_id} has not started."

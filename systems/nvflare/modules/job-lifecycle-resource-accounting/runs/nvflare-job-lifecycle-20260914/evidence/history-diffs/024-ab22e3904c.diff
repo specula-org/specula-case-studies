@@ -1,0 +1,84 @@
+commit ab22e3904c1610a34112e4dca2c5b2d2a03c1ed3
+Author:     Peter Cnudde <pcnudde@nvidia.com>
+AuthorDate: Mon Jun 22 14:01:43 2026 -0700
+Commit:     GitHub <noreply@github.com>
+CommitDate: Mon Jun 22 21:01:43 2026 +0000
+
+    Bind START_JOB metadata to deployed metadata (#4818)
+    
+    ## What
+    
+    Bind client START_JOB launch metadata to the deployed job metadata
+    before selecting a job launcher.
+    
+    The client now reads the deployed `meta.json` and rejects START_JOB
+    metadata drift for launch/runtime-sensitive fields:
+    
+    - `job_id`
+    - `resource_spec`
+    - `launcher_spec`
+    - `scope`
+    - `study`
+    
+    Scheduler-maintained start metadata such as status and participating
+    clients can still be recorded.
+    
+    ## Why
+    
+    Deploy-time app authorization and metadata verification happen before
+    the client writes the deployed `meta.json`. START_JOB previously
+    accepted fresh `job_meta` from the server, rewrote local metadata with
+    it, and selected Docker/K8s launch settings from that start-time
+    metadata. A tampered START_JOB could therefore replace
+    image/resource/study/scope metadata after deploy.
+---
+ nvflare/private/fed/client/client_executor.py | 22 ++++++++++++++++++++--
+ 1 file changed, 20 insertions(+), 2 deletions(-)
+
+diff --git a/nvflare/private/fed/client/client_executor.py b/nvflare/private/fed/client/client_executor.py
+index a583e917..c246dc3d 100644
+--- a/nvflare/private/fed/client/client_executor.py
++++ b/nvflare/private/fed/client/client_executor.py
+@@ -13,6 +13,7 @@
+ # limitations under the License.
+ import copy
+ import json
++import os
+ import threading
+ import time
+ from abc import ABC, abstractmethod
+@@ -20,6 +21,7 @@ from abc import ABC, abstractmethod
+ from nvflare.apis.event_type import EventType
+ from nvflare.apis.fl_constant import AdminCommandNames, ConnPropKey, FLContextKey, RunProcessKey, SystemConfigs
+ from nvflare.apis.fl_context import FLContext
++from nvflare.apis.job_def import JobMetaKey
+ from nvflare.apis.job_launcher_spec import JobLauncherSpec, JobProcessArgs, JobReturnCode
+ from nvflare.apis.resource_manager_spec import ResourceManagerSpec
+ from nvflare.apis.workspace import Workspace
+@@ -176,8 +178,24 @@ class JobExecutor(ClientExecutor):
+         # update the job meta
+         workspace = Workspace(args.workspace, site_name=client.client_name)
+         meta_file = workspace.get_job_meta_path(job_id)
+-
+-        # rewrite the meta file with the received meta
++        if not os.path.exists(meta_file):
++            raise RuntimeError(f"missing deployed job metadata file for job '{job_id}': {meta_file}")
++        with open(meta_file) as f:
++            deployed_job_meta = json.load(f)
++        for meta_key in (
++            JobMetaKey.JOB_ID.value,
++            JobMetaKey.RESOURCE_SPEC.value,
++            JobMetaKey.JOB_LAUNCHER_SPEC.value,
++            JobMetaKey.SCOPE.value,
++            JobMetaKey.STUDY.value,
++        ):
++            deployed_value = deployed_job_meta.get(meta_key)
++            if deployed_value != job_meta.get(meta_key):
++                raise RuntimeError(f"START_JOB metadata differs from deployed job metadata for '{meta_key}'")
++            if meta_key in deployed_job_meta:
++                job_meta[meta_key] = copy.deepcopy(deployed_value)
++
++        # Preserve deploy-time launch metadata while recording scheduler-maintained start metadata.
+         with open(meta_file, "w") as f:
+             json.dump(job_meta, f, indent=4)
+ 

@@ -1,0 +1,120 @@
+commit 397983be971f71e2234ed4046957fc086dee33c9
+Author:     Yan Cheng <58191769+yanchengnv@users.noreply.github.com>
+AuthorDate: Mon Dec 9 16:34:14 2024 -0500
+Commit:     GitHub <noreply@github.com>
+CommitDate: Mon Dec 9 16:34:14 2024 -0500
+
+    [2.5] Support explicit message authentication (#3096)
+    
+    * add client auth to 2.5
+    
+    * fix test case
+    
+    * remove unused func
+    
+    * support explicit client auth
+    
+    * fix unused imports
+    
+    * add docstring
+    
+    * fix insecure processing
+    
+    * fix simulator
+---
+ nvflare/private/fed/client/client_engine.py   | 19 +------------------
+ nvflare/private/fed/client/client_executor.py |  2 ++
+ nvflare/private/fed/server/server_engine.py   | 16 +++++++++++++++-
+ 3 files changed, 18 insertions(+), 19 deletions(-)
+
+diff --git a/nvflare/private/fed/client/client_engine.py b/nvflare/private/fed/client/client_engine.py
+index 6f7c8d66..7896da35 100644
+--- a/nvflare/private/fed/client/client_engine.py
++++ b/nvflare/private/fed/client/client_engine.py
+@@ -25,7 +25,7 @@ from nvflare.apis.fl_constant import FLContextKey, MachineStatus, SystemComponen
+ from nvflare.apis.fl_context import FLContext, FLContextManager
+ from nvflare.apis.workspace import Workspace
+ from nvflare.fuel.utils.network_utils import get_open_ports
+-from nvflare.private.defs import ERROR_MSG_PREFIX, ClientStatusKey, EngineConstant
++from nvflare.private.defs import ERROR_MSG_PREFIX, ClientStatusKey
+ from nvflare.private.event import fire_event
+ from nvflare.private.fed.server.job_meta_validator import JobMetaValidator
+ from nvflare.private.fed.utils.app_deployer import AppDeployer
+@@ -185,23 +185,6 @@ class ClientEngine(ClientEngineInternalSpec):
+     def get_client_name(self):
+         return self.client.client_name
+ 
+-    def _write_token_file(self, job_id, open_port):
+-        token_file = os.path.join(self.args.workspace, EngineConstant.CLIENT_TOKEN_FILE)
+-        if os.path.exists(token_file):
+-            os.remove(token_file)
+-        with open(token_file, "wt") as f:
+-            f.write(
+-                "%s\n%s\n%s\n%s\n%s\n%s\n"
+-                % (
+-                    self.client.token,
+-                    self.client.ssid,
+-                    job_id,
+-                    self.client.client_name,
+-                    open_port,
+-                    list(self.client.servers.values())[0]["target"],
+-                )
+-            )
+-
+     def abort_app(self, job_id: str) -> str:
+         status = self.client_executor.get_status(job_id)
+         if status == ClientStatus.STOPPED:
+diff --git a/nvflare/private/fed/client/client_executor.py b/nvflare/private/fed/client/client_executor.py
+index 8830cdbf..79f9646f 100644
+--- a/nvflare/private/fed/client/client_executor.py
++++ b/nvflare/private/fed/client/client_executor.py
+@@ -184,6 +184,8 @@ class ProcessExecutor(ClientExecutor):
+             + self.startup
+             + " -t "
+             + client.token
++            + " -ts "
++            + client.token_signature
+             + " -d "
+             + client.ssid
+             + " -n "
+diff --git a/nvflare/private/fed/server/server_engine.py b/nvflare/private/fed/server/server_engine.py
+index 65393b7e..3724ca55 100644
+--- a/nvflare/private/fed/server/server_engine.py
++++ b/nvflare/private/fed/server/server_engine.py
+@@ -53,7 +53,14 @@ from nvflare.fuel.utils.argument_utils import parse_vars
+ from nvflare.fuel.utils.network_utils import get_open_ports
+ from nvflare.fuel.utils.zip_utils import zip_directory_to_bytes
+ from nvflare.private.admin_defs import Message, MsgHeader
+-from nvflare.private.defs import CellChannel, CellMessageHeaderKeys, RequestHeader, TrainingTopic, new_cell_message
++from nvflare.private.defs import (
++    AUTH_CLIENT_NAME_FOR_SJ,
++    CellChannel,
++    CellMessageHeaderKeys,
++    RequestHeader,
++    TrainingTopic,
++    new_cell_message,
++)
+ from nvflare.private.fed.server.server_json_config import ServerJsonConfigurator
+ from nvflare.private.fed.server.server_state import ServerState
+ from nvflare.private.fed.utils.fed_utils import (
+@@ -253,6 +260,11 @@ class ServerEngine(ServerEngineInternalSpec):
+         for t in args.set:
+             command_options += " " + t
+ 
++        # create token and signature for SJ
++        token = run_number  # use the run_number as the auth token
++        client_name = AUTH_CLIENT_NAME_FOR_SJ
++        signature = self.server.sign_auth_token(client_name, token)
++
+         command = (
+             sys.executable
+             + " -m nvflare.private.fed.app.server.runner_process -m "
+@@ -261,6 +273,8 @@ class ServerEngine(ServerEngineInternalSpec):
+             + app_root
+             + " -n "
+             + str(run_number)
++            + " -ts "
++            + signature
+             + " -p "
+             + str(cell.get_internal_listener_url())
+             + " -u "

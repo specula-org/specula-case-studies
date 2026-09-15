@@ -1,0 +1,137 @@
+commit 7043c2abbeb6c6e4a41e34c209aca4ba9fe9d07a
+Author:     Yuhong Wen <yuhongw@nvidia.com>
+AuthorDate: Thu Oct 10 12:25:35 2024 -0400
+Commit:     GitHub <noreply@github.com>
+CommitDate: Fri Oct 11 00:25:35 2024 +0800
+
+    Remove the need to create additinal ports when running a job. (#3017)
+---
+ nvflare/private/fed/client/client_engine.py   | 4 ----
+ nvflare/private/fed/client/client_executor.py | 6 ------
+ nvflare/private/fed/server/server_engine.py   | 7 -------
+ 3 files changed, 17 deletions(-)
+
+diff --git a/nvflare/private/fed/client/client_engine.py b/nvflare/private/fed/client/client_engine.py
+index 6f7c8d66..6c4acb92 100644
+--- a/nvflare/private/fed/client/client_engine.py
++++ b/nvflare/private/fed/client/client_engine.py
+@@ -24,7 +24,6 @@ from nvflare.apis.fl_component import FLComponent
+ from nvflare.apis.fl_constant import FLContextKey, MachineStatus, SystemComponents, WorkspaceConstants
+ from nvflare.apis.fl_context import FLContext, FLContextManager
+ from nvflare.apis.workspace import Workspace
+-from nvflare.fuel.utils.network_utils import get_open_ports
+ from nvflare.private.defs import ERROR_MSG_PREFIX, ClientStatusKey, EngineConstant
+ from nvflare.private.event import fire_event
+ from nvflare.private.fed.server.job_meta_validator import JobMetaValidator
+@@ -161,15 +160,12 @@ class ClientEngine(ClientEngineInternalSpec):
+ 
+         self.logger.info("Starting client app. rank: {}".format(self.rank))
+ 
+-        open_port = get_open_ports(1)[0]
+-
+         server_config = list(self.client.servers.values())[0]
+         self.client_executor.start_app(
+             self.client,
+             job_id,
+             self.args,
+             app_custom_folder,
+-            open_port,
+             allocated_resource,
+             token,
+             resource_manager,
+diff --git a/nvflare/private/fed/client/client_executor.py b/nvflare/private/fed/client/client_executor.py
+index 8830cdbf..b93aaf63 100644
+--- a/nvflare/private/fed/client/client_executor.py
++++ b/nvflare/private/fed/client/client_executor.py
+@@ -42,7 +42,6 @@ class ClientExecutor(ABC):
+         job_id,
+         args,
+         app_custom_folder,
+-        listen_port,
+         allocated_resource,
+         token,
+         resource_manager,
+@@ -56,7 +55,6 @@ class ClientExecutor(ABC):
+             job_id: the job_id
+             args: admin command arguments for starting the FL client training
+             app_custom_folder: FL application custom folder
+-            listen_port: port to listen the command.
+             allocated_resource: allocated resources
+             token: token from resource manager
+             resource_manager: resource manager
+@@ -149,7 +147,6 @@ class ProcessExecutor(ClientExecutor):
+         job_id,
+         args,
+         app_custom_folder,
+-        listen_port,
+         allocated_resource,
+         token,
+         resource_manager: ResourceManagerSpec,
+@@ -163,7 +160,6 @@ class ProcessExecutor(ClientExecutor):
+             job_id: the job_id
+             args: admin command arguments for starting the worker process
+             app_custom_folder: FL application custom folder
+-            listen_port: port to listen the command.
+             allocated_resource: allocated resources
+             token: token from resource manager
+             resource_manager: resource manager
+@@ -208,8 +204,6 @@ class ProcessExecutor(ClientExecutor):
+ 
+         with self.lock:
+             self.run_processes[job_id] = {
+-                RunProcessKey.LISTEN_PORT: listen_port,
+-                RunProcessKey.CONNECTION: None,
+                 RunProcessKey.CHILD_PROCESS: process,
+                 RunProcessKey.STATUS: ClientStatus.STARTING,
+             }
+diff --git a/nvflare/private/fed/server/server_engine.py b/nvflare/private/fed/server/server_engine.py
+index 65393b7e..d59128cd 100644
+--- a/nvflare/private/fed/server/server_engine.py
++++ b/nvflare/private/fed/server/server_engine.py
+@@ -50,7 +50,6 @@ from nvflare.fuel.f3.cellnet.core_cell import FQCN, CoreCell
+ from nvflare.fuel.f3.cellnet.defs import MessageHeaderKey
+ from nvflare.fuel.f3.cellnet.defs import ReturnCode as CellMsgReturnCode
+ from nvflare.fuel.utils.argument_utils import parse_vars
+-from nvflare.fuel.utils.network_utils import get_open_ports
+ from nvflare.fuel.utils.zip_utils import zip_directory_to_bytes
+ from nvflare.private.admin_defs import Message, MsgHeader
+ from nvflare.private.defs import CellChannel, CellMessageHeaderKeys, RequestHeader, TrainingTopic, new_cell_message
+@@ -179,13 +178,11 @@ class ServerEngine(ServerEngineInternalSpec):
+             if not isinstance(job, Job):
+                 return "Must provide a job object to start the server app."
+ 
+-            open_ports = get_open_ports(2)
+             self._start_runner_process(
+                 self.args,
+                 app_root,
+                 run_number,
+                 app_custom_folder,
+-                open_ports,
+                 job.job_id,
+                 job_clients,
+                 snapshot,
+@@ -233,7 +230,6 @@ class ServerEngine(ServerEngineInternalSpec):
+         app_root,
+         run_number,
+         app_custom_folder,
+-        open_ports,
+         job_id,
+         job_clients,
+         snapshot,
+@@ -244,7 +240,6 @@ class ServerEngine(ServerEngineInternalSpec):
+         if app_custom_folder != "":
+             add_custom_dir_to_path(app_custom_folder, new_env)
+ 
+-        listen_port = open_ports[1]
+         if snapshot:
+             restore_snapshot = True
+         else:
+@@ -289,8 +284,6 @@ class ServerEngine(ServerEngineInternalSpec):
+ 
+         with self.lock:
+             self.run_processes[run_number] = {
+-                RunProcessKey.LISTEN_PORT: listen_port,
+-                RunProcessKey.CONNECTION: None,
+                 RunProcessKey.CHILD_PROCESS: process,
+                 RunProcessKey.JOB_ID: job_id,
+                 RunProcessKey.PARTICIPANTS: job_clients,
