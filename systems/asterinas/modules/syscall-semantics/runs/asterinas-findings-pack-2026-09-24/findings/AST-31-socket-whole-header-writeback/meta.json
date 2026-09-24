@@ -1,0 +1,45 @@
+{
+  "id": "AST-31",
+  "title": "Socket effects precede whole-header writeback to user memory",
+  "status": "SOURCE LEAD",
+  "origin": {
+    "kind": "specula-run",
+    "alias": "Recon",
+    "run_id": "asterinas-syscall-user-memory-baseline-20260822T172958Z",
+    "finding_ids": ["MC-3", "T-5", "CR-3"],
+    "pin": "604948581512d83734377974d4c34adb4530f2d7"
+  },
+  "also_seen_in": [],
+  "mechanism": "sys_recvmsg and send_mmsg_hdrs snapshot the whole user msghdr/mmsghdr, perform the socket effect, then write_val the entire saved structure back, touching input-only fields that Linux never writes.",
+  "sites": [
+    "kernel/core/src/syscall/recvmsg.rs::sys_recvmsg",
+    "kernel/core/src/syscall/sendmmsg.rs::send_mmsg_hdrs",
+    "kernel/core/src/syscall/sendmmsg.rs::sys_sendmmsg",
+    "kernel/core/src/util/net/socket.rs::CUserMsgHdr"
+  ],
+  "syscalls": ["recvmsg", "sendmmsg"],
+  "keywords": ["recvmsg", "sendmmsg", "msghdr", "mmsghdr", "copy-out", "writeback", "input-only field", "post-effect fault", "efault", "stale overwrite", "msg_len"],
+  "contract": "recvmsg writes back only msg_namelen, msg_controllen and msg_flags, and sendmmsg writes only msg_len, so input-only header fields are never overwritten and cannot cause a post-effect EFAULT (Linux net/socket.c).",
+  "observed": "Source only: after the receive or send completes, the whole saved header is written back, so an unwritable input-only field yields EFAULT after the effect and concurrent input-field updates are reverted.",
+  "upstream": {"match": "none", "refs": []},
+  "fix_status": "unfixed",
+  "fix_refs": [],
+  "repro": {
+    "available": false,
+    "files": [],
+    "how_to_run": "No reproducer. finding.md Reproduction describes page-boundary placements of msghdr/mmsghdr with a read-only input-only part, controls on output fields, and a two-thread stale-overwrite check.",
+    "smp": null,
+    "runtime_status": "NOT_RUN"
+  },
+  "evidence": [
+    "/home/chin39/Documents/play/Specula/runs/asterinas-syscall-user-memory-baseline-20260822T172958Z/asterinas-syscall-user-memory/.specula-output/analysis-report.md",
+    "/home/chin39/Documents/play/Specula/runs/asterinas-syscall-user-memory-baseline-20260822T172958Z/asterinas-syscall-user-memory/.specula-output/modeling-brief.md",
+    "/home/chin39/Documents/play/Specula/runs/asterinas-syscall-user-memory-baseline-20260822T172958Z/asterinas-syscall-user-memory/.specula-output/review-analysis.md",
+    "/home/chin39/Documents/play/specula-profile/references/asterinas-syscall-security-audit.md",
+    "/home/chin39/Documents/play/specula-profile/reports/asterinas-bug-findings-2026-08/README.md",
+    "/home/chin39/Documents/play/specula-profile/reports/asterinas-bug-findings-2026-08/id-map.md",
+    "/home/chin39/Documents/play/specula-profile/reports/upstream-dedup-2026-09-14/matches.json"
+  ],
+  "related": ["AST-32", "AST-38"],
+  "caveats": "Source-only lead. Linux permits post-effect faults at contractual output fields, so those cases are controls. The UIO_MAXIOV part of CR-3 is AST-38."
+}

@@ -1,0 +1,79 @@
+{
+  "id": "AST-24",
+  "title": "ext2 direct-write fault/rollback can leave an earlier BIO live",
+  "status": "MASKED",
+  "origin": {
+    "kind": "specula-run",
+    "alias": "01a",
+    "run_id": "asterinas-syscall-regular-file-partial-progress-20260823T030315Z",
+    "finding_ids": [
+      "MC-6"
+    ],
+    "pin": "604948581512d83734377974d4c34adb4530f2d7"
+  },
+  "also_seen_in": [],
+  "mechanism": "InodeInner::write_direct_blocks submits each mapped run into a local IoBatch and only waits after the loop. A user-copy fault on a later run returns through ?, dropping the batch (no Drop, no cancel) with an earlier BIO in flight, after which write_direct_at rolls back and, for extending writes, frees the blocks the live BIO targets.",
+  "sites": [
+    "kernel/core/src/fs/fs_impls/ext2/inode/file.rs::InodeInner::write_direct_blocks",
+    "kernel/core/src/fs/fs_impls/ext2/inode/file.rs::InodeInner::write_direct_at",
+    "kernel/core/src/fs/fs_impls/ext2/inode/file.rs::InodeInner::rollback_write",
+    "kernel/libs/io-util/src/batch.rs::IoBatch",
+    "kernel/core/comps/block/src/bio.rs::Bio::submit"
+  ],
+  "syscalls": [
+    "pwrite64",
+    "write"
+  ],
+  "keywords": [
+    "ext2",
+    "o_direct",
+    "iobatch",
+    "bio",
+    "in flight",
+    "efault",
+    "rollback",
+    "write after free",
+    "wait_all",
+    "masked"
+  ],
+  "contract": "An I/O syscall that returns (including with EFAULT) has no outstanding device I/O. Linux iomap_dio_rw waits for every submitted BIO, and IoBatch documents that the caller waits for all records it added.",
+  "observed": "An O_DIRECT pwrite spanning two non-adjacent runs returned EFAULT while the first run's BIO was still in flight and later published 4096 bytes. No later operation was ever clobbered in 64-round and 32-round probes on virtio-blk and NVMe.",
+  "upstream": {
+    "match": "related",
+    "refs": [
+      "https://github.com/asterinas/asterinas/pull/3297",
+      "https://github.com/asterinas/asterinas/issues/3604"
+    ],
+    "dedup_status": "RELATED_ONLY",
+    "upstream_fix_status": "NOT_ESTABLISHED"
+  },
+  "fix_status": "unfixed",
+  "fix_refs": [],
+  "repro": {
+    "available": true,
+    "files": [
+      "repro/test_bugMC-6_direct_write_pending_bio.c",
+      "repro/test_bugMC-6_direct_write_pending_bio.sh",
+      "repro/test_bugMC-6_extend_rollback_free.c",
+      "repro/test_bugMC-6_extend_rollback_free.sh",
+      "repro/specula-initramfs-plumbing.patch"
+    ],
+    "how_to_run": "Apply specula-initramfs-plumbing.patch to the pin, place the C files in test/initramfs/src/regression/io/specula/, and boot with SMP=2 and SPECULA_INIT pointing at a script that runs them on /ext2 (and /nvme). Cases A/B COMMIT_WITHOUT_REPORT with C NO_PUBLICATION show the mechanism.",
+    "smp": 2,
+    "runtime_status": "MASKED at 604948581 (01a MC-6, SMP=2): mechanism observed in cases A/B/C, harm not observed in D-G, J, J2"
+  },
+  "evidence": [
+    "/home/chin39/Documents/play/Specula/runs/asterinas-syscall-regular-file-partial-progress-20260823T030315Z/asterinas-syscall-regular-file-partial-progress/.specula-output/confirmed-bugs.md",
+    "/home/chin39/Documents/play/Specula/runs/asterinas-syscall-regular-file-partial-progress-20260823T030315Z/asterinas-syscall-regular-file-partial-progress/.specula-output/confirmation/MC-6/investigation.md",
+    "/home/chin39/Documents/play/Specula/runs/asterinas-syscall-regular-file-partial-progress-20260823T030315Z/asterinas-syscall-regular-file-partial-progress/.specula-output/confirmation/MC-6/investigation-turn02-B.md",
+    "/home/chin39/Documents/play/Specula/runs/asterinas-syscall-regular-file-partial-progress-20260823T030315Z/asterinas-syscall-regular-file-partial-progress/.specula-output/confirmation/MC-6/verdict.json",
+    "/home/chin39/Documents/play/Specula/runs/asterinas-syscall-regular-file-partial-progress-20260823T030315Z/asterinas-syscall-regular-file-partial-progress/.specula-output/repro/out_bugMC-6/",
+    "/home/chin39/Documents/play/Specula/runs/asterinas-syscall-regular-file-partial-progress-20260823T030315Z/asterinas-syscall-regular-file-partial-progress/.specula-output/repro/out_bugMC-6_extend/",
+    "/home/chin39/Documents/play/specula-profile/references/active-specula-run-handoff.md"
+  ],
+  "related": [
+    "AST-40",
+    "AST-01"
+  ],
+  "caveats": "Masked by backend: the mask is a single-worker FIFO staging queue per device plus the blocking wait_all in zero_new_blocks (a debater correction, whereas turn 1 and the 01a handoff name the in-order virtqueue). The write-after-free shape needs a near-full block group. Linux ext4 also returns EFAULT with a committed prefix, so that return alone is not a contract violation. Drivers reference a removed confirmation worktree."
+}

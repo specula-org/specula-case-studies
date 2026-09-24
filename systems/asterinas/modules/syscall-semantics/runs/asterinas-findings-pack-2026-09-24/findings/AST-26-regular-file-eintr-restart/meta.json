@@ -1,0 +1,75 @@
+{
+  "id": "AST-26",
+  "title": "Regular-file partial-progress EINTR restart candidate",
+  "status": "FALSE POSITIVE",
+  "origin": {
+    "kind": "specula-run",
+    "alias": "01a",
+    "run_id": "asterinas-syscall-regular-file-partial-progress-20260823T030315Z",
+    "finding_ids": [
+      "CR-1"
+    ],
+    "pin": "604948581512d83734377974d4c34adb4530f2d7"
+  },
+  "also_seen_in": [],
+  "mechanism": "Candidate: sys_read/sys_write map any backend EINTR to ERESTARTSYS without a progress count, so an SA_RESTART replay could repeat a committed partial transfer. Rejected because no regular-file backend returns EINTR (waits are uninterruptible and copy faults are EFAULT).",
+  "sites": [
+    "kernel/core/src/syscall/read.rs::sys_read",
+    "kernel/core/src/syscall/write.rs::sys_write",
+    "kernel/core/src/process/signal/mod.rs::handle_pending_signal",
+    "kernel/core/src/fs/file/inode_handle.rs::InodeHandle::write"
+  ],
+  "syscalls": [
+    "read",
+    "write"
+  ],
+  "keywords": [
+    "eintr",
+    "erestartsys",
+    "sa_restart",
+    "restart",
+    "partial progress",
+    "replay",
+    "o_append",
+    "regular file",
+    "signal",
+    "false positive"
+  ],
+  "contract": "signal(7): regular-file (disk) I/O is not interrupted by signals. Read(2)/write(2) return a partial count when interrupted after transferring data.",
+  "observed": "Under roughly 17k to 45k signals per section, regular-file read/write on ramfs and ext2 (buffered, O_DIRECT, O_SYNC) never returned EINTR, and O_APPEND size and shared offset equalled the sum of returned counts, matching Linux. The pipe control restarted as expected.",
+  "upstream": {
+    "match": "none",
+    "refs": [],
+    "dedup_status": "NON_ACTIONABLE_RECORD",
+    "upstream_fix_status": "NOT_APPLICABLE",
+    "reviewed_candidates": [
+      "https://github.com/asterinas/asterinas/issues/1578",
+      "https://github.com/asterinas/asterinas/pull/3576"
+    ]
+  },
+  "fix_status": "not-applicable",
+  "fix_refs": [],
+  "repro": {
+    "available": true,
+    "files": [
+      "repro/test_bugCR-1_restart_progress_provenance.c",
+      "repro/test_bugCR-1_restart_progress_provenance.sh",
+      "repro/specula-initramfs-plumbing.patch"
+    ],
+    "how_to_run": "Negative probe: run the binary with --ctrl, then with <dir> <label> [direct|sync] on /tmp and /ext2 in the guest and on a Linux host. UNINTERRUPTIBLE, NO_REPLAY and NO_DOUBLE_ADVANCE confirm the false positive, and the pipe control must print RESTARTED.",
+    "smp": 2,
+    "runtime_status": "negative probe ran at 604948581 (01a CR-1, SMP=2): no regular-file EINTR, no replay. FALSE POSITIVE"
+  },
+  "evidence": [
+    "/home/chin39/Documents/play/Specula/runs/asterinas-syscall-regular-file-partial-progress-20260823T030315Z/asterinas-syscall-regular-file-partial-progress/.specula-output/confirmed-bugs.md",
+    "/home/chin39/Documents/play/Specula/runs/asterinas-syscall-regular-file-partial-progress-20260823T030315Z/asterinas-syscall-regular-file-partial-progress/.specula-output/confirmation/CR-1/investigation.md",
+    "/home/chin39/Documents/play/Specula/runs/asterinas-syscall-regular-file-partial-progress-20260823T030315Z/asterinas-syscall-regular-file-partial-progress/.specula-output/confirmation/CR-1/verdict.json",
+    "/home/chin39/Documents/play/Specula/runs/asterinas-syscall-regular-file-partial-progress-20260823T030315Z/asterinas-syscall-regular-file-partial-progress/.specula-output/repro/out_bugCR-1/",
+    "/home/chin39/Documents/play/specula-profile/references/active-specula-run-handoff.md"
+  ],
+  "related": [
+    "AST-09",
+    "AST-39"
+  ],
+  "caveats": "Regular files only. Pipes are AST-09 (reproduced) and sockets remain AST-39. The rejection depends on no backend returning EINTR after committed progress. matches.json classifies it NON_ACTIONABLE_RECORD. #3576 rewrites the same lines but is a different defect."
+}

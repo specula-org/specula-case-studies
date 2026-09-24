@@ -1,0 +1,145 @@
+diff --git a/test/initramfs/src/regression/fs/Makefile b/test/initramfs/src/regression/fs/Makefile
+--- a/test/initramfs/src/regression/fs/Makefile
++++ b/test/initramfs/src/regression/fs/Makefile
+@@ -1,6 +1,7 @@
+ # SPDX-License-Identifier: MPL-2.0
+ 
+ SUBDIRS := \
++	empty_write \
+ 	ext2 \
+ 	fdatasync \
+ 	getcwd \
+diff --git a/test/initramfs/src/regression/fs/empty_write/Makefile b/test/initramfs/src/regression/fs/empty_write/Makefile
+new file mode 100644
+--- /dev/null
++++ b/test/initramfs/src/regression/fs/empty_write/Makefile
+@@ -0,0 +1,5 @@
++# SPDX-License-Identifier: MPL-2.0
++
++EXTRA_C_FLAGS := -static
++
++include ../../common/Makefile
+diff --git a/test/initramfs/src/regression/fs/empty_write/empty_write.c b/test/initramfs/src/regression/fs/empty_write/empty_write.c
+new file mode 100644
+--- /dev/null
++++ b/test/initramfs/src/regression/fs/empty_write/empty_write.c
+@@ -0,0 +1,103 @@
++/* SPDX-License-Identifier: MPL-2.0 */
++
++#define _GNU_SOURCE
++#include <fcntl.h>
++#include <limits.h>
++#include <sys/stat.h>
++#include <time.h>
++#include <unistd.h>
++
++#include "../../common/test.h"
++
++static char path[PATH_MAX];
++static int fd;
++static int io_fd;
++
++static int same_time(struct timespec a, struct timespec b)
++{
++	return a.tv_sec == b.tv_sec && a.tv_nsec == b.tv_nsec;
++}
++
++FN_SETUP(create_file)
++{
++	const char *dir = getenv("TEST_TMPDIR");
++	if (!dir) {
++		dir = "/tmp";
++	}
++	CHECK_WITH(snprintf(path, sizeof(path), "%s/empty-write-XXXXXX", dir),
++		   _ret > 0 && (size_t)_ret < sizeof(path));
++	fd = CHECK(mkstemp(path));
++	int direct = getenv("TEST_DIRECT") != NULL;
++	io_fd = CHECK(open(path, O_RDWR | (direct ? O_DIRECT : 0)));
++	fprintf(stderr, "fixture=%s mode=%s\n", dir,
++		direct ? "direct" : "buffered");
++}
++END_SETUP()
++
++FN_TEST(empty_writes_preserve_metadata_and_position)
++{
++	const off_t offsets[] = { 1, 2, 8192 };
++	/* An old mtime exposes an update without relying on a sleep. */
++	const struct timespec times[2] = { { 946684800, 0 }, { 946684800, 0 } };
++
++	for (int positional = 0; positional < 2; positional++) {
++		for (size_t i = 0; i < sizeof(offsets) / sizeof(offsets[0]);
++		     i++) {
++			const char *op = positional ? "pwrite" : "write";
++			fprintf(stderr, "%s offset=%lld\n", op,
++				(long long)offsets[i]);
++			CHECK(ftruncate(fd, 0));
++			CHECK_WITH(pwrite(fd, "hi", 2, 0), _ret == 2);
++			CHECK(futimens(fd, times));
++			struct stat before, after;
++			CHECK(fstat(fd, &before));
++			off_t position = positional ? 1 : offsets[i];
++			CHECK_WITH(lseek(io_fd, position, SEEK_SET),
++				   _ret == position);
++
++			errno = 0;
++			ssize_t written =
++				positional ? pwrite(io_fd, "", 0, offsets[i]) :
++					     write(io_fd, "", 0);
++			int write_errno = errno;
++			CHECK(fstat(fd, &after));
++			off_t after_position = CHECK(lseek(io_fd, 0, SEEK_CUR));
++			fprintf(stderr,
++				"result=%zd expected=0; errno=%d expected=0; size=%lld expected=%lld; position=%lld expected=%lld\n",
++				written, write_errno, (long long)after.st_size,
++				(long long)before.st_size,
++				(long long)after_position, (long long)position);
++			fprintf(stderr, "blocks=%lld expected=%lld\n",
++				(long long)after.st_blocks,
++				(long long)before.st_blocks);
++			fprintf(stderr,
++				"mtime=%lld.%09ld expected=%lld.%09ld; ctime=%lld.%09ld expected=%lld.%09ld\n",
++				(long long)after.st_mtim.tv_sec,
++				after.st_mtim.tv_nsec,
++				(long long)before.st_mtim.tv_sec,
++				before.st_mtim.tv_nsec,
++				(long long)after.st_ctim.tv_sec,
++				after.st_ctim.tv_nsec,
++				(long long)before.st_ctim.tv_sec,
++				before.st_ctim.tv_nsec);
++			TEST_RES(written, _ret == 0);
++			TEST_RES(write_errno, _ret == 0);
++			TEST_RES(after.st_size, _ret == before.st_size);
++			TEST_RES(after.st_blocks, _ret == before.st_blocks);
++			TEST_RES(same_time(before.st_mtim, after.st_mtim),
++				 _ret);
++			TEST_RES(same_time(before.st_ctim, after.st_ctim),
++				 _ret);
++			TEST_RES(after_position, _ret == position);
++		}
++	}
++}
++END_TEST()
++
++FN_SETUP(cleanup)
++{
++	CHECK(close(io_fd));
++	CHECK(close(fd));
++	CHECK(unlink(path));
++}
++END_SETUP()
+diff --git a/test/initramfs/src/regression/fs/run_test.sh b/test/initramfs/src/regression/fs/run_test.sh
+--- a/test/initramfs/src/regression/fs/run_test.sh
++++ b/test/initramfs/src/regression/fs/run_test.sh
+@@ -113,6 +113,12 @@
+ test_mount_bind_file
+ echo "All mount bind file test passed."
+ 
++./empty_write/empty_write
++TEST_TMPDIR=/exfat ./empty_write/empty_write
++TEST_TMPDIR=/exfat TEST_DIRECT=1 ./empty_write/empty_write
++TEST_TMPDIR=/ext2 ./empty_write/empty_write
++TEST_TMPDIR=/ext2 TEST_DIRECT=1 ./empty_write/empty_write
++
+ ./getcwd/getcwd
+ 
+ ./inotify/inotify_align

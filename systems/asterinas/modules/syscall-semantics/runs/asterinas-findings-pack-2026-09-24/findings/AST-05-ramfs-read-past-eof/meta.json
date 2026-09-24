@@ -1,0 +1,118 @@
+{
+  "id": "AST-05",
+  "title": "ramfs/exFAT reads copy beyond the reported EOF prefix",
+  "status": "REPRODUCED",
+  "origin": {
+    "kind": "specula-run",
+    "alias": "01a",
+    "run_id": "asterinas-syscall-regular-file-partial-progress-20260823T030315Z",
+    "finding_ids": [
+      "MC-3"
+    ],
+    "pin": "604948581512d83734377974d4c34adb4530f2d7"
+  },
+  "aliases": [
+    "RF-05"
+  ],
+  "also_seen_in": [
+    {
+      "alias": "GLM",
+      "run_id": "asterinas-glm53-eval-20260826T035049Z",
+      "finding_id": "MC-2",
+      "verdict": "REPRODUCED"
+    },
+    {
+      "alias": "01b",
+      "run_id": "20260908-150910-0a8c",
+      "finding_id": "MC-2",
+      "verdict": "REPRODUCED"
+    },
+    {
+      "alias": "01b",
+      "run_id": "20260908-150910-0a8c",
+      "finding_id": "CR-1",
+      "verdict": "REPRODUCED"
+    }
+  ],
+  "mechanism": "RamInode::read_at and ExfatInode::read_at compute the EOF-limited length but hand the caller's unlimited writer to the page cache; the cache is page-aligned and Vmo::read clips only against capacity, so bytes past the returned count are overwritten (or a fault past EOF becomes EFAULT).",
+  "sites": [
+    "kernel/core/src/fs/fs_impls/ramfs/fs.rs::RamInode::read_at",
+    "kernel/core/src/fs/fs_impls/exfat/inode.rs::ExfatInode::read_at",
+    "kernel/core/src/vm/page_cache/mod.rs::PageCache",
+    "kernel/core/src/vm/page_cache/vmo/mod.rs::Vmo::read"
+  ],
+  "syscalls": [
+    "read",
+    "pread64",
+    "readv",
+    "preadv"
+  ],
+  "keywords": [
+    "eof",
+    "page cache",
+    "capacity",
+    "page-aligned",
+    "read past eof",
+    "buffer clobber",
+    "writer limit",
+    "ramfs",
+    "exfat",
+    "sentinel",
+    "short read"
+  ],
+  "contract": "read(2): the kernel writes only the returned number of bytes into the caller's buffer and leaves the rest untouched.",
+  "observed": "Asterinas ramfs and exFAT overwrite the caller's buffer past the returned count (zeros up to the page-cache capacity), even when the read returns 0 at EOF.",
+  "upstream": {
+    "match": "open-pr",
+    "refs": [
+      "https://github.com/asterinas/asterinas/pull/3778"
+    ]
+  },
+  "fix_status": "pr-open",
+  "fix_refs": [
+    "https://github.com/asterinas/asterinas/pull/3778 (open, head d007cbb623bde58c6692feb6e3257ca1490438fd on a5449e62b; commits 042ff520c, 17234066b, 16e1bcaa6, d007cbb62)",
+    "branch fix/ramfs-read-past-eof in /home/chin39/Documents/asterinas-dev",
+    "/home/chin39/Documents/play/specula-profile/references/pr-3778-handoff.md"
+  ],
+  "report": "https://github.com/asterinas/asterinas/pull/3778",
+  "repro": {
+    "available": true,
+    "files": [
+      "repro/repro.c",
+      "repro/run.sh",
+      "repro/min_ast05.c",
+      "repro/read_eof-regression-pr3778.patch",
+      "repro/README.md",
+      "repro/variants/GLM-MC-2/",
+      "repro/variants/01a-MC-3/",
+      "repro/variants/01b-CR-1/",
+      "repro/variants/01b-MC-2/"
+    ],
+    "how_to_run": "Build repro.c into the initramfs, mkdir /mc3 in the guest and run it on /mc3 (ramfs) or /exfat in an SMP=2 guest; compare with Linux tmpfs. The PR #3778 patch adds the in-tree fs/read_eof regression.",
+    "smp": 2,
+    "runtime_status": "REPRODUCED at 604948581"
+  },
+  "evidence": [
+    "/home/chin39/Documents/play/specula-profile/reports/asterinas-bug-findings-2026-08/AST-05-ramfs-read-past-eof/description.md",
+    "/home/chin39/Documents/play/Specula/runs/asterinas-syscall-regular-file-partial-progress-20260823T030315Z/asterinas-syscall-regular-file-partial-progress/.specula-output/confirmation/MC-3/",
+    "/home/chin39/Documents/play/Specula/runs/asterinas-syscall-regular-file-partial-progress-20260823T030315Z/asterinas-syscall-regular-file-partial-progress/.specula-output/repro/test_bugMC-3_ramfs_read_past_eof.c",
+    "/home/chin39/Documents/play/specula-profile/reports/patch-validation-report.md",
+    "/home/chin39/Documents/play/specula-profile/reports/ast-validation-2026-09-02/README.md",
+    "/home/chin39/Documents/play/specula-profile/reports/ast-validation-2026-09-02/logs/asterinas-604948581-guest-transcript.txt",
+    "/home/chin39/Documents/play/specula-profile/reports/ast-validation-2026-09-02/logs/linux-7.1.9-AST-05-tmpfs.txt",
+    "/home/chin39/Documents/play/specula-profile/reports/ast-validation-2026-09-02/logs/ast05-fix-read_eof-baseline-604948581.txt",
+    "/home/chin39/Documents/play/specula-profile/reports/ast-validation-2026-09-02/logs/ast05-review/",
+    "/home/chin39/Documents/play/specula-profile/reports/ast-validation-2026-09-02/logs/wip-2026-09-11/",
+    "/home/chin39/Documents/play/specula-profile/references/pr-3778-handoff.md",
+    "/home/chin39/Documents/play/Specula/runs/asterinas-glm53-eval-20260826T035049Z/asterinas-glm53-eval/.specula-output/confirmation/MC-2/",
+    "/home/chin39/Documents/play/Specula/runs/20260908-150910-0a8c/asterinas-syscall-buffered-file-size-read-consistency/.specula-output/confirmed-bugs.md",
+    "/home/chin39/Documents/play/specula-profile/reports/upstream-dedup-2026-09-14/matches.json"
+  ],
+  "related": [
+    "AST-10",
+    "AST-25",
+    "AST-11"
+  ],
+  "caveats": "AST-10 (stale read length vs resize) is a distinct defect also fixed in PR #3778. An in-place writer.limit fix (ext2 style, historical v5) breaks readv/preadv iovec progression; the clone form is required. PR head d007cbb62 was not re-run in the catalog pass.",
+  "record": "findings/AST-05-ramfs-read-past-eof/finding.md"
+}

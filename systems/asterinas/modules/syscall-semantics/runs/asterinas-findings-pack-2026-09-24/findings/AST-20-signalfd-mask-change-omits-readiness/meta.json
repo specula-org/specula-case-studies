@@ -1,0 +1,96 @@
+{
+  "id": "AST-20",
+  "title": "signalfd mask change omits newly eligible readiness",
+  "status": "REPRODUCED",
+  "origin": {
+    "kind": "specula-run",
+    "alias": "FD",
+    "run_id": "asterinas-fd-epoll-pipeline-20260811T164254Z",
+    "finding_ids": [
+      "MC-5"
+    ],
+    "pin": "4ba4abbe8cb3f2892129d67b0301cf247bbdda0f"
+  },
+  "also_seen_in": [],
+  "mechanism": "update_existing_signalfd only stores the new mask (relaxed store) and nonblocking flag without notifying pollers. SigQueues::enqueue is the only notifier, so an already-pending signal that the new mask admits never wakes the existing epoll registration.",
+  "sites": [
+    "kernel/core/src/syscall/signalfd.rs::update_existing_signalfd",
+    "kernel/core/src/syscall/signalfd.rs::SignalFile::update_signal_mask",
+    "kernel/core/src/syscall/signalfd.rs::SignalFile::poll",
+    "kernel/core/src/process/signal/sig_queues.rs::SigQueues::enqueue",
+    "kernel/core/src/process/posix_thread/mod.rs::PosixThread::register_signalfd_poller",
+    "kernel/core/src/events/epoll/file.rs::EpollFile::wait"
+  ],
+  "syscalls": [
+    "signalfd4",
+    "epoll_wait",
+    "epoll_ctl",
+    "kill",
+    "rt_sigprocmask"
+  ],
+  "keywords": [
+    "signalfd",
+    "mask update",
+    "pending signal",
+    "epoll",
+    "notify",
+    "missed wakeup",
+    "readiness",
+    "sig_queues",
+    "transition",
+    "signalfd4"
+  ],
+  "contract": "signalfd(2): replacing the mask of an existing signalfd makes it readable when a pending signal is in the new mask, and Linux wakes pollers on the update.",
+  "observed": "After signalfd4 adds an already-pending signal to an existing signalfd's mask, epoll_wait times out while direct poll and read of the signalfd succeed.",
+  "upstream": {
+    "match": "none",
+    "refs": [],
+    "dedup_status": "NO_DIRECT_MATCH",
+    "upstream_fix_status": "NOT_ESTABLISHED",
+    "checked_against": "bc12195df4acfb1fc4ae968cf7acf9333ed83435",
+    "related_refs": [
+      "https://github.com/asterinas/asterinas/pull/2245",
+      "https://github.com/asterinas/asterinas/pull/3656"
+    ]
+  },
+  "fix_status": "unfixed",
+  "fix_refs": [],
+  "repro": {
+    "available": true,
+    "files": [
+      "repro/test_bug5_signalfd_mask_transition.c",
+      "repro/specula_validation.c",
+      "repro/test_bugMC-5_signalfd_mask_transition.c",
+      "repro/test_bugMC-5_signalfd_mask_transition.nix",
+      "repro/test_bugMC-5_signalfd_mask_transition.sh",
+      "repro/test_bugMC-5_exact_counterexample.c",
+      "repro/test_bugMC-5_exact_counterexample.nix",
+      "repro/test_bugMC-5_exact_counterexample.sh",
+      "repro/specula-initramfs-plumbing.patch",
+      "repro/README.md"
+    ],
+    "how_to_run": "Apply the plumbing patch at the pin, copy the test into test/initramfs/src/regression/io/specula/, and run make run_kernel SMP=2 ... SPECULA_INIT=\"/test/io/specula/run_bug.sh test_bug5_signalfd_mask_transition\". See repro/README.md.",
+    "smp": 2,
+    "runtime_status": "REPRODUCED at 4ba4abbe8cb3f2892129d67b0301cf247bbdda0f"
+  },
+  "evidence": [
+    "/home/chin39/Documents/play/Specula/runs/asterinas-fd-epoll-pipeline-20260811T164254Z/asterinas-fd-epoll/.specula-output/confirmation/MC-5/investigation.md",
+    "/home/chin39/Documents/play/Specula/runs/asterinas-fd-epoll-pipeline-20260811T164254Z/asterinas-fd-epoll/.specula-output/confirmation/MC-5/reproduction.md",
+    "/home/chin39/Documents/play/Specula/runs/asterinas-fd-epoll-pipeline-20260811T164254Z/asterinas-fd-epoll/.specula-output/confirmation/MC-5/verdict.json",
+    "/home/chin39/Documents/play/Specula/runs/asterinas-fd-epoll-pipeline-20260811T164254Z/asterinas-fd-epoll/.specula-output/confirmation/MC-5/turn01_A.log",
+    "/home/chin39/Documents/play/Specula/runs/asterinas-fd-epoll-pipeline-20260811T164254Z/asterinas-fd-epoll/.specula-output/confirmation/MC-5/turn02_B.log",
+    "/home/chin39/Documents/play/Specula/runs/asterinas-fd-epoll-pipeline-20260811T164254Z/asterinas-fd-epoll/.specula-output/harness/logs/repro_test_bug5_signalfd_mask_transition_smp2_round6_attempt1.log",
+    "/home/chin39/Documents/play/Specula/runs/asterinas-fd-epoll-pipeline-20260811T164254Z/asterinas-fd-epoll/.specula-output/harness/logs/repro_host_round6.log",
+    "/home/chin39/Documents/play/Specula/runs/asterinas-fd-epoll-pipeline-20260811T164254Z/asterinas-fd-epoll/.specula-output/spec/output/MC_hunt_s4_mask_transition_round2_bfs_cex.json",
+    "/home/chin39/Documents/play/specula-profile/reports/independent-review/terra-asterinas-bug-report-vm-final.md",
+    "/home/chin39/Documents/play/Specula/runs/asterinas-fd-epoll-pipeline-20260811T164254Z/asterinas-fd-epoll/.specula-output/confirmed-bugs.md",
+    "/home/chin39/Documents/play/Specula/runs/asterinas-fd-epoll-pipeline-20260811T164254Z/asterinas-fd-epoll/.specula-output/bug-severity.md",
+    "/home/chin39/Documents/play/specula-profile/references/asterinas-syscall-security-audit.md",
+    "/home/chin39/Documents/play/specula-profile/reports/workflow-validation.md"
+  ],
+  "related": [
+    "AST-22",
+    "AST-41"
+  ],
+  "caveats": "Process-directed signal path only (self-kill with the signal blocked). The debate addendum cites a worktree qemu.log that no longer exists. Challenger output survives in reproduction.md and turn logs. Not the AST-41 binding oracle. Historical evidence at the pin only. Static read of upstream main bc12195df on 2026-09-24 showed the same code shape. No runtime retest."
+}

@@ -1,0 +1,49 @@
+{
+  "id": "AST-35",
+  "title": "IP socket user copy may fault while holding atomic-mode locks",
+  "status": "SOURCE LEAD",
+  "origin": {
+    "kind": "specula-run",
+    "alias": "Recon",
+    "run_id": "asterinas-syscall-user-memory-baseline-20260822T172958Z",
+    "finding_ids": ["T-10"],
+    "pin": "604948581512d83734377974d4c34adb4530f2d7"
+  },
+  "also_seen_in": [],
+  "mechanism": "aster-bigtcp UdpSocket::send/recv and TcpConnection::send/recv run the user-copy closure while holding spin locks (UDP with bottom halves disabled), and user pages are not prefaulted, so a user page fault can occur in atomic mode.",
+  "sites": [
+    "kernel/libs/aster-bigtcp/src/socket/bound/udp.rs::UdpSocket::send",
+    "kernel/libs/aster-bigtcp/src/socket/bound/udp.rs::UdpSocket::recv",
+    "kernel/libs/aster-bigtcp/src/socket/bound/tcp_conn.rs::TcpConnection::send",
+    "kernel/libs/aster-bigtcp/src/socket/bound/tcp_conn.rs::TcpConnection::recv",
+    "kernel/core/src/net/socket/ip/stream/connected.rs::ConnectedStream::try_send",
+    "kernel/core/src/net/socket/ip/stream/connected.rs::ConnectedStream::try_recv",
+    "kernel/core/src/net/socket/ip/stream/mod.rs::StreamSocket"
+  ],
+  "syscalls": ["sendto", "sendmsg", "recvfrom", "recvmsg"],
+  "keywords": ["atomic mode", "spin lock", "page fault", "user copy", "tcp", "udp", "bottom half", "sleep in atomic", "preempt count", "aster-bigtcp"],
+  "contract": "send and recv on a valid mapped but not-yet-present user buffer succeed, with the page fault served in a context that may sleep (send(2), recv(2)).",
+  "observed": "Source only: the user copy runs under spin locks without prefaulting, which a source FIXME says breaks atomic mode. No panic, hang or EFAULT has been observed.",
+  "upstream": {"match": "partial", "refs": ["https://github.com/asterinas/asterinas/issues/1304", "https://github.com/asterinas/asterinas/pull/1365"]},
+  "fix_status": "unfixed",
+  "fix_refs": [],
+  "repro": {
+    "available": false,
+    "files": [],
+    "how_to_run": "No reproducer. finding.md Reproduction describes UDP and TCP loopback sends and receives using untouched file-backed mappings, run at SMP=1 and SMP of 2 or more.",
+    "smp": null,
+    "runtime_status": "NOT_RUN"
+  },
+  "evidence": [
+    "/home/chin39/Documents/play/Specula/runs/asterinas-syscall-user-memory-baseline-20260822T172958Z/asterinas-syscall-user-memory/.specula-output/analysis-report.md",
+    "/home/chin39/Documents/play/Specula/runs/asterinas-syscall-user-memory-baseline-20260822T172958Z/asterinas-syscall-user-memory/.specula-output/modeling-brief.md",
+    "/home/chin39/Documents/play/Specula/runs/asterinas-syscall-user-memory-baseline-20260822T172958Z/asterinas-syscall-user-memory/.specula-output/review-analysis.md",
+    "/home/chin39/Documents/play/specula-profile/references/asterinas-syscall-security-audit.md",
+    "/home/chin39/Documents/play/specula-profile/reports/asterinas-bug-findings-2026-08/README.md",
+    "/home/chin39/Documents/play/specula-profile/reports/asterinas-bug-findings-2026-08/id-map.md",
+    "/home/chin39/Documents/play/specula-profile/reports/upstream-dedup-2026-09-14/matches.json",
+    "/home/chin39/Documents/play/specula-profile/reports/upstream-dedup-2026-09-14/raw/details/1304-issue.json"
+  ],
+  "related": ["AST-30"],
+  "caveats": "Concrete fault/lock failure not reproduced. #1304/#1365 fixed the UNIX-socket variant only. Report T-10 equals brief T-9."
+}

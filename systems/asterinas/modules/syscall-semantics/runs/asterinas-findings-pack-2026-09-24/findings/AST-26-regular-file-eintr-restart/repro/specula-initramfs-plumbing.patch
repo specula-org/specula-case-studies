@@ -1,0 +1,146 @@
+diff --git a/Makefile b/Makefile
+index 0ee7af9..5c1bdaa 100644
+--- a/Makefile
++++ b/Makefile
+@@ -62,6 +62,8 @@ XFSTESTS_TEST_DEV ?= /dev/vdd
+ XFSTESTS_SCRATCH_DEV ?= /dev/vde
+ # Specify whether to build regression tests under `test/initramfs/src/regression`.
+ ENABLE_REGRESSION_TEST ?= false
++# Build the isolated Specula regular-file trace harness.
++ENABLE_SPECULA_TRACE ?= false
+ # End of auto test features.
+ 
+ # Network settings
+@@ -113,6 +115,11 @@ CARGO_OSDK_BUILD_ARGS += $(foreach arg,$(CMDLINE),--kcmd-args="$(arg)")
+ endif
+ CARGO_OSDK_TEST_ARGS :=
+ 
++ifneq ($(SPECULA_INIT),)
++ENABLE_SPECULA_TRACE := true
++CARGO_OSDK_BUILD_ARGS += --init-args="$(SPECULA_INIT)"
++endif
++
+ ifeq ($(AUTO_TEST), conformance)
+ ENABLE_CONFORMANCE_TEST := true
+ CARGO_OSDK_BUILD_ARGS += --kcmd-args="CONFORMANCE_TEST_SUITE=$(CONFORMANCE_TEST_SUITE)"
+diff --git a/test/initramfs/Makefile b/test/initramfs/Makefile
+index 0f31c0d..55ef060 100644
+--- a/test/initramfs/Makefile
++++ b/test/initramfs/Makefile
+@@ -7,6 +7,7 @@ ENABLE_CONFORMANCE_TEST ?= false
+ CONFORMANCE_TEST_SUITE ?= ltp
+ CONFORMANCE_TEST_WORKDIR ?= /tmp
+ ENABLE_REGRESSION_TEST ?= false
++ENABLE_SPECULA_TRACE ?= false
+ # Specify platform macros when building regression tests (supported: asterinas, linux).
+ # - asterinas: Define both `__asterinas__` and `__linux__`. Tests may fail in Linux.
+ # - linux: Define only `__linux__`. Tests may fail in Asterinas.
+@@ -56,6 +57,7 @@ BOOT_IMAGE_NIX_ARGS := \
+ 	--arg enableBenchmarkTest $(ENABLE_BENCHMARK_TEST) \
+ 	--arg enableConformanceTest $(ENABLE_CONFORMANCE_TEST) \
+ 	--arg enableRegressionTest $(ENABLE_REGRESSION_TEST) \
++	--arg enableSpeculaTrace $(ENABLE_SPECULA_TRACE) \
+ 	--argstr conformanceTestSuite $(CONFORMANCE_TEST_SUITE) \
+ 	--argstr conformanceTestWorkDir $(CONFORMANCE_TEST_WORKDIR) \
+ 	--argstr regressionTestPlatform $(REGRESSION_TEST_PLATFORM) \
+diff --git a/test/initramfs/nix/default.nix b/test/initramfs/nix/default.nix
+index c221c49..1aa037f 100644
+--- a/test/initramfs/nix/default.nix
++++ b/test/initramfs/nix/default.nix
+@@ -1,7 +1,8 @@
+ { target ? "x86_64", enableBenchmarkTest ? false, enableConformanceTest ? false
+-, enableRegressionTest ? false, conformanceTestSuite ? "ltp"
+-, conformanceTestWorkDir ? "/tmp", regressionTestPlatform ? "asterinas"
+-, dnsServer ? "none", smp ? 1, initramfsCompressed ? true, }:
++, enableRegressionTest ? false, enableSpeculaTrace ? false
++, conformanceTestSuite ? "ltp", conformanceTestWorkDir ? "/tmp"
++, regressionTestPlatform ? "asterinas", dnsServer ? "none", smp ? 1
++, initramfsCompressed ? true, }:
+ let
+   crossSystem.config = if target == "x86_64" then
+     "x86_64-unknown-linux-gnu"
+@@ -32,12 +33,14 @@ in rec {
+   };
+   regression =
+     pkgs.callPackage ./regression { testPlatform = regressionTestPlatform; };
++  specula = pkgs.callPackage ./specula { };
+ 
+   initramfs = pkgs.callPackage ./initramfs.nix {
+     inherit busybox;
+     benchmark = if enableBenchmarkTest then benchmark else null;
+     conformance = if enableConformanceTest then conformance else null;
+     regression = if enableRegressionTest then regression else null;
++    specula = if enableSpeculaTrace then specula else null;
+     dnsServer = dnsServer;
+   };
+   initramfs-image = pkgs.callPackage ./initramfs-image.nix {
+diff --git a/test/initramfs/nix/initramfs.nix b/test/initramfs/nix/initramfs.nix
+index 3bf35a8..7765236 100644
+--- a/test/initramfs/nix/initramfs.nix
++++ b/test/initramfs/nix/initramfs.nix
+@@ -1,5 +1,5 @@
+ { lib, pkgs, stdenvNoCC, fetchFromGitHub, hostPlatform, writeClosure, busybox
+-, benchmark, conformance, regression, dnsServer, }:
++, benchmark, conformance, regression, specula, dnsServer, }:
+ let
+   boot_hello = builtins.path { path = ./../src/boot_hello.sh; };
+   init = builtins.path { path = ./../src/init; };
+@@ -22,6 +22,7 @@ let
+     ++ lib.optionals (benchmark != null) [ benchmark.package ]
+     ++ lib.optionals (conformance != null) [ conformance.package ]
+     ++ lib.optionals (regression != null) [ regression.package ]
++    ++ lib.optionals (specula != null) [ specula ]
+     ++ lib.optionals is_evtest_included [ pkgs.evtest ];
+ in stdenvNoCC.mkDerivation {
+   name = "initramfs";
+@@ -49,6 +50,10 @@ in stdenvNoCC.mkDerivation {
+       cp -r ${regression.package}/* $out/test/
+     ''}
+ 
++    ${lib.optionalString (specula != null) ''
++      cp -r ${specula}/* $out/test/
++    ''}
++
+     ${lib.optionalString (benchmark != null) ''
+       cp -r "${benchmark.package}"/* $out/benchmark/
+     ''}
+diff --git a/test/initramfs/nix/specula/default.nix b/test/initramfs/nix/specula/default.nix
+new file mode 100644
+index 0000000..94d1f1e
+--- /dev/null
++++ b/test/initramfs/nix/specula/default.nix
+@@ -0,0 +1,23 @@
++{ lib, stdenv, glibc, hostPlatform, }:
++stdenv.mkDerivation {
++  pname = "specula-regular-file-trace";
++  version = "0.1.0";
++  src = lib.fileset.toSource {
++    root = ./../../src/regression;
++    fileset = lib.fileset.unions [
++      ./../../src/regression/common
++      ./../../src/regression/io/specula
++    ];
++  };
++
++  HOST_PLATFORM = "${hostPlatform.system}";
++  TEST_PLATFORM = "asterinas";
++  CC = "${stdenv.cc.targetPrefix}cc";
++  buildInputs = [ glibc glibc.static ];
++
++  buildCommand = ''
++    mkdir -p $out/io/specula
++    make --no-print-directory BUILD_DIR=$(mktemp -d) \
++      OUTPUT_DIR=$out -C "$src/io/specula"
++  '';
++}
+diff --git a/test/initramfs/src/regression/io/specula/Makefile b/test/initramfs/src/regression/io/specula/Makefile
+new file mode 100644
+index 0000000..8bb74d3
+--- /dev/null
++++ b/test/initramfs/src/regression/io/specula/Makefile
+@@ -0,0 +1,5 @@
++# SPDX-License-Identifier: MPL-2.0
++
++EXTRA_C_FLAGS := -static -lpthread
++
++include ../../common/Makefile

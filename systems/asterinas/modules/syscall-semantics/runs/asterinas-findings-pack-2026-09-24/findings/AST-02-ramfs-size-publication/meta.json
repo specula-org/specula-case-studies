@@ -1,0 +1,122 @@
+{
+  "id": "AST-02",
+  "title": "ramfs size publication before an empty or zero-progress write",
+  "status": "REPRODUCED",
+  "origin": {
+    "kind": "specula-run",
+    "alias": "01a",
+    "run_id": "asterinas-syscall-regular-file-partial-progress-20260823T030315Z",
+    "finding_ids": [
+      "MC-4"
+    ],
+    "pin": "604948581512d83734377974d4c34adb4530f2d7"
+  },
+  "aliases": [
+    "RF-02"
+  ],
+  "also_seen_in": [
+    {
+      "alias": "GLM",
+      "run_id": "asterinas-glm53-eval-20260826T035049Z",
+      "finding_id": "MC-3",
+      "verdict": "REPRODUCED"
+    },
+    {
+      "alias": "01b",
+      "run_id": "20260908-150910-0a8c",
+      "finding_id": "MC-6",
+      "verdict": "REPRODUCED"
+    },
+    {
+      "alias": "01b",
+      "run_id": "20260908-150910-0a8c",
+      "finding_id": "MC-8",
+      "verdict": "REPRODUCED"
+    },
+    {
+      "alias": "Backend audit",
+      "run_id": null,
+      "finding_id": "tmpfs/devtmpfs ordinary-file dispatch",
+      "verdict": "static reachability, no runtime run"
+    }
+  ],
+  "mechanism": "RamInode::write_at publishes size, blocks, mtime and ctime and resizes the page cache to offset+len before the fallible page_cache.write, with no rollback on a copy fault and no early return for a zero-length write.",
+  "sites": [
+    "kernel/core/src/fs/fs_impls/ramfs/fs.rs::RamInode::write_at"
+  ],
+  "syscalls": [
+    "write",
+    "pwrite64",
+    "writev",
+    "pwritev"
+  ],
+  "keywords": [
+    "ramfs",
+    "tmpfs",
+    "file size",
+    "publish",
+    "zero-length write",
+    "empty write",
+    "efault",
+    "zero progress",
+    "extend",
+    "phantom bytes",
+    "rollback",
+    "timestamps"
+  ],
+  "contract": "write(2): a zero-length write to a regular file has no other effect, and a write that copies nothing must not extend the file beyond the write start.",
+  "observed": "Asterinas ramfs grows the file to offset+len (or beyond, for a seeked offset) after a zero-length write past EOF or a write that faults before copying any byte.",
+  "upstream": {
+    "match": "open-pr",
+    "refs": [
+      "https://github.com/asterinas/asterinas/pull/3875",
+      "https://github.com/asterinas/asterinas/pull/3481"
+    ]
+  },
+  "fix_status": "pr-open",
+  "fix_refs": [
+    "https://github.com/asterinas/asterinas/pull/3875 (open, head 37b18435c70f77413293584deb662256ac5716ef on bc12195df; empty-write subcase only)",
+    "branch fix/empty-write-metadata-review in /home/chin39/Documents/asterinas-dev (6fca818f4 ramfs, 37b18435c exFAT)",
+    "branch fix/ramfs-empty-write in /home/chin39/Documents/asterinas-ast02-empty-write (2026-09-16 batch, unstaged, FIX_PENDING_VALIDATION)",
+    "/home/chin39/Documents/play/specula-profile/reports/runs/asterinas-syscall-regular-file-partial-progress-20260823T030315Z.fixes.patch (v5, historical, at 604948581)"
+  ],
+  "report": "https://github.com/asterinas/asterinas/pull/3875",
+  "repro": {
+    "available": true,
+    "files": [
+      "repro/repro.c",
+      "repro/run.sh",
+      "repro/min_ast02.c",
+      "repro/empty_write-regression-pr3875.patch",
+      "repro/README.md",
+      "repro/variants/GLM-MC-3/",
+      "repro/variants/01b-MC-6/",
+      "repro/variants/01b-MC-8/"
+    ],
+    "how_to_run": "Build repro.c into the initramfs and run it on / (ramfs) in an SMP=2 guest, then compare with the same source on Linux tmpfs; the PR #3875 patch adds an in-tree fs regression for the empty-write subcase.",
+    "smp": 2,
+    "runtime_status": "REPRODUCED at 604948581"
+  },
+  "evidence": [
+    "/home/chin39/Documents/play/specula-profile/reports/asterinas-bug-findings-2026-08/AST-02-ramfs-size-publication/description.md",
+    "/home/chin39/Documents/play/Specula/runs/asterinas-syscall-regular-file-partial-progress-20260823T030315Z/asterinas-syscall-regular-file-partial-progress/.specula-output/confirmation/MC-4/",
+    "/home/chin39/Documents/play/Specula/runs/asterinas-syscall-regular-file-partial-progress-20260823T030315Z/asterinas-syscall-regular-file-partial-progress/.specula-output/repro/test_bugMC-4_ramfs_size_publication.c",
+    "/home/chin39/Documents/play/specula-profile/reports/patch-validation-report.md",
+    "/home/chin39/Documents/play/specula-profile/reports/ast-validation-2026-09-02/logs/asterinas-604948581-guest-transcript.txt",
+    "/home/chin39/Documents/play/specula-profile/reports/ast-validation-2026-09-02/logs/linux-7.1.9-AST-02-tmpfs.txt",
+    "/home/chin39/Documents/play/specula-profile/reports/ast-validation-2026-09-02/minimal/",
+    "/home/chin39/Documents/play/specula-profile/reports/empty-write-batch-2026-09-16/README.md",
+    "/home/chin39/Documents/play/specula-profile/reports/ast-02-empty-write-2026-09-14/README.md",
+    "/home/chin39/Documents/play/specula-profile/reports/ast-02-empty-write-2026-09-14/related-filesystems-2026-09-16.md",
+    "/home/chin39/Documents/play/Specula/runs/asterinas-glm53-eval-20260826T035049Z/asterinas-glm53-eval/.specula-output/confirmation/MC-3/",
+    "/home/chin39/Documents/play/Specula/runs/20260908-150910-0a8c/asterinas-syscall-buffered-file-size-read-consistency/.specula-output/confirmed-bugs.md",
+    "/home/chin39/Documents/play/specula-profile/reports/upstream-dedup-2026-09-14/matches.json"
+  ],
+  "related": [
+    "AST-14",
+    "AST-72",
+    "AST-06"
+  ],
+  "caveats": "PR #3875 and the 2026-09-16 batch fix only the count-zero case; the zero-progress copy-fault cases remain unfixed. The register records the empty-write fix as FIX_PENDING_VALIDATION (runtime deferred) while the later PR #3875 body reports runtime validation; the register does not mention #3875.",
+  "record": "findings/AST-02-ramfs-size-publication/finding.md"
+}

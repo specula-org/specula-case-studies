@@ -1,0 +1,102 @@
+diff --git a/test/initramfs/src/regression/process/signal/syscall_restart.c b/test/initramfs/src/regression/process/signal/syscall_restart.c
+index 8ab0a1386..d4d523129 100644
+--- a/test/initramfs/src/regression/process/signal/syscall_restart.c
++++ b/test/initramfs/src/regression/process/signal/syscall_restart.c
+@@ -1,6 +1,7 @@
+ // SPDX-License-Identifier: MPL-2.0
+ 
+ #define _GNU_SOURCE
++#include <fcntl.h>
+ #include <linux/futex.h>
+ #include <poll.h>
+ #include <signal.h>
+@@ -10,6 +11,7 @@
+ #include <sys/socket.h>
+ #include <sys/syscall.h>
+ #include <sys/time.h>
++#include <sys/uio.h>
+ #include <sys/wait.h>
+ #include <time.h>
+ #include <unistd.h>
+@@ -64,6 +66,81 @@ FN_TEST(read_restarts_with_sa_restart)
+ }
+ END_TEST()
+ 
++FN_TEST(readv_restarts_with_sa_restart)
++{
++	signal_count = 0;
++
++	int pipefds[2];
++	TEST_SUCC(pipe(pipefds));
++
++	pid_t parent = getpid();
++	pid_t child = TEST_SUCC(fork());
++	if (child == 0) {
++		CHECK(close(pipefds[0]));
++		sleep(1);
++		CHECK(kill(parent, SIGUSR1));
++		sleep(1);
++		CHECK(write(pipefds[1], "a", 1));
++		_exit(0);
++	}
++
++	TEST_SUCC(close(pipefds[1]));
++
++	char byte = 0;
++	struct iovec iov = { .iov_base = &byte, .iov_len = sizeof(byte) };
++	TEST_RES(readv(pipefds[0], &iov, 1),
++		 _ret == 1 && byte == 'a' && signal_count > 0);
++
++	int status = 0;
++	TEST_RES(waitpid(child, &status, 0), _ret == child &&
++						     WIFEXITED(status) &&
++						     WEXITSTATUS(status) == 0);
++	TEST_SUCC(close(pipefds[0]));
++}
++END_TEST()
++
++FN_TEST(writev_restarts_with_sa_restart)
++{
++	static char chunk[4096];
++
++	signal_count = 0;
++
++	int pipefds[2];
++	TEST_SUCC(pipe(pipefds));
++
++	// Fill the pipe so that the vectored write below has to wait.
++	TEST_SUCC(fcntl(pipefds[1], F_SETFL, O_NONBLOCK));
++	while (write(pipefds[1], chunk, sizeof(chunk)) > 0)
++		;
++	TEST_ERRNO(write(pipefds[1], chunk, sizeof(chunk)), EAGAIN);
++	TEST_SUCC(fcntl(pipefds[1], F_SETFL, 0));
++
++	pid_t parent = getpid();
++	pid_t child = TEST_SUCC(fork());
++	if (child == 0) {
++		CHECK(close(pipefds[1]));
++		sleep(1);
++		CHECK(kill(parent, SIGUSR1));
++		sleep(1);
++		CHECK(fcntl(pipefds[0], F_SETFL, O_NONBLOCK));
++		while (read(pipefds[0], chunk, sizeof(chunk)) > 0)
++			;
++		_exit(0);
++	}
++
++	char byte = 'a';
++	struct iovec iov = { .iov_base = &byte, .iov_len = sizeof(byte) };
++	TEST_RES(writev(pipefds[1], &iov, 1), _ret == 1 && signal_count > 0);
++
++	int status = 0;
++	TEST_RES(waitpid(child, &status, 0), _ret == child &&
++						     WIFEXITED(status) &&
++						     WEXITSTATUS(status) == 0);
++	TEST_SUCC(close(pipefds[0]));
++	TEST_SUCC(close(pipefds[1]));
++}
++END_TEST()
++
+ FN_TEST(poll_does_not_restart_with_sa_restart)
+ {
+ 	signal_count = 0;

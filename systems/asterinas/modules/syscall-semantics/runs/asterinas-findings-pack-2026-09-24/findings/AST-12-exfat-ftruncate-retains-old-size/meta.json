@@ -1,0 +1,77 @@
+{
+  "id": "AST-12",
+  "title": "Successful exFAT ftruncate retains the old logical size",
+  "status": "REPRODUCED",
+  "origin": {
+    "kind": "specula-run",
+    "alias": "01b",
+    "run_id": "20260908-150910-0a8c",
+    "finding_ids": [
+      "MC-4"
+    ],
+    "pin": "604948581512d83734377974d4c34adb4530f2d7"
+  },
+  "also_seen_in": [],
+  "mechanism": "The public ExfatInode::resize used by ftruncate delegates to ExfatInodeInner::resize, which only updates size_allocated and clusters (size is assigned only when clusters decrease below the old size), and never publishes the logical size itself, so extension and same-cluster shrink leave inner.size unchanged.",
+  "sites": [
+    "kernel/core/src/fs/fs_impls/exfat/inode.rs::ExfatInode::resize",
+    "kernel/core/src/fs/fs_impls/exfat/inode.rs::ExfatInodeInner::resize",
+    "kernel/core/src/fs/fs_impls/exfat/inode.rs::ExfatInode::metadata",
+    "kernel/core/src/fs/fs_impls/exfat/inode.rs::ExfatInode::read_at"
+  ],
+  "syscalls": [
+    "ftruncate",
+    "fstat",
+    "pread64"
+  ],
+  "keywords": [
+    "exfat",
+    "ftruncate",
+    "resize",
+    "logical size",
+    "size_allocated",
+    "extend",
+    "shrink",
+    "st_size",
+    "stale size",
+    "truncated bytes readable"
+  ],
+  "contract": "ftruncate(2): on success the file length becomes exactly the requested size. Extension reads as zeros and data beyond a shrink is lost.",
+  "observed": "ftruncate(fd, 1) and ftruncate(fd, 8192) on an empty exFAT file returned 0 with st_size 0, and ftruncate(fd, 2048) on a 4096-byte file returned 0 with st_size 4096 and all 4096 bytes still readable.",
+  "upstream": {
+    "match": "none",
+    "refs": [],
+    "dedup_status": "NO_DIRECT_MATCH",
+    "upstream_fix_status": "NOT_ESTABLISHED",
+    "reviewed_candidates": [
+      "https://github.com/asterinas/asterinas/pull/3603",
+      "https://github.com/asterinas/asterinas/issues/3604",
+      "https://github.com/asterinas/asterinas/pull/787",
+      "https://github.com/asterinas/asterinas/pull/788"
+    ]
+  },
+  "fix_status": "unfixed",
+  "fix_refs": [],
+  "repro": {
+    "available": true,
+    "files": [
+      "repro/test_bugMC-4_exfat_resize.sh"
+    ],
+    "how_to_run": "Run the script on a host with QEMU/KVM, mkfs.ext2, mkfs.exfat and a static C toolchain after pointing QEMU, MKFS_EXFAT, GLIBC_STATIC and KERNEL at local paths. MC4BUG lines and MC4VERDICT BUG mean the bug fired.",
+    "smp": 2,
+    "runtime_status": "REPRODUCED at 604948581 (01b MC-4, SMP=2, single-threaded, Level 0)"
+  },
+  "evidence": [
+    "/home/chin39/Documents/play/Specula/runs/20260908-150910-0a8c/asterinas-syscall-buffered-file-size-read-consistency/.specula-output/confirmed-bugs.md",
+    "/home/chin39/Documents/play/Specula/runs/20260908-150910-0a8c/asterinas-syscall-buffered-file-size-read-consistency/.specula-output/confirmation/MC-4/investigation.md",
+    "/home/chin39/Documents/play/Specula/runs/20260908-150910-0a8c/asterinas-syscall-buffered-file-size-read-consistency/.specula-output/confirmation/MC-4/verdict.json",
+    "/home/chin39/Documents/play/Specula/runs/20260908-150910-0a8c/asterinas-syscall-buffered-file-size-read-consistency/.specula-output/confirmation/MC-4/repro-output.txt",
+    "/home/chin39/Documents/play/Specula/runs/20260908-150910-0a8c/asterinas-syscall-buffered-file-size-read-consistency/.specula-output/spec/output/MC_hunt_s3_extend_zero_exfat_bfs1.out",
+    "/home/chin39/Documents/play/specula-profile/reports/runs/asterinas-syscall-buffered-file-size-read-consistency-20260907T161100Z.prep/handoff-01b.md"
+  ],
+  "related": [
+    "AST-13",
+    "AST-15"
+  ],
+  "caveats": "Run reused the harness kernel ELF (pin plus passive trace hooks) under host QEMU because the Docker image pull failed. The runner hardcodes host Nix store paths. ext2 served as the in-kernel control. No separate Linux run was recorded. A later write can republish size and hide the state."
+}

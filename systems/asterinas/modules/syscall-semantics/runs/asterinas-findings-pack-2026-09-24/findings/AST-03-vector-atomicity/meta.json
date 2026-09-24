@@ -1,0 +1,103 @@
+{
+  "id": "AST-03",
+  "title": "Vectored I/O releases the offset lock between iovecs",
+  "status": "REPRODUCED",
+  "origin": {
+    "kind": "specula-run",
+    "alias": "01a",
+    "run_id": "asterinas-syscall-regular-file-partial-progress-20260823T030315Z",
+    "finding_ids": [
+      "MC-5"
+    ],
+    "pin": "604948581512d83734377974d4c34adb4530f2d7"
+  },
+  "aliases": [
+    "RF-03"
+  ],
+  "also_seen_in": [
+    {
+      "alias": "GLM",
+      "run_id": "asterinas-glm53-eval-20260826T035049Z",
+      "finding_id": "MC-4",
+      "verdict": "INCOMPLETE"
+    },
+    {
+      "alias": "Recon",
+      "run_id": "asterinas-syscall-user-memory-baseline-20260822T172958Z",
+      "finding_id": "analysis-report MC-1; modeling-brief MC-1",
+      "verdict": "analysis-only candidate"
+    }
+  ],
+  "mechanism": "do_sys_readv/do_sys_writev call the scalar file.read/file.write once per iovec, and InodeHandle takes and releases the shared offset lock per scalar call, so a competitor on a dup'd descriptor can commit between two iovecs of one vector call.",
+  "sites": [
+    "kernel/core/src/syscall/preadv.rs::do_sys_readv",
+    "kernel/core/src/syscall/pwritev.rs::do_sys_writev",
+    "kernel/core/src/fs/file/inode_handle.rs::InodeHandle::read",
+    "kernel/core/src/fs/file/inode_handle.rs::InodeHandle::write"
+  ],
+  "syscalls": [
+    "readv",
+    "writev",
+    "preadv2",
+    "pwritev2"
+  ],
+  "keywords": [
+    "readv",
+    "writev",
+    "atomicity",
+    "iovec",
+    "vector",
+    "offset lock",
+    "f_pos_lock",
+    "interleaving",
+    "torn",
+    "shared offset",
+    "dup",
+    "race"
+  ],
+  "contract": "readv(2)/writev(2): a vector transfer on one open file description is atomic with respect to other I/O through that description (Linux holds f_pos_lock for the whole call).",
+  "observed": "Asterinas lets a concurrent read or write on a dup'd descriptor land between two iovecs of one readv/writev (79 to 98 of 100 rounds torn at SMP=2).",
+  "upstream": {
+    "match": "related",
+    "refs": [
+      "https://github.com/asterinas/asterinas/pull/2230",
+      "https://github.com/asterinas/asterinas/issues/1554"
+    ]
+  },
+  "fix_status": "fix-local",
+  "fix_refs": [
+    "/home/chin39/Documents/play/specula-profile/reports/runs/asterinas-syscall-regular-file-partial-progress-20260823T030315Z.fixes.patch (v5, historical, at 604948581, not rebased, not submitted)"
+  ],
+  "report": null,
+  "repro": {
+    "available": true,
+    "files": [
+      "repro/repro.c",
+      "repro/run.sh",
+      "repro/README.md",
+      "repro/variants/GLM-MC-4/"
+    ],
+    "how_to_run": "Build repro.c with -pthread into the initramfs and run it on / (ramfs) in an SMP=2 or larger guest; compare with the same source on Linux tmpfs.",
+    "smp": 2,
+    "runtime_status": "REPRODUCED at 604948581"
+  },
+  "evidence": [
+    "/home/chin39/Documents/play/specula-profile/reports/asterinas-bug-findings-2026-08/AST-03-vector-atomicity/description.md",
+    "/home/chin39/Documents/play/Specula/runs/asterinas-syscall-regular-file-partial-progress-20260823T030315Z/asterinas-syscall-regular-file-partial-progress/.specula-output/confirmation/MC-5/",
+    "/home/chin39/Documents/play/Specula/runs/asterinas-syscall-regular-file-partial-progress-20260823T030315Z/asterinas-syscall-regular-file-partial-progress/.specula-output/repro/test_bugMC-5_vector_atomicity.c",
+    "/home/chin39/Documents/play/specula-profile/reports/patch-validation-report.md",
+    "/home/chin39/Documents/play/specula-profile/reports/ast-validation-2026-09-02/logs/asterinas-604948581-guest-transcript.txt",
+    "/home/chin39/Documents/play/specula-profile/reports/ast-validation-2026-09-02/logs/linux-7.1.9-AST-03-tmpfs.txt",
+    "/home/chin39/Documents/play/Specula/runs/asterinas-glm53-eval-20260826T035049Z/asterinas-glm53-eval/.specula-output/confirmation/MC-4/",
+    "/home/chin39/Documents/play/specula-profile/reports/glm53-eval-final-report.md",
+    "/home/chin39/Documents/play/specula-profile/reports/upstream-dedup-2026-09-14/matches.json"
+  ],
+  "related": [
+    "AST-04",
+    "AST-27",
+    "AST-43",
+    "AST-44"
+  ],
+  "caveats": "Schedule-dependent race; needs SMP>=2 and counts vary per run. GLM's own confirmation stayed INCOMPLETE. The v5 local fix covers regular files (InodeHandle) only.",
+  "record": "findings/AST-03-vector-atomicity/finding.md"
+}

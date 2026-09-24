@@ -1,0 +1,48 @@
+{
+  "id": "AST-39",
+  "title": "Socket timeout/restart may repeat committed progress",
+  "status": "SOURCE LEAD",
+  "origin": {
+    "kind": "specula-run",
+    "alias": "Recon",
+    "run_id": "asterinas-syscall-user-memory-baseline-20260822T172958Z",
+    "finding_ids": ["MC-5", "T-7"],
+    "pin": "604948581512d83734377974d4c34adb4530f2d7"
+  },
+  "also_seen_in": [],
+  "mechanism": "Socket syscall handlers map EINTR to ERESTARTSYS unconditionally, and handle_pending_signal rewinds the syscall under SA_RESTART, so timed socket calls restart and any path returning EINTR after committed progress would repeat it.",
+  "sites": [
+    "kernel/core/src/syscall/sendmsg.rs::send_one_message",
+    "kernel/core/src/syscall/sendto.rs::sys_sendto",
+    "kernel/core/src/syscall/recvmsg.rs::sys_recvmsg",
+    "kernel/core/src/syscall/recvfrom.rs::sys_recvfrom",
+    "kernel/core/src/syscall/accept.rs::do_accept",
+    "kernel/core/src/syscall/connect.rs::sys_connect",
+    "kernel/core/src/process/signal/mod.rs::handle_pending_signal",
+    "kernel/core/src/process/signal/poll.rs::Pollable::wait_events"
+  ],
+  "syscalls": ["sendto", "sendmsg", "recvfrom", "recvmsg", "accept", "accept4", "connect"],
+  "keywords": ["restart", "erestartsys", "eintr", "sa_restart", "so_rcvtimeo", "so_sndtimeo", "socket timeout", "signal", "duplicate progress", "committed progress"],
+  "contract": "With SA_RESTART, socket calls that have a timeout set fail with EINTR instead of restarting, and an interrupted call that already transferred data returns the partial count (signal(7)).",
+  "observed": "Source only: timed socket calls are restarted, as FIXMEs acknowledge. No backend was found that returns EINTR after committed progress.",
+  "upstream": {"match": "partial", "refs": ["https://github.com/asterinas/asterinas/pull/3576"]},
+  "fix_status": "pr-open",
+  "fix_refs": ["https://github.com/asterinas/asterinas/pull/3576"],
+  "repro": {
+    "available": false,
+    "files": [],
+    "how_to_run": "No reproducer. finding.md Reproduction describes an SO_RCVTIMEO recv interrupted by an SA_RESTART signal and a patterned large send interrupted repeatedly.",
+    "smp": null,
+    "runtime_status": "NOT_RUN"
+  },
+  "evidence": [
+    "/home/chin39/Documents/play/Specula/runs/asterinas-syscall-user-memory-baseline-20260822T172958Z/asterinas-syscall-user-memory/.specula-output/analysis-report.md",
+    "/home/chin39/Documents/play/Specula/runs/asterinas-syscall-user-memory-baseline-20260822T172958Z/asterinas-syscall-user-memory/.specula-output/modeling-brief.md",
+    "/home/chin39/Documents/play/Specula/runs/asterinas-syscall-user-memory-baseline-20260822T172958Z/asterinas-syscall-user-memory/.specula-output/review-analysis.md",
+    "/home/chin39/Documents/play/specula-profile/reports/asterinas-bug-findings-2026-08/README.md",
+    "/home/chin39/Documents/play/specula-profile/reports/asterinas-bug-findings-2026-08/id-map.md",
+    "/home/chin39/Documents/play/specula-profile/reports/upstream-dedup-2026-09-14/matches.json"
+  ],
+  "related": ["AST-09", "AST-26"],
+  "caveats": "Broad restart question. AST-26 rejection applies only to regular files. Open PR #3576 covers the timeout part only partially and is unmerged. No committed-progress replay path was established."
+}

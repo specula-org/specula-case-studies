@@ -1,0 +1,86 @@
+{
+  "id": "AST-18",
+  "title": "Final close retains dead epoll interest metadata",
+  "status": "REPRODUCED",
+  "origin": {
+    "kind": "specula-run",
+    "alias": "FD",
+    "run_id": "asterinas-fd-epoll-pipeline-20260811T164254Z",
+    "finding_ids": [
+      "MC-3"
+    ],
+    "pin": "4ba4abbe8cb3f2892129d67b0301cf247bbdda0f"
+  },
+  "also_seen_in": [],
+  "mechanism": "EpollFile keeps an Entry keyed by a weak file reference after the watched file's final close. The only dead-entry cleanup is in pop_multi_ready for ready entries, so a never-ready entry stays in interest and dump_proc_fdinfo keeps printing its tfd line.",
+  "sites": [
+    "kernel/core/src/events/epoll/file.rs::EpollFile::add_interest",
+    "kernel/core/src/events/epoll/file.rs::EpollFile::pop_multi_ready",
+    "kernel/core/src/events/epoll/file.rs::EpollFile::dump_proc_fdinfo",
+    "kernel/core/src/events/epoll/entry.rs::EntryKey",
+    "kernel/core/src/syscall/close.rs::sys_close",
+    "kernel/core/src/fs/file/file_table.rs::FileTable::close_file"
+  ],
+  "syscalls": [
+    "close",
+    "epoll_ctl",
+    "openat",
+    "read"
+  ],
+  "keywords": [
+    "epoll",
+    "final close",
+    "dead interest",
+    "stale entry",
+    "fdinfo",
+    "weak reference",
+    "interest list",
+    "lifecycle",
+    "cleanup",
+    "tfd"
+  ],
+  "contract": "epoll(7) Q6: once all descriptors of the watched open file description are closed, the file is removed from every epoll interest list.",
+  "observed": "After the only descriptor of a never-ready watched eventfd is closed, /proc/self/fdinfo/<epfd> still lists its tfd entry for the life of the epoll instance.",
+  "upstream": {
+    "match": "related",
+    "refs": [
+      "https://github.com/asterinas/asterinas/pull/1277",
+      "https://github.com/asterinas/asterinas/issues/200"
+    ],
+    "dedup_status": "RELATED_ONLY",
+    "upstream_fix_status": "NOT_ESTABLISHED",
+    "checked_against": "bc12195df4acfb1fc4ae968cf7acf9333ed83435"
+  },
+  "fix_status": "unfixed",
+  "fix_refs": [],
+  "repro": {
+    "available": true,
+    "files": [
+      "repro/test_bug4_epoll_dead_interest.c",
+      "repro/specula_validation.c",
+      "repro/test_bugMC-3_dead_interest.c",
+      "repro/specula-initramfs-plumbing.patch",
+      "repro/README.md"
+    ],
+    "how_to_run": "Apply the plumbing patch at the pin, copy the test into test/initramfs/src/regression/io/specula/, and run make run_kernel SMP=2 ... SPECULA_INIT=\"/test/io/specula/run_bug.sh test_bug4_epoll_dead_interest\". See repro/README.md.",
+    "smp": 2,
+    "runtime_status": "REPRODUCED at 4ba4abbe8cb3f2892129d67b0301cf247bbdda0f"
+  },
+  "evidence": [
+    "/home/chin39/Documents/play/Specula/runs/asterinas-fd-epoll-pipeline-20260811T164254Z/asterinas-fd-epoll/.specula-output/confirmation/MC-3/investigation.md",
+    "/home/chin39/Documents/play/Specula/runs/asterinas-fd-epoll-pipeline-20260811T164254Z/asterinas-fd-epoll/.specula-output/confirmation/MC-3/turn02_B.last-message.txt",
+    "/home/chin39/Documents/play/Specula/runs/asterinas-fd-epoll-pipeline-20260811T164254Z/asterinas-fd-epoll/.specula-output/confirmation/MC-3/verdict.json",
+    "/home/chin39/Documents/play/Specula/runs/asterinas-fd-epoll-pipeline-20260811T164254Z/asterinas-fd-epoll/.specula-output/harness/logs/repro_test_bug4_epoll_dead_interest_smp2_round6_attempt1.log",
+    "/home/chin39/Documents/play/Specula/runs/asterinas-fd-epoll-pipeline-20260811T164254Z/asterinas-fd-epoll/.specula-output/harness/logs/validation_dead_interest_smp2_round5_attempt2.log",
+    "/home/chin39/Documents/play/Specula/runs/asterinas-fd-epoll-pipeline-20260811T164254Z/asterinas-fd-epoll/.specula-output/harness/logs/repro_host_round6.log",
+    "/home/chin39/Documents/play/Specula/runs/asterinas-fd-epoll-pipeline-20260811T164254Z/asterinas-fd-epoll/.specula-output/spec/output/MC_hunt_s2_epoll_delivery_round2_bfs_cex.json",
+    "/home/chin39/Documents/play/Specula/runs/asterinas-fd-epoll-pipeline-20260811T164254Z/asterinas-fd-epoll/.specula-output/spec/bug-report.md",
+    "/home/chin39/Documents/play/specula-profile/reports/independent-review/terra-asterinas-bug-report-vm-final.md",
+    "/home/chin39/Documents/play/Specula/runs/asterinas-fd-epoll-pipeline-20260811T164254Z/asterinas-fd-epoll/.specula-output/confirmed-bugs.md",
+    "/home/chin39/Documents/play/Specula/runs/asterinas-fd-epoll-pipeline-20260811T164254Z/asterinas-fd-epoll/.specula-output/bug-severity.md",
+    "/home/chin39/Documents/play/specula-profile/references/asterinas-syscall-security-audit.md",
+    "/home/chin39/Documents/play/specula-profile/reports/workflow-validation.md"
+  ],
+  "related": [],
+  "caveats": "No numeric-FD retargeting or stale-event delivery demonstrated. The observable harm is fdinfo membership and the retained Entry. Stage-2 table said Medium, final Stage-3 severity is High. Historical evidence at the pin only. Static read of upstream main bc12195df on 2026-09-24 showed the same code shape. No runtime retest."
+}

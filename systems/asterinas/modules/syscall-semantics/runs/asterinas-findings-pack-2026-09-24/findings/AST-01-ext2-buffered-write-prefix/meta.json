@@ -1,0 +1,104 @@
+{
+  "id": "AST-01",
+  "title": "ext2 durable write prefix returned as EFAULT",
+  "status": "REPRODUCED",
+  "origin": {
+    "kind": "specula-run",
+    "alias": "01a",
+    "run_id": "asterinas-syscall-regular-file-partial-progress-20260823T030315Z",
+    "finding_ids": [
+      "MC-2"
+    ],
+    "pin": "604948581512d83734377974d4c34adb4530f2d7"
+  },
+  "aliases": [
+    "RF-01"
+  ],
+  "also_seen_in": [
+    {
+      "alias": "GLM",
+      "run_id": "asterinas-glm53-eval-20260826T035049Z",
+      "finding_id": "MC-1",
+      "verdict": "REPRODUCED"
+    },
+    {
+      "alias": "Recon",
+      "run_id": "asterinas-syscall-user-memory-baseline-20260822T172958Z",
+      "finding_id": "analysis-report T-1, CR-1; modeling-brief T-1, CR-1",
+      "verdict": "analysis-only candidate"
+    }
+  ],
+  "mechanism": "The page-cache write fault arm marks an up-to-date page dirty and returns the error, the (ostd::Error, usize) conversion drops the copied count, and ext2 write_at returns a count only on success, so the shared offset and size stay behind data that is already durable.",
+  "sites": [
+    "kernel/core/src/vm/page_cache/vmo/mod.rs::Vmo::write",
+    "kernel/core/src/vm/page_cache/vmo/mod.rs::Vmo::write_pages_with_backend",
+    "kernel/core/src/error.rs::From<(ostd::Error, usize)>::from",
+    "kernel/core/src/fs/fs_impls/ext2/inode/file.rs::InodeInner::write_at",
+    "kernel/core/src/fs/fs_impls/ext2/inode/file.rs::InodeInner::write_direct_at",
+    "kernel/core/src/fs/file/inode_handle.rs::InodeHandle::write"
+  ],
+  "syscalls": [
+    "write",
+    "pwrite64",
+    "writev",
+    "pwritev"
+  ],
+  "keywords": [
+    "efault",
+    "partial write",
+    "short write",
+    "prefix",
+    "dirty page",
+    "copied count",
+    "committed",
+    "ext2",
+    "offset",
+    "o_direct"
+  ],
+  "contract": "write(2): a transfer interrupted by a faulting user page after a positive prefix returns the short count, and the committed data, the count, and the offset agree.",
+  "observed": "Asterinas commits the prefix to the ext2 page cache (and to disk under O_DIRECT) but returns -1/EFAULT and leaves the offset and size unchanged.",
+  "upstream": {
+    "match": "partial",
+    "refs": [
+      "https://github.com/asterinas/asterinas/issues/711",
+      "https://github.com/asterinas/asterinas/pull/3297"
+    ]
+  },
+  "fix_status": "fix-local",
+  "fix_refs": [
+    "/home/chin39/Documents/play/specula-profile/reports/runs/asterinas-syscall-regular-file-partial-progress-20260823T030315Z.fixes.patch (v5, historical, at 604948581, not rebased, not submitted)"
+  ],
+  "report": null,
+  "repro": {
+    "available": true,
+    "files": [
+      "repro/repro.c",
+      "repro/run.sh",
+      "repro/README.md",
+      "repro/variants/GLM-MC-1/"
+    ],
+    "how_to_run": "Build repro.c into the initramfs (see docs/running-reproducers.md) and run it with /ext2 as the argument in an SMP=2 guest; compile the same source on Linux and run it on a disk filesystem as the control.",
+    "smp": 2,
+    "runtime_status": "REPRODUCED at 604948581"
+  },
+  "evidence": [
+    "/home/chin39/Documents/play/specula-profile/reports/asterinas-bug-findings-2026-08/AST-01-ext2-buffered-write-prefix/description.md",
+    "/home/chin39/Documents/play/Specula/runs/asterinas-syscall-regular-file-partial-progress-20260823T030315Z/asterinas-syscall-regular-file-partial-progress/.specula-output/confirmed-bugs.md",
+    "/home/chin39/Documents/play/Specula/runs/asterinas-syscall-regular-file-partial-progress-20260823T030315Z/asterinas-syscall-regular-file-partial-progress/.specula-output/confirmation/MC-2/",
+    "/home/chin39/Documents/play/Specula/runs/asterinas-syscall-regular-file-partial-progress-20260823T030315Z/asterinas-syscall-regular-file-partial-progress/.specula-output/repro/test_bugMC-2_retained_write_prefix_efault.c",
+    "/home/chin39/Documents/play/specula-profile/reports/patch-validation-report.md",
+    "/home/chin39/Documents/play/specula-profile/reports/runs/asterinas-syscall-regular-file-partial-progress-20260823T030315Z.patchval/",
+    "/home/chin39/Documents/play/specula-profile/reports/ast-validation-2026-09-02/README.md",
+    "/home/chin39/Documents/play/specula-profile/reports/ast-validation-2026-09-02/logs/asterinas-604948581-guest-transcript.txt",
+    "/home/chin39/Documents/play/specula-profile/reports/ast-validation-2026-09-02/logs/linux-7.1.9-AST-01-ext4.txt",
+    "/home/chin39/Documents/play/Specula/runs/asterinas-glm53-eval-20260826T035049Z/asterinas-glm53-eval/.specula-output/confirmation/MC-1/",
+    "/home/chin39/Documents/play/specula-profile/reports/upstream-dedup-2026-09-14/matches.json"
+  ],
+  "related": [
+    "AST-04",
+    "AST-24",
+    "AST-40"
+  ],
+  "caveats": "Linux control ran on ext4, not ext2; separately compiled binaries; v5 A/B evidence is historical at 604948581. Mechanism is the #711 count erasure shared with AST-04; only the durable ext2 file/offset consequence is new.",
+  "record": "findings/AST-01-ext2-buffered-write-prefix/finding.md"
+}

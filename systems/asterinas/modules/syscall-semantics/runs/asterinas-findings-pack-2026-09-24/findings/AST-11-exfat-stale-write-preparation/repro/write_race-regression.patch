@@ -1,0 +1,242 @@
+diff --git a/test/initramfs/src/regression/fs/Makefile b/test/initramfs/src/regression/fs/Makefile
+index 358e7fac2..76d127308 100644
+--- a/test/initramfs/src/regression/fs/Makefile
++++ b/test/initramfs/src/regression/fs/Makefile
+@@ -16,5 +16,6 @@ SUBDIRS := \
+ 	sync \
+ 	tmpfile \
+ 	utimensat \
++	write_race \
+ 
+ include ../common/Makefile
+diff --git a/test/initramfs/src/regression/fs/run_test.sh b/test/initramfs/src/regression/fs/run_test.sh
+index 0a11a1d08..80a394e56 100755
+--- a/test/initramfs/src/regression/fs/run_test.sh
++++ b/test/initramfs/src/regression/fs/run_test.sh
+@@ -159,3 +159,5 @@ echo "All mount bind file test passed."
+ ./tmpfile/tmpfile
+ 
+ ./utimensat/utimensat
++
++./write_race/write_race
+diff --git a/test/initramfs/src/regression/fs/write_race/Makefile b/test/initramfs/src/regression/fs/write_race/Makefile
+new file mode 100644
+index 000000000..8bb74d3aa
+--- /dev/null
++++ b/test/initramfs/src/regression/fs/write_race/Makefile
+@@ -0,0 +1,5 @@
++# SPDX-License-Identifier: MPL-2.0
++
++EXTRA_C_FLAGS := -static -lpthread
++
++include ../../common/Makefile
+diff --git a/test/initramfs/src/regression/fs/write_race/write_race.c b/test/initramfs/src/regression/fs/write_race/write_race.c
+new file mode 100644
+index 000000000..cd1e923d2
+--- /dev/null
++++ b/test/initramfs/src/regression/fs/write_race/write_race.c
+@@ -0,0 +1,204 @@
++/* SPDX-License-Identifier: MPL-2.0 */
++
++#include <fcntl.h>
++#include <pthread.h>
++#include <sched.h>
++#include <stdio.h>
++#include <string.h>
++#include <sys/stat.h>
++#include <sys/syscall.h>
++#include <unistd.h>
++
++#include "../../common/test.h"
++
++#define FILE_NAME "aster_write_race"
++#define LONG_LEN 8192
++#define SHORT_LEN 4096
++#define ROUNDS 2000
++#define SENTINEL 0xAA
++#define NR_WRITERS 2
++
++/* Mount points of the file systems whose writes go through the page cache. */
++static const char *const DIRS[] = { "/tmp", "/ext2", "/exfat" };
++#define NR_DIRS (sizeof(DIRS) / sizeof(DIRS[0]))
++
++static int fds[NR_DIRS];
++static char data[LONG_LEN];
++
++struct writer {
++	size_t len;
++	_Atomic int cpu;
++};
++
++static struct writer writers[NR_WRITERS] = { { .len = LONG_LEN },
++					     { .len = SHORT_LEN } };
++
++/* The file the writers write to; set by the checker before each round. */
++static int target_fd;
++static _Atomic int stop_requested;
++
++/*
++ * Both writers sleep on `start_barrier` until the checker releases them, so
++ * they wake together and race; `end_barrier` tells the checker both are done.
++ */
++static pthread_barrier_t start_barrier;
++static pthread_barrier_t end_barrier;
++
++static int current_cpu(void)
++{
++	unsigned int cpu;
++
++	CHECK(syscall(SYS_getcpu, &cpu, NULL, NULL));
++	return cpu;
++}
++
++static void barrier_wait(pthread_barrier_t *barrier)
++{
++	CHECK_WITH(pthread_barrier_wait(barrier),
++		   _ret == 0 || _ret == PTHREAD_BARRIER_SERIAL_THREAD);
++}
++
++/* Writes `len` bytes at offset 0 once per round until the checker stops it. */
++static void *write_rounds(void *arg)
++{
++	struct writer *writer = arg;
++
++	writer->cpu = current_cpu();
++	for (;;) {
++		barrier_wait(&start_barrier);
++		if (stop_requested)
++			break;
++		CHECK_WITH(pwrite(target_fd, data, writer->len, 0),
++			   _ret == (ssize_t)writer->len);
++		barrier_wait(&end_barrier);
++	}
++
++	return NULL;
++}
++
++static void start_writers(pthread_t *threads)
++{
++	CHECK_WITH(pthread_barrier_init(&start_barrier, NULL, NR_WRITERS + 1),
++		   _ret == 0);
++	CHECK_WITH(pthread_barrier_init(&end_barrier, NULL, NR_WRITERS + 1),
++		   _ret == 0);
++	for (int i = 0; i < NR_WRITERS; i++) {
++		writers[i].cpu = -1;
++		CHECK_WITH(pthread_create(&threads[i], NULL, write_rounds,
++					  &writers[i]),
++			   _ret == 0);
++	}
++	for (int i = 0; i < NR_WRITERS; i++) {
++		while (writers[i].cpu < 0)
++			sched_yield();
++	}
++}
++
++/* Must run before the test returns, cleanup closes the fds under the writers. */
++static void stop_writers(pthread_t *threads)
++{
++	stop_requested = 1;
++	barrier_wait(&start_barrier);
++	for (int i = 0; i < NR_WRITERS; i++) {
++		CHECK_WITH(pthread_join(threads[i], NULL), _ret == 0);
++	}
++	CHECK_WITH(pthread_barrier_destroy(&start_barrier), _ret == 0);
++	CHECK_WITH(pthread_barrier_destroy(&end_barrier), _ret == 0);
++}
++
++/*
++ * Empties the file, then lets a LONG_LEN write and a SHORT_LEN write at
++ * offset 0 race, ROUNDS times. Both writes extend the file, so afterwards it
++ * must be LONG_LEN bytes long with every byte written, whichever finished
++ * last. Returns the number of rounds that ended otherwise.
++ */
++static long count_bad_rounds(int fd)
++{
++	static unsigned char buf[LONG_LEN];
++	struct stat st;
++	long bad = 0;
++
++	target_fd = fd;
++	for (long i = 0; i < ROUNDS; i++) {
++		CHECK(ftruncate(fd, 0));
++		barrier_wait(&start_barrier);
++		barrier_wait(&end_barrier);
++
++		memset(buf, SENTINEL, sizeof(buf));
++		CHECK(fstat(fd, &st));
++		ssize_t ret = CHECK(pread(fd, buf, sizeof(buf), 0));
++		if (st.st_size != LONG_LEN || ret != LONG_LEN ||
++		    memchr(buf, SENTINEL, sizeof(buf)) != NULL) {
++			bad++;
++		}
++	}
++
++	return bad;
++}
++
++FN_SETUP(create_files)
++{
++	char path[64];
++	struct stat st;
++
++	memset(data, 'x', sizeof(data));
++
++	for (size_t i = 0; i < NR_DIRS; i++) {
++		if (stat(DIRS[i], &st) < 0) {
++			fds[i] = -1;
++			continue;
++		}
++
++		CHECK(snprintf(path, sizeof(path), "%s/" FILE_NAME, DIRS[i]));
++		unlink(path);
++
++		fds[i] = CHECK(open(path, O_RDWR | O_CREAT | O_TRUNC, 0600));
++	}
++}
++END_SETUP()
++
++FN_TEST(concurrent_extending_writes_fill_the_file)
++{
++	SKIP_TEST_IF(sysconf(_SC_NPROCESSORS_ONLN) < 2);
++
++	pthread_t threads[NR_WRITERS];
++	start_writers(threads);
++
++	/*
++	 * The race needs the writers on different CPUs. This placement check
++	 * assumes threads do not migrate between CPUs.
++	 */
++	int same_cpu = writers[0].cpu == writers[1].cpu;
++	if (same_cpu)
++		stop_writers(threads);
++	SKIP_TEST_IF(same_cpu);
++
++	for (size_t i = 0; i < NR_DIRS; i++) {
++		if (fds[i] < 0) {
++			continue;
++		}
++
++		long bad = count_bad_rounds(fds[i]);
++		fprintf(stderr, "%s: on %s, %ld bad rounds\n", __func__,
++			DIRS[i], bad);
++		TEST_RES(bad, _ret == 0);
++	}
++	stop_writers(threads);
++}
++END_TEST()
++
++FN_SETUP(cleanup)
++{
++	char path[64];
++
++	for (size_t i = 0; i < NR_DIRS; i++) {
++		if (fds[i] < 0) {
++			continue;
++		}
++
++		CHECK(close(fds[i]));
++		CHECK(snprintf(path, sizeof(path), "%s/" FILE_NAME, DIRS[i]));
++		CHECK(unlink(path));
++	}
++}
++END_SETUP()

@@ -1,0 +1,92 @@
+{
+  "id": "AST-21",
+  "title": "poll times out after timerfd becomes readable",
+  "status": "REPRODUCED",
+  "origin": {
+    "kind": "specula-run",
+    "alias": "FD",
+    "run_id": "asterinas-fd-epoll-pipeline-20260811T164254Z",
+    "finding_ids": [
+      "MC-6"
+    ],
+    "pin": "4ba4abbe8cb3f2892129d67b0301cf247bbdda0f"
+  },
+  "also_seen_in": [],
+  "mechanism": "do_poll returns Ok(0) directly when Poller::wait (Waiter::pause_timeout) reports ETIME, skipping the count_events rescan it runs after other wakeups, so a timerfd that expired and notified before the timeout decision is reported as a timeout.",
+  "sites": [
+    "kernel/core/src/syscall/poll.rs::do_poll",
+    "kernel/core/src/process/signal/poll.rs::Poller::wait",
+    "kernel/core/src/process/signal/pause.rs::Waiter::pause_timeout",
+    "kernel/core/src/time/timerfd.rs::TimerfdFile::new"
+  ],
+  "syscalls": [
+    "poll",
+    "ppoll",
+    "select",
+    "pselect6"
+  ],
+  "keywords": [
+    "poll",
+    "timeout",
+    "etime",
+    "terminal race",
+    "final rescan",
+    "count_events",
+    "timerfd",
+    "readiness",
+    "pause_timeout",
+    "arbitration"
+  ],
+  "contract": "poll(2): a return of 0 means the timeout expired before any descriptor became ready. Linux do_poll rescans descriptors before accepting the timeout.",
+  "observed": "poll returns 0 at the timeout boundary although the timerfd was already readable (observed readable while the poller slept), and an immediate nonblocking read returns a full tick.",
+  "upstream": {
+    "match": "none",
+    "refs": [],
+    "dedup_status": "NO_DIRECT_MATCH",
+    "upstream_fix_status": "NOT_ESTABLISHED",
+    "checked_against": "bc12195df4acfb1fc4ae968cf7acf9333ed83435",
+    "related_refs": [
+      "https://github.com/asterinas/asterinas/pull/1049",
+      "https://github.com/asterinas/asterinas/pull/1831"
+    ]
+  },
+  "fix_status": "unfixed",
+  "fix_refs": [],
+  "repro": {
+    "available": true,
+    "files": [
+      "repro/test_bug6_poll_timeout_race.c",
+      "repro/specula_validation.c",
+      "repro/test_bugMC-6_poll_timeout_race.c",
+      "repro/test_bugMC-6_ordered_timerfd_poll.c",
+      "repro/test_bugMC-6_proc_ordered_timerfd_poll.c",
+      "repro/specula-initramfs-plumbing.patch",
+      "repro/README.md"
+    ],
+    "how_to_run": "Apply the plumbing patch at the pin, place the chosen program at test/initramfs/src/regression/io/specula/test_bug6_poll_timeout_race.c, and run make run_kernel SMP=2 ... SPECULA_INIT=\"/test/io/specula/run_bug.sh test_bug6_poll_timeout_race\". See repro/README.md.",
+    "smp": 2,
+    "runtime_status": "REPRODUCED at 4ba4abbe8cb3f2892129d67b0301cf247bbdda0f"
+  },
+  "evidence": [
+    "/home/chin39/Documents/play/Specula/runs/asterinas-fd-epoll-pipeline-20260811T164254Z/asterinas-fd-epoll/.specula-output/confirmation/MC-6/investigation.md",
+    "/home/chin39/Documents/play/Specula/runs/asterinas-fd-epoll-pipeline-20260811T164254Z/asterinas-fd-epoll/.specula-output/confirmation/MC-6/reproduction.md",
+    "/home/chin39/Documents/play/Specula/runs/asterinas-fd-epoll-pipeline-20260811T164254Z/asterinas-fd-epoll/.specula-output/confirmation/MC-6/verdict.json",
+    "/home/chin39/Documents/play/Specula/runs/asterinas-fd-epoll-pipeline-20260811T164254Z/asterinas-fd-epoll/.specula-output/confirmation/MC-6/turn02_B.log",
+    "/home/chin39/Documents/play/Specula/runs/asterinas-fd-epoll-pipeline-20260811T164254Z/asterinas-fd-epoll/.specula-output/confirmation/MC-6/repro/mc6-level0-smp2-pinned-toolchain.log",
+    "/home/chin39/Documents/play/Specula/runs/asterinas-fd-epoll-pipeline-20260811T164254Z/asterinas-fd-epoll/.specula-output/confirmation/MC-6/repro/mc6b-level0-ordered-smp2-retry.log",
+    "/home/chin39/Documents/play/Specula/runs/asterinas-fd-epoll-pipeline-20260811T164254Z/asterinas-fd-epoll/.specula-output/confirmation/MC-6/repro/mc6-linux-control.log",
+    "/home/chin39/Documents/play/Specula/runs/asterinas-fd-epoll-pipeline-20260811T164254Z/asterinas-fd-epoll/.specula-output/harness/logs/validation_poll_timeout_race_smp2_repeat_manifest.txt",
+    "/home/chin39/Documents/play/Specula/runs/asterinas-fd-epoll-pipeline-20260811T164254Z/asterinas-fd-epoll/.specula-output/harness/logs/validation_repro_smp2_round6_manifest.txt",
+    "/home/chin39/Documents/play/Specula/runs/asterinas-fd-epoll-pipeline-20260811T164254Z/asterinas-fd-epoll/.specula-output/harness/logs/repro_test_bug6_poll_timeout_race_smp2_level3_print.log",
+    "/home/chin39/Documents/play/Specula/runs/asterinas-fd-epoll-pipeline-20260811T164254Z/asterinas-fd-epoll/.specula-output/spec/output/MC_hunt_s5_arbitration_round2_bfs_cex.json",
+    "/home/chin39/Documents/play/specula-profile/reports/independent-review/terra-asterinas-bug-report-vm-final.md",
+    "/home/chin39/Documents/play/Specula/runs/asterinas-fd-epoll-pipeline-20260811T164254Z/asterinas-fd-epoll/.specula-output/confirmed-bugs.md",
+    "/home/chin39/Documents/play/Specula/runs/asterinas-fd-epoll-pipeline-20260811T164254Z/asterinas-fd-epoll/.specula-output/bug-severity.md",
+    "/home/chin39/Documents/play/specula-profile/references/asterinas-syscall-security-audit.md",
+    "/home/chin39/Documents/play/specula-profile/reports/workflow-validation.md"
+  ],
+  "related": [
+    "AST-23"
+  ],
+  "caveats": "The independent Terra review held this ambiguous. The final ordering evidence came later and the Level-3 observation run was excluded by that review. The canonical /proc-ordered marker survives only in reproduction.md and the turn log. Rare timing boundary. Only SMP=2 recorded. Static read of upstream main bc12195df on 2026-09-24 showed the same code shape. No runtime retest."
+}

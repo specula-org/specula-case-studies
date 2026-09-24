@@ -1,0 +1,1150 @@
+diff --git a/kernel/core/src/fs/file/inode_handle.rs b/kernel/core/src/fs/file/inode_handle.rs
+index 99e0cd9..209365f 100644
+--- a/kernel/core/src/fs/file/inode_handle.rs
++++ b/kernel/core/src/fs/file/inode_handle.rs
+@@ -282,12 +282,16 @@ impl FileLike for InodeHandle {
+             return file_ops.read_at(0, writer, status_flags);
+         }
+ 
++        let specula_start = crate::tla_trace::stamp();
+         let mut offset = self.offset.lock();
+-
+-        let len = file_ops.read_at(*offset, writer, status_flags)?;
+-        *offset += len;
+-
+-        Ok(len)
++        crate::tla_trace::enter(specula_start, 0, *offset, writer.avail(), 0);
++        let result = file_ops.read_at(*offset, writer, status_flags);
++        let specula_start = crate::tla_trace::stamp();
++        if let Ok(len) = result { *offset += len; }
++        let specula_position = *offset;
++        drop(offset);
++        crate::tla_trace::returned("InodeHandleReturn", specula_start, &result, specula_position);
++        result
+     }
+ 
+     fn write(&self, reader: &mut VmReader) -> Result<usize> {
+@@ -328,7 +332,12 @@ impl FileLike for InodeHandle {
+ 
+         let status_flags = self.status_flags();
+ 
+-        file_ops.read_at(offset, writer, status_flags)
++        let specula_start = crate::tla_trace::stamp();
++        crate::tla_trace::enter(specula_start, 1, offset, writer.avail(), 0);
++        let result = file_ops.read_at(offset, writer, status_flags);
++        let specula_start = crate::tla_trace::stamp();
++        crate::tla_trace::returned("InodeHandleReturn", specula_start, &result, 0);
++        result
+     }
+ 
+     fn write_at(&self, mut offset: usize, reader: &mut VmReader) -> Result<usize> {
+@@ -350,7 +359,12 @@ impl FileLike for InodeHandle {
+             offset = self.path().size();
+         }
+ 
+-        file_ops.write_at(offset, reader, status_flags)
++        let specula_start = crate::tla_trace::stamp();
++        crate::tla_trace::enter(specula_start, 2, offset, reader.remain(), 0);
++        let result = file_ops.write_at(offset, reader, status_flags);
++        let specula_start = crate::tla_trace::stamp();
++        crate::tla_trace::returned("InodeHandleReturn", specula_start, &result, 0);
++        result
+     }
+ 
+     fn ioctl(&self, raw_ioctl: RawIoctl) -> Result<i32> {
+diff --git a/kernel/core/src/fs/fs_impls/exfat/inode.rs b/kernel/core/src/fs/fs_impls/exfat/inode.rs
+index 68be618..3f59ed6 100644
+--- a/kernel/core/src/fs/fs_impls/exfat/inode.rs
++++ b/kernel/core/src/fs/fs_impls/exfat/inode.rs
+@@ -148,8 +148,15 @@ impl BlockAsPageCacheBackend for ExfatInode {
+         complete_fn: BioCompleteFn,
+         io_batch: &mut IoBatch,
+     ) -> Result<()> {
++        if crate::tla_trace::holds_writer() {
++            let specula_start = crate::tla_trace::stamp();
++            if self.inner.try_read().is_none() {
++                crate::tla_trace::event("ExfatBackendReadBlocked", specula_start, [0; 8]);
++            }
++        }
+         let inner = self.inner.read();
+         if inner.size_allocated <= idx * PAGE_SIZE {
++            crate::tla_trace::event("VmoRangeError", crate::tla_trace::stamp(), [1, 0, 0, 0, 0, 0, 0, 0]);
+             return_errno_with_message!(Errno::EINVAL, "invalid read size");
+         } else if inner.size <= idx * PAGE_SIZE {
+             drop(inner);
+@@ -284,6 +291,7 @@ impl ExfatInodeInner {
+     /// Resize current inode to new_size.
+     /// The `size_allocated` field in inode can be enlarged, while the `size` field will not.
+     fn resize(&mut self, new_size: usize, fs_guard: &MutexGuard<()>) -> Result<()> {
++        let specula_start = crate::tla_trace::stamp();
+         let fs = self.fs();
+         let cluster_size = fs.cluster_size();
+ 
+@@ -310,6 +318,7 @@ impl ExfatInodeInner {
+             _ => {}
+         };
+         self.size_allocated = new_size;
++        crate::tla_trace::event("ExfatResizeAllocation", specula_start, [self.size, self.size_allocated, self.num_clusters() as usize, 0, 0, 0, 0, 0]);
+ 
+         Ok(())
+     }
+@@ -641,6 +650,8 @@ impl ExfatInodeInner {
+ 
+ impl ExfatInode {
+     fn read_at(&self, offset: usize, writer: &mut VmWriter) -> Result<usize> {
++        let result = (|| {
++        let specula_start = crate::tla_trace::stamp();
+         let inner = self.inner.upread();
+         if inner.inode_type.is_directory() {
+             return_errno!(Errno::EISDIR)
+@@ -651,10 +662,17 @@ impl ExfatInode {
+             let end = file_size.min(offset + writer.avail());
+             (start, end - start)
+         };
++        crate::tla_trace::bind_vmo(inner.page_cache.as_vmo().as_ref() as *const _ as usize);
++        crate::tla_trace::event("ExfatReadAt", specula_start, [inner.size, read_off, read_len, writer.avail(), 0, 0, 0, 0]);
+         inner.page_cache.read(read_off, writer)?;
+ 
+         inner.upgrade().update_atime()?;
+         Ok(read_len)
++    
++        })();
++        let specula_start = crate::tla_trace::stamp();
++        crate::tla_trace::returned("BackendReturn", specula_start, &result, 0);
++        result
+     }
+ 
+     // The offset and the length of buffer must be multiples of the block size.
+@@ -709,8 +727,10 @@ impl ExfatInode {
+     }
+ 
+     fn write_at(&self, offset: usize, reader: &mut VmReader) -> Result<usize> {
++        let result = (|| {
+         let write_len = reader.remain();
+         // We need to obtain the fs lock to resize the file.
++        let specula_start = crate::tla_trace::stamp();
+         let new_size = {
+             let mut inner = self.inner.write();
+             if inner.inode_type.is_directory() {
+@@ -720,6 +740,8 @@ impl ExfatInode {
+             let file_size = inner.size;
+             let file_allocated_size = inner.size_allocated;
+             let new_size = offset + write_len;
++            crate::tla_trace::bind_vmo(inner.page_cache.as_vmo().as_ref() as *const _ as usize);
++        crate::tla_trace::event("ExfatWriteAtPrepare", specula_start, [file_size, new_size.max(file_size), new_size, file_allocated_size, 0, 0, 0, 0]);
+             let fs = inner.fs();
+             let fs_guard = fs.lock();
+             if new_size > file_size {
+@@ -731,16 +753,23 @@ impl ExfatInode {
+             new_size.max(file_size)
+         };
+ 
++        crate::tla_trace::event("ExfatWriteAtReleasePreparation", crate::tla_trace::last_end(), [0; 8]);
++        crate::tla_trace::mc3_release_hook();
++        let specula_start = crate::tla_trace::stamp();
+         // Locks released here, so that file write can be parallelized.
+         let inner = self.inner.upread();
++        crate::tla_trace::event("ExfatWriteAtAcquireCopy", specula_start, [0; 8]);
++        crate::tla_trace::event("WriteAtCopyStart", crate::tla_trace::stamp(), [offset, reader.remain(), 0, 0, 0, 0, 0, 0]);
+         inner.page_cache.write(offset, reader)?;
+ 
+         // Update timestamps and size.
+         {
++            let specula_start = crate::tla_trace::stamp();
+             let mut inner = inner.upgrade();
+ 
+             inner.update_atime_mtime_and_ctime()?;
+             inner.size = new_size;
++            crate::tla_trace::event("ExfatWriteAtPublish", specula_start, [inner.size, 0, 0, 0, 0, 0, 0, 0]);
+         }
+ 
+         let inner = self.inner.read();
+@@ -753,6 +782,11 @@ impl ExfatInode {
+         }
+ 
+         Ok(write_len)
++    
++        })();
++        let specula_start = crate::tla_trace::stamp();
++        crate::tla_trace::returned("BackendReturn", specula_start, &result, 0);
++        result
+     }
+ 
+     fn write_direct_at(&self, offset: usize, reader: &mut VmReader) -> Result<usize> {
+@@ -1434,6 +1468,8 @@ impl Inode for ExfatInode {
+     }
+ 
+     fn resize(&self, new_size: usize) -> Result<()> {
++        let result = (|| {
++        let specula_start = crate::tla_trace::stamp();
+         let inner = self.inner.upread();
+ 
+         if inner.inode_type.is_directory() {
+@@ -1444,10 +1480,14 @@ impl Inode for ExfatInode {
+         }
+ 
+         let file_size = inner.size;
++        crate::tla_trace::bind_vmo(inner.page_cache.as_vmo().as_ref() as *const _ as usize);
++        crate::tla_trace::event("ExfatResize", specula_start, [file_size, new_size, 0, 0, 0, 0, 0, 0]);
+         let fs = inner.fs();
+         let fs_guard = fs.lock();
+ 
++        let specula_start = crate::tla_trace::stamp();
+         let mut inner = inner.upgrade();
++        crate::tla_trace::event("ExfatResizeUpgrade", specula_start, [0; 8]);
+ 
+         if new_size < file_size {
+             inner.page_cache.resize(new_size, file_size)?;
+@@ -1460,6 +1500,11 @@ impl Inode for ExfatInode {
+         }
+ 
+         Ok(())
++    
++        })();
++        let specula_start = crate::tla_trace::stamp();
++        crate::tla_trace::returned("BackendReturn", specula_start, &result.as_ref().map(|_| 0).map_err(Clone::clone), 0);
++        result
+     }
+ 
+     fn metadata(&self) -> Result<Metadata> {
+diff --git a/kernel/core/src/fs/fs_impls/ext2/inode/block_manager/block_ptr_tree.rs b/kernel/core/src/fs/fs_impls/ext2/inode/block_manager/block_ptr_tree.rs
+index 929ac8d..105ffa6 100644
+--- a/kernel/core/src/fs/fs_impls/ext2/inode/block_manager/block_ptr_tree.rs
++++ b/kernel/core/src/fs/fs_impls/ext2/inode/block_manager/block_ptr_tree.rs
+@@ -687,10 +687,13 @@ impl BlockPtrTree {
+ 
+         let bio_segment = BioSegment::alloc(block_range.len(), BioDirection::ToDevice);
+         let mut segment_writer = bio_segment.writer().unwrap();
++        let specula_before = segment_writer.cursor() as usize;
+         segment_writer.fill_zeros(block_range.len() * BLOCK_SIZE);
++        let specula_zeroed = segment_writer.cursor() as usize - specula_before;
+         fs.write_blocks_async(block_range.start, bio_segment, None, &mut io_batch)?;
+ 
+         io_batch.wait_all()?;
++        crate::tla_trace::zero_receipt(specula_zeroed);
+         Ok(())
+     }
+ 
+diff --git a/kernel/core/src/fs/fs_impls/ext2/inode/block_manager/mod.rs b/kernel/core/src/fs/fs_impls/ext2/inode/block_manager/mod.rs
+index e911a5a..f56e8a7 100644
+--- a/kernel/core/src/fs/fs_impls/ext2/inode/block_manager/mod.rs
++++ b/kernel/core/src/fs/fs_impls/ext2/inode/block_manager/mod.rs
+@@ -90,7 +90,12 @@ impl InodeBlockManager {
+             }
+         };
+         let mut tree = self.block_ptr_tree.write();
+-        tree.truncate_to_byte_len(&fs, new_size)
++        tree.truncate_to_byte_len(&fs, new_size);
++        if crate::tla_trace::active() {
++            let mut mask = 0;
++            for i in 0..12 { if tree.lookup_block(Iblock::try_from(i).unwrap()).unwrap().is_some() { mask |= 1 << i; } }
++            crate::tla_trace::set_blocks(mask);
++        }
+     }
+ 
+     /// Flushes all dirty cached indirect blocks to the device.
+@@ -101,7 +106,10 @@ impl InodeBlockManager {
+     /// Allocates missing data blocks that cover the requested logical block range.
+     pub(super) fn allocate_range_blocks(&self, start_block: usize, end_block: usize) -> Result<()> {
+         let fs = self.fs()?;
++        let specula_start = crate::tla_trace::stamp();
+         let mut tree = self.block_ptr_tree.write();
++        let mut fresh = 0usize;
++        crate::tla_trace::reset_zeros();
+         let mut current_block = start_block;
+         while current_block < end_block {
+             let iblock = Iblock::try_from(current_block)
+@@ -116,11 +124,18 @@ impl InodeBlockManager {
+                     current_block += range.len();
+                 }
+                 ResolvedBlockRange::NewlyAllocated(range) => {
++                    for i in current_block..current_block + range.len() { if i < 12 { fresh |= 1 << i; } }
+                     debug_assert!(!range.is_empty());
+                     current_block += range.len();
+                 }
+             }
+         }
++        if crate::tla_trace::active() {
++            let mut mask = 0;
++            for i in 0..12 { if tree.lookup_block(Iblock::try_from(i).unwrap()).unwrap().is_some() { mask |= 1 << i; } }
++            crate::tla_trace::set_blocks(mask);
++            crate::tla_trace::event("Ext2AllocateRangeBlocks", specula_start, [mask, fresh, crate::tla_trace::zeros(), 0, 0, 0, 0, 0]);
++        }
+         Ok(())
+     }
+ 
+@@ -138,7 +153,9 @@ impl BlockAsPageCacheBackend for InodeBlockManager {
+         complete_fn: BioCompleteFn,
+         io_batch: &mut IoBatch,
+     ) -> Result<()> {
++        let specula_start = crate::tla_trace::stamp();
+         if idx >= self.npages.load(Ordering::Acquire) {
++            crate::tla_trace::event("VmoRangeError", specula_start, [1, 0, 0, 0, 0, 0, 0, 0]);
+             return_errno_with_message!(Errno::EINVAL, "invalid read size");
+         }
+         let iblock = Iblock::try_from(idx)
+diff --git a/kernel/core/src/fs/fs_impls/ext2/inode/file.rs b/kernel/core/src/fs/fs_impls/ext2/inode/file.rs
+index 8ae1f20..af2995a 100644
+--- a/kernel/core/src/fs/fs_impls/ext2/inode/file.rs
++++ b/kernel/core/src/fs/fs_impls/ext2/inode/file.rs
+@@ -25,30 +25,50 @@ impl Inode {
+         }
+ 
+         if writer.avail() == 0 {
+-            return Ok(0);
+-        }
+-
+-        let read_len = self.inner.read().read_at(offset, writer)?;
++            crate::tla_trace::event("Ext2ReadAtEmpty", crate::tla_trace::stamp(), [0; 8]);
++            let result = Ok(0);
++            crate::tla_trace::returned("BackendReturn", crate::tla_trace::last_end(), &result, 0);
++            return result;
++        }
++
++        let specula_start = crate::tla_trace::stamp();
++        let inner = self.inner.read();
++        crate::tla_trace::set_start(specula_start);
++        let result = inner.read_at(offset, writer);
++        drop(inner);
++        crate::tla_trace::returned("BackendReturn", crate::tla_trace::last_end(), &result, 0);
++        let read_len = result?;
+         if read_len > 0 {
++            let specula_start = crate::tla_trace::stamp();
+             self.inner.write().set_atime(utils::now());
++            crate::tla_trace::event("Ext2ReadAtUpdateAtime", specula_start, [0; 8]);
+         }
+         Ok(read_len)
+     }
+ 
+     /// Writes file data at `offset` through the page cache.
+     pub(in ext2) fn write_at(&self, offset: usize, reader: &mut VmReader) -> Result<usize> {
++        let result = (|| {
+         if self.type_ == InodeType::Dir {
+             return_errno!(Errno::EISDIR);
+         }
+ 
+         let write_len = reader.remain();
+         if write_len == 0 {
++            crate::tla_trace::event("Ext2WriteAtEmpty", crate::tla_trace::stamp(), [0; 8]);
+             return Ok(0);
+         }
+ 
+         let fs = self.fs()?;
++        let specula_start = crate::tla_trace::stamp();
+         let mut inner = self.inner.write();
++        crate::tla_trace::set_start(specula_start);
+         inner.write_at(&fs, offset, reader)
++    
++        })();
++        let specula_start = crate::tla_trace::stamp();
++        crate::tla_trace::returned("BackendReturn", specula_start, &result, 0);
++        result
+     }
+ 
+     /// Direct-I/O read path.
+@@ -97,6 +117,7 @@ impl Inode {
+ 
+     /// Truncates or extends the file to `new_size` bytes.
+     pub(in ext2) fn resize(&self, new_size: usize) -> Result<()> {
++        let result = (|| {
+         if self.type_ == InodeType::Dir {
+             return_errno!(Errno::EISDIR);
+         }
+@@ -105,6 +126,7 @@ impl Inode {
+         }
+ 
+         let fs = self.fs()?;
++        let specula_start = crate::tla_trace::stamp();
+         let mut inner = self.inner.write();
+         if inner.is_fast_symlink() && inner.file_size() != 0 {
+             return_errno!(Errno::EINVAL);
+@@ -118,6 +140,8 @@ impl Inode {
+         }
+ 
+         let old_size = inner.file_size();
++        crate::tla_trace::bind_vmo(inner.page_cache().as_vmo().as_ref() as *const _ as usize);
++        crate::tla_trace::event("Ext2Resize", specula_start, [old_size, new_size, 0, 0, 0, 0, 0, 0]);
+         if new_size == old_size {
+             return Ok(());
+         }
+@@ -127,8 +151,14 @@ impl Inode {
+         } else {
+             inner.expand(&fs, new_size)?;
+         }
++        crate::tla_trace::event("Ext2ResizePublish", crate::tla_trace::last_end(), [inner.file_size(), crate::tla_trace::blocks(), 0, 0, 0, 0, 0, 0]);
+         inner.set_mtime_ctime(utils::now());
+         Ok(())
++    
++        })();
++        let specula_start = crate::tla_trace::stamp();
++        crate::tla_trace::returned("BackendReturn", specula_start, &result.as_ref().map(|_| 0).map_err(Clone::clone), 0);
++        result
+     }
+ 
+     /// Implements fallocate operations for ext2.
+@@ -203,6 +233,7 @@ impl InodeInner {
+ 
+     /// Truncates page cache and blocks after a failed write.
+     pub(super) fn rollback_write(&mut self, old_size: usize, end: usize) {
++        crate::tla_trace::event("Ext2RollbackWrite", crate::tla_trace::stamp(), [old_size, end, 0, 0, 0, 0, 0, 0]);
+         if end <= old_size {
+             return;
+         }
+@@ -215,6 +246,7 @@ impl InodeInner {
+ 
+         if let Ok(block_manager) = self.block_manager() {
+             block_manager.truncate_to_byte_len(old_size);
++            crate::tla_trace::event("Ext2RollbackBlocks", crate::tla_trace::last_end(), [crate::tla_trace::blocks(), 0, 0, 0, 0, 0, 0, 0]);
+         }
+     }
+ 
+@@ -233,11 +265,15 @@ impl InodeInner {
+ 
+         let file_size = self.file_size();
+         if offset >= file_size {
++            crate::tla_trace::bind_vmo(self.page_cache().as_vmo().as_ref() as *const _ as usize);
++        crate::tla_trace::event("Ext2ReadAt", crate::tla_trace::take_start(), [file_size, offset, 0, 0, 0, 0, 0, 0]);
+             return Ok(0);
+         }
+ 
+         let read_len = writer.avail().min(file_size - offset);
+         writer.limit(read_len);
++        crate::tla_trace::bind_vmo(self.page_cache().as_vmo().as_ref() as *const _ as usize);
++        crate::tla_trace::event("Ext2ReadAt", crate::tla_trace::take_start(), [file_size, offset, read_len, writer.avail(), 0, 0, 0, 0]);
+         self.page_cache().read(offset, writer)?;
+         Ok(read_len)
+     }
+@@ -253,21 +289,26 @@ impl InodeInner {
+             .checked_add(write_len)
+             .ok_or_else(|| Error::with_message(Errno::EINVAL, "write range overflow"))?;
+         let old_size = self.file_size();
++        crate::tla_trace::bind_vmo(self.page_cache().as_vmo().as_ref() as *const _ as usize);
++        crate::tla_trace::event("Ext2WriteAtPrepare", crate::tla_trace::take_start(), [old_size, end, 0, 0, 0, 0, 0, 0]);
+ 
+         if let Err(err) = self.prepare_write(fs, offset, end) {
+             self.rollback_write(old_size, end);
+             return Err(err);
+         }
+ 
++        crate::tla_trace::event("WriteAtCopyStart", crate::tla_trace::stamp(), [offset, reader.remain(), 0, 0, 0, 0, 0, 0]);
+         if let Err(err) = self.page_cache().write(offset, reader) {
+             self.rollback_write(old_size, end);
+             return Err(err.into());
+         }
+ 
++        let specula_start = crate::tla_trace::stamp();
+         self.set_mtime_ctime(utils::now());
+         if end > old_size {
+             self.set_file_size(end);
+         }
++        crate::tla_trace::event("Ext2WriteAtPublish", specula_start, [self.file_size(), 0, 0, 0, 0, 0, 0, 0]);
+         Ok(write_len)
+     }
+ 
+diff --git a/kernel/core/src/fs/fs_impls/ext2/inode/mod.rs b/kernel/core/src/fs/fs_impls/ext2/inode/mod.rs
+index 0e5396b..fc13dbc 100644
+--- a/kernel/core/src/fs/fs_impls/ext2/inode/mod.rs
++++ b/kernel/core/src/fs/fs_impls/ext2/inode/mod.rs
+@@ -477,7 +477,9 @@ impl InodeInner {
+         };
+         page_cache.resize(new_size_bytes, old_size_bytes)?;
+         // Reset the npages to let the `PageCacheBackend` know the size of page cache.
++        let specula_start = crate::tla_trace::stamp();
+         block_manager.set_npages(new_size_bytes.div_ceil(PAGE_SIZE));
++        crate::tla_trace::event("Ext2ResizePageCacheBound", specula_start, [new_size_bytes.div_ceil(PAGE_SIZE), 0, 0, 0, 0, 0, 0, 0]);
+         Ok(())
+     }
+ 
+diff --git a/kernel/core/src/fs/fs_impls/ramfs/fs.rs b/kernel/core/src/fs/fs_impls/ramfs/fs.rs
+index 005b013..95b6a07 100644
+--- a/kernel/core/src/fs/fs_impls/ramfs/fs.rs
++++ b/kernel/core/src/fs/fs_impls/ramfs/fs.rs
+@@ -698,15 +698,22 @@ impl FileOps for RamInode {
+         writer: &mut VmWriter,
+         _status_flags: StatusFlags,
+     ) -> Result<usize> {
++        let result = (|| {
+         let read_len = match &self.inner {
+             Inner::File(page_cache) => {
+-                let (offset, read_len) = {
++                let specula_start = crate::tla_trace::stamp();
++                let (offset, read_len, specula_size) = {
+                     let file_size = self.size();
+                     let start = file_size.min(offset);
+                     let end = file_size.min(offset + writer.avail());
+-                    (start, end - start)
++                    (start, end - start, file_size)
+                 };
+-                page_cache.lock().read(offset, writer)?;
++                crate::tla_trace::event("RamfsReadAtObserve", specula_start, [specula_size, offset, read_len, 0, 0, 0, 0, 0]);
++                let specula_start = crate::tla_trace::stamp();
++                let cache = page_cache.lock();
++                crate::tla_trace::bind_vmo(cache.as_vmo().as_ref() as *const _ as usize);
++                crate::tla_trace::event("RamfsReadAtAcquireCache", specula_start, [offset, writer.avail(), 0, 0, 0, 0, 0, 0]);
++                cache.read(offset, writer)?;
+                 read_len
+             }
+             _ => return_errno_with_message!(Errno::EISDIR, "read is not supported"),
+@@ -716,6 +723,11 @@ impl FileOps for RamInode {
+             self.set_atime(now());
+         }
+         Ok(read_len)
++    
++        })();
++        let specula_start = crate::tla_trace::stamp();
++        crate::tla_trace::returned("BackendReturn", specula_start, &result, 0);
++        result
+     }
+ 
+     fn write_at(
+@@ -724,12 +736,16 @@ impl FileOps for RamInode {
+         reader: &mut VmReader,
+         _status_flags: StatusFlags,
+     ) -> Result<usize> {
++        let result = (|| {
+         let written_len = match self.typ {
+             InodeType::File => {
+                 let now = now();
+ 
++                let specula_start = crate::tla_trace::stamp();
+                 let mut page_cache = self.inner.as_file().unwrap().lock();
+-
++                crate::tla_trace::bind_vmo(page_cache.as_vmo().as_ref() as *const _ as usize);
++                crate::tla_trace::event("RamfsWriteAtAcquireCache", specula_start, [0; 8]);
++                let specula_start = crate::tla_trace::stamp();
+                 let mut inode_meta = self.metadata.lock();
+                 let file_size = inode_meta.size;
+                 let write_len = reader.remain();
+@@ -742,11 +758,15 @@ impl FileOps for RamInode {
+                     inode_meta.size = new_size;
+                     inode_meta.blocks = new_size_aligned / BLOCK_SIZE;
+                 }
++                let specula_size = inode_meta.size;
+                 drop(inode_meta);
++                crate::tla_trace::event("RamfsWriteAtPublish", specula_start, [specula_size, file_size, new_size, new_size_aligned, 0, 0, 0, 0]);
+ 
+                 if should_expand_size {
+                     page_cache.resize(new_size_aligned, file_size)?;
+                 }
++                let specula_start = crate::tla_trace::stamp();
++                crate::tla_trace::event("WriteAtCopyStart", specula_start, [offset, reader.remain(), 0, 0, 0, 0, 0, 0]);
+                 page_cache.write(offset, reader)?;
+ 
+                 write_len
+@@ -754,6 +774,11 @@ impl FileOps for RamInode {
+             _ => return_errno_with_message!(Errno::EISDIR, "write is not supported"),
+         };
+         Ok(written_len)
++    
++        })();
++        let specula_start = crate::tla_trace::stamp();
++        crate::tla_trace::returned("BackendReturn", specula_start, &result, 0);
++        result
+     }
+ 
+     fn readdir_at(&self, offset: usize, visitor: &mut dyn DirentVisitor) -> Result<usize> {
+@@ -786,6 +811,7 @@ impl Inode for RamInode {
+     }
+ 
+     fn resize(&self, new_size: usize) -> Result<()> {
++        let result = (|| {
+         if self.typ == InodeType::Dir {
+             return_errno_with_message!(Errno::EISDIR, "the inode is a directory");
+         }
+@@ -793,10 +819,15 @@ impl Inode for RamInode {
+             return_errno_with_message!(Errno::EINVAL, "the inode is not a regular file");
+         }
+ 
++        let specula_start = crate::tla_trace::stamp();
+         let mut page_cache = self.inner.as_file().unwrap().lock();
++        crate::tla_trace::bind_vmo(page_cache.as_vmo().as_ref() as *const _ as usize);
++        crate::tla_trace::event("RamfsResizeAcquireCache", specula_start, [0; 8]);
++        let specula_start = crate::tla_trace::stamp();
+         let mut inode_meta = self.metadata.lock();
+         let file_size = inode_meta.size;
+         if file_size == new_size {
++            crate::tla_trace::event("RamfsResize", specula_start, [file_size, new_size, inode_meta.size, 0, 0, 0, 0, 0]);
+             return Ok(());
+         }
+         let now = now();
+@@ -805,15 +836,27 @@ impl Inode for RamInode {
+ 
+         if new_size > file_size {
+             inode_meta.resize(new_size);
++            let specula_size = inode_meta.size;
+             drop(inode_meta);
++            crate::tla_trace::event("RamfsResize", specula_start, [file_size, new_size, specula_size, 0, 0, 0, 0, 0]);
+             page_cache.resize(new_size, file_size)?;
+         } else {
++            let specula_size = inode_meta.size;
+             drop(inode_meta);
++            crate::tla_trace::event("RamfsResize", specula_start, [file_size, new_size, specula_size, 0, 0, 0, 0, 0]);
+             page_cache.resize(new_size, file_size)?;
+-            self.metadata.lock().resize(new_size);
++            let specula_start = crate::tla_trace::stamp();
++            let mut metadata = self.metadata.lock();
++            metadata.resize(new_size);
++            crate::tla_trace::event("RamfsResizePublish", specula_start, [metadata.size, 0, 0, 0, 0, 0, 0, 0]);
+         }
+ 
+         Ok(())
++    
++        })();
++        let specula_start = crate::tla_trace::stamp();
++        crate::tla_trace::returned("BackendReturn", specula_start, &result.as_ref().map(|_| 0).map_err(Clone::clone), 0);
++        result
+     }
+ 
+     fn atime(&self) -> Duration {
+diff --git a/kernel/core/src/lib.rs b/kernel/core/src/lib.rs
+index bfa6b7c..b2fb69d 100644
+--- a/kernel/core/src/lib.rs
++++ b/kernel/core/src/lib.rs
+@@ -56,6 +56,7 @@ mod sched;
+ mod security;
+ mod syscall;
+ mod thread;
++pub(crate) mod tla_trace;
+ mod time;
+ mod util;
+ // TODO: Add vDSO support for other architectures.
+diff --git a/kernel/core/src/process/posix_thread/thread_local.rs b/kernel/core/src/process/posix_thread/thread_local.rs
+index 0860345..3f24e74 100644
+--- a/kernel/core/src/process/posix_thread/thread_local.rs
++++ b/kernel/core/src/process/posix_thread/thread_local.rs
+@@ -21,6 +21,7 @@ use crate::{
+ 
+ /// Local data for a POSIX thread.
+ pub(crate) struct ThreadLocal {
++    pub(crate) specula_trace: RefCell<crate::tla_trace::Recorder>,
+     // TID pointers.
+     // https://man7.org/linux/man-pages/man2/set_tid_address.2.html
+     set_child_tid: Cell<Vaddr>,
+@@ -71,6 +72,7 @@ impl ThreadLocal {
+         ns_proxy: Arc<NsProxy>,
+     ) -> Self {
+         Self {
++            specula_trace: RefCell::new(crate::tla_trace::Recorder::new()),
+             set_child_tid: Cell::new(set_child_tid),
+             clear_child_tid: Cell::new(clear_child_tid),
+             vmar: RefCell::new(Some(vmar)),
+diff --git a/kernel/core/src/syscall/prctl.rs b/kernel/core/src/syscall/prctl.rs
+index 6e141f4..19d91ac 100644
+--- a/kernel/core/src/syscall/prctl.rs
++++ b/kernel/core/src/syscall/prctl.rs
+@@ -20,6 +20,10 @@ pub(super) fn sys_prctl(
+     arg5: u64,
+     ctx: &Context,
+ ) -> Result<SyscallReturn> {
++    if option == 0x53504543 || option == 0x53504544 || option == 0x53504551 {
++        return crate::tla_trace::control(option, arg2 as usize, arg3 as usize, arg4 as usize)
++            .map(|n| SyscallReturn::Return(n as _));
++    }
+     let prctl_cmd = PrctlCmd::from_args(option, arg2, arg3, arg4, arg5)?;
+     debug!("prctl_cmd = {:x?}", prctl_cmd);
+ 
+diff --git a/kernel/core/src/syscall/truncate.rs b/kernel/core/src/syscall/truncate.rs
+index b5e5660..8e8b56b 100644
+--- a/kernel/core/src/syscall/truncate.rs
++++ b/kernel/core/src/syscall/truncate.rs
+@@ -23,7 +23,12 @@ pub(super) fn sys_ftruncate(
+ 
+     let mut file_table = ctx.thread_local.borrow_file_table_mut();
+     let file = get_file_fast!(&mut file_table, raw_fd.try_into()?);
+-    file.resize(len as usize)?;
++    let specula_start = crate::tla_trace::stamp();
++    crate::tla_trace::enter(specula_start, 3, 0, 0, len as usize);
++    let result = file.resize(len as usize).map(|_| 0);
++    let specula_start = crate::tla_trace::stamp();
++    crate::tla_trace::returned("InodeHandleReturn", specula_start, &result, 0);
++    result?;
+     fs::vfs::notify::on_change(file.path());
+     Ok(SyscallReturn::Return(0))
+ }
+diff --git a/kernel/core/src/tla_trace.rs b/kernel/core/src/tla_trace.rs
+new file mode 100644
+index 0000000..481a6b1
+--- /dev/null
++++ b/kernel/core/src/tla_trace.rs
+@@ -0,0 +1,198 @@
++// SPDX-License-Identifier: MPL-2.0
++
++//! Per-task receipts. User space arms and drains the buffer outside the attempt.
++
++use ostd::{mm::{Infallible, VmIo}, task::Task};
++use crate::prelude::*;
++
++const LIMIT: usize = 2048;
++#[derive(Clone, Copy)]
++struct Receipt {
++    name: &'static str,
++    start: u64,
++    end: u64,
++    values: [usize; 8],
++    data: [u8; 16],
++}
++
++pub(crate) struct Recorder {
++    tid: usize,
++    start: u64,
++    blocks: usize,
++    vmo: usize,
++    zeros: usize,
++    writer: bool,
++    unit: usize,
++    fault: usize,
++    armed: bool,
++    active: bool,
++    overflow: bool,
++    records: Vec<Receipt>,
++    /// MC-3 repro hook: busy-wait iterations at the exFAT write_at
++    /// release-preparation/acquire-copy window. 0 = disarmed (default).
++    mc3_iters: u64,
++}
++
++impl Recorder {
++    pub(crate) fn new() -> Self {
++        Self { tid: 0, start: 0, blocks: 0, vmo: 0, zeros: 0, writer: false, unit: 2048, fault: 0, armed: false, active: false,
++               overflow: false, records: Vec::new(), mc3_iters: 0 }
++    }
++}
++
++fn with<R>(f: impl FnOnce(&mut Recorder) -> R) -> Option<R> {
++    let task = Task::current()?;
++    let local = task.as_thread_local()?;
++    let mut recorder = local.specula_trace.try_borrow_mut().ok()?;
++    Some(f(&mut recorder))
++}
++
++pub(crate) fn active() -> bool { with(|r| r.active).unwrap_or(false) }
++pub(crate) fn stamp() -> u64 {
++    core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
++    let time = ostd::arch::read_tsc();
++    core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
++    time
++}
++
++fn push(name: &'static str, start: u64, end: u64, values: [usize; 8], data: [u8; 16]) {
++    with(|r| {
++        if !r.active { return; }
++        if r.records.len() == r.records.capacity() { r.overflow = true; return; }
++        match name {
++            "ExfatWriteAtPrepare" | "ExfatResizeUpgrade" | "ExfatWriteAtPublish" => r.writer = true,
++            "ExfatWriteAtReleasePreparation" | "BackendReturn" => r.writer = false,
++            _ => {}
++        }
++        r.records.push(Receipt { name, start, end, values, data });
++    });
++}
++
++pub(crate) fn event(name: &'static str, start: u64, values: [usize; 8]) {
++    let end = stamp();
++    push(name, start, end, values, [255; 16]);
++}
++
++pub(crate) fn enter(start: u64, kind: usize, offset: usize, length: usize, target: usize) {
++    let fault = with(|r| { r.active = r.armed; r.vmo = 0; r.fault.min(length) }).unwrap_or(0);
++    event("SyscallEnter", start, [kind, offset, length, target, fault, 0, 0, 0]);
++}
++
++pub(crate) fn returned(name: &'static str, start: u64, result: &Result<usize>, position: usize) {
++    let start = if name == "BackendReturn" { last_end() } else { start };
++    let (count, errno) = match result {
++        Ok(n) => (*n, 0),
++        Err(e) => (usize::MAX, e.error() as usize),
++    };
++    event(name, start, [count, errno, position, 0, 0, 0, 0, 0]);
++    if name == "InodeHandleReturn" { with(|r| r.active = false); }
++}
++
++// A tag is emitted only when every byte in its exact unit has that value.
++fn tags(bytes: &[u8], unit: usize, out: &mut [u8; 16]) {
++    if unit == 0 || bytes.len() % unit != 0 || bytes.len() / unit > out.len() {
++        out[0] = 254; return;
++    }
++    for (i, cell) in bytes.chunks_exact(unit).enumerate() {
++        out[i] = if cell.iter().all(|v| *v == cell[0]) { cell[0] } else { 254 };
++    }
++}
++
++pub(crate) fn page(name: &'static str, start: u64, index: usize, state: usize,
++                   mut reader: VmReader<Infallible>) {
++    let end = stamp();
++    if !active() { return; }
++    let mut data = [255; 16];
++    if state != 0 {
++        let mut bytes = [0u8; 4096];
++        reader.read(&mut VmWriter::from(&mut bytes[..]));
++        tags(&bytes, with(|r| r.unit).unwrap(), &mut data);
++    }
++    push(name, start, end, [index, state, 0, 0, 0, 0, 0, 0], data);
++}
++
++pub(crate) fn copied(start: u64, index: usize, page_offset: usize, before: usize,
++    after: usize, failed: bool, state: usize, reader: VmReader<Infallible>, destination: bool) {
++    let end = stamp();
++    if !active() { return; }
++    let delta = after - before;
++    let unit = with(|r| r.unit).unwrap();
++    let mut data = [255; 16];
++    if destination {
++        let mut bytes = [0u8; 4096];
++        if delta > bytes.len() { data[0] = 254; }
++        else {
++            let result = crate::context::current_userspace!().read_bytes(before, &mut bytes[..delta]);
++            if result.is_err() { data[0] = 254; }
++            else { tags(&bytes[..delta], unit, &mut data); }
++        }
++    } else {
++        let mut bytes = [0u8; 4096];
++        let mut reader = reader;
++        if state != 0 {
++            reader.read(&mut VmWriter::from(&mut bytes[..]));
++            tags(&bytes, unit, &mut data);
++        } else if delta > 0 {
++            reader.skip(page_offset).read(&mut VmWriter::from(&mut bytes[..delta]));
++            let mut prefix = [255; 16];
++            tags(&bytes[..delta], unit, &mut prefix);
++            if page_offset % unit != 0 { data[0] = 254; }
++            else { for i in 0..delta / unit { data[page_offset / unit + i] = prefix[i]; } }
++        }
++    }
++    push("VmoCopyPage", start, end,
++         [index, page_offset, before, after, delta, usize::from(failed), state, usize::from(destination)], data);
++}
++
++pub(crate) fn control(option: i32, tid: usize, unit: usize, fault: usize) -> Result<usize> {
++    if option == 0x53504551 {
++        // MC-3 repro hook control: arg2=1 arms with arg3 busy-wait
++        // iterations, arg2=0 disarms. Timing-only; no logic altered.
++        with(|r| r.mc3_iters = if tid == 1 { unit as u64 } else { 0 });
++        return Ok(0);
++    }
++    if option == 0x53504543 {
++        if tid > 2 || unit != 2048 { return_errno!(Errno::EINVAL); }
++        with(|r| { *r = Recorder { tid, start: 0, blocks: 0, vmo: 0, zeros: 0, writer: false, unit, fault, armed: true, active: false,
++            overflow: false, records: Vec::with_capacity(LIMIT), mc3_iters: 0 }; });
++        return Ok(0);
++    }
++    let saved = with(|r| { r.active = false; r.armed = false;
++        (r.tid, r.overflow, core::mem::take(&mut r.records)) }).unwrap();
++    for e in &saved.2 {
++        ostd::early_println!("SPECULA_RAW {{\"event\":\"{}\",\"tid\":{},\"start\":{},\"end\":{},\"v\":{:?},\"data\":{:?}}}",
++            e.name, saved.0, e.start, e.end, e.values, e.data);
++    }
++    if saved.1 { return_errno!(Errno::EOVERFLOW); }
++    Ok(saved.2.len())
++}
++
++pub(crate) fn last_end() -> u64 { with(|r| r.records.last().map(|e| e.end).unwrap_or_else(stamp)).unwrap_or_else(stamp) }
++
++/// MC-3 repro hook: when armed via prctl(0x53504551), busy-wait at the exact
++/// counterexample window (after ExfatWriteAtReleasePreparation, before
++/// reacquiring the guard for the copy). No locks are held while spinning;
++/// only this thread's timing is dilated, the system's logic is unchanged.
++pub(crate) fn mc3_release_hook() {
++    let iters = with(|r| r.mc3_iters).unwrap_or(0);
++    for _ in 0..iters {
++        core::hint::spin_loop();
++    }
++}
++pub(crate) fn set_start(value: u64) { with(|r| r.start = value); }
++pub(crate) fn take_start() -> u64 { with(|r| r.start).unwrap_or_else(stamp) }
++pub(crate) fn blocks() -> usize { with(|r| r.blocks).unwrap_or(0) }
++pub(crate) fn set_blocks(value: usize) { with(|r| r.blocks = value); }
++
++
++pub(crate) fn bind_vmo(address: usize) { with(|r| if r.active { r.vmo = address; }); }
++pub(crate) struct Scope(bool);
++pub(crate) fn scope(address: usize) -> Scope {
++    Scope(with(|r| { let old = r.active; r.active &= r.vmo == address; old }).unwrap_or(false))
++}
++impl Drop for Scope { fn drop(&mut self) { with(|r| r.active = self.0); } }
++
++pub(crate) fn reset_zeros() { with(|r| r.zeros = 0); }
++pub(crate) fn zero_receipt(bytes: usize) { with(|r| if r.active { r.zeros += bytes; }); }
++pub(crate) fn zeros() -> usize { with(|r| r.zeros).unwrap_or(0) }
++pub(crate) fn holds_writer() -> bool { with(|r| r.active && r.writer).unwrap_or(false) }
+diff --git a/kernel/core/src/vm/page_cache/mod.rs b/kernel/core/src/vm/page_cache/mod.rs
+index c2b5f85..224d215 100644
+--- a/kernel/core/src/vm/page_cache/mod.rs
++++ b/kernel/core/src/vm/page_cache/mod.rs
+@@ -244,15 +244,22 @@ impl PageCache {
+     /// assert_eq!(page_cache.size(), PAGE_SIZE);
+     /// ```
+     pub(crate) fn resize(&mut self, new_file_size: usize, old_file_size: usize) -> Result<()> {
++        let _specula_scope = crate::tla_trace::scope(self.as_vmo().as_ref() as *const _ as usize);
++        let specula_start = crate::tla_trace::stamp();
+         let vmo = &self.0;
+         assert!(vmo.flags.contains(VmoFlags::RESIZABLE));
+ 
+         if new_file_size < old_file_size && !new_file_size.is_multiple_of(PAGE_SIZE) {
+             let fill_zero_end = old_file_size.min(new_file_size.align_up(PAGE_SIZE));
++            crate::tla_trace::event("PageCacheResizeBegin", specula_start, [new_file_size, old_file_size, new_file_size, fill_zero_end, 0, 0, 0, 0]);
+             self.fill_zeros(new_file_size..fill_zero_end)?;
+         } else if new_file_size > old_file_size && !old_file_size.is_multiple_of(PAGE_SIZE) {
+             let fill_zero_end = new_file_size.min(old_file_size.align_up(PAGE_SIZE));
++            crate::tla_trace::event("PageCacheResizeBegin", specula_start, [new_file_size, old_file_size, old_file_size, fill_zero_end, 0, 0, 0, 0]);
+             self.fill_zeros(old_file_size..fill_zero_end)?;
++        } else {
++            let lo = new_file_size.min(old_file_size);
++            crate::tla_trace::event("PageCacheResizeBegin", specula_start, [new_file_size, old_file_size, lo, lo, 0, 0, 0, 0]);
+         }
+ 
+         let rmap = if new_file_size < old_file_size {
+@@ -261,10 +268,13 @@ impl PageCache {
+             None
+         };
+ 
++        let specula_start = crate::tla_trace::stamp();
+         let new_cache_size = new_file_size.align_up(PAGE_SIZE);
+         let locked_pages = vmo.pages.lock();
+         let old_cache_size = vmo.size();
+         if new_cache_size == old_cache_size {
++            let specula_start = crate::tla_trace::stamp();
++            crate::tla_trace::event("PageCacheResizeCapacity", specula_start, [old_cache_size, new_cache_size, 0, 0, 0, 0, 0, 0]);
+             return Ok(());
+         }
+ 
+@@ -278,6 +288,7 @@ impl PageCache {
+                 vmo.decommit_anon_pages(locked_rmap, locked_pages, decommit_range)?;
+             }
+         }
++        crate::tla_trace::event("PageCacheResizeCapacity", specula_start, [old_cache_size, new_cache_size, usize::from(new_file_size < old_file_size), 0, 0, 0, 0, 0]);
+ 
+         Ok(())
+     }
+diff --git a/kernel/core/src/vm/page_cache/vmo/mod.rs b/kernel/core/src/vm/page_cache/vmo/mod.rs
+index 1380cc8..47f4b2e 100644
+--- a/kernel/core/src/vm/page_cache/vmo/mod.rs
++++ b/kernel/core/src/vm/page_cache/vmo/mod.rs
+@@ -307,6 +307,7 @@ impl Vmo {
+     }
+ 
+     fn commit_on_anonymous(&self, page_idx: usize) -> Result<CachePage> {
++        let specula_start = crate::tla_trace::stamp();
+         let mut locked_pages = self.pages.lock();
+         if page_idx >= self.size().div_ceil(PAGE_SIZE) {
+             return_errno_with_message!(Errno::EINVAL, "the offset is outside the VMO");
+@@ -314,11 +315,13 @@ impl Vmo {
+ 
+         let mut cursor = locked_pages.cursor_mut(page_idx as u64);
+         if let Some(page) = cursor.load() {
++            crate::tla_trace::page("VmoCommitPage", specula_start, page_idx, page.state() as usize, page.reader());
+             return Ok(page.clone());
+         }
+ 
+         let new_page = CachePage::alloc_zero()?;
+         cursor.store(new_page.clone());
++        crate::tla_trace::page("VmoCommitPage", specula_start, page_idx, new_page.state() as usize, new_page.reader());
+         Ok(new_page)
+     }
+ 
+@@ -374,7 +377,9 @@ impl Vmo {
+         if let Some(backed_vmo) = self.as_backed_vmo() {
+             return backed_vmo.try_commit_with_cursor(cursor, commit_mode);
+         } else if let Some(page) = cursor.load() {
++            let specula_start = crate::tla_trace::stamp();
+             let index = cursor.index() as usize;
++            crate::tla_trace::page("VmoCommitPage", specula_start, index, page.state() as usize, page.reader());
+             return Ok((index, page.clone()));
+         }
+ 
+@@ -532,7 +537,10 @@ impl Vmo {
+ 
+     /// Reads data from the VMO at `offset` into `writer`.
+     pub(crate) fn read(&self, offset: usize, writer: &mut VmWriter) -> Result<()> {
++        let _specula_scope = crate::tla_trace::scope(self as *const Self as usize);
++        let specula_start = crate::tla_trace::stamp();
+         let read_len = writer.avail().min(self.size().saturating_sub(offset));
++        crate::tla_trace::event("VmoIoBegin", specula_start, [offset, writer.avail(), read_len, 0, 0, 0, 0, 0]);
+         if read_len == 0 {
+             return Ok(());
+         }
+@@ -553,8 +561,13 @@ impl Vmo {
+                 &mut page_batch,
+             )?;
+ 
+-            for (_, page) in page_batch.iter() {
+-                page.reader().skip(page_offset).read_fallible(writer)?;
++            for (idx, page) in page_batch.iter() {
++                let specula_start = crate::tla_trace::stamp();
++                let before = writer.cursor() as usize;
++                let result = page.reader().skip(page_offset).read_fallible(writer);
++                crate::tla_trace::copied(specula_start, *idx, page_offset, before, writer.cursor() as usize,
++                    result.is_err(), page.state() as usize, page.reader(), true);
++                result?;
+                 page_offset = 0;
+             }
+ 
+@@ -568,7 +581,10 @@ impl Vmo {
+ 
+     /// Writes data from `reader` into the VMO at `offset`.
+     pub(crate) fn write(&self, offset: usize, reader: &mut VmReader) -> Result<()> {
++        let _specula_scope = crate::tla_trace::scope(self as *const Self as usize);
++        let specula_start = crate::tla_trace::stamp();
+         let write_len = reader.remain().min(self.size().saturating_sub(offset));
++        crate::tla_trace::event("VmoIoBegin", specula_start, [offset, reader.remain(), write_len, 0, 0, 0, 0, 0]);
+         if write_len == 0 {
+             return Ok(());
+         }
+@@ -642,12 +658,16 @@ impl Vmo {
+ 
+     /// Fills the specified range with zeros.
+     pub(super) fn fill_zeros(&self, range: Range<usize>) -> Result<()> {
++        let _specula_scope = crate::tla_trace::scope(self as *const Self as usize);
+         if range.is_empty() {
+             return Ok(());
+         }
++        let specula_start = crate::tla_trace::stamp();
+         if range.end > self.size() {
++            crate::tla_trace::event("VmoRangeError", specula_start, [0; 8]);
+             return_errno_with_message!(Errno::EINVAL, "the range to fill exceeds the VMO size");
+         }
++        crate::tla_trace::event("PageCacheFillZeros", specula_start, [range.start, range.end, 0, 0, 0, 0, 0, 0]);
+ 
+         static ZERO_PAGE: [u8; PAGE_SIZE] = [0; PAGE_SIZE];
+ 
+@@ -686,8 +706,13 @@ impl Vmo {
+                 page_batch,
+             )?;
+ 
+-            for (_, page) in page_batch.iter() {
+-                page.writer().skip(*page_offset).write_fallible(reader)?;
++            for (idx, page) in page_batch.iter() {
++                let specula_start = crate::tla_trace::stamp();
++                let before = reader.cursor() as usize;
++                let result = page.writer().skip(*page_offset).write_fallible(reader);
++                crate::tla_trace::copied(specula_start, *idx, *page_offset, before, reader.cursor() as usize,
++                    result.is_err(), page.state() as usize, page.reader(), false);
++                result?;
+                 *page_offset = 0;
+             }
+ 
+@@ -731,6 +756,8 @@ impl Vmo {
+                     continue;
+                 }
+ 
++                let specula_start = crate::tla_trace::stamp();
++                let before = reader.cursor() as usize;
+                 let written_size = match locked_page
+                     .writer()
+                     .skip(*page_offset)
+@@ -742,6 +769,8 @@ impl Vmo {
+                         if written_size > 0 && state.is_up_to_date() {
+                             locked_page.set_dirty();
+                         }
++                        crate::tla_trace::copied(specula_start, idx, *page_offset, before, reader.cursor() as usize,
++                            true, locked_page.state() as usize, locked_page.reader(), false);
+                         return Err(Error::from(err));
+                     }
+                 };
+@@ -749,6 +778,8 @@ impl Vmo {
+                 if written_size > 0 {
+                     locked_page.set_dirty();
+                 }
++                crate::tla_trace::copied(specula_start, idx, *page_offset, before, reader.cursor() as usize,
++                    false, locked_page.state() as usize, locked_page.reader(), false);
+ 
+                 *page_offset = 0;
+             }
+@@ -777,7 +808,9 @@ impl Vmo {
+         commit_mode: CommitMode,
+         pages: &mut Vec<(usize, CachePage)>,
+     ) -> Result<()> {
++        let specula_start = crate::tla_trace::stamp();
+         let end_idx = end_idx.min(start_idx + pages.capacity());
++        crate::tla_trace::event("VmoCollectBegin", specula_start, [start_idx, end_idx, usize::from(commit_mode.skips_backend_read()), 0, 0, 0, 0, 0]);
+         pages.clear();
+         let range = (start_idx * PAGE_SIZE)..(end_idx * PAGE_SIZE);
+         let mut current_range = range.clone();
+@@ -786,14 +819,18 @@ impl Vmo {
+             let mut operate =
+                 |commit_fn: &mut dyn FnMut() -> Result<(usize, CachePage), VmoCommitError>| {
+                     let (idx, page) = commit_fn()?;
++                    let specula_start = crate::tla_trace::stamp();
+                     pages.push((idx, page));
++                    crate::tla_trace::event("VmoCollectedPage", specula_start, [idx, 0, 0, 0, 0, 0, 0, 0]);
+                     Ok(())
+                 };
+             match self.try_operate_on_range_internal(&current_range, &mut operate, commit_mode) {
+                 Ok(()) => break 'retry,
+                 Err(err) => {
+                     let (idx, page) = self.handle_commit_error(err, commit_mode)?;
++                    let specula_start = crate::tla_trace::stamp();
+                     pages.push((idx, page));
++                    crate::tla_trace::event("VmoCollectedPage", specula_start, [idx, 0, 0, 0, 0, 0, 0, 0]);
+                     current_range.start = (idx + 1) * PAGE_SIZE;
+                     if current_range.start >= range.end {
+                         break 'retry;
+@@ -819,12 +856,14 @@ impl Vmo {
+                 Ok((index, self.commit_on_internal(index, commit_mode)?))
+             }
+             VmoCommitError::WaitUntilInit { index, page } => {
++                let specula_start = crate::tla_trace::stamp();
+                 page.ensure_init(|locked_page| {
+                     self.as_backed_vmo()
+                         .unwrap()
+                         .backend
+                         .read_page(index, locked_page)
+                 })?;
++                crate::tla_trace::page("VmoBackendRead", specula_start, index, page.state() as usize, page.reader());
+                 Ok((index, page))
+             }
+         }
+@@ -1018,6 +1057,7 @@ impl<'a> BackedVmo<'a> {
+ 
+     /// Commits a page at the given index for a VMO with a backend.
+     fn commit_on_internal(&self, page_idx: usize, commit_mode: CommitMode) -> Result<CachePage> {
++        let specula_start = crate::tla_trace::stamp();
+         let mut locked_pages = self.pages.lock();
+         if page_idx >= self.size().div_ceil(PAGE_SIZE) {
+             return_errno_with_message!(Errno::EINVAL, "the offset is outside the VMO");
+@@ -1027,10 +1067,14 @@ impl<'a> BackedVmo<'a> {
+ 
+         if let Some(page) = cursor.load() {
+             let page = page.clone();
++            crate::tla_trace::page("VmoCommitPage", specula_start, page_idx, page.state() as usize, page.reader());
+             drop(locked_pages);
+ 
+             if !commit_mode.skips_backend_read() {
++                let specula_start = crate::tla_trace::stamp();
++                let was_uninit = page.state().is_uninit();
+                 page.ensure_init(|locked_page| self.backend.read_page(page_idx, locked_page))?;
++                if was_uninit { crate::tla_trace::page("VmoBackendRead", specula_start, page_idx, page.state() as usize, page.reader()); }
+                 return Ok(page);
+             }
+ 
+@@ -1040,6 +1084,7 @@ impl<'a> BackedVmo<'a> {
+         // The page is within the file bounds - need to allocate a cache page.
+         let uninit_page = CachePage::alloc_uninit()?;
+         cursor.store(uninit_page.clone());
++        crate::tla_trace::page("VmoCommitPage", specula_start, page_idx, uninit_page.state() as usize, uninit_page.reader());
+         drop(locked_pages);
+ 
+         if commit_mode.skips_backend_read() {
+@@ -1047,7 +1092,9 @@ impl<'a> BackedVmo<'a> {
+             Ok(uninit_page)
+         } else {
+             // Read the page from the backend storage.
++            let specula_start = crate::tla_trace::stamp();
+             uninit_page.ensure_init(|locked_page| self.backend.read_page(page_idx, locked_page))?;
++            crate::tla_trace::page("VmoBackendRead", specula_start, page_idx, uninit_page.state() as usize, uninit_page.reader());
+             Ok(uninit_page)
+         }
+     }
+@@ -1058,12 +1105,14 @@ impl<'a> BackedVmo<'a> {
+         cursor: &mut Cursor<'_, CachePage>,
+         commit_mode: CommitMode,
+     ) -> Result<(usize, CachePage), VmoCommitError> {
++        let specula_start = crate::tla_trace::stamp();
+         let page_idx = cursor.index() as usize;
+ 
+         let Some(page) = cursor.load() else {
+             return Err(VmoCommitError::NeedIo { index: page_idx });
+         };
+ 
++        crate::tla_trace::page("VmoCommitPage", specula_start, page_idx, page.state() as usize, page.reader());
+         // Check if the page is initialized.
+         if !commit_mode.skips_backend_read() && page.state().is_uninit() {
+             return Err(VmoCommitError::WaitUntilInit {

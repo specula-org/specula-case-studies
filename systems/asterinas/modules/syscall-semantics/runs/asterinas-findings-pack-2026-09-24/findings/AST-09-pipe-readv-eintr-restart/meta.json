@@ -1,0 +1,77 @@
+{
+  "id": "AST-09",
+  "title": "Pipe readv/writev return EINTR despite SA_RESTART",
+  "status": "REPRODUCED",
+  "origin": {
+    "kind": "specula-run",
+    "alias": "GLM",
+    "run_id": "asterinas-glm53-eval-20260826T035049Z",
+    "finding_ids": ["CR-2"],
+    "pin": "604948581512d83734377974d4c34adb4530f2d7"
+  },
+  "aliases": [],
+  "also_seen_in": [],
+  "mechanism": "Pipe reads and writes wait through wait_events and pause_timeout, which return EINTR; only sys_read/sys_write map EINTR to ERESTARTSYS, while do_sys_readv/do_sys_writev return the raw EINTR, so handle_pending_signal never restarts the vectored calls under SA_RESTART.",
+  "sites": [
+    "kernel/core/src/syscall/preadv.rs::do_sys_readv",
+    "kernel/core/src/syscall/pwritev.rs::do_sys_writev",
+    "kernel/core/src/syscall/pread64.rs::sys_pread64",
+    "kernel/core/src/syscall/pwrite64.rs::sys_pwrite64",
+    "kernel/core/src/fs/pipe/common.rs::PipeHandle::read_at",
+    "kernel/core/src/fs/pipe/common.rs::PipeHandle::write_at",
+    "kernel/core/src/process/signal/poll.rs::Poller::wait",
+    "kernel/core/src/process/signal/pause.rs::Pause::pause_timeout",
+    "kernel/core/src/process/signal/mod.rs::handle_pending_signal"
+  ],
+  "syscalls": ["readv", "writev", "preadv2", "pwritev2"],
+  "keywords": ["eintr", "erestartsys", "sa_restart", "syscall restart", "signal", "pipe", "readv", "writev", "vectored io", "pause_timeout", "blocking wait"],
+  "contract": "signal(7): a blocking read/readv/write/writev on a slow device (such as a pipe) interrupted by a handler installed with SA_RESTART is restarted, not failed with EINTR.",
+  "observed": "Asterinas returns -1/EINTR from readv on an empty pipe and writev on a full pipe after an SA_RESTART handler runs, while scalar read/write restart in the same boot.",
+  "upstream": {
+    "match": "open-pr",
+    "refs": [
+      "https://github.com/asterinas/asterinas/pull/3576",
+      "https://github.com/asterinas/asterinas/issues/1578",
+      "https://github.com/asterinas/asterinas/pull/3607"
+    ]
+  },
+  "fix_status": "pr-open",
+  "fix_refs": [
+    "https://github.com/asterinas/asterinas/pull/3576 (open, third-party, head 8e02d0e94230b9021b3f1d937664ba236b3e6832; covers AST-09 by inspection, validated locally merged on d76b4dcc0)",
+    "branch fix/vectored-io-restart in /home/chin39/Documents/asterinas-dev: 10b2439cd fix, f80ee60c2 test, on e60087be1 (not pushed)",
+    "branch scratch/3576-on-main in /home/chin39/Documents/asterinas-dev: d2e4ed4b9 merge of #3576, a57ded014 test cases",
+    "/home/chin39/Documents/play/specula-profile/reports/asterinas-bug-findings-2026-08/upstream-issues/AST-09-issue-draft.md (not filed)"
+  ],
+  "report": null,
+  "repro": {
+    "available": true,
+    "files": [
+      "repro/repro.c",
+      "repro/repro-min.c",
+      "repro/run.sh",
+      "repro/vectored_io_restart-regression.patch",
+      "repro/syscall_restart-cases-for-pr3576.patch",
+      "repro/README.md"
+    ],
+    "how_to_run": "Build repro.c into the initramfs and run it with no arguments in an SMP=2 guest; checks 2 and 4 FAIL with errno=4 on the unfixed kernel while Linux passes 5/5. The regression patch adds process/signal/vectored_io_restart to the process suite.",
+    "smp": 2,
+    "runtime_status": "REPRODUCED at 604948581"
+  },
+  "evidence": [
+    "/home/chin39/Documents/play/specula-profile/reports/asterinas-bug-findings-2026-08/AST-09-pipe-readv-eintr-restart/description.md",
+    "/home/chin39/Documents/play/Specula/runs/asterinas-glm53-eval-20260826T035049Z/asterinas-glm53-eval/.specula-output/confirmation/CR-2/",
+    "/home/chin39/Documents/play/Specula/runs/asterinas-glm53-eval-20260826T035049Z/asterinas-glm53-eval/.specula-output/repro/test_bugCR-2_eintr_restart_divergence.c",
+    "/home/chin39/Documents/play/Specula/runs/asterinas-glm53-eval-20260826T035049Z/asterinas-glm53-eval/.specula-output/repro/test_bugCR-2_eintr_restart_divergence.guest_output.log",
+    "/home/chin39/Documents/play/Specula/runs/asterinas-glm53-eval-20260826T035049Z/asterinas-glm53-eval/.specula-output/repro/test_bugCR-2_eintr_restart_divergence.challenger_rerun.log",
+    "/home/chin39/Documents/play/Specula/runs/asterinas-glm53-eval-20260826T035049Z/asterinas-glm53-eval/.specula-output/confirmed-bugs.md",
+    "/home/chin39/Documents/play/specula-profile/reports/glm53-eval-final-report.md",
+    "/home/chin39/Documents/play/specula-profile/reports/ast-validation-2026-09-02/README.md",
+    "/home/chin39/Documents/play/specula-profile/reports/ast-validation-2026-09-02/logs/ast09/",
+    "/home/chin39/Documents/play/specula-profile/reports/ast-validation-2026-09-02/logs/ast09-3576/",
+    "/home/chin39/Documents/play/specula-profile/reports/ast-validation-2026-09-02/logs/linux-7.1.9-AST-09.txt",
+    "/home/chin39/Documents/play/specula-profile/reports/asterinas-bug-findings-2026-08/upstream-issues/AST-09-issue-draft.md",
+    "/home/chin39/Documents/play/specula-profile/reports/upstream-dedup-2026-09-14/matches.json"
+  ],
+  "related": ["AST-26", "AST-39", "AST-44"],
+  "caveats": "The pread64/pwrite64 half is latent (no regular-file EINTR producer; pipes are not seekable). Linux-compatibility defect (spurious EINTR); no security impact beyond that was demonstrated. The GLM CR-2 worktree and its AUTO_TEST wiring were not preserved."
+}

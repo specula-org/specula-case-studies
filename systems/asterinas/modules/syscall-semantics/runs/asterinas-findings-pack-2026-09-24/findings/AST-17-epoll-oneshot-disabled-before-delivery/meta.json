@@ -1,0 +1,89 @@
+{
+  "id": "AST-17",
+  "title": "epoll disables one-shot interest before successful delivery",
+  "status": "REPRODUCED",
+  "origin": {
+    "kind": "specula-run",
+    "alias": "FD",
+    "run_id": "asterinas-fd-epoll-pipeline-20260811T164254Z",
+    "finding_ids": [
+      "MC-2"
+    ],
+    "pin": "4ba4abbe8cb3f2892129d67b0301cf247bbdda0f"
+  },
+  "also_seen_in": [],
+  "mechanism": "Entry::poll calls Observer::reset_enabled for an EPOLLONESHOT entry while collecting the event, before do_epoll_pwait2 copies it out. An EFAULT leaves the interest disabled, ReadySet::push ignores later notifications, and only EPOLL_CTL_MOD (Entry::update) re-enables it.",
+  "sites": [
+    "kernel/core/src/events/epoll/entry.rs::Entry::poll",
+    "kernel/core/src/syscall/epoll.rs::do_epoll_pwait2",
+    "kernel/core/src/events/epoll/file.rs::EpollFile::pop_multi_ready",
+    "kernel/core/src/events/epoll/entry.rs::ReadySet::push",
+    "kernel/core/src/events/epoll/entry.rs::Entry::update"
+  ],
+  "syscalls": [
+    "epoll_wait",
+    "epoll_pwait",
+    "epoll_pwait2",
+    "epoll_ctl"
+  ],
+  "keywords": [
+    "epoll",
+    "efault",
+    "copyout",
+    "epolloneshot",
+    "one-shot",
+    "disabled",
+    "reset_enabled",
+    "rearm",
+    "lost event",
+    "commit before copy"
+  ],
+  "contract": "epoll(7): EPOLLONESHOT disables the descriptor only after an event is pulled out by epoll_wait. A call that failed with EFAULT pulled no event, so the next valid epoll_wait must report it.",
+  "observed": "After epoll_wait returns EFAULT, the one-shot interest stays disabled and a valid retry returns 0 until EPOLL_CTL_MOD rearms it.",
+  "upstream": {
+    "match": "none",
+    "refs": [],
+    "dedup_status": "NO_DIRECT_MATCH",
+    "upstream_fix_status": "NOT_ESTABLISHED",
+    "checked_against": "bc12195df4acfb1fc4ae968cf7acf9333ed83435",
+    "related_refs": [
+      "https://github.com/asterinas/asterinas/pull/1277",
+      "https://github.com/asterinas/asterinas/issues/868"
+    ]
+  },
+  "fix_status": "unfixed",
+  "fix_refs": [],
+  "repro": {
+    "available": true,
+    "files": [
+      "repro/test_bug2_epoll_efault_oneshot.c",
+      "repro/specula_validation.c",
+      "repro/test_bugMC-2_challenge.c",
+      "repro/test_bugMC-2_oneshot_efault.sh",
+      "repro/specula-initramfs-plumbing.patch",
+      "repro/README.md"
+    ],
+    "how_to_run": "Apply the plumbing patch at the pin, copy the test into test/initramfs/src/regression/io/specula/, and run make run_kernel SMP=2 ... SPECULA_INIT=\"/test/io/specula/run_bug.sh test_bug2_epoll_efault_oneshot\". See repro/README.md.",
+    "smp": 2,
+    "runtime_status": "REPRODUCED at 4ba4abbe8cb3f2892129d67b0301cf247bbdda0f"
+  },
+  "evidence": [
+    "/home/chin39/Documents/play/Specula/runs/asterinas-fd-epoll-pipeline-20260811T164254Z/asterinas-fd-epoll/.specula-output/confirmation/MC-2/investigation.md",
+    "/home/chin39/Documents/play/Specula/runs/asterinas-fd-epoll-pipeline-20260811T164254Z/asterinas-fd-epoll/.specula-output/confirmation/MC-2/verdict.json",
+    "/home/chin39/Documents/play/Specula/runs/asterinas-fd-epoll-pipeline-20260811T164254Z/asterinas-fd-epoll/.specula-output/repro/test_bugMC-2_oneshot_efault.final.log",
+    "/home/chin39/Documents/play/Specula/runs/asterinas-fd-epoll-pipeline-20260811T164254Z/asterinas-fd-epoll/.specula-output/repro/test_bugMC-2_oneshot_efault.repeat2.log",
+    "/home/chin39/Documents/play/Specula/runs/asterinas-fd-epoll-pipeline-20260811T164254Z/asterinas-fd-epoll/.specula-output/repro/test_bugMC-2_oneshot_efault.run.log",
+    "/home/chin39/Documents/play/Specula/runs/asterinas-fd-epoll-pipeline-20260811T164254Z/asterinas-fd-epoll/.specula-output/harness/logs/repro_test_bug2_epoll_efault_oneshot_smp2_round6_attempt1.log",
+    "/home/chin39/Documents/play/Specula/runs/asterinas-fd-epoll-pipeline-20260811T164254Z/asterinas-fd-epoll/.specula-output/harness/logs/repro_host_round6.log",
+    "/home/chin39/Documents/play/Specula/runs/asterinas-fd-epoll-pipeline-20260811T164254Z/asterinas-fd-epoll/.specula-output/spec/output/MC_hunt_s2_oneshot_round2_bfs_cex.json",
+    "/home/chin39/Documents/play/specula-profile/reports/independent-review/terra-asterinas-bug-report-vm-final.md",
+    "/home/chin39/Documents/play/Specula/runs/asterinas-fd-epoll-pipeline-20260811T164254Z/asterinas-fd-epoll/.specula-output/confirmed-bugs.md",
+    "/home/chin39/Documents/play/Specula/runs/asterinas-fd-epoll-pipeline-20260811T164254Z/asterinas-fd-epoll/.specula-output/bug-severity.md",
+    "/home/chin39/Documents/play/specula-profile/references/asterinas-syscall-security-audit.md",
+    "/home/chin39/Documents/play/specula-profile/reports/workflow-validation.md"
+  ],
+  "related": [
+    "AST-16"
+  ],
+  "caveats": "Historical SMP=2 evidence at the pin only. The challenger's fresh rerun was blocked by a Cargo TLS fetch failure and is not evidence. Only maxevents=1 tested. Shares the commit-before-copy-out root with AST-16. Static read of upstream main bc12195df on 2026-09-24 showed the same code shape. No runtime retest."
+}

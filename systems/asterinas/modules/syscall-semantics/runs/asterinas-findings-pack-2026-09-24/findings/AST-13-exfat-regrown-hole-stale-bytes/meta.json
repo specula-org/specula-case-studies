@@ -1,0 +1,80 @@
+{
+  "id": "AST-13",
+  "title": "exFAT regrown holes expose the file's old backing bytes",
+  "status": "REPRODUCED",
+  "origin": {
+    "kind": "specula-run",
+    "alias": "01b",
+    "run_id": "20260908-150910-0a8c",
+    "finding_ids": [
+      "MC-5"
+    ],
+    "pin": "604948581512d83734377974d4c34adb4530f2d7"
+  },
+  "also_seen_in": [],
+  "mechanism": "exFAT truncate frees clusters only in the allocation bitmap. A later extending write reallocates them first-fit, PageCache::resize zero-fills only the old partial tail page, and submit_read_bio returns zeros only for pages at or beyond logical size, so hole pages below EOF are read from the reused clusters' old on-disk bytes.",
+  "sites": [
+    "kernel/core/src/fs/fs_impls/exfat/inode.rs::ExfatInode::write_at",
+    "kernel/core/src/fs/fs_impls/exfat/inode.rs::<ExfatInode as BlockAsPageCacheBackend>::submit_read_bio",
+    "kernel/core/src/fs/fs_impls/exfat/inode.rs::ExfatInode::resize",
+    "kernel/core/src/fs/fs_impls/exfat/fat.rs::ExfatChain::alloc_cluster_from_empty",
+    "kernel/core/src/fs/fs_impls/exfat/fat.rs::<ExfatChain as ClusterAllocator>::remove_clusters_from_tail",
+    "kernel/core/src/vm/page_cache/mod.rs::PageCache::resize"
+  ],
+  "syscalls": [
+    "ftruncate",
+    "pwrite64",
+    "pread64"
+  ],
+  "keywords": [
+    "exfat",
+    "hole",
+    "stale data",
+    "cluster reuse",
+    "truncate",
+    "extend",
+    "zero fill",
+    "gap",
+    "submit_read_bio",
+    "disclosure"
+  ],
+  "contract": "lseek(2)/ftruncate(2): bytes in a gap created by writing or extending past EOF read as zeros until written.",
+  "observed": "After ftruncate(fd, 0) and a pwrite of one page at 8192 on exFAT, pread of [0, 8192) returned the file's previous 'A' and 'B' page contents instead of zeros.",
+  "upstream": {
+    "match": "none",
+    "refs": [],
+    "dedup_status": "NO_DIRECT_MATCH",
+    "upstream_fix_status": "NOT_ESTABLISHED",
+    "reviewed_candidates": [
+      "https://github.com/asterinas/asterinas/pull/3603",
+      "https://github.com/asterinas/asterinas/pull/3256",
+      "https://github.com/asterinas/asterinas/pull/3229"
+    ]
+  },
+  "fix_status": "unfixed",
+  "fix_refs": [],
+  "repro": {
+    "available": true,
+    "files": [
+      "repro/test_bugMC-5_exfat_regrown_hole.c",
+      "repro/test_bugMC-5_init.c",
+      "repro/test_bugMC-5_run.sh"
+    ],
+    "how_to_run": "Build both C files statically, pack them as /init and /test_mc5 in a cpio, attach fresh ext2 (/dev/vda) and exFAT (/dev/vdb, 4096-byte clusters) images, and boot. MC5_RESULT BUG on the [exfat] line means the bug fired.",
+    "smp": 2,
+    "runtime_status": "REPRODUCED at 604948581 (01b MC-5, SMP=2, single-threaded, Level 0)"
+  },
+  "evidence": [
+    "/home/chin39/Documents/play/Specula/runs/20260908-150910-0a8c/asterinas-syscall-buffered-file-size-read-consistency/.specula-output/confirmed-bugs.md",
+    "/home/chin39/Documents/play/Specula/runs/20260908-150910-0a8c/asterinas-syscall-buffered-file-size-read-consistency/.specula-output/confirmation/MC-5/investigation.md",
+    "/home/chin39/Documents/play/Specula/runs/20260908-150910-0a8c/asterinas-syscall-buffered-file-size-read-consistency/.specula-output/confirmation/MC-5/verdict.json",
+    "/home/chin39/Documents/play/Specula/runs/20260908-150910-0a8c/asterinas-syscall-buffered-file-size-read-consistency/.specula-output/repro/work_mc5/guest-mc5.log",
+    "/home/chin39/Documents/play/Specula/runs/20260908-150910-0a8c/asterinas-syscall-buffered-file-size-read-consistency/.specula-output/spec/output/MC_hunt_s3_holes_exfat_bfs1.out",
+    "/home/chin39/Documents/play/specula-profile/reports/runs/asterinas-syscall-buffered-file-size-read-consistency-20260907T161100Z.prep/handoff-01b.md"
+  ],
+  "related": [
+    "AST-12",
+    "AST-14"
+  ],
+  "caveats": "Same-file stale data only. No cross-file or cross-principal disclosure was demonstrated. Deterministic reuse relies on a fresh image where the subject owns the lowest free clusters. ext2 and ramfs controls ran in the same guest. No Linux run was recorded."
+}

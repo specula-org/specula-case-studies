@@ -1,0 +1,105 @@
+{
+  "id": "AST-19",
+  "title": "Consumed timerfd remains ready through the poll cache",
+  "status": "REPRODUCED",
+  "origin": {
+    "kind": "specula-run",
+    "alias": "FD",
+    "run_id": "asterinas-fd-epoll-pipeline-20260811T164254Z",
+    "finding_ids": [
+      "MC-4"
+    ],
+    "pin": "4ba4abbe8cb3f2892129d67b0301cf247bbdda0f"
+  },
+  "also_seen_in": [
+    {
+      "alias": "TLPI-v2",
+      "run_id": null,
+      "finding_id": "F17",
+      "verdict": "NOT_RUN"
+    }
+  ],
+  "mechanism": "TimerfdFile::try_read clears ticks with fetch_and(0) but never calls Pollee::invalidate, so Pollee::poll_with keeps returning the cached POLLIN. TimerfdFile::set_time clears ticks the same way (static only).",
+  "sites": [
+    "kernel/core/src/time/timerfd.rs::TimerfdFile::try_read",
+    "kernel/core/src/time/timerfd.rs::TimerfdFile::poll",
+    "kernel/core/src/time/timerfd.rs::TimerfdFile::set_time",
+    "kernel/core/src/process/signal/poll.rs::Pollee::poll_with",
+    "kernel/core/src/process/signal/poll.rs::Pollee::invalidate",
+    "kernel/core/src/syscall/poll.rs::PollFiles::register_poller"
+  ],
+  "syscalls": [
+    "read",
+    "poll",
+    "timerfd_create",
+    "timerfd_settime",
+    "epoll_wait",
+    "ppoll",
+    "select"
+  ],
+  "keywords": [
+    "timerfd",
+    "pollee",
+    "cache",
+    "invalidate",
+    "stale readiness",
+    "pollin",
+    "eagain",
+    "poll_with",
+    "ticks",
+    "consume",
+    "disarm"
+  ],
+  "contract": "timerfd_create(2): a timerfd is readable only while expirations are pending. After a successful read consumes them, poll must not report POLLIN and a nonblocking read returns EAGAIN.",
+  "observed": "After a successful read of a one-shot timerfd, repeated poll calls return POLLIN while the next nonblocking read returns EAGAIN.",
+  "upstream": {
+    "match": "none",
+    "refs": [],
+    "dedup_status": "NO_DIRECT_MATCH",
+    "upstream_fix_status": "NOT_ESTABLISHED",
+    "checked_against": "bc12195df4acfb1fc4ae968cf7acf9333ed83435",
+    "related_refs": [
+      "https://github.com/asterinas/asterinas/pull/2037",
+      "https://github.com/asterinas/asterinas/issues/3823",
+      "https://github.com/asterinas/asterinas/pull/3824"
+    ]
+  },
+  "fix_status": "unfixed",
+  "fix_refs": [],
+  "repro": {
+    "available": true,
+    "files": [
+      "repro/test_bug3_timerfd_cache.c",
+      "repro/specula_validation.c",
+      "repro/test_bugMC-4_timerfd_cache.c",
+      "repro/test_bugMC-4_guest-init.sh",
+      "repro/test_bugMC-4_challenge.c",
+      "repro/test_bugMC-4_challenge-init.sh",
+      "repro/specula-initramfs-plumbing.patch",
+      "repro/README.md"
+    ],
+    "how_to_run": "Apply the plumbing patch at the pin, copy the test into test/initramfs/src/regression/io/specula/, and run make run_kernel SMP=2 ... SPECULA_INIT=\"/test/io/specula/run_bug.sh test_bug3_timerfd_cache\". See repro/README.md (MC-4 programs use inverted exit codes).",
+    "smp": 2,
+    "runtime_status": "REPRODUCED at 4ba4abbe8cb3f2892129d67b0301cf247bbdda0f"
+  },
+  "evidence": [
+    "/home/chin39/Documents/play/Specula/runs/asterinas-fd-epoll-pipeline-20260811T164254Z/asterinas-fd-epoll/.specula-output/confirmation/MC-4/investigation.md",
+    "/home/chin39/Documents/play/Specula/runs/asterinas-fd-epoll-pipeline-20260811T164254Z/asterinas-fd-epoll/.specula-output/confirmation/MC-4/challenge_B.md",
+    "/home/chin39/Documents/play/Specula/runs/asterinas-fd-epoll-pipeline-20260811T164254Z/asterinas-fd-epoll/.specula-output/confirmation/MC-4/verdict.json",
+    "/home/chin39/Documents/play/Specula/runs/asterinas-fd-epoll-pipeline-20260811T164254Z/asterinas-fd-epoll/.specula-output/confirmation/MC-4/repro/qemu.log",
+    "/home/chin39/Documents/play/Specula/runs/asterinas-fd-epoll-pipeline-20260811T164254Z/asterinas-fd-epoll/.specula-output/confirmation/MC-4/repro/host-control.log",
+    "/home/chin39/Documents/play/Specula/runs/asterinas-fd-epoll-pipeline-20260811T164254Z/asterinas-fd-epoll/.specula-output/harness/logs/repro_test_bug3_timerfd_cache_smp2_round6_attempt1.log",
+    "/home/chin39/Documents/play/Specula/runs/asterinas-fd-epoll-pipeline-20260811T164254Z/asterinas-fd-epoll/.specula-output/harness/logs/repro_host_round6.log",
+    "/home/chin39/Documents/play/Specula/runs/asterinas-fd-epoll-pipeline-20260811T164254Z/asterinas-fd-epoll/.specula-output/spec/output/MC_hunt_s3_cache_round2_bfs_cex.json",
+    "/home/chin39/Documents/play/specula-profile/reports/independent-review/terra-asterinas-bug-report-vm-final.md",
+    "/home/chin39/Documents/play/specula-profile/reports/tlpi-audit-2026-09-14/finding-map.md",
+    "/home/chin39/Documents/play/specula-profile/reports/tlpi-audit-2026-09-14/package/findings.json",
+    "/home/chin39/Documents/play/specula-profile/reports/tlpi-audit-2026-09-14/case-plan.json",
+    "/home/chin39/Documents/play/Specula/runs/asterinas-fd-epoll-pipeline-20260811T164254Z/asterinas-fd-epoll/.specula-output/confirmed-bugs.md",
+    "/home/chin39/Documents/play/Specula/runs/asterinas-fd-epoll-pipeline-20260811T164254Z/asterinas-fd-epoll/.specula-output/bug-severity.md",
+    "/home/chin39/Documents/play/specula-profile/references/asterinas-syscall-security-audit.md",
+    "/home/chin39/Documents/play/specula-profile/reports/workflow-validation.md"
+  ],
+  "related": [],
+  "caveats": "Runtime evidence covers the read (drain) path through poll only. The disarm and epoll paths come from TLPI-v2 F17, whose probes are NOT_RUN. Cache installation uses compare_exchange_weak, so tests should prime the cache. Some MC-4 programs exit 0 when the bug triggers. Static read of upstream main bc12195df on 2026-09-24 showed the same code shape. No runtime retest."
+}

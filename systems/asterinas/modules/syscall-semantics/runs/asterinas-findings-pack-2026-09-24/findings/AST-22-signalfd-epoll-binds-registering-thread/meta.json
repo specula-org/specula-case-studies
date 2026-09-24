@@ -1,0 +1,95 @@
+{
+  "id": "AST-22",
+  "title": "signalfd epoll readiness binds to the registering thread",
+  "status": "REPRODUCED",
+  "origin": {
+    "kind": "specula-run",
+    "alias": "FD",
+    "run_id": "asterinas-fd-epoll-pipeline-20260811T164254Z",
+    "finding_ids": [
+      "CR-4"
+    ],
+    "pin": "4ba4abbe8cb3f2892129d67b0301cf247bbdda0f"
+  },
+  "also_seen_in": [],
+  "mechanism": "SignalFile::poll, called from Entry::update in the epoll_ctl caller's context, registers the epoll poller only with that thread's (and its process's) signal queues. A thread-directed signal to another waiter thread notifies only that thread's queue, so the epoll entry is never woken.",
+  "sites": [
+    "kernel/core/src/syscall/signalfd.rs::SignalFile::poll",
+    "kernel/core/src/syscall/signalfd.rs::SignalFile::read",
+    "kernel/core/src/process/posix_thread/mod.rs::PosixThread::register_signalfd_poller",
+    "kernel/core/src/process/signal/sig_queues.rs::SigQueues::enqueue",
+    "kernel/core/src/process/kill.rs::tgkill",
+    "kernel/core/src/events/epoll/entry.rs::Entry::update"
+  ],
+  "syscalls": [
+    "epoll_ctl",
+    "epoll_wait",
+    "tgkill",
+    "signalfd4",
+    "read"
+  ],
+  "keywords": [
+    "signalfd",
+    "epoll",
+    "thread-directed",
+    "registering thread",
+    "pthread_kill",
+    "tgkill",
+    "binding",
+    "missed wakeup",
+    "multithread",
+    "sig_queues"
+  ],
+  "contract": "signalfd(2): a thread reading a signalfd receives signals directed to itself, and the descriptor is readable to poll/epoll when such a signal is pending, regardless of which thread registered it.",
+  "observed": "When thread A registers the signalfd and a signal is directed at waiter thread B, B's epoll_wait times out twice while B's direct read of the signalfd returns the signal.",
+  "upstream": {
+    "match": "none",
+    "refs": [],
+    "dedup_status": "NO_DIRECT_MATCH",
+    "upstream_fix_status": "NOT_ESTABLISHED",
+    "checked_against": "bc12195df4acfb1fc4ae968cf7acf9333ed83435",
+    "related_refs": [
+      "https://github.com/asterinas/asterinas/issues/200",
+      "https://github.com/asterinas/asterinas/pull/3656",
+      "https://github.com/asterinas/asterinas/pull/1277"
+    ]
+  },
+  "fix_status": "unfixed",
+  "fix_refs": [],
+  "repro": {
+    "available": true,
+    "files": [
+      "repro/test_bugCR-4_thread_registration.c",
+      "repro/test_bugCR-4_registration_actor_control.c",
+      "repro/test_bugCR-4_preexisting_waiter.c",
+      "repro/test_bugCR-4_thread_registration.nix",
+      "repro/test_bugCR-4_registration_actor_control.nix",
+      "repro/test_bugCR-4_preexisting_waiter.nix",
+      "repro/test_bugCR-4_thread_registration.sh",
+      "repro/test_bugCR-4_pinned_cargo.sh",
+      "repro/specula-initramfs-plumbing.patch",
+      "repro/README.md"
+    ],
+    "how_to_run": "Build the static test into an initramfs (the .nix files need the plumbing patch's initramfs.nix change), build the kernel at the pin with cargo osdk, and boot with qemu -smp 2. See repro/README.md.",
+    "smp": 2,
+    "runtime_status": "REPRODUCED at 4ba4abbe8cb3f2892129d67b0301cf247bbdda0f"
+  },
+  "evidence": [
+    "/home/chin39/Documents/play/Specula/runs/asterinas-fd-epoll-pipeline-20260811T164254Z/asterinas-fd-epoll/.specula-output/confirmation/CR-4/investigation.md",
+    "/home/chin39/Documents/play/Specula/runs/asterinas-fd-epoll-pipeline-20260811T164254Z/asterinas-fd-epoll/.specula-output/confirmation/CR-4/challenge_B.md",
+    "/home/chin39/Documents/play/Specula/runs/asterinas-fd-epoll-pipeline-20260811T164254Z/asterinas-fd-epoll/.specula-output/confirmation/CR-4/verdict.json",
+    "/home/chin39/Documents/play/Specula/runs/asterinas-fd-epoll-pipeline-20260811T164254Z/asterinas-fd-epoll/.specula-output/repro/test_bugCR-4_thread_registration.asterinas.log",
+    "/home/chin39/Documents/play/Specula/runs/asterinas-fd-epoll-pipeline-20260811T164254Z/asterinas-fd-epoll/.specula-output/repro/test_bugCR-4_challenger.asterinas.log",
+    "/home/chin39/Documents/play/Specula/runs/asterinas-fd-epoll-pipeline-20260811T164254Z/asterinas-fd-epoll/.specula-output/repro/test_bugCR-4_registration_actor_control.asterinas.log",
+    "/home/chin39/Documents/play/Specula/runs/asterinas-fd-epoll-pipeline-20260811T164254Z/asterinas-fd-epoll/.specula-output/repro/test_bugCR-4_preexisting_waiter.asterinas.log",
+    "/home/chin39/Documents/play/Specula/runs/asterinas-fd-epoll-pipeline-20260811T164254Z/asterinas-fd-epoll/.specula-output/confirmed-bugs.md",
+    "/home/chin39/Documents/play/Specula/runs/asterinas-fd-epoll-pipeline-20260811T164254Z/asterinas-fd-epoll/.specula-output/bug-severity.md",
+    "/home/chin39/Documents/play/specula-profile/references/asterinas-syscall-security-audit.md",
+    "/home/chin39/Documents/play/specula-profile/reports/workflow-validation.md"
+  ],
+  "related": [
+    "AST-41",
+    "AST-20"
+  ],
+  "caveats": "Found by code review. The corrected model hunt does not cover it. Kept separate from the AST-41 model oracle, whose trace has a similar shape but no caller-visible outcome. Process-directed signals were not shown to fail. Not reviewed by the Terra review. Static read of upstream main bc12195df on 2026-09-24 showed the same code shape. No runtime retest."
+}

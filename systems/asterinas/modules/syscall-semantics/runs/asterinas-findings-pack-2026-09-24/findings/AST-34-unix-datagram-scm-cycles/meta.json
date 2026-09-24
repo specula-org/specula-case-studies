@@ -1,0 +1,46 @@
+{
+  "id": "AST-34",
+  "title": "Unix datagram SCM_RIGHTS references can form ownership cycles",
+  "status": "SOURCE LEAD",
+  "origin": {
+    "kind": "specula-run",
+    "alias": "Recon",
+    "run_id": "asterinas-syscall-user-memory-baseline-20260822T172958Z",
+    "finding_ids": ["T-9", "CR-7"],
+    "pin": "604948581512d83734377974d4c34adb4530f2d7"
+  },
+  "also_seen_in": [],
+  "mechanism": "UnixDatagramSocket -> MessageReceiver -> Arc<MessageQueue> -> Message -> AuxiliaryData files -> Arc<UnixDatagramSocket> forms a strong cycle when a datagram socket is sent into its own queue. AuxiliaryData::from_control checks only UnixStreamSocket, and no collector exists, so MessageReceiver::drop never runs.",
+  "sites": [
+    "kernel/core/src/net/socket/unix/ctrl_msg.rs::AuxiliaryData::from_control",
+    "kernel/core/src/net/socket/unix/datagram/message.rs::MessageQueue::try_send",
+    "kernel/core/src/net/socket/unix/datagram/message.rs::MessageReceiver::drop",
+    "kernel/core/src/net/socket/unix/datagram/socket.rs::UnixDatagramSocket"
+  ],
+  "syscalls": ["sendmsg", "close", "bind"],
+  "keywords": ["scm_rights", "unix datagram", "reference cycle", "garbage collection", "self fd", "leak", "arc", "abstract address", "ownership", "inflight"],
+  "contract": "Unreachable Unix sockets kept alive only by in-flight SCM_RIGHTS references are reclaimed by the Unix garbage collector (Linux net/unix/garbage.c).",
+  "observed": "Source only: a datagram socket sent into its own queue keeps itself alive after all descriptors close, so its queue, carried files and bound address are never released.",
+  "upstream": {"match": "partial", "refs": ["https://github.com/asterinas/asterinas/pull/2176"]},
+  "fix_status": "unfixed",
+  "fix_refs": [],
+  "repro": {
+    "available": false,
+    "files": [],
+    "how_to_run": "No reproducer. finding.md Reproduction describes a self-SCM_RIGHTS send on an abstract-bound datagram socket followed by close and a rebind of the same name.",
+    "smp": null,
+    "runtime_status": "NOT_RUN"
+  },
+  "evidence": [
+    "/home/chin39/Documents/play/Specula/runs/asterinas-syscall-user-memory-baseline-20260822T172958Z/asterinas-syscall-user-memory/.specula-output/analysis-report.md",
+    "/home/chin39/Documents/play/Specula/runs/asterinas-syscall-user-memory-baseline-20260822T172958Z/asterinas-syscall-user-memory/.specula-output/modeling-brief.md",
+    "/home/chin39/Documents/play/Specula/runs/asterinas-syscall-user-memory-baseline-20260822T172958Z/asterinas-syscall-user-memory/.specula-output/review-analysis.md",
+    "/home/chin39/Documents/play/specula-profile/references/asterinas-syscall-security-audit.md",
+    "/home/chin39/Documents/play/specula-profile/reports/asterinas-bug-findings-2026-08/README.md",
+    "/home/chin39/Documents/play/specula-profile/reports/asterinas-bug-findings-2026-08/id-map.md",
+    "/home/chin39/Documents/play/specula-profile/reports/upstream-dedup-2026-09-14/matches.json",
+    "/home/chin39/Documents/play/specula-profile/reports/upstream-dedup-2026-09-14/raw/details/2176-review-comments.json"
+  ],
+  "related": ["AST-32", "AST-33"],
+  "caveats": "Ownership graph source-confirmed, runtime release consequence untested. #2176 discusses the stream-socket hazard, and the datagram/self-FD instance is a scope extension. Report T-9 is AST-34 but brief T-9 is AST-35."
+}

@@ -1,0 +1,84 @@
+{
+  "id": "AST-10",
+  "title": "ramfs snapshots read length before serializing with resize",
+  "status": "REPRODUCED",
+  "origin": {
+    "kind": "specula-run",
+    "alias": "01b",
+    "run_id": "20260908-150910-0a8c",
+    "finding_ids": [
+      "MC-1"
+    ],
+    "pin": "604948581512d83734377974d4c34adb4530f2d7"
+  },
+  "also_seen_in": [],
+  "mechanism": "RamInode::read_at reads the file size and computes read_len before taking the page-cache lock, then returns the saved read_len after Vmo::read silently clamps the copy to the current VMO capacity. A concurrent ftruncate or extending write in that gap makes the returned count differ from the bytes delivered, and InodeHandle::read advances the shared offset by the stale count.",
+  "sites": [
+    "kernel/core/src/fs/fs_impls/ramfs/fs.rs::RamInode::read_at",
+    "kernel/core/src/fs/fs_impls/ramfs/fs.rs::RamInode::resize",
+    "kernel/core/src/fs/fs_impls/ramfs/fs.rs::RamInode::write_at",
+    "kernel/core/src/vm/page_cache/vmo/mod.rs::Vmo::read",
+    "kernel/core/src/fs/file/inode_handle.rs::InodeHandle::read"
+  ],
+  "syscalls": [
+    "read",
+    "pread64",
+    "ftruncate",
+    "pwrite64"
+  ],
+  "keywords": [
+    "ramfs",
+    "read_len",
+    "stale",
+    "snapshot",
+    "truncate",
+    "resize",
+    "page cache lock",
+    "race",
+    "return count",
+    "offset advance"
+  ],
+  "contract": "read(2)/pread(2): the returned count equals the bytes stored in the buffer, and read advances the offset by exactly that count, even when racing truncate or an extending write.",
+  "observed": "pread64 of a 4096-byte ramfs file racing ftruncate(fd, 0) returned 4096 while delivering 0 bytes, and read(2) advanced the shared offset by 4096 with 0 or 8192 bytes delivered.",
+  "upstream": {
+    "match": "open-pr",
+    "refs": [
+      "https://github.com/asterinas/asterinas/pull/3778"
+    ],
+    "dedup_status": "OPEN_PR_COVERS",
+    "upstream_fix_status": "OPEN_PR_STATIC_COVERAGE",
+    "pr_head": "d007cbb623bde58c6692feb6e3257ca1490438fd"
+  },
+  "fix_status": "pr-open",
+  "fix_refs": [
+    "https://github.com/asterinas/asterinas/pull/3778",
+    "/home/chin39/Documents/asterinas-dev branch fix/ramfs-read-past-eof: 16e1bcaa6 (Serialize ramfs reads with resizing), d007cbb62 (fs/read_truncate_race test)"
+  ],
+  "repro": {
+    "available": true,
+    "files": [
+      "repro/test_bugMC-1_ramfs_saved_count.c",
+      "repro/test_bugMC-1_init.c",
+      "repro/test_bugMC-1_run.sh",
+      "repro/read_truncate_race-regression.patch"
+    ],
+    "how_to_run": "Boot an Asterinas kernel with -smp 2 and an initramfs whose /init is test_bugMC-1_init.c and whose /test_mc1 is test_bugMC-1_ramfs_saved_count.c. MC1_RESULT BUG_TRIGGERED means the bug fired. For a fix, apply read_truncate_race-regression.patch and run the fs regression suite with SMP=4.",
+    "smp": 2,
+    "runtime_status": "REPRODUCED at 604948581 (01b MC-1, SMP=2, Level 1 timing help)"
+  },
+  "evidence": [
+    "/home/chin39/Documents/play/Specula/runs/20260908-150910-0a8c/asterinas-syscall-buffered-file-size-read-consistency/.specula-output/confirmed-bugs.md",
+    "/home/chin39/Documents/play/Specula/runs/20260908-150910-0a8c/asterinas-syscall-buffered-file-size-read-consistency/.specula-output/confirmation/MC-1/investigation.md",
+    "/home/chin39/Documents/play/Specula/runs/20260908-150910-0a8c/asterinas-syscall-buffered-file-size-read-consistency/.specula-output/confirmation/MC-1/verdict.json",
+    "/home/chin39/Documents/play/Specula/runs/20260908-150910-0a8c/asterinas-syscall-buffered-file-size-read-consistency/.specula-output/confirmation/MC-1/repro-guest.log",
+    "/home/chin39/Documents/play/Specula/runs/20260908-150910-0a8c/asterinas-syscall-buffered-file-size-read-consistency/.specula-output/spec/output/MC_hunt_s1_ramfs_bfs1.out",
+    "/home/chin39/Documents/play/specula-profile/reports/runs/asterinas-syscall-buffered-file-size-read-consistency-20260907T161100Z.prep/handoff-01b.md",
+    "/home/chin39/Documents/play/specula-profile/references/pr-3778-handoff.md",
+    "/home/chin39/Documents/play/specula-profile/reports/ast-validation-2026-09-02/logs/wip-2026-09-11/wip-check.out"
+  ],
+  "related": [
+    "AST-05",
+    "AST-25"
+  ],
+  "caveats": "Distinct from AST-05 (unlimited writer). The shrink schedule is the AST-10-specific witness, while the grow schedule's over-delivery also needs AST-05. Level 1 timing help on two vCPUs. Fix evidence (2026-09-11 WIP, SMP=4) is family-level, not a rerun of the 01b schedules. Fix commit ids differ between handoff records. The register cites PR head d007cbb62."
+}

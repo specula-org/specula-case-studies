@@ -1,0 +1,155 @@
+diff --git a/test/initramfs/src/regression/process/run_test.sh b/test/initramfs/src/regression/process/run_test.sh
+index 43632e13c..cd7134e89 100755
+--- a/test/initramfs/src/regression/process/run_test.sh
++++ b/test/initramfs/src/regression/process/run_test.sh
+@@ -62,6 +62,7 @@ fi
+ ./signal/pidfd_send_signal
+ ./signal/signal_fd
+ ./signal/signal_test2
++./signal/vectored_io_restart
+ 
+ if [ "$(uname -m)" = "x86_64" ]; then
+     ./signal/fault_signals
+diff --git a/test/initramfs/src/regression/process/signal/vectored_io_restart.c b/test/initramfs/src/regression/process/signal/vectored_io_restart.c
+new file mode 100644
+index 000000000..dd1c54818
+--- /dev/null
++++ b/test/initramfs/src/regression/process/signal/vectored_io_restart.c
+@@ -0,0 +1,137 @@
++// SPDX-License-Identifier: MPL-2.0
++
++#include <fcntl.h>
++#include <signal.h>
++#include <sys/uio.h>
++#include <sys/wait.h>
++#include <unistd.h>
++
++#include "../../common/test.h"
++
++static volatile sig_atomic_t signal_count;
++
++static void signal_handler(int signum)
++{
++	signal_count++;
++}
++
++static void install_handler(int flags)
++{
++	struct sigaction action;
++
++	memset(&action, 0, sizeof(action));
++	action.sa_handler = signal_handler;
++	action.sa_flags = flags;
++	CHECK(sigaction(SIGUSR1, &action, NULL));
++}
++
++FN_SETUP(install_sa_restart_handler)
++{
++	install_handler(SA_RESTART);
++}
++END_SETUP()
++
++FN_TEST(readv_on_empty_pipe_restarts)
++{
++	int pipefds[2];
++	TEST_SUCC(pipe(pipefds));
++
++	signal_count = 0;
++	pid_t parent = getpid();
++	pid_t child = TEST_SUCC(fork());
++	if (child == 0) {
++		CHECK(close(pipefds[0]));
++		sleep(1);
++		CHECK(kill(parent, SIGUSR1));
++		sleep(1);
++		CHECK(write(pipefds[1], "a", 1));
++		_exit(0);
++	}
++	TEST_SUCC(close(pipefds[1]));
++
++	char byte = 0;
++	struct iovec iov = { .iov_base = &byte, .iov_len = sizeof(byte) };
++	TEST_RES(readv(pipefds[0], &iov, 1),
++		 _ret == 1 && byte == 'a' && signal_count > 0);
++
++	int status = 0;
++	TEST_RES(waitpid(child, &status, 0), _ret == child &&
++						     WIFEXITED(status) &&
++						     WEXITSTATUS(status) == 0);
++	TEST_SUCC(close(pipefds[0]));
++}
++END_TEST()
++
++FN_TEST(writev_on_full_pipe_restarts)
++{
++	static char chunk[4096];
++	int pipefds[2];
++	TEST_SUCC(pipe(pipefds));
++
++	// Fill the pipe so that the vectored write below has to wait.
++	TEST_SUCC(fcntl(pipefds[1], F_SETFL, O_NONBLOCK));
++	while (write(pipefds[1], chunk, sizeof(chunk)) > 0)
++		;
++	TEST_ERRNO(write(pipefds[1], chunk, sizeof(chunk)), EAGAIN);
++	TEST_SUCC(fcntl(pipefds[1], F_SETFL, 0));
++
++	signal_count = 0;
++	pid_t parent = getpid();
++	pid_t child = TEST_SUCC(fork());
++	if (child == 0) {
++		CHECK(close(pipefds[1]));
++		sleep(1);
++		CHECK(kill(parent, SIGUSR1));
++		sleep(1);
++		CHECK(fcntl(pipefds[0], F_SETFL, O_NONBLOCK));
++		while (read(pipefds[0], chunk, sizeof(chunk)) > 0)
++			;
++		_exit(0);
++	}
++
++	char byte = 'a';
++	struct iovec iov = { .iov_base = &byte, .iov_len = sizeof(byte) };
++	TEST_RES(writev(pipefds[1], &iov, 1), _ret == 1 && signal_count > 0);
++
++	int status = 0;
++	TEST_RES(waitpid(child, &status, 0), _ret == child &&
++						     WIFEXITED(status) &&
++						     WEXITSTATUS(status) == 0);
++	TEST_SUCC(close(pipefds[0]));
++	TEST_SUCC(close(pipefds[1]));
++}
++END_TEST()
++
++FN_TEST(readv_on_empty_pipe_fails_without_sa_restart)
++{
++	install_handler(0);
++
++	int pipefds[2];
++	TEST_SUCC(pipe(pipefds));
++
++	signal_count = 0;
++	pid_t parent = getpid();
++	pid_t child = TEST_SUCC(fork());
++	if (child == 0) {
++		CHECK(close(pipefds[0]));
++		sleep(1);
++		CHECK(kill(parent, SIGUSR1));
++		sleep(1);
++		_exit(0);
++	}
++	TEST_SUCC(close(pipefds[1]));
++
++	char byte = 0;
++	struct iovec iov = { .iov_base = &byte, .iov_len = sizeof(byte) };
++	TEST_ERRNO(readv(pipefds[0], &iov, 1), EINTR);
++	TEST_RES(signal_count, _ret > 0);
++
++	int status = 0;
++	TEST_RES(waitpid(child, &status, 0), _ret == child &&
++						     WIFEXITED(status) &&
++						     WEXITSTATUS(status) == 0);
++	TEST_SUCC(close(pipefds[0]));
++
++	install_handler(SA_RESTART);
++}
++END_TEST()

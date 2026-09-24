@@ -1,0 +1,78 @@
+{
+  "id": "AST-15",
+  "title": "exFAT cold-tail extension re-enters an inode write guard",
+  "status": "REPRODUCED",
+  "origin": {
+    "kind": "specula-run",
+    "alias": "01b",
+    "run_id": "20260908-150910-0a8c",
+    "finding_ids": [
+      "CR-2"
+    ],
+    "pin": "604948581512d83734377974d4c34adb4530f2d7"
+  },
+  "also_seen_in": [],
+  "mechanism": "ExfatInode::write_at calls PageCache::resize under inner.write(). For an unaligned old size the extension branch runs fill_zeros on the tail page, which commits an uncached page through the backend, and the exFAT backend submit_read_bio takes inner.read() on the same non-reentrant RwMutex, so the writer deadlocks on itself while holding the fs lock.",
+  "sites": [
+    "kernel/core/src/fs/fs_impls/exfat/inode.rs::ExfatInode::write_at",
+    "kernel/core/src/fs/fs_impls/exfat/inode.rs::<ExfatInode as BlockAsPageCacheBackend>::submit_read_bio",
+    "kernel/core/src/vm/page_cache/mod.rs::PageCache::resize",
+    "kernel/core/src/vm/page_cache/vmo/mod.rs::Vmo::fill_zeros",
+    "kernel/core/src/fs/fs_impls/exfat/inode.rs::ExfatInode::resize"
+  ],
+  "syscalls": [
+    "pwrite64",
+    "write"
+  ],
+  "keywords": [
+    "exfat",
+    "deadlock",
+    "self-deadlock",
+    "rwmutex",
+    "write guard",
+    "fill_zeros",
+    "tail page",
+    "cold cache",
+    "page cache resize",
+    "backend read",
+    "hang"
+  ],
+  "contract": "write(2)/pwrite(2): an extending write to a regular file returns a count or an error and never blocks forever on a lock held by the calling task.",
+  "observed": "After remounting exFAT so the tail page of a 100-byte file was uncached, pwrite64(fd, buf, 16, 100) did not return within 10 s and the guest had to be killed by the outer timeout. Cached-tail exFAT and remounted ext2 controls returned 16.",
+  "upstream": {
+    "match": "none",
+    "refs": [],
+    "dedup_status": "NO_DIRECT_MATCH",
+    "upstream_fix_status": "NOT_ESTABLISHED",
+    "reviewed_candidates": [
+      "https://github.com/asterinas/asterinas/pull/3603",
+      "https://github.com/asterinas/asterinas/issues/762",
+      "https://github.com/asterinas/asterinas/pull/767",
+      "https://github.com/asterinas/asterinas/issues/2269"
+    ]
+  },
+  "fix_status": "unfixed",
+  "fix_refs": [],
+  "repro": {
+    "available": true,
+    "files": [
+      "repro/test_bugCR-2_exfat_resize_tailclear.c",
+      "repro/test_bugCR-2_run.sh"
+    ],
+    "how_to_run": "Build test_bugCR-2_exfat_resize_tailclear.c statically with -pthread as /init, attach fresh ext2 (/dev/vda) and exFAT (/dev/vdb) images, boot with an outer timeout. 'pwrite64 DID NOT RETURN' and CR2-CLAIM-A: REPRODUCED mean the bug fired.",
+    "smp": 2,
+    "runtime_status": "REPRODUCED at 604948581 (01b CR-2, SMP=2, Level 0, guest ran as root for umount/mount)"
+  },
+  "evidence": [
+    "/home/chin39/Documents/play/Specula/runs/20260908-150910-0a8c/asterinas-syscall-buffered-file-size-read-consistency/.specula-output/confirmed-bugs.md",
+    "/home/chin39/Documents/play/Specula/runs/20260908-150910-0a8c/asterinas-syscall-buffered-file-size-read-consistency/.specula-output/confirmation/CR-2/investigation.md",
+    "/home/chin39/Documents/play/Specula/runs/20260908-150910-0a8c/asterinas-syscall-buffered-file-size-read-consistency/.specula-output/confirmation/CR-2/verdict.json",
+    "/home/chin39/Documents/play/Specula/runs/20260908-150910-0a8c/asterinas-syscall-buffered-file-size-read-consistency/.specula-output/confirmation/CR-2/repro-guest.log",
+    "/home/chin39/Documents/play/specula-profile/reports/runs/asterinas-syscall-buffered-file-size-read-consistency-20260907T161100Z.prep/handoff-01b.md",
+    "/home/chin39/Documents/play/specula-profile/reports/ast-validation-2026-09-02/exfat-write-race/README.md"
+  ],
+  "related": [
+    "AST-11"
+  ],
+  "caveats": "Raw CR-2 was a documentation-contradiction finding that confirmation turned into a runtime deadlock. The guest ran as root to umount/mount for the cold cache. Unprivileged cold-cache setup was not independently established. Only the buffered path ran, and write_direct_at was not tested. The AST-11 fix branch leaves this deadlock in place."
+}

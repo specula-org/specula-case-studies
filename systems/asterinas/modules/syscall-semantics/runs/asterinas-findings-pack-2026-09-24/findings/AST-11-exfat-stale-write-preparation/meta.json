@@ -1,0 +1,88 @@
+{
+  "id": "AST-11",
+  "title": "exFAT write preparation becomes stale before copy/publication",
+  "status": "REPRODUCED",
+  "origin": {
+    "kind": "specula-run",
+    "alias": "01b",
+    "run_id": "20260908-150910-0a8c",
+    "finding_ids": [
+      "MC-3"
+    ],
+    "pin": "604948581512d83734377974d4c34adb4530f2d7"
+  },
+  "also_seen_in": [],
+  "mechanism": "ExfatInode::write_at computes new_size and resizes the page cache under inner.write(), releases the lock, copies under a fresh upread() where Vmo::write silently clamps to the current capacity, then publishes the stale new_size and returns the full count. A competing extending write or truncate in the gap shrinks the cache or overtakes the size.",
+  "sites": [
+    "kernel/core/src/fs/fs_impls/exfat/inode.rs::ExfatInode::write_at",
+    "kernel/core/src/fs/fs_impls/exfat/inode.rs::ExfatInode::resize",
+    "kernel/core/src/vm/page_cache/mod.rs::PageCache::resize",
+    "kernel/core/src/vm/page_cache/mod.rs::<PageCache as VmIo>::write",
+    "kernel/core/src/vm/page_cache/vmo/mod.rs::Vmo::write"
+  ],
+  "syscalls": [
+    "pwrite64",
+    "write",
+    "ftruncate",
+    "pread64",
+    "fstat"
+  ],
+  "keywords": [
+    "exfat",
+    "write_at",
+    "lock release",
+    "stale new_size",
+    "page cache resize",
+    "vmo clamp",
+    "false success",
+    "size regression",
+    "concurrent writers",
+    "truncate race"
+  ],
+  "contract": "write(2): a successful write returns the bytes actually stored, and after it returns the file size covers the written range and reads return the written data.",
+  "observed": "Two racing extending pwrite64 calls on one exFAT file: one returned 4096 after storing 0 bytes and left st_size beyond the cache (reads return 4096 without data), or st_size regressed below an already-successful write.",
+  "upstream": {
+    "match": "none",
+    "refs": [],
+    "dedup_status": "NO_DIRECT_MATCH",
+    "upstream_fix_status": "NOT_ESTABLISHED",
+    "reviewed_candidates": [
+      "https://github.com/asterinas/asterinas/pull/3603",
+      "https://github.com/asterinas/asterinas/pull/3481"
+    ]
+  },
+  "fix_status": "fix-local",
+  "fix_refs": [
+    "/home/chin39/Documents/asterinas-dev branch fix/exfat-write-size-race: 864356cec (Hold the exfat inode lock across a buffered write), 3ece54702 (fs/write_race test), base upstream/main bc12195df",
+    "/home/chin39/Documents/play/specula-profile/reports/ast-validation-2026-09-02/exfat-write-race/fix/patches/v2/",
+    "/home/chin39/Documents/play/specula-profile/reports/ast-validation-2026-09-02/exfat-write-race/fix/pr-draft.md"
+  ],
+  "repro": {
+    "available": true,
+    "files": [
+      "repro/write_race-regression.patch",
+      "repro/guest_mc3.c",
+      "repro/test_bugMC-3_exfat_stale_prepare.sh",
+      "repro/mc3-l3-timing-hook.patch"
+    ],
+    "how_to_run": "Preferred: apply write_race-regression.patch and run the fs regression suite with SMP>=2. The /exfat case fails on an unfixed tree. Exact 01b schedules: apply mc3-l3-timing-hook.patch to the pin, build guest_mc3.c with -DMC3_MODE=3 (CE order) or -DMC3_MODE=4 (regression order), boot with -smp 2 and an exFAT disk.",
+    "smp": 2,
+    "runtime_status": "REPRODUCED at 604948581 with a Level 3 timing hook (01b MC-3, SMP=2). The write_race regression fails 65 to 93 of 2000 rounds at bc12195df (SMP=4)"
+  },
+  "evidence": [
+    "/home/chin39/Documents/play/Specula/runs/20260908-150910-0a8c/asterinas-syscall-buffered-file-size-read-consistency/.specula-output/confirmed-bugs.md",
+    "/home/chin39/Documents/play/Specula/runs/20260908-150910-0a8c/asterinas-syscall-buffered-file-size-read-consistency/.specula-output/confirmation/MC-3/investigation.md",
+    "/home/chin39/Documents/play/Specula/runs/20260908-150910-0a8c/asterinas-syscall-buffered-file-size-read-consistency/.specula-output/confirmation/MC-3/verdict.json",
+    "/home/chin39/Documents/play/Specula/runs/20260908-150910-0a8c/asterinas-syscall-buffered-file-size-read-consistency/.specula-output/confirmation/MC-3/build/guest-L1.log",
+    "/home/chin39/Documents/play/Specula/runs/20260908-150910-0a8c/asterinas-syscall-buffered-file-size-read-consistency/.specula-output/confirmation/MC-3/build/guest-L3.log",
+    "/home/chin39/Documents/play/Specula/runs/20260908-150910-0a8c/asterinas-syscall-buffered-file-size-read-consistency/.specula-output/confirmation/MC-3/build/guest-L3R.log",
+    "/home/chin39/Documents/play/specula-profile/reports/ast-validation-2026-09-02/exfat-write-race/README.md",
+    "/home/chin39/Documents/play/specula-profile/reports/ast-validation-2026-09-02/exfat-write-race/fix/logs/v2/",
+    "/home/chin39/Documents/play/specula-profile/reports/runs/asterinas-syscall-buffered-file-size-read-consistency-20260907T161100Z.prep/handoff-01b.md"
+  ],
+  "related": [
+    "AST-15",
+    "AST-05"
+  ],
+  "caveats": "01b reproduction needed a Level 3 timing-only kernel hook (500 hook-free trials at the pin did not trigger). Hook-free regression evidence is at bc12195df, not the pin. Fixed-tree A/B covers the writers shape. Both exact 01b schedules still need a retest. The fix leaves AST-15 open. handoff-01b.md still cites the older series (d5b645d84 + 97199dd30, 79/2000). The register's 864356cec/3ece54702 (65 to 93/2000) is followed here."
+}

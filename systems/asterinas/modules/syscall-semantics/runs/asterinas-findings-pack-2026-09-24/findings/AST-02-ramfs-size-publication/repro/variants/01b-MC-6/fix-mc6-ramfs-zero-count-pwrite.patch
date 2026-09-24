@@ -1,0 +1,36 @@
+From: Specula 01b campaign (run 20260908-150910-0a8c, finding MC-6)
+Target: Asterinas 604948581512d83734377974d4c34adb4530f2d7
+
+Ramfs: zero-count positional write must not enlarge the file
+
+RamInode::write_at publishes new_size = offset + write_len whenever it
+exceeds the current size, with no special case for write_len == 0. A
+pwrite64(fd, off > EOF, 0) therefore grows inode_meta.size and the page
+cache while copying zero bytes and returning Ok(0).
+
+POSIX write(2) requires an nbyte == 0 write to a regular file to "return
+zero and have no other results"; Linux (tmpfs, ext4) honors this. ext2 in
+the same tree already guards (ext2/inode/file.rs:45). Mirror that guard,
+placed before the mtime/ctime update so a zero-length write has no
+observable effect at all.
+
+Reproduced and fix-verified with repro/test_bugMC-6_run.sh (guest
+test_bugMC-6_ramfs_empty_pwrite.c): unpatched kernel reports
+MC6_RESULT BUG_TRIGGERED, patched kernel reports MC6_RESULT OK.
+---
+ kernel/core/src/fs/fs_impls/ramfs/fs.rs | 3 +++
+ 1 file changed, 3 insertions(+)
+
+--- a/kernel/core/src/fs/fs_impls/ramfs/fs.rs
++++ b/kernel/core/src/fs/fs_impls/ramfs/fs.rs
+@@ -732,7 +732,10 @@
+ 
+                 let mut inode_meta = self.metadata.lock();
+                 let file_size = inode_meta.size;
+                 let write_len = reader.remain();
++                if write_len == 0 {
++                    return Ok(0);
++                }
+                 let new_size = offset + write_len;
+                 let should_expand_size = new_size > file_size;
+                 let new_size_aligned = new_size.align_up(BLOCK_SIZE);

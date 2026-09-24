@@ -1,0 +1,73 @@
+{
+  "id": "AST-25",
+  "title": "PageCache/VmIo no-short-read contract versus capacity clamp",
+  "status": "SOURCE LEAD",
+  "origin": {
+    "kind": "specula-run",
+    "alias": "01b",
+    "run_id": "20260908-150910-0a8c",
+    "finding_ids": [
+      "CR-1"
+    ],
+    "pin": "604948581512d83734377974d4c34adb4530f2d7"
+  },
+  "also_seen_in": [],
+  "mechanism": "PageCache implements VmIo::read, whose documentation forbids short reads, by delegating to Vmo::read, which clamps the copy to the page-aligned VMO capacity and returns Ok after a short or zero-length transfer. Callers that trust the all-or-error contract can mis-account delivered bytes.",
+  "sites": [
+    "ostd/src/mm/io/mod.rs::VmIo::read",
+    "kernel/core/src/vm/page_cache/mod.rs::<PageCache as VmIo>::read",
+    "kernel/core/src/vm/page_cache/vmo/mod.rs::Vmo::read",
+    "ostd/src/mm/io/util.rs::<S: HasVmReaderWriter as VmIo>::read (blanket impl, contract-conforming control)"
+  ],
+  "syscalls": [
+    "read",
+    "pread64"
+  ],
+  "keywords": [
+    "vmio",
+    "no short reads",
+    "page cache",
+    "vmo",
+    "capacity clamp",
+    "short read",
+    "contract",
+    "read_bytes",
+    "read_val",
+    "silent success"
+  ],
+  "contract": "Internal ostd contract: VmIo::read succeeds only after filling the writer completely and returns an error when data is only partially available.",
+  "observed": "Vmo::read (and so PageCache as VmIo) returns Ok after copying min(avail, capacity - offset) bytes, including 0. The reproduced consequence (ramfs/exFAT reads storing past the returned count) is tracked as AST-05, and no independent consequence has been shown.",
+  "upstream": {
+    "match": "none",
+    "refs": [],
+    "dedup_status": "NO_DIRECT_MATCH",
+    "upstream_fix_status": "NOT_ESTABLISHED",
+    "reviewed_candidates": [
+      "https://github.com/asterinas/asterinas/pull/3778",
+      "https://github.com/asterinas/asterinas/pull/3729",
+      "https://github.com/asterinas/asterinas/pull/2953"
+    ]
+  },
+  "fix_status": "unfixed",
+  "fix_refs": [],
+  "repro": {
+    "available": false,
+    "files": [],
+    "how_to_run": "No AST-25-specific reproducer. The 01b CR-1 test in the run's .specula-output/repro/ demonstrates AST-05's syscall effect.",
+    "smp": null,
+    "runtime_status": "not applicable"
+  },
+  "evidence": [
+    "/home/chin39/Documents/play/Specula/runs/20260908-150910-0a8c/asterinas-syscall-buffered-file-size-read-consistency/.specula-output/confirmed-bugs.md",
+    "/home/chin39/Documents/play/Specula/runs/20260908-150910-0a8c/asterinas-syscall-buffered-file-size-read-consistency/.specula-output/confirmation/CR-1/investigation.md",
+    "/home/chin39/Documents/play/Specula/runs/20260908-150910-0a8c/asterinas-syscall-buffered-file-size-read-consistency/.specula-output/confirmation/CR-1/verdict.json",
+    "/home/chin39/Documents/play/Specula/runs/20260908-150910-0a8c/asterinas-syscall-buffered-file-size-read-consistency/.specula-output/repro/test_bugCR-1_guest.log",
+    "/home/chin39/Documents/play/specula-profile/reports/runs/asterinas-syscall-buffered-file-size-read-consistency-20260907T161100Z.prep/handoff-01b.md",
+    "/home/chin39/Documents/play/specula-profile/references/pr-3778-handoff.md"
+  ],
+  "related": [
+    "AST-05",
+    "AST-10"
+  ],
+  "caveats": "SOURCE LEAD. The raw 01b CR-1 verdict REPRODUCED belongs to the AST-05 syscall effect. Promotion needs a supported caller beyond ramfs/exFAT reads and an independent observable consequence after the caller fixes. Latent-caller analysis is static at the pin."
+}

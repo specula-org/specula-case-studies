@@ -1,0 +1,90 @@
+{
+  "id": "AST-14",
+  "title": "Empty exFAT writes enlarge EOF and may allocate clusters",
+  "status": "REPRODUCED",
+  "origin": {
+    "kind": "specula-run",
+    "alias": "01b",
+    "run_id": "20260908-150910-0a8c",
+    "finding_ids": [
+      "MC-7"
+    ],
+    "pin": "604948581512d83734377974d4c34adb4530f2d7"
+  },
+  "also_seen_in": [
+    {
+      "alias": "Backend audit",
+      "run_id": null,
+      "finding_id": null,
+      "verdict": "static source follow-up for the exFAT direct empty-write path at bc12195df. No runtime verdict"
+    }
+  ],
+  "mechanism": "ExfatInode::write_at (and write_direct_at) has no write_len == 0 guard, so offset + 0 > file_size takes the extension path: clusters are allocated, the page cache grows, and inner.size is set to the offset while the call returns 0. The zero-length errno probe in do_sys_pwritev reaches the same path.",
+  "sites": [
+    "kernel/core/src/fs/fs_impls/exfat/inode.rs::ExfatInode::write_at",
+    "kernel/core/src/fs/fs_impls/exfat/inode.rs::ExfatInode::write_direct_at",
+    "kernel/core/src/fs/fs_impls/exfat/inode.rs::ExfatInodeInner::resize",
+    "kernel/core/src/syscall/pwritev.rs::do_sys_pwritev",
+    "kernel/core/src/fs/file/inode_handle.rs::InodeHandle::write_at"
+  ],
+  "syscalls": [
+    "pwrite64",
+    "pwritev",
+    "write"
+  ],
+  "keywords": [
+    "exfat",
+    "zero-length",
+    "empty write",
+    "count zero",
+    "extend",
+    "eof",
+    "cluster allocation",
+    "st_blocks",
+    "pwritev probe",
+    "no other effect"
+  ],
+  "contract": "write(2): a zero-count write to a regular file returns 0 without causing any other effect.",
+  "observed": "pwrite64(fd, buf, 0, 4096) on a 2-byte exFAT file returned 0 and set st_size to 4096. Empty pwritev at 8192 and lseek+write(0) at 16384 also enlarged the file and raised st_blocks.",
+  "upstream": {
+    "match": "none",
+    "refs": [],
+    "dedup_status": "NO_DIRECT_MATCH",
+    "upstream_fix_status": "NOT_ESTABLISHED",
+    "reviewed_candidates": [
+      "https://github.com/asterinas/asterinas/pull/3603",
+      "https://github.com/asterinas/asterinas/pull/3481"
+    ]
+  },
+  "fix_status": "fix-pending-validation",
+  "fix_refs": [
+    "/home/chin39/Documents/asterinas-ast02-empty-write branch fix/ramfs-empty-write (uncommitted, base bc12195df)",
+    "/home/chin39/Documents/play/specula-profile/reports/empty-write-batch-2026-09-16/exfat-fix.patch",
+    "/home/chin39/Documents/play/specula-profile/reports/empty-write-batch-2026-09-16/series/02-exfat.patch"
+  ],
+  "repro": {
+    "available": true,
+    "files": [
+      "repro/test_bugMC-7_exfat_empty_pwrite.c",
+      "repro/test_bugMC-7_run.sh",
+      "repro/empty_write-regression.patch"
+    ],
+    "how_to_run": "Build test_bugMC-7_exfat_empty_pwrite.c statically as /init, attach fresh ext2 (/dev/vda) and exFAT (/dev/vdb) images, boot. MC7_RESULT REPRODUCED means the bug fired. empty_write-regression.patch is an unexecuted regression test for the fix batch.",
+    "smp": 2,
+    "runtime_status": "REPRODUCED at 604948581 for buffered I/O (01b MC-7, SMP=2, Level 0). Regression test NOT_RUN"
+  },
+  "evidence": [
+    "/home/chin39/Documents/play/Specula/runs/20260908-150910-0a8c/asterinas-syscall-buffered-file-size-read-consistency/.specula-output/confirmed-bugs.md",
+    "/home/chin39/Documents/play/Specula/runs/20260908-150910-0a8c/asterinas-syscall-buffered-file-size-read-consistency/.specula-output/confirmation/MC-7/investigation.md",
+    "/home/chin39/Documents/play/Specula/runs/20260908-150910-0a8c/asterinas-syscall-buffered-file-size-read-consistency/.specula-output/confirmation/MC-7/verdict.json",
+    "/home/chin39/Documents/play/Specula/runs/20260908-150910-0a8c/asterinas-syscall-buffered-file-size-read-consistency/.specula-output/confirmation/MC-7/repro-guest.log",
+    "/home/chin39/Documents/play/specula-profile/reports/empty-write-batch-2026-09-16/README.md",
+    "/home/chin39/Documents/play/specula-profile/reports/empty-write-batch-2026-09-16/remediation.json",
+    "/home/chin39/Documents/play/specula-profile/reports/ast-02-empty-write-2026-09-14/related-filesystems-2026-09-16.md"
+  ],
+  "related": [
+    "AST-02",
+    "AST-72"
+  ],
+  "caveats": "Historical reproduction covers buffered I/O only. The direct path is a static observation. The 01b confirmation claimed O_DIRECT alignment rejects len == 0, but the pin source (is_block_aligned treats 0 as aligned) and the 2026-09-16 audit disagree. Fix batch is uncommitted and runtime-unvalidated by user request."
+}

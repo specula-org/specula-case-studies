@@ -1,0 +1,45 @@
+{
+  "id": "AST-40",
+  "title": "ext2 invalidation error may bypass write rollback",
+  "status": "SOURCE LEAD",
+  "origin": {
+    "kind": "specula-run",
+    "alias": "Recon",
+    "run_id": "asterinas-syscall-user-memory-baseline-20260822T172958Z",
+    "finding_ids": ["CR-2"],
+    "pin": "604948581512d83734377974d4c34adb4530f2d7"
+  },
+  "also_seen_in": [],
+  "mechanism": "InodeInner::write_direct_at calls prepare_write (which may grow the page cache and allocate blocks) and then invalidate_range with ?, so an invalidation writeback error returns without rollback_write when the write extends past EOF.",
+  "sites": [
+    "kernel/core/src/fs/fs_impls/ext2/inode/file.rs::InodeInner::write_direct_at",
+    "kernel/core/src/fs/fs_impls/ext2/inode/file.rs::InodeInner::prepare_write",
+    "kernel/core/src/fs/fs_impls/ext2/inode/file.rs::InodeInner::rollback_write",
+    "kernel/core/src/vm/page_cache/mod.rs::PageCache::invalidate_range"
+  ],
+  "syscalls": ["write", "pwrite64", "writev", "pwritev"],
+  "keywords": ["ext2", "direct io", "o_direct", "rollback", "invalidate_range", "page cache", "prepare_write", "block allocation", "error path", "writeback failure"],
+  "contract": "A failed write leaves no page-cache growth or block allocation past the unchanged file size (InodeInner::prepare_write rollback rule, Linux ext2_write_failed).",
+  "observed": "Source only: an invalidate_range error in the direct-write path returns before rollback_write, which can leave allocated blocks and page-cache capacity past EOF.",
+  "upstream": {"match": "open-pr", "refs": ["https://github.com/asterinas/asterinas/pull/3297"]},
+  "fix_status": "pr-open",
+  "fix_refs": ["https://github.com/asterinas/asterinas/pull/3297"],
+  "repro": {
+    "available": false,
+    "files": [],
+    "how_to_run": "No reproducer. finding.md Reproduction describes an O_DIRECT write spanning old EOF with injected writeback failure, checking st_blocks and e2fsck.",
+    "smp": null,
+    "runtime_status": "NOT_RUN"
+  },
+  "evidence": [
+    "/home/chin39/Documents/play/Specula/runs/asterinas-syscall-user-memory-baseline-20260822T172958Z/asterinas-syscall-user-memory/.specula-output/analysis-report.md",
+    "/home/chin39/Documents/play/Specula/runs/asterinas-syscall-user-memory-baseline-20260822T172958Z/asterinas-syscall-user-memory/.specula-output/modeling-brief.md",
+    "/home/chin39/Documents/play/Specula/runs/asterinas-syscall-user-memory-baseline-20260822T172958Z/asterinas-syscall-user-memory/.specula-output/review-analysis.md",
+    "/home/chin39/Documents/play/specula-profile/reports/asterinas-bug-findings-2026-08/README.md",
+    "/home/chin39/Documents/play/specula-profile/reports/asterinas-bug-findings-2026-08/id-map.md",
+    "/home/chin39/Documents/play/specula-profile/reports/upstream-dedup-2026-09-14/matches.json",
+    "/home/chin39/Documents/play/specula-profile/reports/upstream-dedup-2026-09-14/raw/final-check/pr-3297.json"
+  ],
+  "related": ["AST-24", "AST-01"],
+  "caveats": "Static coverage only. Needs writeback-failure injection to trigger. Draft PR #3297 covers it by inspection but is unmerged. Report CR-2 is this entry, brief CR-2 is AST-33/34."
+}

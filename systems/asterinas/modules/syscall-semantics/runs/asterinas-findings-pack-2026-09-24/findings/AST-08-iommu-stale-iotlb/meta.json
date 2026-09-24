@@ -1,0 +1,91 @@
+{
+  "id": "AST-08",
+  "title": "IOMMU teardown frees frames before IOTLB invalidation",
+  "status": "REPRODUCED",
+  "origin": {
+    "kind": "external-package",
+    "alias": "External",
+    "run_id": null,
+    "finding_ids": [
+      "CR-20"
+    ],
+    "pin": "4c1fdd1e4"
+  },
+  "aliases": [
+    "OS-02"
+  ],
+  "also_seen_in": [],
+  "mechanism": "unmap_dma_remap removes the IOMMU PTEs per page but issues no IOTLB invalidation, and DmaCoherent/DmaStream drop then frees the frames, so a device with a cached translation can write into a recycled frame.",
+  "sites": [
+    "ostd/src/mm/dma/util.rs::unmap_dma_remap",
+    "ostd/src/mm/dma/util.rs::unprepare_dma",
+    "ostd/src/mm/dma/dma_coherent.rs::<DmaCoherent as Drop>::drop",
+    "ostd/src/mm/dma/dma_stream.rs::<DmaStream as Drop>::drop",
+    "ostd/src/arch/x86/iommu/dma_remapping/mod.rs::unmap",
+    "ostd/src/arch/x86/iommu/invalidate/queue.rs::Queue::append_descriptor"
+  ],
+  "syscalls": [],
+  "keywords": [
+    "iommu",
+    "iotlb",
+    "invalidation",
+    "vt-d",
+    "dma",
+    "unmap",
+    "stale translation",
+    "use-after-free",
+    "frame reuse",
+    "dmacoherent",
+    "dmastream",
+    "invalidation queue"
+  ],
+  "contract": "DMA revocation: after an unmap returns and its frames are freed, the device can no longer reach those frames (VT-d requires IOTLB invalidation after removing a translation).",
+  "observed": "Asterinas never invalidates the IOTLB on DMA teardown, so a device wrote 64 bytes into a frame already recycled to an unrelated kernel allocation (QEMU vIOMMU, edu device).",
+  "upstream": {
+    "match": "none",
+    "refs": [],
+    "related_refs": [
+      "https://github.com/asterinas/asterinas/issues/237",
+      "https://github.com/asterinas/asterinas/pull/2351",
+      "https://github.com/asterinas/asterinas/pull/3108",
+      "https://github.com/asterinas/asterinas/pull/1218",
+      "https://github.com/asterinas/asterinas/issues/2849"
+    ]
+  },
+  "fix_status": "fix-local",
+  "fix_refs": [
+    "branch fix/iommu-iotlb-invalidate in /home/chin39/Documents/asterinas-dev: d370078dd, 9f338d737, bfef1ca11 on 29b0f4bcf (not pushed)",
+    "/home/chin39/Documents/play/specula-profile/reports/asterinas-bug-findings-2026-08/upstream-issues/AST-08-patches/",
+    "/home/chin39/Documents/play/specula-profile/reports/asterinas-bug-findings-2026-08/upstream-issues/AST-08-pr-draft.md (not filed)"
+  ],
+  "report": null,
+  "repro": {
+    "available": true,
+    "files": [
+      "repro/README.md",
+      "repro/verification-package.md",
+      "repro/test_bugCR-20_stale_iotlb_after_teardown.rs",
+      "repro/run.sh",
+      "repro/OSDK.cr20.toml",
+      "repro/run-cr20-validation-2026-09-02.sh"
+    ],
+    "how_to_run": "Run repro/run.sh <asterinas-worktree> on an x86_64 host whose QEMU has the edu and intel-iommu devices; it installs the ktest, builds a worktree-local OSDK, boots with a vIOMMU plus edu, and a FAILED ktest with witness_clobbered_after_replay=true is the positive result.",
+    "smp": 2,
+    "runtime_status": "REPRODUCED at 604948581"
+  },
+  "evidence": [
+    "/home/chin39/Documents/play/specula-profile/reports/asterinas-bug-findings-2026-08/AST-08-iommu-stale-iotlb/description.md",
+    "/home/chin39/Documents/play/specula-profile/reports/asterinas-bug-findings-2026-08/AST-08-iommu-stale-iotlb/verification-package-local-copy.md",
+    "/home/chin39/Documents/play/specula-profile/reports/CR-20-verification-report.md",
+    "/home/chin39/Documents/play/specula-profile/reports/cr20/",
+    "/home/chin39/Documents/play/specula-profile/reports/ast-validation-2026-09-02/README.md",
+    "/home/chin39/Documents/play/specula-profile/reports/ast-validation-2026-09-02/logs/ast08-driver-summary.txt",
+    "/home/chin39/Documents/play/specula-profile/reports/ast-validation-2026-09-02/logs/ast08-ktest-cr20_stale_iotlb_after_dma_teardown.txt",
+    "/home/chin39/Documents/play/specula-profile/reports/ast-validation-2026-09-02/logs/ast08-fix-final-chain-summary.txt",
+    "/home/chin39/Documents/play/specula-profile/reports/ast-validation-2026-09-02/ast08-codex-handoff-slice1.md",
+    "/home/chin39/Documents/play/specula-profile/reports/asterinas-bug-findings-2026-08/upstream-issues/AST-08-pr-draft.md",
+    "/home/chin39/Documents/play/specula-profile/reports/upstream-dedup-2026-09-14/matches.json"
+  ],
+  "related": [],
+  "caveats": "Device attacker model; evidence is QEMU vIOMMU plus the edu device, not VT-d hardware; x86_64 VT-d only; -m 8G harness requirement; no ATS support in tree so device-TLB invalidation is out of scope. 4c1fdd1e4 is a local Nix-branch commit, not upstream."
+}
