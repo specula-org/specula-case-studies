@@ -1,0 +1,2063 @@
+--- adopted/harness/HOOKS.md
++++ current/harness/HOOKS.md
+@@ -0,0 +1,53 @@
++# Instrumentation points (copied patch, current build)
++
++Paths below are relative to `harness/build/nvflare_src/nvflare`, except the `src/nvf_env.py` edge hooks. These are locations in the instrumented copy, not pristine source citations. The section extents restrict schedules as explained in [INSTRUMENTATION.md](INSTRUMENTATION.md).
++
++| Event(s) | Location | Section extent / notes |
++|---|---|---|
++| RunnerScanList | apis/impl/job_def_manager.py:521 | around `store.list_objects` (only in `runner_scan` context, set at :515) |
++| RunnerScanRead | job_def_manager.py:528 → app_common/job_schedulers/job_scheduler.py:277 | from the first meta read (tags included) until the end of `_exceed_max_jobs` |
++| RunnerScanReadDeleted | job_def_manager.py:540-541 | `get_meta` raised for a listed object (re-raised; run() dies) |
++| RunnerTryNext | job_scheduler.py:202 (CHECK branch, tracer increments att), :365 (blocked), :383 (no CHECK), :302 (`_try_job` raised) | one per candidate |
++| RunnerBackoffSkip / RunnerTryDone | job_scheduler.py:374 / :396 | TryDone only if the candidate list was non-empty |
++| RunnerCheckCollect / RunnerCheckTimeout | private/fed/server/server_engine.py:1031 | after `_send_admin_requests`; the tracer names it Timeout if a reply is missing/`None` |
++| RunnerRefreshRead / RunnerRefreshWrite | app_common/storages/filesystem_storage.py:270 / :282 (context set at job_scheduler.py:311, :316) | the two halves of `update_meta` (gate `rmw.between` at :280) |
++| RunnerSetCantSched | job_scheduler.py:318 | around `set_status(FINISHED_CANT_SCHEDULE)` |
++| RunnerCheckSubmitted / RunnerCheckDispatched | private/fed/server/job_runner.py:778 (`_check_job_status`) | around `get_job` + compare; emitted on raise too |
++| RunnerDeployJob | job_runner.py:227 (unknown clients, `failed=[]`), :284 (deploy failure), :288 (success) | exits of `_deploy_job`; `arg.failed` mapped to c-names |
++| RunnerSetDispatched | job_runner.py:697 | around `set_status(DISPATCHED)` |
++| RunnerMetaRead / RunnerMetaWrite | filesystem_storage.py:270 / :282 (context `rmw:RunnerMeta` at job_runner.py:702) | the RMW at :674 of the pinned file |
++| RunnerStartServerApp (/Fail) | job_runner.py:301 → :317 | `get_job_clients` .. SJ launch .. pending registration; the stub SJ launcher renames it `RunnerStartServerAppFail` when it raises; an error return is closed by run()'s handler (:747) |
++| RunnerStartCollect / RunnerStartTimeout | job_runner.py:322 → :377 | after `start_client_job` returns .. JOB_STARTED; the tracer names it Timeout if a START reply is `None`; raises closed at :747 |
++| RunnerInsertRunning / RunnerSetRunning | job_runner.py:739 / :743 | around the insert under `self.lock` / around `set_status(RUNNING)` |
++| RunnerExceptStop / RunnerExceptSetFailed / RunnerExceptMeta | job_runner.py:748→755 / :756 / :759→767 | except path; ExceptMeta ends after JOB_ABORTED (or when `update_meta` raises: run() dies, closed by the thread wrapper) |
++| CmpFinalizeBegin / CmpOutcomeDeadline | job_runner.py:460 → :511; :492 (intermediate emit) | from the `run_processes` pre-check to the latch; cancelled (:488, :562, :565) when there is nothing to finalize |
++| CmpPublish / CmpRemove | job_runner.py:543 / :552 → :564 | publish `set_status`; `del running_jobs` .. events .. `remove_exception_process` (a KeyError kills the thread, closed by excepthook) |
++| AdminStopRun / AdminMarkAborted | job_runner.py:843 / :845 (`stop_run`) | absorbed when called inside `SpProcessJobFailure` |
++| AdminAbortBegin / AdminAbortWrite | private/fed/server/job_cmds.py:1070 / :1080 | Begin cancelled unless SUBMITTED/DISPATCHED/RUNNING |
++| AdminDeleteAuthorize / AdminDeleteExec | job_cmds.py:301 / :514 | only in the `admin_delete` context (set by `Env.admin_delete`) |
++| AdminDisable | server_engine.py:631 | around `disable_client` + token cleanup |
++| SpWaitForComplete | server_engine.py:220 (after pop), :238 (entry already gone) | the ≤2 s UPDATE_RUN_STATUS wait is **outside** the section |
++| SpRemoveRunProcesses | server_engine.py:407 | `terminate()` + final pop (the ≤10 s wait loop is outside) |
++| SpUpdateRunStatus / SpProcessJobFailure | private/fed/server/fed_server.py:599 / :912 (wrapper method) | whole handler |
++| SweepBegin / SweepEnd | fed_server.py:1116 (emit) / :319 (section around `logout_client`) | `logout_client` .. pending loop (SweepBegin) .. run_processes loop (SweepEnd) |
++| CpCheckResource / CpCancelResource | private/fed/client/scheduler_cmds.py:69 / :161 | whole resource-manager call |
++| CpStartAllocate (/AppMissing) | scheduler_cmds.py:123 → private/fed/client/client_engine.py:360/:370/:372 | allocate .. `start_app` status + app-dir checks; failures closed at scheduler_cmds.py:145 after the free |
++| CpStartRegister | client_executor.py:303 → :312 | STARTING registration; "still registered" raise closed at scheduler_cmds.py:145 after the free |
++| CpStartLaunch (/Fail) | client_executor.py:315 → :344 (renamed at :321) | launch .. attach (pending abort honoured) .. waiter thread start |
++| CpAbortApp | client_engine.py:397 → client_executor.py:522/:531/:545/:549/:558 (or client_engine.py:404/:408/:412) | status read .. abort recorded (.. `terminate()` / CJ ABORT fired / `_terminate_job` started), before the join |
++| CpTerminateJob | client_executor.py:601 → :606 (early return) / :620 (after `terminate()`) | per poll iteration; cancelled (:613) between polls |
++| CpChildFinished | client_executor.py:650 → :704 | reap .. rc remap .. REPORT (deferred) .. free .. pop |
++| CpTick | app_common/resource_managers/auto_clean_resource_manager.py:106 → :120 | one real tick body; no event when nothing is reserved |
++| SjFinish / SjCrash / SjHandleAbort | src/nvf_env.py `Env.sj_finish` / `sj_crash` / `sj_handle_abort` | stub SJ at the process edge |
++| CjNotifyStarted / CjNotifyStopped / CjHandleAbort | `Env.cj_notify_started` / `cj_notify_stopped` / `_cj_on_abort` | wrap the real `NotifyJobStatusProcessor` |
++| CjExit / CjGroupExit | `Env.cj_exit` / `cj_group_exit` | stub CJ leader / descendants |
++| Heartbeat | `Env.heartbeat` | CP `get_all_job_ids` + real `FederatedServer._sync_client_jobs`; the abort list is then processed by the real `Communicator._clean_up_runs` (CpAbortApp, flag=TRUE) |
++| ClientCrash | `Env.client_crash` | CP stops; its CJs exit; queued requests to it are purged |
++| LoseMsg | `Network.lose` (drop policy or `drop_held`) | identity = the dropped message |
++
++Reproduction gates (no-op unless a scenario registers them; never honoured while `T` is held):
++`runner.after_scan_list` (job_def_manager.py:525), `runner.before_check_submitted` (job_runner.py:686),
++`runner.after_deploy` (:696), `runner.before_check_dispatched` (:726), `runner.before_set_running` (:742),
++`runner.after_start_client_job` (:319), `rmw.between` (filesystem_storage.py:280),
++`wfc.after_read` (server_engine.py:208; retained source entry, before the UPDATE wait).
++
+--- adopted/harness/INSTRUMENTATION.md
++++ current/harness/INSTRUMENTATION.md
+@@ -1,248 +1,92 @@
+-# nvflare-job trace harness: instrumentation guide (for Phase 3)
++# nvflare-job instrumentation guide for Phase 3
+ 
+-Category A harness: one linear NDJSON trace per scenario, produced by the **real** product code of the pinned source
+-(`53ba7ee5`) running server parent (SP) and client parents (CP) in one Python process. Only the CellNet edge and
+-the SJ/CJ processes are stubbed. Every line has `"tag":"trace"`, a real `ts` (epoch ns, as a string), `seq`, the
+-emitting `thread`, and `event = {name, job, cl, [msg], [arg], state}` with the full post-state snapshot required by
+-`spec/Trace.tla` (`ValidatePostState` compares every field on every event).
++The continuation harness is ready: **32 freshly generated traces, 2,244 events, 64 of 65 event types, and 32 successful smoke replays**. This is finite trace compatibility under the controls below. It is not completed Phase 3 convergence or independent product confirmation. See [phase2_5-report.md](phase2_5-report.md) for results and provenance, [HOOKS.md](HOOKS.md) for every event's capture point, and [the adoption audit](../adoption/model-audit.md) for V01–V10 obligations.
+ 
+-## 1. Files
++## Run and inspect
+ 
+-| Path | Role |
+-|---|---|
+-| `patches/instrumentation.patch` | Hooks in 11 product files (81 `TLA-TRACE` markers). |
+-| `src/tla_hooks.py` | No-op hook API, copied into the build as `nvflare/fuel/utils/tla_hooks.py`. Hooks do nothing unless a tracer is installed. |
+-| `src/nvf_tracer.py` | Trace backend: trace lock `T`, section stack, deferred outbox, snapshot (state mapping), NDJSON writer, side tables. |
+-| `src/nvf_env.py` | Environment: real `FederatedServer`/`ServerEngine`/`RunManager`/`ClientManager`/`JobRunner`/`DefaultJobScheduler`/`SimpleJobDefManager`+`FilesystemStorage`/`JobCommandModule`, and real `ClientEngine`/`JobExecutor`/`ListResourceManager`/request processors. Stubs: `Network`, `StubAdminServer`, `Stub{Server,Client}Cell`, `StubFedClient`, `FakeProc` (inside the real `ProcessHandle`), stub SJ/CJ launchers, `GatedTime`. |
+-| `src/nvf_scenarios.py` | Scenarios (section 6) and helpers (`Gate`, `wait_ev`, network policies). |
+-| `src/run_scenario.py` | Runs one scenario. It refuses to run unless `nvflare` resolves to the instrumented copy. |
+-| `src/trace_inspect.py` | Compact listing of a trace, or a window around the first event TLC could not match (`--tlc-log`). |
+-| `apply.sh` / `make_patch.sh` / `clean.sh` | Build the instrumented copy / regenerate the patch from it / remove `build/`. |
+-| `run.sh` / `validate.sh` / `stress.sh` | Build and run all scenarios into `../traces/` / TLC trace validation / N parallel rounds to check flakiness. |
+-
+-The arm's source tree is **never modified**. `apply.sh` extracts `git archive 53ba7ee5 nvflare` into
+-`build/nvflare_src`, adds `tla_hooks.py`, commits that as the base of a throwaway git repo, and applies the patch as
+-working-tree changes. `build/PROVENANCE` records the patch and hook hashes.
+-
+-## 2. Rebuild and re-run
++From this `.specula-output` directory:
+ 
+ ```bash
+-cd .specula-output
+-bash harness/run.sh                                  # apply + run the 29 default scenarios -> traces/*.ndjson
+-VALIDATE=1 bash harness/run.sh                       # ... and TLC-validate each trace
++bash harness/run.sh
++VALIDATE=1 bash harness/run.sh
+ SCENARIOS="normal_two_jobs start_failures" bash harness/run.sh
+-bash harness/validate.sh traces/<name>.ndjson        # TLC: spec/Trace.tla + spec/Trace.cfg, JSON=<trace>
+-python3 harness/src/trace_inspect.py traces/<name>.ndjson --tlc-log harness/build/validation-logs/<name>.log
+-bash harness/stress.sh 3                             # 3 parallel rounds; results in harness/build/stress/
++bash harness/validate.sh traces/normal_two_jobs.ndjson
++bash harness/validate.sh traces/*.ndjson --results harness/build/replay-results.json
++source harness/paths.sh
++"$NVF_PYTHON" harness/src/trace_inspect.py traces/normal_two_jobs.ndjson --tlc-log <tlc.log>
+ ```
+ 
+-`validate.sh` runs TLC directly with `-metadir harness/build/tlc-meta`. The MCP validator's
+-`/tmp/tlc_validation` path is a dangling symlink into another user's home on this host and is not writable. Each run
+-uses 1 worker and `-Xmx4g`. Uses the Python env from `PATH`; `run.sh` sets `PYTHONPATH=build/nvflare_src:src`.
++`paths.sh` selects this continuation's source, framework and prepared Python runtime. `apply.sh` checks source HEAD is `53ba7ee567468ea7971dad4faccef13c6cb35dc2`, archives its `nvflare/` package into `harness/build/nvflare_src`, copies the hook module, applies the supplied patch and compiles the affected modules. The product checkout is untouched. `run_scenario.py` rejects imports outside that build. To relocate, override `NVF_SOURCE`, `NVF_PYTHON` and `SPECULA_ROOT` with paths to the same pins/runtime; a different source HEAD is rejected.
+ 
+-**Editing hooks:** edit `harness/build/nvflare_src/...`, then run `bash harness/make_patch.sh` **before** the next
+-`run.sh`/`apply.sh`. `apply.sh` wipes and rebuilds `build/nvflare_src`, so unsaved edits there are lost.
++Each scenario has a 180-second shell timeout. Its report, stdout, stderr, exit code and integrity result go to `build/reports/`. `run.sh` exits nonzero for scenario, integrity or requested replay failure. A timeout requires diagnosis; it is not automatically a product deadlock.
+ 
+-## 3. Section model (how an event is emitted)
++`validate.sh` calls the pinned Specula durable TLC task API (the same resource wrapper used by the TLC service), never bare Java. Runs are sequential, each with 2 GiB heap, 1 GiB offheap, one worker and a five-minute limit, under aggregate 64 GiB/16-worker limits. The JSON trace, spec hashes, task ID, final exit status, log paths and TLC statistics are retained. PASS requires both exit code 0 and TLC's success result. Scratch spec copies and trace-explorer outputs stay in `build/replay/`; durable logs are in `../.tlc-tasks/`. A time-limited run without completion is not PASS.
+ 
+-- `with _tla.section("Name", job=..., cl=...)` and `_tla.begin("Name")` .. `_tla.end("Name")` delimit one traced
+-  atomic step. The outermost section of a thread takes the process-wide trace lock `T` **before** the traced state
+-  change. At its end it writes one line with the post-state snapshot and releases `T`. The NDJSON order is therefore
+-  a linearization, and no snapshot can observe a half-done step.
+-- Nested sections are absorbed. For example, `stop_run` inside `SpProcessJobFailure` emits no `AdminStopRun`.
+-  `end(name)` and `cancel(name)` act only if `name` is the innermost open section. `emit(name)` writes an intermediate
+-  event inside the open section (`CmpOutcomeDeadline`, `SweepBegin`). `event(name)` is a one-shot section.
+-- A step that raises is closed by the handler that catches it: `_tla.end_open()` in `JobRunner.run`'s `except` block
+-  and in `StartJobProcessor`'s `except` block. A thread that dies with an open section is closed by
+-  `threading.excepthook`, or by the harness thread wrapper for the runner. The event then carries an `"error"` field.
+-- **Deadlock rules:** `T` is always taken before product locks, and the snapshot takes no product locks. `T` is never
+-  held while waiting for an RPC reply. Stub sends made inside a section are queued in the thread's outbox and
+-  delivered after the event line is written; the sender sees an injected timeout. This is used only where the product
+-  ignores the reply: ABORT fan-out from `_stop_run`/completion, the SJ ABORT command, REPORT, UPDATE_RUN_STATUS, and
+-  the CJ ABORT. A watchdog aborts the process (exit 3, stack dump) if `T` cannot be obtained within 120 s.
+-- **Hook arguments** are only locals or objects (`engine=self`, `executor=self`, `msg=req`, `replies=replies`), never
+-  derived attributes. The tracer resolves client names and Collect/Timeout names only when tracing is on, so with
+-  tracing off a hook cannot raise. Product unit tests give identical outcomes on the pristine and instrumented code
+-  (`evidence/unit_test_equivalence.txt`).
+-- `when="ctx"` makes a section conditional on a harness context. `runner_scan` is set by
+-  `get_jobs_to_schedule`, `rmw:<Prefix>` around the two status-reverting read-modify-writes, and `admin_delete` by the
+-  harness around delete commands. `@rmw.read` / `@rmw.write` resolve to `<Prefix>Read` / `<Prefix>Write`.
++`stress.sh N` is an optional schedule-variation runner (up to four scenario processes, serial TLC); it was adapted and syntax checked but **not rerun in this phase**. Historical stress logs are not fresh results. `clean.sh` removes `build/`. Fresh delivered traces/reports and runtime versions are also frozen outside it in [evidence/continuation/fresh-suite](evidence/continuation/fresh-suite).
+ 
+-## 4. Instrumentation points (file:line in `harness/build/nvflare_src` after `apply.sh`)
++## What executes
+ 
+-| Event(s) | Location | Section extent / notes |
++This is a Category A message-passing harness. Actual pinned server/client lifecycle code runs in one Python process: `FederatedServer`, `ServerEngine`, `RunManager`, `ClientManager`, `JobRunner`, `DefaultJobScheduler`, `SimpleJobDefManager`, `FilesystemStorage`, `JobCommandModule`, `ClientEngine`, `JobExecutor`, `ListResourceManager` and the request/status processors. The real `ProcessHandle` wraps `FakeProc`.
++
++`nvf_env.py` supplies CellNet/admin transport, launcher, SJ/CJ process and authenticated-session setup substitutes. It creates the relevant real objects and temporary workspaces; it does not run a full local deployment, worker bootstrap or actual OS process groups. `FakeSJ` omits `HANDLE_DEAD_JOB` effects. Heartbeat calls the real sync/cleanup methods directly, bypassing transport/authentication and delayed snapshot delivery. The list-unit resource manager is supported, but does not exercise the default GPU memory accounting or device binding. These boundaries are material for confirmation.
++
++## Files and instrumentation changes
++
++| File | Purpose |
++|---|---|
++| `patches/instrumentation.patch` | Unchanged supplied patch: 11 product files, 82 trace markers. Applied only in the build. |
++| `src/tla_hooks.py` | Hook API, inactive until a tracer is installed. Object arguments avoid attribute reads when disabled. |
++| `src/nvf_tracer.py` | Event sections, ordering lock, post-state projection, token mapping and frozen NDJSON writer. |
++| `src/nvf_env.py`, `src/nvf_scenarios.py` | Real-object wiring, explicit process/network substitutes, timing gates, 30 supplied plus two deadline scenarios. |
++| `src/resource_observer.py` | Separately records actual allocation/free calls and compares their outstanding units to event-driven ownership projections. |
++| `src/run_scenario.py` | Import guard, execution, expected-error assertions, admission stop/network drain, report/hash and process exit. |
++| `src/trace_contract.py`, `src/validate_traces.py` | Strict trace/report input guard and budgeted TLC replay. |
++| `src/check_scenario_evidence.py`, `src/negative_controls.py` | Seed-mechanism/control assertions and labeled corruptions of a fresh trace. |
++| `src/run_unit_controls.py`, `src/pytest_import_control.py` | Scoped existing unit tests on pristine, patched-disabled and patched-no-op code with import-origin checks. |
++| `src/audit_phase2_5.py` | Read-only verification of frozen evidence, original hashes, coverage and syntax; writes the audit result. |
++
++To edit a hook, edit the isolated build file and run `bash harness/make_patch.sh` **before** rebuilding. `apply.sh` replaces the build. Add an event by following a nearby `_tla.section` or `_tla.begin`/`_tla.end` pair, passing local variables/objects. Resolve attributes in `Tracer._normalize`, not in product hook arguments. A new action also requires a corresponding Trace wrapper and inclusion in `TraceNext` during the validation/repair phase.
++
++Add a captured field in `Tracer.snapshot()`, update `trace_contract.py`, and add the actual comparison to the appropriate Trace validator. Document its source and absence behavior. Move a capture point by moving the section boundary; check source locks and observable intervening operations before treating the region as atomic. Every event wrapper currently reaches `ValidatePostState` and advances the trace cursor; there are no silent base-action wrappers. This says nothing about implementation operations omitted by the model.
++
++## Scheduling controls and fault injection
++
++The tracer's process-wide lock `T` is acquired before a traced section's mutations and held until its post-state event is written. Snapshots take no additional product locks. Nested sections are absorbed, and explicit `emit` calls can publish intermediate events. Exception handlers close open sections; unexpected thread death fails a scenario report. This imposes atomic regions beyond the source's synchronization. No-op unit tests do not demonstrate transparency with `T` active.
++
++Requests sent while `T` is held are queued until release; the sender sees an injected timeout where applicable. REPORT and SJ ABORT therefore have selected deferred schedules with immediate stub TIMEOUT results. The real synchronous waits (up to five seconds for REPORT, one for SJ ABORT) and report-before-free windows are not represented faithfully by these steps. Audit records expose the requested timeout, result and deferral, rather than hiding them.
++
++CHECK/START admin requests now honor the actual caller's deadline (15/20 seconds); late replies are discarded. `delay:N` delays handler admission without holding `T`, so the two new scenarios actually wait out those deadlines. Explicit `hold` and `drop` policies still inject an immediate timeout; `drop` emits `LoseMsg`, `fail` supplies a DEPLOY error reply. Policy, elapsed wait, reply retention and dispatch are in `network_observation` in each report. The delay is a timing control in the stub transport, not an actual congested network.
++
++Other controls: gates pause at the locations listed in [HOOKS.md](HOOKS.md); gates are ignored inside `T` to avoid a harness deadlock. `GatedTime` makes the real reservation expiry thread take one tick per `Env.tick`. Outcome grace is configured explicitly. A CP crash freezes its waiter and forcibly exits fake children/descendants; it **assumes** cleanup and does not establish parent-death liveness. Cooperative `stop_only` children acknowledge STOPPED but exit slowly, permitting overlapping termination threads. Seeded random scenarios are timing dependent.
++
++At the end, the runner stop flag prevents new admissions, active network handlers are drained, and the writer is closed under `T` before hashing. Sleeping product threads/fake crash waiters end at `os._exit`. Reports identify this as a finite prefix after scenario assertions, not whole-system shutdown. Two deletion scenarios require an exact expected runner exception and a still-SUBMITTED later job; all other runner/thread failures are rejected.
++
++## State validation coverage (L2)
++
++All emitted event-state fields are mapped by `ValidateServer`/`ValidateClients`, subject to the presence conditions below. These validators contain real equations, not `TRUE`. Timestamp/thread/error metadata are diagnostics, not model state. The config line is separate from event lines; all subsequent rows must have `tag=trace`.
++
++| Captured state | Implementation observation | Trace comparison and limits |
+ |---|---|---|
+-| RunnerScanList | apis/impl/job_def_manager.py:521 | around `store.list_objects` (only in `runner_scan` context, set at :515) |
+-| RunnerScanRead | job_def_manager.py:528 → app_common/job_schedulers/job_scheduler.py:277 | from the first meta read (tags included) until the end of `_exceed_max_jobs` |
+-| RunnerScanReadDeleted | job_def_manager.py:540-541 | `get_meta` raised for a listed object (re-raised; run() dies) |
+-| RunnerTryNext | job_scheduler.py:202 (CHECK branch, tracer increments att), :365 (blocked), :383 (no CHECK), :302 (`_try_job` raised) | one per candidate |
+-| RunnerBackoffSkip / RunnerTryDone | job_scheduler.py:374 / :396 | TryDone only if the candidate list was non-empty |
+-| RunnerCheckCollect / RunnerCheckTimeout | private/fed/server/server_engine.py:1031 | after `_send_admin_requests`; the tracer names it Timeout if a reply is missing/`None` |
+-| RunnerRefreshRead / RunnerRefreshWrite | app_common/storages/filesystem_storage.py:270 / :282 (context set at job_scheduler.py:311, :316) | the two halves of `update_meta` (gate `rmw.between` at :280) |
+-| RunnerSetCantSched | job_scheduler.py:318 | around `set_status(FINISHED_CANT_SCHEDULE)` |
+-| RunnerCheckSubmitted / RunnerCheckDispatched | private/fed/server/job_runner.py:778 (`_check_job_status`) | around `get_job` + compare; emitted on raise too |
+-| RunnerDeployJob | job_runner.py:227 (unknown clients, `failed=[]`), :284 (deploy failure), :288 (success) | exits of `_deploy_job`; `arg.failed` mapped to c-names |
+-| RunnerSetDispatched | job_runner.py:697 | around `set_status(DISPATCHED)` |
+-| RunnerMetaRead / RunnerMetaWrite | filesystem_storage.py:270 / :282 (context `rmw:RunnerMeta` at job_runner.py:702) | the RMW at :674 of the pinned file |
+-| RunnerStartServerApp (/Fail) | job_runner.py:301 → :317 | `get_job_clients` .. SJ launch .. pending registration; the stub SJ launcher renames it `RunnerStartServerAppFail` when it raises; an error return is closed by run()'s handler (:747) |
+-| RunnerStartCollect / RunnerStartTimeout | job_runner.py:322 → :377 | after `start_client_job` returns .. JOB_STARTED; the tracer names it Timeout if a START reply is `None`; raises closed at :747 |
+-| RunnerInsertRunning / RunnerSetRunning | job_runner.py:739 / :743 | around the insert under `self.lock` / around `set_status(RUNNING)` |
+-| RunnerExceptStop / RunnerExceptSetFailed / RunnerExceptMeta | job_runner.py:748→755 / :756 / :759→767 | except path; ExceptMeta ends after JOB_ABORTED (or when `update_meta` raises: run() dies, closed by the thread wrapper) |
+-| CmpFinalizeBegin / CmpOutcomeDeadline | job_runner.py:460 → :511; :492 (intermediate emit) | from the `run_processes` pre-check to the latch; cancelled (:488, :562, :565) when there is nothing to finalize |
+-| CmpPublish / CmpRemove | job_runner.py:543 / :552 → :564 | publish `set_status`; `del running_jobs` .. events .. `remove_exception_process` (a KeyError kills the thread, closed by excepthook) |
+-| AdminStopRun / AdminMarkAborted | job_runner.py:843 / :845 (`stop_run`) | absorbed when called inside `SpProcessJobFailure` |
+-| AdminAbortBegin / AdminAbortWrite | private/fed/server/job_cmds.py:1070 / :1080 | Begin cancelled unless SUBMITTED/DISPATCHED/RUNNING |
+-| AdminDeleteAuthorize / AdminDeleteExec | job_cmds.py:301 / :514 | only in the `admin_delete` context (set by `Env.admin_delete`) |
+-| AdminDisable | server_engine.py:630 | around `disable_client` + token cleanup |
+-| SpWaitForComplete | server_engine.py:219 (after pop), :237 (entry already gone) | the ≤2 s UPDATE_RUN_STATUS wait is **outside** the section |
+-| SpRemoveRunProcesses | server_engine.py:406 | `terminate()` + final pop (the ≤10 s wait loop is outside) |
+-| SpUpdateRunStatus / SpProcessJobFailure | private/fed/server/fed_server.py:599 / :912 (wrapper method) | whole handler |
+-| SweepBegin / SweepEnd | fed_server.py:1116 (emit) / :319 (section around `logout_client`) | `logout_client` .. pending loop (SweepBegin) .. run_processes loop (SweepEnd) |
+-| CpCheckResource / CpCancelResource | private/fed/client/scheduler_cmds.py:69 / :161 | whole resource-manager call |
+-| CpStartAllocate (/AppMissing) | scheduler_cmds.py:123 → private/fed/client/client_engine.py:360/:370/:372 | allocate .. `start_app` status + app-dir checks; failures closed at scheduler_cmds.py:145 after the free |
+-| CpStartRegister | client_executor.py:303 → :312 | STARTING registration; "still registered" raise closed at scheduler_cmds.py:145 after the free |
+-| CpStartLaunch (/Fail) | client_executor.py:315 → :344 (renamed at :321) | launch .. attach (pending abort honoured) .. waiter thread start |
+-| CpAbortApp | client_engine.py:397 → client_executor.py:522/:531/:545/:549/:558 (or client_engine.py:404/:408/:412) | status read .. abort recorded (.. `terminate()` / CJ ABORT fired / `_terminate_job` started), before the join |
+-| CpTerminateJob | client_executor.py:601 → :606 (early return) / :620 (after `terminate()`) | per poll iteration; cancelled (:613) between polls |
+-| CpChildFinished | client_executor.py:650 → :704 | reap .. rc remap .. REPORT (deferred) .. free .. pop |
+-| CpTick | app_common/resource_managers/auto_clean_resource_manager.py:106 → :120 | one real tick body; no event when nothing is reserved |
+-| SjFinish / SjCrash / SjHandleAbort | src/nvf_env.py `Env.sj_finish` / `sj_crash` / `sj_handle_abort` | stub SJ at the process edge |
+-| CjNotifyStarted / CjNotifyStopped / CjHandleAbort | `Env.cj_notify_started` / `cj_notify_stopped` / `_cj_on_abort` | wrap the real `NotifyJobStatusProcessor` |
+-| CjExit / CjGroupExit | `Env.cj_exit` / `cj_group_exit` | stub CJ leader / descendants |
+-| Heartbeat | `Env.heartbeat` | CP `get_all_job_ids` + real `FederatedServer._sync_client_jobs`; the abort list is then processed by the real `Communicator._clean_up_runs` (CpAbortApp, flag=TRUE) |
+-| ClientCrash | `Env.client_crash` | CP stops; its CJs exit; queued requests to it are purged |
+-| LoseMsg | `Network.lose` (drop policy or `drop_held`) | identity = the dropped message |
++| `tagged`, `scheduled_jobs`, `running_jobs`, `sessions` | Tag/store cache, scheduler slots, runner map, session membership | Sets compared on every event. Deleted tags retain a ghost value; session generations are absent. |
++| job `status`, `schedule_count` | Stored job metadata; cached counter after deletion | Compared to `status`/`pCount`; `DELETED` denotes absence. Cached values are not reads from a deleted object. |
++| job `run_aborted` | Current or cached `Job` object | Compared to `runAborted`; sticky after removal, contrary to the old mapping's “else false” prose. |
++| job `pending`, `latched` | Runner pending set and finalizer latch | `PendingMatches`, `latched` equation. Absent-record empty members are schema padding. |
++| job `run_process`, `exception_process` | Actual engine records | `RecMatches`: presence, then finished/error/rc/participants. Absent-record false/zero/empty values are padding, not observations. |
++| job `sj`, client job `cj` | Fake leader/process state | Compared to `sj`/`cjProc`; not an OS/group observation. |
++| client `alive`, `free`, `reserved` | Harness CP liveness; real list pool/reservation table | `cpAlive`, multiplicity-preserving `BagOf`, `ResvOf` (token→attempt/job mapping). Reservation units are sets, with uniqueness required by the input guard. |
++| client job `registration` | Real executor registration | `RegMatches`: presence, then status/attached/abort intent. Absent-record values are padding. |
++| client job `starting`, `allocated` | Tracer event-driven side tables | `StartingMatches`/`alloc` equation. Independently cross-checked against actual successful allocate/free calls at each live-client snapshot, sharing token identity mapping. This checks the projection, not all resource contracts. |
+ 
+-Reproduction gates (no-op unless a scenario registers them; never honoured while `T` is held):
+-`runner.after_scan_list` (job_def_manager.py:525), `runner.before_check_submitted` (job_runner.py:686),
+-`runner.after_deploy` (:696), `runner.before_check_dispatched` (:726), `runner.before_set_running` (:742),
+-`runner.after_start_client_job` (:319), `rmw.between` (filesystem_storage.py:280).
++For a dead CP only `alive=false` is emitted, because Trace intentionally stops checking that client's local state. Its old frozen pool/registration fields were removed and the affected scenario rerun. No live allocation claim is made for dead clients. The observer's 79 allocate calls include one expected expired-token error; 78 succeed, and 77 frees return. The remaining call belongs to the intentionally frozen dead CP, whose cleanup is not measured.
+ 
+-## 5. State mapping, observation decisions and reproduction controls
++Hidden/model-inferred state includes the full message multiset, termination counters, waiter retained references, service-thread PCs, client registry generations and OS descendant use. Those require source audit and separate scenarios/reproduction; 64 event names do not establish all branch/interleaving coverage.
+ 
+-The snapshot is built by `Tracer.snapshot()` in `nvf_tracer.py`. Mapping follows instrumentation-spec 1.2.
+-Observation decisions that refine the spec's text are listed here; they are observation fixes, not model or property
+-changes:
++Before replay, `trace_contract.py` checks one initial config, every retained row, contiguous sequence, recognized names, domains, required fields, real ordered timestamps, successful report/exit, exact frozen hash/event counts and drained network. It rejects malformed/filtered records and post-collection truncation. It cannot prove the tracer observed every implementation change. A valid truncated prefix passes raw TLC when the report check is deliberately bypassed; preserve this limitation.
+ 
+-- **`jobs[j].run_aborted`** is the flag of the Job object that the server most recently held in `running_jobs`, and
+-  it stays sticky after `CmpRemove`. The instrumentation spec's "else false" clause would contradict `base.tla`, where
+-  `CmpRemove` leaves `runAborted` unchanged.
+-- **Deleted jobs:** `schedule_count` and `tagged` keep their last observed values after the object is deleted. The
+-  implementation's tag file disappears with the directory, while `AdminDeleteExec` changes only `status`. If Phase 3
+-  prefers the literal tag-file view, change `snapshot()`: every trace that deletes a tagged job, such as
+-  `abort_running_and_queued`, will then fail at `AdminDeleteExec` until `base.tla` untags on delete.
+-- **`starting` / `allocated`** are harness side tables keyed by (client, job), as the instrumentation spec defines.
+-  `starting` is set at `CpStartAllocate` with the allocated units, unless the "already started" branch leaked them.
+-  It moves to `allocated` at `CpStartLaunch`. `CpStartLaunchFail` and `CpStartRegister`-failure clear it after the
+-  free. `CpChildFinished` clears `allocated`.
+-- **Tokens → att:** the tracer counts `RunnerTryNext(check=True)`, the stub attaches that att to the CHECK requests
+-  it sends, and `CpCheckResource` records `token → (att, job)` for reserved tokens. CANCEL and START identities, and
+-  `reserved[].att/job`, use that table.
+-- **`RunnerStartServerApp` on an error return** ("already started"): the event is emitted and then `RunnerExceptStop`.
+-  This follows `base.tla`, whose action has an `rp ≠ None` branch leading to ExceptStop. The instrumentation spec's
+-  "emit RunnerExceptStop next instead" is ambiguous.
+-- **`CpTick`** is not emitted for a tick that runs while nothing is reserved; that tick changes nothing, and the
+-  spec action requires reservations.
+-- **Unresponsive CJ** (`on_abort="ignore"`): no `CjHandleAbort` event. The `stop_only` behaviour (handles the abort,
+-  slow to exit) is the cooperative variant used in the default scenarios.
++## Current scenarios and next phase
+ 
+-Reproduction controls (timing and edge only, behavior-preserving):
+-- Network policies: deliver, hold (sender times out and the message may be processed later with its reply
+-  discarded), drop (`LoseMsg`), or fail (DEPLOY error reply). A dead CP never processes requests.
+-- Deferred delivery with injected timeout for sends made inside a traced step (section 3).
+-- `GatedTime` replaces `auto_clean_resource_manager.time`, so the real expiry thread runs exactly one real tick per
+-  `Env.tick`.
+-- `client_outcome_wait_timeout` is set via `ConfigService` `var_dict`; `heart_beat_timeout` is large, and the harness
+-  calls the real `remove_dead_clients` after back-dating the crashed client.
+-- The tla_hooks gates listed in section 4. `FakeProc` models `ProcessAdapter`: `poll`/`wait`/`killpg`, with no kill
+-  after reap. The real `ProcessHandle` maps return codes. The stub CJ exits 0 only when STARTED/STOPPED and writes
+-  the rc-102 file only while STARTING (cooperative CJ).
++The 30 supplied defaults (including `wfc_stale_read_after_pop`) and the new `check_deadline_backoff_expiry`/`start_deadline_late_start` all generated successfully and replayed successfully against the adopted, unchanged spec. Per-scenario counts, hashes, errors/controls and TLC logs are linked in [final-audit.json](evidence/continuation/final-audit.json). The only uncovered event is `CpStartAllocateAppMissing`: its opt-in scenario is outside the ordinary `EnableUnsupported=FALSE` envelope and was not rerun or counted as a supported defect.
+ 
+-## 6. Scenarios and current validation status (spec/Trace.cfg as delivered)
++The old guide's 29-scenario/26-PASS/3-FAIL result predates supplied model repairs (message bags, termination counters and waiter handling). It is historical, not a fresh failure or proof that those repairs are faithful. The guide and old build are preserved under `history/pre-continuation-phase2_5/`.
+ 
+-All 29 default scenarios run to completion (`run.sh` exit 0). With `VALIDATE=1`, 26 traces pass and 3 fail on the
+-two discrepancies in section 7. The result was stable in 3 parallel stress rounds. 64 of 65 `Trace.tla` event types
+-appear; `CpStartAllocateAppMissing` appears only in the opt-in `unsupported_app_missing`, which passes when
+-`EnableUnsupported = TRUE`.
+-
+-| Scenario | Exercises | TLC |
+-|---|---|---|
+-| normal_two_jobs | full lifecycle ×2, heartbeats, CjGroupExit | PASS |
+-| abort_running_and_queued | queued abort (store-only), running abort (stop_run, SJ abort, abort cleanup, 10 s kill), delete refused/done | PASS |
+-| check_timeout_backoff_expiry | held CHECK → timeout → cancel → refresh RMW; late CHECK reserves; expiry ticks; back-off; retry runs | PASS |
+-| lossy_check_cant_schedule | LoseMsg CHECK ×2 → CANT_SCHEDULE; later job still admitted | PASS |
+-| start_failures | SJ launch fail; CJ launch fail (ERROR reply fails whole job); deploy fail on required site; orphan reservations expire | PASS |
+-| client_failure_and_sj_crash | CJ rc 1 → EXCEPTION report → fail_run; SJ crash → EXECUTION_EXCEPTION | PASS |
+-| client_crash_sweep | CP crash, dead-client sweep (SweepBegin/End), completion from remaining outcome | PASS |
+-| outcome_deadline_hb_cleanup | CmpOutcomeDeadline; heartbeat cleanup aborts the orphan CJ | PASS |
+-| disable_client_outcome_wait | AdminDisable; rejected report; finalize by deadline (F12 shape) | PASS |
+-| delete_held_job_kills_runner | seed F2 (delete before SUBMITTED re-check → runner dies) | PASS |
+-| delete_during_scan | RunnerScanReadDeleted → runner dies | PASS |
+-| abort_during_deploy | seed F1 (acked abort overwritten by DISPATCHED; job runs) | PASS |
+-| failrun_during_start | seed F5 (KeyError after fail_run → FAILED_TO_RUN), ordered so no duplicate ABORT is in flight | PASS |
+-| failrun_during_start_dup_abort | F5 with overlapping stop paths: two identical ABORTs to c2 and to the SJ | **FAIL** (7.1) |
+-| refresh_rmw_revert | seed F16 (refresh RMW reverts an acked abort to SUBMITTED; job runs) | PASS |
+-| running_after_terminal | seed F3 (RUNNING written after terminal publication) | PASS |
+-| start_timeout_late_start | held START → RunnerStartTimeout; late START launches an orphan CJ; heartbeat cleanup | PASS |
+-| concurrent_jobs_contention | max_jobs=2, 1 unit/client: concurrent jobs, NO_RESOURCE retries, partial dispatch | PASS |
+-| expiry_before_start | reservation expires during deploy → allocate error → FAILED_TO_RUN | PASS |
+-| disable_between_schedule_and_deploy | "unknown clients" at deploy fails a job min_sites could run (F15 shape); later job runs | PASS |
+-| abort_before_checks | abort before SUBMITTED / DISPATCHED re-checks (skip paths; F6 orphan reservations) | PASS |
+-| lost_report_heartbeat | lost REPORT → heartbeat → fail_run(INFRA) → FINISHED:ABNORMAL | PASS |
+-| double_abort_terminate | admin abort + heartbeat-cleanup abort of a slow-exiting CJ → two `_terminate_job` threads | **FAIL** (7.2) |
+-| random_mix_s1 … s6 | seeded mix of aborts, deletes, SJ/CJ failures, holds/drops, heartbeats, ticks, max_jobs=2 (timing-dependent) | s2–s6 PASS; s1 **FAIL** (7.2) |
+-| unsupported_app_missing (opt-in) | seed F9 trigger (outside the supported envelope) | FAIL by design; PASS with EnableUnsupported=TRUE |
+-
+-Random scenarios are timing-dependent. In two sweeps of seeds 7–40, 30 and then 31 of 34 passed. Every failure
+-(s8, s29, s30, s31, s40, depending on the run) stopped at a second `CpTerminateJob`, which is 7.2. No other failure
+-class appeared after the harness fixes in section 8.
+-
+-## 7. Trace-validation discrepancies found (spec/model side; harness verified)
+-
+-1. **Duplicate identical messages.** `msgs` is a set in `base.tla`. The implementation can have two identical
+-   requests in flight: here `fail_run`'s `_stop_run` and the runner's exception-path `_stop_run` each send
+-   `ABORT(j1)` to c2 and to the SJ, and both copies are delivered and processed (`CpAbortApp` twice, `SjHandleAbort`
+-   twice). In the spec the copies merge, so the second consumption (the second `CpAbortApp(c2)` in
+-   `failrun_during_start_dup_abort`, #28 or #29 depending on the interleaving) has no message. A candidate model fix
+-   is a message bag, or treating duplicate requests explicitly.
+-2. **Several pending `_terminate_job` threads per (client, job).** `termP[c][j]` is a boolean, but every
+-   `CpAbortApp` on a STARTED/STOPPED registration starts a new `_terminate_job` thread. For example, an admin abort
+-   and then a heartbeat-cleanup abort while the CJ is still stopping. Each thread ends with its own `CpTerminateJob`,
+-   and the second one (`double_abort_terminate` #68, `random_mix_s1` #96) finds `termP = FALSE`. A candidate fix is
+-   a counter.
+-3. **Not observed yet, but worth checking.**
+-   - `SpWaitForComplete`: the `run_processes` entry is read before the ≤2 s wait. If `_remove_run_processes` pops it
+-     during the wait, the code still records a non-zero rc from the stale dict, while `base.tla` leaves `exc`
+-     unchanged when `rp = None`.
+-   - The completion loop calls `remove_exception_process` even when the job vanished from `running_jobs` between the
+-     key snapshot and `get`. That is an untraced `exc` change with no spec action.
+-   - `SweepEnd`'s Dead branch needs a concurrent `run_processes` change **during** the loop, which cannot happen
+-     while the sweep holds `T`.
+-
+-## 8. Harness fixes made while validating (harness side only; no product, model or property change)
+-
+-- **CJ "ignore" behaviour.** It emitted `CjHandleAbort` without writing STOPPED. An unresponsive CJ now emits no
+-  event. The default scenarios use the cooperative `stop_only` variant: the CJ handles the abort but is slow to exit.
+-- **Network hold queue.** `release`/`drop_held` evaluated the (randomized) selection predicate twice per message, so
+-  one held CHECK was both reported lost and later delivered (seen in `random_mix_s6`). It is now a single-pass
+-  partition; seed 6 and seeds 7–40 no longer show that failure class.
+-- **Scenario ordering.** `failrun_during_start` now waits for fail_run's stop to settle before releasing the runner.
+-  The overlapping variant is kept separately as `failrun_during_start_dup_abort`, the reproducer for 7.1.
+-- **Random drain.** The randomized drain now also waits for queued jobs, so random traces end with every job terminal.
+-- **Hook arguments.** An earlier patch revision passed `cl=self.client_name` / `cl=client.client_name` and computed
+-  Collect/Timeout names in product code. With tracing off, 7 product unit tests failed because their fakes lack these
+-  attributes, so the patch was not behavior-preserving. Hooks now pass only objects, and names are resolved in
+-  `Tracer._normalize`. The unit-test outcomes are now identical, and all traces were regenerated with the fixed patch.
+-- **Benign gate.** The `rmw.between` gate reached inside other traced steps is ignored silently. `validate.sh` writes
+-  TLC's trace-explorer specs to `build/tlc-ttrace/`, not `spec/`. Earlier runs had left `Trace_TTrace_*` files in
+-  `spec/`; they were moved to `build/tlc-ttrace/dev-runs/`.
+-
+-## 9. Evidence kept outside `build/`
+-
+-`harness/evidence/`:
+-- `run_final.log`: the official `VALIDATE=1 run.sh` output for the delivered traces.
+-- `validation/<trace>.tlc.log` and `<trace>.stuck-window.txt`: TLC counterexamples for the three failing official
+-  traces, with the event window around the first unmatched event.
+-- `stress_default_3rounds.txt`: 3 parallel rounds of the default set.
+-- `stress_random_seeds_7_40.validate.txt`: one round of seeds 7–40.
+-- `unit_test_equivalence.txt`: product unit tests (1703 outcomes) on the pristine vs instrumented code, tracing off.
++All [V01–V10](../adoption/model-audit.md) obligations remain for normal validation/repair: scan/store; partial deployment/I/O; startup/fanout; outcome/abort/latch/report/free; same-job admin concurrency; sessions/sweeper/heartbeat; wait/reap/groups; configured resource accounting; allocation/spawn ownership; parent-death/notification liveness. In particular the global sweep section still blocks the live-map mutation race, and the forced CP cleanup still excludes F11/CL-4/CL-6. Fresh replay does not discharge these gaps, residual/hunt exclusions, named MC seed fidelity, MC-U1 classification or the confirmation queue in [findings-reconciliation.md](../adoption/findings-reconciliation.md).
+--- adopted/harness/apply.sh
++++ current/harness/apply.sh
+@@ -10,14 +10,16 @@
+ set -euo pipefail
+ 
+ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+-SRC="${NVF_SOURCE:-/home/experiment/runs/specula/nvflare-lite-full-opus55-20260925/full/source}"
+-COMMIT="${NVF_COMMIT:-53ba7ee567468ea7971dad4faccef13c6cb35dc2}"
++source "$SCRIPT_DIR/paths.sh"
++SRC="$NVF_SOURCE"
++COMMIT=53ba7ee567468ea7971dad4faccef13c6cb35dc2
+ BUILD="$SCRIPT_DIR/build/nvflare_src"
+ PATCH="$SCRIPT_DIR/patches/instrumentation.patch"
+ 
+ head_commit="$(git -C "$SRC" rev-parse HEAD)"
+ if [ "$head_commit" != "$COMMIT" ]; then
+-    echo "WARNING: source HEAD is $head_commit, building from the pinned commit $COMMIT" >&2
++    echo "Source HEAD $head_commit is not the authorized pin $COMMIT" >&2
++    exit 1
+ fi
+ 
+ rm -rf "$BUILD"
+@@ -40,6 +42,6 @@
+ } > "$SCRIPT_DIR/build/PROVENANCE"
+ 
+ # every instrumented module must still compile
+-python3 -m compileall -q "$BUILD/nvflare/fuel/utils/tla_hooks.py" \
++timeout 120 "$NVF_PYTHON" -m compileall -q "$BUILD/nvflare/fuel/utils/tla_hooks.py" \
+     $(git -C "$BUILD" diff --name-only | sed "s|^|$BUILD/|") > /dev/null
+ echo "instrumented copy ready: $BUILD ($(git -C "$BUILD" diff --stat | tail -1))"
+--- adopted/harness/paths.sh
++++ current/harness/paths.sh
+@@ -0,0 +1,9 @@
++#!/bin/bash
++# Pinned continuation paths; callers may relocate the same pinned source/runtime.
++NVF_CONTINUATION_ROOT="${NVF_CONTINUATION_ROOT:-/home/ubuntu/specula-nvflare-gpt-continuation-20260926}"
++export NVF_SOURCE="${NVF_SOURCE:-$NVF_CONTINUATION_ROOT/source}"
++export NVF_PYTHON="${NVF_PYTHON:-$NVF_CONTINUATION_ROOT/nvflare-venv/bin/python}"
++export SPECULA_ROOT="${SPECULA_ROOT:-$NVF_CONTINUATION_ROOT/framework}"
++export PYTHONDONTWRITEBYTECODE=1
++export SPECULA_TLC_MEMORY_LIMIT=64G
++export SPECULA_TLC_WORKER_LIMIT=16
+--- adopted/harness/phase2_5-report.md
++++ current/harness/phase2_5-report.md
+@@ -0,0 +1,98 @@
++# BYOM Phase 2.5 continuation report: nvflare-job
++
++Phase 2.5 is complete. The adapted supplied harness generates fresh implementation traces at the authorized source pin. **All 30 supplied default scenarios and two added deadline scenarios succeeded; all 32 fresh traces passed the input/report guard and a basic TLC replay.** The ordinary outputs are [run.sh](run.sh), [the instrumentation guide](INSTRUMENTATION.md), [the hook map](HOOKS.md), [instrumentation.patch](patches/instrumentation.patch), the supporting `src/` files and [32 active traces](../traces).
++
++This result is finite compatibility with the adopted model under the documented harness controls. It does not accept the prior model as fully faithful, discharge the adoption audit, establish unbounded correctness, or independently confirm product defects. The next launcher-owned phase is validation/repair/convergence and hunting. Eligible candidates remain queued for the separately configured confirmation phase.
++
++## Fresh evidence
++
++| Check | Result | Evidence |
++|---|---|---|
++| Fresh scenario generation | 32/32, 2,244 event rows; successful process exits, reports, drain and integrity checks | [generation log](evidence/continuation/suite-generation.log), [frozen traces/reports](evidence/continuation/fresh-suite), [final audit](evidence/continuation/final-audit.json) |
++| Event coverage | 64/65 `Trace.tla` event types | [event counts and per-scenario manifest](evidence/continuation/final-audit.json); `CpStartAllocateAppMissing` is deliberately outside the supported default envelope |
++| Basic replay | 32/32 PASS; exit code 0 plus TLC success, no error result | [structured replay results](evidence/continuation/suite-replay.json), [replay log](evidence/continuation/suite-replay.log); each row links durable TLC task/log/statistics |
++| Resource observation consistency | 11,354 live-client/job projection comparisons, zero mismatches | Each frozen report's `resource_observation`; actual allocate/free caller, token, arguments, result/error and pool values recorded |
++| Source-derived scenario mechanisms and controls | 11/11 assertions pass | [scenario assertions](evidence/continuation/scenario-assertions.json), [checker](src/check_scenario_evidence.py) |
++| Existing targeted unit tests | 392 passed in each of pristine, patched-disabled and patched-no-op configurations, identical outcomes | [commands/results](evidence/continuation/unit-tests/results.json), three retained pytest logs with import-origin guards |
++| Negative controls against fresh `normal_two_jobs` | Four state/order corruptions fail `TraceMatched`; five malformed-record controls fail the input guard; truncated-prefix integrity check fails as intended | [negative-control results](evidence/continuation/negative-controls/results.json), corrupted copies and TLC logs kept separately |
++| Syntax/build | 14 harness Python files parse; seven shell scripts pass `bash -n`; all 11 patched product files parse and match the unchanged supplied patch/build bytes | [final audit](evidence/continuation/final-audit.json); fresh `apply.sh` also compiles patched modules |
++| Source/original preservation | Source HEAD exact, tracked worktree unchanged; only pre-existing untracked `.agents/`; 4,301 supplied asset hashes and 20 raw conversation hashes verified | [final audit](evidence/continuation/final-audit.json) |
++| Specification preservation | All 45 recorded specification/config/mapping files unchanged during this phase | [baseline hashes](evidence/continuation/spec-before.json), final audit |
++| Scoped style check | Could not complete: runtime has no `black`; no style PASS claimed | [style-check.log](evidence/continuation/style-check.log) |
++
++The final audit is rerunnable with `source harness/paths.sh` followed by `"$NVF_PYTHON" harness/src/audit_phase2_5.py`. It audits the frozen Phase 2.5 evidence against this spec revision, not a future repaired model.
++
++The resource call totals are 79 allocation calls (78 successful, one expected expired-token exception) and 77 successful frees. One successful allocation belongs to the deliberately frozen dead CP. It is excluded from live-client projection comparisons; this is not evidence that the actual parent-death cleanup contract holds. The normal passing control verifies both jobs complete and the original list-unit capacity and admission slots return.
++
++The negative controls also expose a meaningful limit: **a valid truncated prefix passes raw TLC** when the report check is intentionally bypassed. Frozen hash/count checks detect truncation after collection. Neither a hash nor TraceMatched proves that instrumentation captured every source action. The synthetic corruptions are labeled and kept outside active `traces/`.
++
++## Supplied assets reused and working-copy changes
++
++The existing patch, real-object environment, 30 default scenarios, timing gates, event mappings and trace-inspection helper were reused. The model/Trace suite was not changed. Historical working files and the old build were preserved under [history/pre-continuation-phase2_5](history/pre-continuation-phase2_5); original supplied files remain untouched.
++
++| Change | Reason / semantic classification |
++|---|---|
++| Pin/path/import guards and fresh isolated build | Replace inaccessible historical paths; ensure traces execute the authorized source and prepared Python 3.12.3 runtime. |
++| Failure propagation and budgeted replay driver | Remove ignored validation failures; require actual successful exit and successful TLC result. Isolate scratch outputs and preserve task evidence. |
++| Deadline-based CHECK/START waiting | Harness semantic correction: old transport waited up to 120 seconds instead of caller budgets. Wait using one request deadline and discard late replies. |
++| Two added deadline scenarios | Coverage addition: delayed handler admission after 16/21 seconds actually crosses the source's 15/20-second deadlines. Measured waits were 15.0002/20.0001 seconds. Timing injection is explicit. |
++| Resource call observer | Observation addition: cross-check event-derived allocation ownership against real allocate/free returns; does not enforce or repair product conservation. |
++| Strict input/report checks | Prevent malformed/filtered rows, sequence gaps, unknown names, missing fields or truncated files from being accepted silently. |
++| Writer freeze, network drain, expected thread-error checks | Trace lifecycle correction: no writes after report hashing; distinguish expected deletion-seed runner death from unexpected harness/product errors. This is still a finite prefix. |
++| Random drain timeout now fails | A scenario that cannot settle no longer silently reports success. |
++| Dead-client state reduced to `alive=false` | Projection correction: remove pool/registration fields that Trace does not validate after CP death. Reran the affected scenario and preserved its prior version. |
++| Fresh mechanism/control assertions and no-op regressions | Check that named scenarios actually exercise their intended mechanism; test inactive hook compatibility. No independent confirmation claim. |
++
++The exact adopted-to-working-copy changes are retained in [working-copy-changes.diff](evidence/continuation/working-copy-changes.diff). Six core runtime modules are preserved by the hashes recorded in reports at [fresh-suite/runtime/index.json](evidence/continuation/fresh-suite/runtime/index.json). Five have one version. `nvf_tracer.py` has two: the sole difference is omission of unchecked fields for a dead CP; the dead-client scenario uses the corrected version. Other scenarios never enter that branch. The earlier version was reconstructed by removing that exact block and checked against its recorded SHA-256 before preservation. Utility/reporting files added after generation are distinguished from runtime modules.
++
++One reporting repair followed successful pytest runs: the first result parser mistook five captured `ERROR` log lines for pytest outcome rows. All three pytest processes had exited 0 with 392 passed. The parser was tightened and the same complete logs were reaggregated; no tests were rerun for that parser correction. [The original aggregation](evidence/continuation/unit-tests/results-before-log-parser-fix.json) and [original driver output](evidence/continuation/unit-controls.log) remain, while `results.json` is the corrected result.
++
++The CP projection correction required only `client_crash_sweep` to be rerun. [Its prior trace/report](evidence/continuation/pre-dead-client-projection) and [rerun log](evidence/continuation/dead-client-projection-rerun.log) are retained. The final 32-trace replay used that corrected trace. Optional old stress rounds and seeds 7–40 were not rerun or counted.
++
++## Commands and provenance
++
++Executed from the target `.specula-output` unless stated otherwise:
++
++```bash
++timeout 600 bash harness/run.sh
++SCENARIOS=client_crash_sweep bash harness/run.sh
++timeout 600 bash harness/validate.sh traces/*.ndjson --results harness/evidence/continuation/suite-replay.json
++source harness/paths.sh
++"$NVF_PYTHON" harness/src/run_unit_controls.py
++"$NVF_PYTHON" harness/src/negative_controls.py
++"$NVF_PYTHON" harness/src/check_scenario_evidence.py
++"$NVF_PYTHON" harness/src/audit_phase2_5.py
++```
++
++The listed controls were invoked with the pinned environment (and command-level timeouts); exact per-scenario commands, Python version, start/finish timestamps, source/patch/hook hashes, scenario configuration and network policies are in reports. Runtime package versions are in [python-packages.txt](evidence/continuation/python-packages.txt). The scoped style command, from the source with the venv first on PATH, was `./runtest.sh -s --skip-install <target-workspace>/harness/src`; it exited 1 on missing `black` without installing dependencies.
++
++Source: `53ba7ee567468ea7971dad4faccef13c6cb35dc2`. Framework/skills: pinned continuation installation at `332cd6e7faad61fca8da439a1b6a8d3fef8ef39e`. Applied pinned [BYOM](../../../../../skills/byom/SKILL.md) and [harness-generation](../../../../../skills/harness-generation/SKILL.md) methodology (full guides read). TLC replays used one sequential task at a time, 2 GiB heap/1 GiB offheap/one worker, within 64 GiB/16-worker aggregate limits. No full service deployment or confirmation task was started; the 80 GiB service budget and one-confirmation-task limit remain unchanged.
++
++This is the authorized **mixed-model continuation**, not an independent pure-model trial. The original Claude run exhausted API credits during validation/hunting, leaving MC-U1 unclassified and the normal confirmation phase incomplete. This phase uses the launcher's GPT-6 Astra/max continuation configuration; later separate confirmation remains assigned to GPT-5.5/xhigh, with no substitution performed here. The original Claude spend is **$180.5573146 including preflight**. This phase's Codex work is subscription usage, separate from that historical spend; no new Claude-account calls were made. Exact continuation token usage or an optional API-equivalent estimate must come from launcher accounting, which is not exposed in these phase tool results; no additional Claude charge or dollar estimate is invented.
++
++## Records inspected and source checks
++
++Started with `handoff/conversations/README.md` and `index.json`, then the four main phase transcripts' line-preserving decision records. Relevant original command/result chunks were read in manageable pieces, not inferred only from a summary:
++
++| Original readable record | Selected command/result lines additionally checked in this phase |
++|---|---|
++| `01-analysis.md` | 9700–9850: controls, prior missing-method harness correction, lifecycle/delete seeds |
++| `02-specification.md` | 13040–13115: synthetic replay/negative controls and initial F16-vs-F1 seed error |
++| `03-harness.md` | 16720–16835: seven disabled-hook failures, object-argument correction, prior unit-test claims |
++| `04-validation-and-hunting.md` | 13875–14038: final residual/hunt conclusions, VAV, MC-U1 and interruption |
++| `analysis-agent-a9b2b77d6bf662997.md` | Initial task and 9810–9875: client-lifetime scope and real CellNet CP-kill retry limits |
++| `analysis-agent-ab99a5ff5dbe12529.md` | 7350–7445: token/re-registration probe and authentication-config errors |
++| `analysis-agent-ac097fcff7aa25dcb.md` | 9800–9820, 10110–10140: forced-thread control and late update/heartbeat results |
++| `analysis-agent-aa05006549b97b289.md` | 8850–8953 and ending index: status/runner/CMP death and lower-priority probes |
++
++The earlier [takeover review](../takeover-review.md) and [findings reconciliation](../adoption/findings-reconciliation.md) retain the wider analysis/deep-analysis record coverage and every lower finding. This phase did not exhaustively reread duplicated source dumps in all transcripts. It inspected every supplied harness source/script and the full patch, Trace wrapper/mapping, and the actual pinned adjacent source controlling resource allocate/free/expiry, request deadlines, startup/registration, process-exit cleanup, fail_run/finalizer, heartbeat and sweeper behavior. Prior commands using inaccessible historical paths were not blindly repeated. No newer source, external answers, upstream discussions, Lite results or unrelated experiments were consulted.
++
++Fresh assertions preserve distinctions among source-derived seeds: F16 witnesses refresh read → acknowledged abort → refresh write to SUBMITTED → later launch, rather than F1's deploy window; F5's two successful CJ launches precede failure report/removal of pending and failed START collection; F3 witnesses terminal publication/removal before a late RUNNING write; both F2 shapes leave the later job SUBMITTED after the expected runner exception. These refresh existing source-derived evidence. They are not new model-checking discoveries, completed MC seed-fidelity checks or public-deployment reproductions.
++
++## Handoff obligations and limits
++
++Read [INSTRUMENTATION.md](INSTRUMENTATION.md) and the existing [model audit](../adoption/model-audit.md) before accepting a PASS. The lock still merges source-visible transitions; REPORT/SJ ABORT use immediate timeout/deferred delivery; the sweep lock prevents live-map mutation; heartbeat bypasses session/auth transport; fake parent death assumes children die; process groups/watchdogs/rc-file lifetimes and default GPU numeric accounting/binding are absent. Resource ownership projections are now cross-checked but still share token identity mapping. Missing/padding/cached fields and finite-prefix limitations are explicit in the L2 table.
++
++V01–V10 remain open validation/repair obligations. Fresh replay and mechanism assertions do not reclassify MC-A–MC-E, MC-U1, F1–F20/R1 or RS/CL/SE/E leads. The full [reconciliation queue](../adoption/findings-reconciliation.md) remains authoritative for what must be rechecked, narrowed, refuted or sent to configured confirmation; unsupported F9/F19 cases remain separate. Do not discard lower findings or treat old residual PASSs as full exclusion coverage.
++
++The launcher must replay fresh traces after semantic repairs, recheck named MC seeds and all residual/hunt exclusions, complete bounded convergence/hunting with honest search bounds, and route every eligible candidate to confirmation. Confirmation must retain real-code evidence, passing controls, injection labels and source provenance, using public APIs and real local deployment where feasible. Repair/evolve/classification and final BYOM modification reporting follow their normal phase ownership. No product logic fix, upstream publication, push or tracker write was performed.
+--- adopted/harness/run.sh
++++ current/harness/run.sh
+@@ -5,11 +5,12 @@
+ #   SCENARIOS="normal_two_jobs start_failures" bash harness/run.sh  # a subset
+ #   VALIDATE=1 bash harness/run.sh                                  # also TLC trace-validate every trace
+ #
+-# Uses the prepared Python environment from PATH; PYTHONPATH is pointed at the instrumented copy (never at the arm's
++# Uses the pinned Python environment from paths.sh; PYTHONPATH is pointed at the instrumented copy (never at the arm's
+ # source) and run_scenario.py refuses to run if nvflare resolves anywhere else.
+ set -uo pipefail
+ 
+ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
++source "$SCRIPT_DIR/paths.sh"
+ OUT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+ TRACES="$OUT_DIR/traces"
+ BUILD="$SCRIPT_DIR/build/nvflare_src"
+@@ -22,7 +23,8 @@
+ delete_held_job_kills_runner delete_during_scan abort_during_deploy failrun_during_start failrun_during_start_dup_abort \
+ refresh_rmw_revert running_after_terminal start_timeout_late_start concurrent_jobs_contention expiry_before_start \
+ disable_between_schedule_and_deploy abort_before_checks lost_report_heartbeat double_abort_terminate \
+-random_mix_s1 random_mix_s2 random_mix_s3 random_mix_s4 random_mix_s5 random_mix_s6 wfc_stale_read_after_pop"
++random_mix_s1 random_mix_s2 random_mix_s3 random_mix_s4 random_mix_s5 random_mix_s6 wfc_stale_read_after_pop \
++check_deadline_backoff_expiry start_deadline_late_start"
+ # opt-in only (outside the supported envelope; Trace.cfg has EnableUnsupported = FALSE): unsupported_app_missing
+ SCENARIOS="${SCENARIOS:-$DEFAULT_SCENARIOS}"
+ 
+@@ -32,7 +34,7 @@
+ export NVF_INSTRUMENTED_ROOT="$BUILD"
+ export PYTHONPATH="$BUILD:$SCRIPT_DIR/src"
+ echo "==> [2/4] checking the import path"
+-python3 -c "import nvflare, os; p=os.path.realpath(nvflare.__file__); assert p.startswith(os.path.realpath('$BUILD')), p; print('   nvflare ->', p)" \
++timeout 30 "$NVF_PYTHON" -c 'import nvflare, os; from pathlib import Path; p=Path(nvflare.__file__).resolve(); assert p.is_relative_to(Path(os.environ["NVF_INSTRUMENTED_ROOT"]).resolve()), p; print("   nvflare ->", p)' \
+     || { echo "nvflare does not resolve to the instrumented copy"; exit 1; }
+ 
+ mkdir -p "$TRACES" "$REPORTS" "$WORK"
+@@ -41,18 +43,20 @@
+ for s in $SCENARIOS; do
+     rm -rf "$WORK/$s" "$TRACES/$s.ndjson"
+     start=$(date +%s)
+-    timeout "$PER_SCENARIO_TIMEOUT" python3 "$SCRIPT_DIR/src/run_scenario.py" "$s" \
++    timeout "$PER_SCENARIO_TIMEOUT" "$NVF_PYTHON" "$SCRIPT_DIR/src/run_scenario.py" "$s" \
+         --out "$TRACES/$s.ndjson" --root "$WORK/$s" --report "$REPORTS/$s.json" \
+         > "$REPORTS/$s.stdout" 2> "$REPORTS/$s.stderr"
+     rc=$?
++    printf '%s\n' "$rc" > "$REPORTS/$s.exitcode"
+     dur=$(( $(date +%s) - start ))
+-    if [ $rc -eq 0 ]; then
++    if [ $rc -eq 0 ] && timeout 30 "$NVF_PYTHON" "$SCRIPT_DIR/src/trace_contract.py" "$TRACES/$s.ndjson" \
++        --report "$REPORTS/$s.json" > "$REPORTS/$s.integrity.json" 2>&1; then
+         printf "   %-40s ok      %4ss\n" "$s" "$dur"
+     elif [ $rc -eq 124 ]; then
+-        printf "   %-40s TIMEOUT %4ss  (treat as a deadlock finding; see %s)\n" "$s" "$dur" "$REPORTS/$s.stderr"
++        printf "   %-40s TIMEOUT %4ss  (investigate timeout/deadlock; see %s)\n" "$s" "$dur" "$REPORTS/$s.stderr"
+         failed+=("$s")
+     else
+-        printf "   %-40s FAILED  %4ss  rc=%s (see %s)\n" "$s" "$dur" "$rc" "$REPORTS/$s.json"
++        printf "   %-40s FAILED  %4ss  scenario_rc=%s (see report and integrity log in %s)\n" "$s" "$dur" "$rc" "$REPORTS"
+         failed+=("$s")
+     fi
+ done
+@@ -68,7 +72,7 @@
+     echo "==> TLC trace validation (spec/Trace.tla + spec/Trace.cfg)"
+     files=()
+     for s in $SCENARIOS; do [ -f "$TRACES/$s.ndjson" ] && files+=("$TRACES/$s.ndjson"); done
+-    bash "$SCRIPT_DIR/validate.sh" "${files[@]}" || true
++    bash "$SCRIPT_DIR/validate.sh" "${files[@]}" || failed+=("trace_validation")
+ fi
+ 
+ if [ ${#failed[@]} -gt 0 ]; then
+--- adopted/harness/src/audit_phase2_5.py
++++ current/harness/src/audit_phase2_5.py
+@@ -0,0 +1,150 @@
++# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++"""Audit the frozen continuation suite. Does not run TLC or product code."""
++
++import ast
++import collections
++import hashlib
++import json
++import os
++import re
++import subprocess
++from datetime import datetime, timezone
++from pathlib import Path
++
++from trace_contract import known_events, validate_trace
++
++
++def digest(path):
++    return hashlib.sha256(path.read_bytes()).hexdigest()
++
++
++def read(path):
++    return json.loads(path.read_text())
++
++
++def run(command, cwd=None):
++    p = subprocess.run(command, cwd=cwd, text=True, capture_output=True, timeout=30, check=False)
++    return {"command": command, "exit_code": p.returncode, "stdout": p.stdout, "stderr": p.stderr}
++
++
++def main():
++    harness = Path(__file__).resolve().parents[1]
++    out = harness.parent
++    source = Path(os.environ["NVF_SOURCE"])
++    root = Path(os.environ.get("NVF_CONTINUATION_ROOT", source.parent))
++    evidence = harness / "evidence/continuation"
++    frozen = evidence / "fresh-suite"
++    replay = {Path(r["trace"]).stem: r for r in read(evidence / "suite-replay.json")}
++    counts = collections.Counter()
++    rows = []
++    projection_checks = 0
++    resource_calls = collections.Counter()
++    for trace in sorted((frozen / "traces").glob("*.ndjson")):
++        report_path = frozen / "reports" / (trace.stem + ".json")
++        report = read(report_path)
++        integrity = validate_trace(trace, out / "spec", report_path)
++        assert (frozen / "reports" / (trace.stem + ".exitcode")).read_text().strip() == "0"
++        assert not report["assertion_errors"]
++        assert not report["resource_observation"]["mismatches"]
++        projection_checks += report["resource_observation"]["checks"]
++        resource_calls.update(call["operation"] for call in report["resource_observation"]["calls"])
++        counts.update(integrity["event_counts"])
++        r = replay[trace.stem]
++        assert r["result"] == "PASS" and r["outcome"]["exit_code"] == 0
++        assert r["integrity"]["sha256"] == integrity["sha256"]
++        log = Path(r["outcome"]["log_path"])
++        assert "Model checking completed. No error has been found" in log.read_text()
++        assert "Error:" not in log.read_text()
++        for name, sha in r["spec_sha256"].items():
++            assert digest(out / "spec" / name) == sha, name
++        rows.append({"scenario": trace.stem, "events": integrity["events"],
++                     "trace": str(trace), "trace_sha256": integrity["sha256"],
++                     "report": str(report_path), "report_sha256": digest(report_path),
++                     "started_utc": datetime.fromtimestamp(report["started_ns"] / 1e9, timezone.utc).isoformat(),
++                     "finished_utc": datetime.fromtimestamp(report["finished_ns"] / 1e9, timezone.utc).isoformat(),
++                     "expected_runner_exception": report["expected_runner_exception"],
++                     "projection_checks": report["resource_observation"]["checks"],
++                     "task_id": r["outcome"]["task_id"], "tlc_log": str(log), "tlc_log_sha256": digest(log),
++                     "statistics": r["statistics"]})
++    assert len(rows) == len(replay) == 32
++    actions = known_events(out / "spec")
++    assert actions - counts.keys() == {"CpStartAllocateAppMissing"}
++
++    unit = read(evidence / "unit-tests/results.json")
++    assert unit["all_passed"] and unit["identical_outcomes"]
++    unit_counts = {r["mode"]: len(r["outcomes"]) for r in unit["runs"]}
++    assert set(unit_counts.values()) == {392}
++    negative = read(evidence / "negative-controls/results.json")
++    assertions = read(evidence / "scenario-assertions.json")
++    assert negative["checks_passed"] and assertions["checks_passed"]
++
++    spec_before = read(evidence / "spec-before.json")
++    assert all(digest(out / name) == sha for name, sha in spec_before.items())
++    original = root / "handoff/full/run/nvflare-job/.specula-output"
++    manifest = read(root / "handoff/asset-manifest.json")
++    mismatches = [r["path"] for r in manifest if not (original / r["path"]).is_file()
++                  or (original / r["path"]).stat().st_size != r["bytes"]
++                  or digest(original / r["path"]) != r["sha256"]]
++    assert not mismatches, mismatches
++    index = read(root / "handoff/conversations/index.json")
++    assert all(digest(root / "handoff" / r["raw"]) == r["sha256"] for r in index)
++    assert digest(harness / "patches/instrumentation.patch") == digest(original / "harness/patches/instrumentation.patch")
++    runtime = read(frozen / "runtime/index.json")
++    assert all(digest(Path(r["path"])) == r["sha256"] for r in runtime)
++    for row in rows:
++        report = read(Path(row["report"]))
++        for version in runtime:
++            if row["scenario"] in version["scenarios"]:
++                assert report["harness_sha256"]["src/" + version["name"]] == version["sha256"]
++
++    head = run(["git", "rev-parse", "HEAD"], source)
++    status = run(["git", "status", "--short"], source)
++    assert head["stdout"].strip() == "53ba7ee567468ea7971dad4faccef13c6cb35dc2"
++    assert status["stdout"] == "?? .agents/\n", status
++    pyfiles = sorted((harness / "src").glob("*.py"))
++    for path in pyfiles:
++        ast.parse(path.read_bytes(), filename=str(path))
++    shell = [run(["bash", "-n", str(p)]) for p in sorted(harness.glob("*.sh"))]
++    assert all(r["exit_code"] == 0 for r in shell)
++    patch_paths = re.findall(r"^\+\+\+ b/(.*)$", (harness / "patches/instrumentation.patch").read_text(), re.M)
++    build = harness / "build/nvflare_src"
++    for name in patch_paths:
++        ast.parse((build / name).read_bytes(), filename=name)
++        assert (build / name).read_bytes() == (original / "harness/build/nvflare_src" / name).read_bytes()
++    result = {
++        "phase": "2.5", "kind": "Fresh harness evidence; no convergence/confirmation verdict",
++        "checked_utc": datetime.now(timezone.utc).isoformat(), "checks_passed": True,
++        "traces": len(rows), "events": sum(counts.values()), "event_types": len(counts),
++        "trace_event_types": len(actions), "uncovered_events": sorted(actions - counts.keys()),
++        "event_counts": dict(sorted(counts.items())), "scenarios": rows,
++        "allocation_projection_checks": projection_checks, "projection_mismatches": 0,
++        "observed_resource_calls": dict(resource_calls), "unit_test_outcomes": unit_counts,
++        "scenario_assertions": len(assertions["checks"]), "negative_control_checks": len(negative["controls"]),
++        "source_head": head, "source_status": status,
++        "original_assets_hash_checked": len(manifest), "raw_conversations_hash_checked": len(index),
++        "spec_files_unchanged": len(spec_before), "patched_files_match_supplied_patch": len(patch_paths),
++        "runtime_versions": runtime, "python_syntax_checked": [str(p) for p in pyfiles], "shell_syntax": shell,
++        "style_check": "See style-check.log; unavailable black dependency, no full style PASS claimed.",
++        "limits": "See INSTRUMENTATION.md and adoption/model-audit.md V01-V10. Finite, scheduled traces with stubs."
++    }
++    (evidence / "final-audit.json").write_text(json.dumps(result, indent=2) + "\n")
++    print(json.dumps({k: result[k] for k in ("checks_passed", "traces", "events", "event_types",
++                     "trace_event_types", "allocation_projection_checks", "observed_resource_calls",
++                     "unit_test_outcomes", "original_assets_hash_checked", "raw_conversations_hash_checked",
++                     "spec_files_unchanged")}, indent=2))
++
++
++if __name__ == "__main__":
++    main()
+--- adopted/harness/src/check_scenario_evidence.py
++++ current/harness/src/check_scenario_evidence.py
+@@ -0,0 +1,139 @@
++# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++"""Check that the adopted source-derived seed scenarios actually exercise their named mechanisms.
++
++These are trace-harness assertions, not MC seed runs or independent product confirmation.
++"""
++import json
++from pathlib import Path
++
++out = Path(__file__).resolve().parents[2]
++rows = []
++
++
++def load(name):
++    records = [json.loads(x) for x in (out / 'traces' / (name + '.ndjson')).read_text().splitlines()]
++    return [r['event'] for r in records[1:]], json.loads((out/'harness/build/reports'/(name+'.json')).read_text())
++
++
++def locate(events, name, after=-1, pred=lambda e: True):
++    return next(i for i,e in enumerate(events) if i > after and e['name'] == name and pred(e))
++
++
++def state(events, i, job='j1'):
++    return events[i]['state']['jobs'][job]
++
++
++def record(name, fn):
++    try:
++        details = fn(*load(name))
++        rows.append({'scenario': name, 'passed': True, 'details': details})
++    except (AssertionError, StopIteration, KeyError) as exc:
++        rows.append({'scenario': name, 'passed': False, 'error': repr(exc)})
++
++
++def normal(events, report):
++    assert all(s == 'FINISHED:COMPLETED' for s in report['final_status'].values())
++    assert not events[-1]['state']['scheduled_jobs'] and not events[-1]['state']['running_jobs']
++    for c in events[-1]['state']['clients'].values():
++        assert sorted(c['free']) == ['u0','u1'] and not c['reserved']
++        assert all(not j['allocated'] and not j['registration']['present'] for j in c['jobs'].values())
++    return 'Two completed jobs, released admission slots and original list-unit capacity.'
++
++
++def f1(events, report):
++    abort = locate(events,'AdminAbortWrite')
++    assert state(events,abort)['status'] == 'FINISHED:ABORTED'
++    launch = locate(events,'RunnerStartServerApp',abort)
++    running = locate(events,'RunnerSetRunning',launch)
++    assert state(events,running)['status'] == 'RUNNING'
++    return {'ack_abort_event':abort+1,'later_launch_event':launch+1,'running_event':running+1}
++
++
++def f16(events, report):
++    read = locate(events,'RunnerRefreshRead')
++    abort = locate(events,'AdminAbortWrite',read)
++    write = locate(events,'RunnerRefreshWrite',abort)
++    assert state(events,abort)['status'] == 'FINISHED:ABORTED'
++    assert state(events,write)['status'] == 'SUBMITTED'
++    launch = locate(events,'RunnerStartServerApp',write)
++    return {'refresh_read':read+1,'abort':abort+1,'refresh_write':write+1,'later_launch':launch+1}
++
++
++def f3(events, report):
++    insert = locate(events,'RunnerInsertRunning')
++    publish = locate(events,'CmpPublish',insert)
++    remove = locate(events,'CmpRemove',publish)
++    running = locate(events,'RunnerSetRunning',remove)
++    assert state(events,publish)['status'] == 'FINISHED:EXECUTION_EXCEPTION'
++    assert state(events,running)['status'] == 'RUNNING'
++    assert not events[running]['state']['running_jobs'] and not events[running]['state']['scheduled_jobs']
++    return {'insert':insert+1,'terminal_publish':publish+1,'remove':remove+1,'late_running':running+1}
++
++
++def f5(events, report):
++    failure = locate(events,'SpProcessJobFailure',pred=lambda e:e['msg']['cl']=='c1' and e['msg']['code']==104)
++    collect = locate(events,'RunnerStartCollect',failure)
++    failed = locate(events,'RunnerExceptSetFailed',collect)
++    assert not state(events,failure)['pending']['present']
++    assert state(events,failed)['status'] == 'FINISHED:FAILED_TO_RUN'
++    assert sum(e['name']=='CpStartLaunch' for e in events) == 2
++    assert not any(e['name']=='CpStartLaunchFail' for e in events)
++    return {'failure_report':failure+1,'collect_missing_pending':collect+1,'failed_write':failed+1,
++            'cause':'Both CJ launches succeeded; report removed pending entry before START collection.'}
++
++
++def f2(events, report):
++    assert report['runner_exception'] and report['expected_runner_exception']
++    assert report['final_status'] == {'j1':'DELETED','j2':'SUBMITTED'}
++    assert not any(e['name']=='RunnerStartServerApp' for e in events)
++    return 'Expected runner exception; deleted j1, later j2 still SUBMITTED and never launched in this finite scenario.'
++
++
++def abort_control(events, report):
++    assert set(report['final_status'].values()) == {'FINISHED:ABORTED'}
++    assert not any(e['name']=='RunnerStartServerApp' for e in events)
++    return 'Aborts before the status checks prevent both launches.'
++
++
++def deadline(events, report):
++    start = report['scenario'].startswith('start_')
++    cutoff = locate(events,'RunnerStartTimeout' if start else 'RunnerCheckTimeout')
++    late = locate(events,'CpStartAllocate' if start else 'CpCheckResource',cutoff,
++                  lambda e:e['msg']['cl']=='c2')
++    timeout = 20 if start else 15
++    waits = [r for r in report['network_observation'] if r['operation']=='admin_wait'
++             and r['requested_timeout_seconds']==timeout and r['elapsed_seconds']>=timeout-0.1
++             and False in r['replies']]
++    assert waits
++    assert report['final_status']=={'j1':'FINISHED:COMPLETED'}
++    return {'timeout_event':cutoff+1,'late_handler_event':late+1,'waits':waits}
++
++
++record('normal_two_jobs',normal)
++record('abort_before_checks',abort_control)
++record('abort_during_deploy',f1)
++record('refresh_rmw_revert',f16)
++record('running_after_terminal',f3)
++record('failrun_during_start',f5)
++record('failrun_during_start_dup_abort',f5)
++record('delete_held_job_kills_runner',f2)
++record('delete_during_scan',f2)
++record('check_deadline_backoff_expiry',deadline)
++record('start_deadline_late_start',deadline)
++result = {'checks_passed':all(r['passed'] for r in rows),'checks':rows,
++          'scope':'Trace assertions only; named MC seed fidelity remains a validation obligation.'}
++(out/'harness/evidence/continuation/scenario-assertions.json').write_text(json.dumps(result,indent=2)+'\n')
++print(json.dumps(result,indent=2))
++raise SystemExit(0 if result['checks_passed'] else 1)
+--- adopted/harness/src/negative_controls.py
++++ current/harness/src/negative_controls.py
+@@ -0,0 +1,107 @@
++# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++"""Corrupt copies of a fresh implementation trace to test the input and replay checks.
++
++These are explicitly synthetic negative controls, never implementation evidence.
++"""
++import copy
++import json
++import os
++import subprocess
++from pathlib import Path
++
++from trace_contract import TraceInputError, validate_trace
++
++out = Path(__file__).resolve().parents[2]
++evidence = out / 'harness/evidence/continuation/negative-controls'
++evidence.mkdir(parents=True, exist_ok=True)
++source = out / 'traces/normal_two_jobs.ndjson'
++report = out / 'harness/build/reports/normal_two_jobs.json'
++original = [json.loads(x) for x in source.read_text().splitlines()]
++results = []
++
++
++def save(name, records):
++    path = evidence / f'{name}.ndjson'
++    path.write_text(''.join(json.dumps(r) + '\n' for r in records))
++    return path
++
++
++def change(name, mutation):
++    records = copy.deepcopy(original)
++    mutation(records)
++    return save(name, records)
++
++
++def event(records, name):
++    return next(r['event'] for r in records[1:] if r['event']['name'] == name)
++
++
++def swapped(records):
++    i = next(i for i,r in enumerate(records) if r.get('event',{}).get('name') == 'CmpFinalizeBegin')
++    j = next(i for i,r in enumerate(records) if r.get('event',{}).get('name') == 'CmpPublish')
++    # Swap semantic events only; keep valid timestamps and sequence envelopes.
++    records[i]['event'], records[j]['event'] = records[j]['event'], records[i]['event']
++
++
++semantic = [
++    change('wrong_status', lambda rs: event(rs,'RunnerSetDispatched')['state']['jobs']['j1'].update(status='RUNNING')),
++    change('wrong_free', lambda rs: event(rs,'CpCheckResource')['state']['clients']['c1']['free'].append('u0')),
++    change('wrong_pending', lambda rs: event(rs,'RunnerStartCollect')['state']['jobs']['j1']['pending'].update(present=False,set=[])),
++    change('publish_before_latch', swapped),
++]
++malformed = [
++    change('filtered_record', lambda rs: rs[-1].update(tag='ignored')),
++    change('unknown_action', lambda rs: rs[1]['event'].update(name='NotAnAction')),
++    change('duplicate_config', lambda rs: rs.append(copy.deepcopy(rs[0]))),
++    change('sequence_gap', lambda rs: rs[-1].update(seq=rs[-1]['seq']+1)),
++    change('missing_state', lambda rs: rs[1]['event'].pop('state')),
++]
++for p in malformed:
++    try:
++        validate_trace(p, out/'spec')
++    except (TraceInputError, KeyError, TypeError, ValueError) as exc:
++        results.append({'control': p.stem, 'input_rejected': True, 'reason': str(exc)})
++    else:
++        results.append({'control': p.stem, 'input_rejected': False})
++truncated = save('truncated_valid_prefix', original[:-2])
++try:
++    validate_trace(truncated, out/'spec', report)
++except TraceInputError as exc:
++    results.append({'control': truncated.stem, 'report_integrity_rejected': True, 'reason': str(exc)})
++else:
++    results.append({'control': truncated.stem, 'report_integrity_rejected': False})
++for p in semantic:
++    validate_trace(p,out/'spec')  # corruption is semantic, not malformed JSON
++command = [os.environ['NVF_PYTHON'], str(out/'harness/src/validate_traces.py'), '--no-report',
++           '--results', str(evidence/'replay-results.json'), *map(str,semantic), str(truncated)]
++with (evidence/'replay.log').open('w') as f:
++    result = subprocess.run(['timeout','600',*command],stdout=f,stderr=subprocess.STDOUT,check=False)
++replays = json.loads((evidence/'replay-results.json').read_text())
++for row in replays:
++    expected = 'PASS' if Path(row['trace']).stem == truncated.stem else 'FAIL'
++    results.append({'control': Path(row['trace']).stem, 'expected_tlc': expected, 'actual_tlc': row['result'],
++                    'exit_code': row.get('outcome',{}).get('exit_code'),
++                    'errors': row.get('errors',[]), 'task_id': row.get('task',{}).get('task_id')})
++ok = all(r.get('input_rejected', True) and r.get('report_integrity_rejected',True)
++         and r.get('expected_tlc') == r.get('actual_tlc') for r in results)
++for r in results:
++    if r.get('expected_tlc') == 'FAIL':
++        ok = ok and r.get('exit_code') not in (None,0) and any('TraceMatched' in e for e in r['errors'])
++final = {'baseline':str(source), 'label':'synthetic corruptions of fresh implementation trace',
++         'checks_passed':ok,'command':command,'validation_command_exit_code':result.returncode,'controls':results,
++         'limitation':'TLC accepts a valid finite prefix. Frozen report hash/count checks detect accidental truncation; they do not prove whole-system observation completeness.'}
++(evidence/'results.json').write_text(json.dumps(final,indent=2)+'\n')
++print(json.dumps(final,indent=2))
++raise SystemExit(0 if ok else 1)
+--- adopted/harness/src/nvf_env.py
++++ current/harness/src/nvf_env.py
+@@ -1,3 +1,16 @@
++# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
+ """In-process NVFlare server parent (SP) + client parents (CP) built from REAL product objects.
+ 
+ Real product code (from the instrumented copy of the pinned source):
+@@ -87,6 +100,7 @@
+ from nvflare.private.scheduler_constants import ShareableHeader
+ 
+ from nvf_tracer import Tracer
++from resource_observer import ResourceObserver
+ 
+ log = logging.getLogger("nvf_env")
+ 
+@@ -202,6 +216,7 @@
+         self.held = []  # list of (ident, deliver_fn)
+         self.lock = threading.Lock()
+         self.inflight = 0
++        self.audit = []
+ 
+     def set_policy(self, pred, action, once=False):
+         self.policies.append([pred, action, once])
+@@ -284,6 +299,8 @@
+         tracer = env.tracer
+         results = []
+         waits = []
++        started = time.monotonic()
++        deadline = started + max(0.0, timeout_secs)
+         for token, req in requests.items():
+             client = env.server.client_manager.clients.get(token)
+             if not client:
+@@ -294,6 +311,7 @@
+                 req._tla_att = tracer.current_check_att
+             ident = env.admin_identity(req, cl)
+             cr = ClientReply(client_token=token, client_name=cl, req=req, reply=None)
++            cr._tla_deadline = deadline
+             results.append(cr)
+             if tracer.holding():
+                 # sender inside a traced step: deliver after the step's event; the sender sees a timeout (its reply,
+@@ -304,14 +322,19 @@
+             if ev is not None:
+                 waits.append(ev)
+         for ev in waits:
+-            if not ev.wait(timeout=120.0):
+-                env.tracer._harness_error(f"handler did not finish within 120s (timeout_secs={timeout_secs})")
++            ev.wait(timeout=max(0.0, deadline - time.monotonic()))
++        self.audit.append({"operation": "admin_wait", "ts": time.time_ns(),
++                           "requested_timeout_seconds": timeout_secs,
++                           "elapsed_seconds": time.monotonic() - started,
++                           "deferred_by_trace_lock": tracer.holding(),
++                           "replies": [r.reply is not None for r in results]})
+         return results
+ 
+     def _route(self, cp, req, ident, cr):
+         if not cp.alive:
+             return None  # a dead CP never processes the request: the sender times out
+         action = self.decide(ident)
++        self.audit.append({"operation": "admin_route", "ts": time.time_ns(), "identity": ident, "policy": action})
+         if action == "hold":
+             self.hold(ident, lambda: self._dispatch(cp, req, None))
+             return None
+@@ -323,21 +346,27 @@
+             if cr is not None:
+                 cr.reply = error_reply(f"(stub) injected failure for {req.topic} on {cp.name}")
+             return None
+-        return self._dispatch(cp, req, cr)
+-
+-    def _dispatch(self, cp, req, cr):
++        delay = float(action.split(":", 1)[1]) if action.startswith("delay:") else 0.0
++        return self._dispatch(cp, req, cr, delay=delay)
++
++    def _dispatch(self, cp, req, cr, delay=0.0):
+         done = threading.Event()
+ 
+         def handle():
+             try:
++                if delay:
++                    time.sleep(delay)  # labeled handler-admission timing control, outside trace/product locks
+                 if not cp.alive:
+                     return
+                 proc = cp.processors.get(req.topic)
+                 if proc is None:
+                     return
+                 reply = proc.process(req, cp.engine)
+-                if cr is not None:
++                if cr is not None and time.monotonic() < cr._tla_deadline:
+                     cr.reply = reply
++                self.audit.append({"operation": "admin_reply", "ts": time.time_ns(),
++                                   "topic": req.topic, "client": cp.name,
++                                   "reply_retained": cr is not None and cr.reply is not None})
+             except Exception as e:
+                 self.env.tracer._harness_error(f"CP handler {req.topic} on {cp.name} raised {e!r}")
+             finally:
+@@ -349,6 +378,10 @@
+     # ------------------------------------------------------------ SP -> SJ commands
+     def send_to_sj(self, job_id, topic, request, wait_reply):
+         env = self.env
++        self.audit.append({"operation": "sj_command", "ts": time.time_ns(), "topic": topic,
++                           "job": env.jname(job_id), "wait_reply": wait_reply,
++                           "stub_result": "immediate injected timeout" if wait_reply else "fire_and_forget",
++                           "deferred_by_trace_lock": env.tracer.holding()})
+         if topic == AdminCommandNames.ABORT:
+             ident = {"type": "SJABORT", "job": env.jname(job_id), "cl": "None", "att": 0, "ok": False, "code": 0,
+                      "flag": False}
+@@ -399,9 +432,13 @@
+         payload = request.payload if isinstance(request.payload, dict) else {}
+         ident = {"type": "REPORT", "job": env.jname(payload.get(JobFailureMsgKey.JOB_ID)), "cl": env.cname(cl),
+                  "att": 0, "ok": False, "code": int(payload.get(JobFailureMsgKey.CODE) or 0), "flag": False}
++        self.audit.append({"operation": "report_send", "ts": time.time_ns(), "identity": ident,
++                           "stub_result": "immediate injected timeout",
++                           "deferred_by_trace_lock": env.tracer.holding()})
+ 
+         def deliver():
+             action = self.decide(ident)
++            self.audit.append({"operation": "report_route", "ts": time.time_ns(), "identity": ident, "policy": action})
+             if action == "drop":
+                 self.lose(ident)
+             elif action == "hold":
+@@ -714,6 +751,7 @@
+             fl_ctx.set_prop(FLContextKey.SITE_OBJ, self.server, private=True, sticky=True)
+ 
+         # ---- client parents ----
++        self.resource_observer = ResourceObserver(self)
+         self.cps = {}
+         self._engine_to_client = {}
+         self._rm_to_client = {}
+@@ -724,6 +762,7 @@
+             self._engine_to_client[id(cp.engine)] = cl
+             self._rm_to_client[id(cp.rm)] = cl
+             self._executor_to_client[id(cp.executor)] = cl
++            self.resource_observer.install(cp)
+ 
+     # ------------------------------------------------------------ name mapping
+     def jname(self, job_id):
+--- adopted/harness/src/nvf_scenarios.py
++++ current/harness/src/nvf_scenarios.py
+@@ -1,3 +1,16 @@
++# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
+ """Trace scenarios for nvflare-job.  Each scenario builds a fresh environment of real product objects, drives it
+ through the stub process/network edges and returns the Env (its tracer holds the emitted events).
+ 
+@@ -265,6 +278,56 @@
+     normal_finish(env, j2, [C1, C2])
+     wait_ev(env, "RunnerSetCantSched", job=j1, timeout=30.0)
+     wait_ev(env, "RunnerScanRead", start=env.tracer.count(), timeout=10.0)
++    return env
++
++
++@scenario
++def check_deadline_backoff_expiry(root, out):
++    """Actual 15-second CHECK deadline; delayed handler reserves after timeout.
++
++    The only new timing control is a 16-second delay before the real handler.
++    Unlike the adopted hold policy, the sender really waits for its deadline.
++    """
++    env = build(root, out, cfg_with(scenario="check_deadline_backoff_expiry", min_schedule_interval=2.5),
++                [job("job1", min_sites=2)])
++    (j1,) = env.job_ids
++    env.net.set_policy(ident_is("CHECK", job=j1, cl=C2, env=env), "delay:16", once=True)
++    env.start_runner()
++    wait_ev(env, "RunnerCheckTimeout", timeout=25)
++    wait_ev(env, "CpCancelResource", cl=C1)
++    wait_ev(env, "RunnerRefreshWrite", job=j1)
++    wait_ev(env, "CpCheckResource", cl=C2)
++    for _ in range(env.expiry):
++        env.tick(C2)
++    wait_until(lambda: not env.cps[C2].rm.reserved_resources, desc="late reservation expired")
++    wait_ev(env, "RunnerBackoffSkip", job=j1)
++    wait_ev(env, "RunnerSetRunning", job=j1)
++    wait_started_on(env, j1, [C1, C2])
++    normal_finish(env, j1, [C1, C2])
++    assert any(r["operation"] == "admin_wait" and r["requested_timeout_seconds"] == 15
++               and r["elapsed_seconds"] >= 14.9 and False in r["replies"] for r in env.net.audit)
++    return env
++
++
++@scenario
++def start_deadline_late_start(root, out):
++    """Actual 20-second START deadline; handler admission delayed 21 seconds."""
++    env = build(root, out, cfg_with(scenario="start_deadline_late_start"), [job("job1")])
++    (j1,) = env.job_ids
++    env.net.set_policy(ident_is("START", job=j1, cl=C2, env=env), "delay:21", once=True)
++    env.start_runner()
++    wait_ev(env, "RunnerStartTimeout", job=j1, timeout=28)
++    wait_ev(env, "RunnerSetRunning", job=j1)
++    wait_started_on(env, j1, [C1, C2])
++    env.sj_finish(j1)
++    wait_ev(env, "SpWaitForComplete", job=j1)
++    env.finish_client_job(C1, j1)
++    wait_ev(env, "CmpRemove", job=j1)
++    env.heartbeat(C2)
++    wait_ev(env, "CpChildFinished", job=j1, cl=C2)
++    env.net.quiesce(5)
++    assert any(r["operation"] == "admin_wait" and r["requested_timeout_seconds"] == 20
++               and r["elapsed_seconds"] >= 19.9 and False in r["replies"] for r in env.net.audit)
+     return env
+ 
+ 
+@@ -802,6 +865,8 @@
+             if rnd.random() < 0.3:
+                 env.heartbeat(cl)
+         time.sleep(0.3)
++    else:
++        raise TimeoutError("random drain did not reach its asserted terminal state")
+     env.net.quiesce(5.0)
+ 
+ 
+--- adopted/harness/src/nvf_tracer.py
++++ current/harness/src/nvf_tracer.py
+@@ -1,3 +1,16 @@
++# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
+ """Specula NDJSON tracer for nvflare-job (Category A: one linear trace written under one process-wide lock).
+ 
+ The tracer is the backend of ``nvflare.fuel.utils.tla_hooks``.  Product hooks and harness stubs open *sections*;
+@@ -124,6 +137,7 @@
+         self._owner = None
+         self._ts = _TS()
+         self._seq = 0
++        self._closed = False
+         self._cv = threading.Condition()
+         self.events = []  # emitted events (dicts), for scenario synchronisation
+         self.deadlock_timeout = deadlock_timeout
+@@ -214,6 +228,11 @@
+             ts.stack.append(frame)
+             return frame
+         self._acquire()
++        if self._closed:
++            self._release()
++            frame = _Frame(name, fields, top=False, on_error=on_error)
++            frame.closed = True
++            return frame
+         frame = _Frame(name, fields, top=True, on_error=on_error)
+         ts.stack.append(frame)
+         try:
+@@ -475,6 +494,7 @@
+     def _write_event(self, name, fields, error, frame):
+         env = self.env
+         self._update_side_tables(name, fields, frame)
++        env.resource_observer.check_projection(name)
+         evt = {"name": name}
+         job = fields.get("job")
+         cl = fields.get("cl")
+@@ -521,11 +541,12 @@
+         self._fh.flush()
+ 
+     def close(self):
+-        try:
++        # Freeze under the writer lock. A hook already waiting for the lock sees
++        # _closed in _begin and cannot append after the report hashes the file.
++        with self._T:
++            self._closed = True
+             self._fh.flush()
+             self._fh.close()
+-        except Exception:
+-            pass
+ 
+     # ------------------------------------------------------------------ snapshot
+     def _rec(self, d):
+@@ -591,6 +612,11 @@
+         clients = {}
+         for cl in env.client_names:
+             cp = env.cps[cl]
++            if not cp.alive:
++                # Trace.tla checks only alive after CP death. Do not emit the
++                # dead parent's frozen pools/registrations as unchecked state.
++                clients[env.cname(cl)] = {"alive": False}
++                continue
+             free = [env.unit_name(u) for u in list(cp.rm.resources.get("gpu", []))]
+             reserved = []
+             for tok, (res, ttl) in list(cp.rm.reserved_resources.items()):
+--- adopted/harness/src/pytest_import_control.py
++++ current/harness/src/pytest_import_control.py
+@@ -0,0 +1,54 @@
++# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++"""Pytest plugin: assert source origin and optionally install behavior-free hooks."""
++import os
++import sys
++from pathlib import Path
++
++
++def pytest_sessionstart(session):
++    import nvflare
++
++    expected = Path(os.environ['EXPECT_NVFLARE_ROOT']).resolve()
++    assert Path(nvflare.__file__).resolve().is_relative_to(expected), nvflare.__file__
++    if os.environ.get('NVF_HOOK_CONTROL') == 'noop':
++        from nvflare.fuel.utils import tla_hooks
++
++        class NoopTracer:
++            def section(self, *args, **kwargs):
++                return tla_hooks._NULL
++
++            context = section
++
++            def in_context(self, tag):
++                return False
++
++            def take(self, key, default=None):
++                return default
++
++            def __getattr__(self, name):
++                if name in {'begin', 'end', 'end_open', 'cancel', 'emit', 'event', 'rename',
++                            'set_fields', 'gate', 'note'}:
++                    return lambda *args, **kwargs: None
++                raise AttributeError(name)
++
++        tla_hooks.install(NoopTracer())
++
++
++def pytest_sessionfinish(session, exitstatus):
++    expected = Path(os.environ['EXPECT_NVFLARE_ROOT']).resolve()
++    wrong = {name: module.__file__ for name, module in list(sys.modules.items())
++             if name.startswith('nvflare') and getattr(module, '__file__', None)
++             and not Path(module.__file__).resolve().is_relative_to(expected)}
++    assert not wrong, wrong
+--- adopted/harness/src/resource_observer.py
++++ current/harness/src/resource_observer.py
+@@ -0,0 +1,77 @@
++# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++"""Observe actual allocation/free calls separately from model-event side tables."""
++
++import copy
++import sys
++import threading
++import time
++from collections import Counter
++
++
++class ResourceObserver:
++    def __init__(self, env):
++        self.env = env
++        self.active = {}
++        self.calls = []
++        self.checks = 0
++        self.mismatches = []
++
++    def install(self, cp):
++        for operation in ("allocate_resources", "free_resources"):
++            original = getattr(cp.rm, operation)
++
++            def observed(*args, _original=original, _operation=operation, **kwargs):
++                caller = sys._getframe(1)
++                entry = {"operation": _operation, "client": cp.name, "ts": time.time_ns(),
++                         "thread": threading.current_thread().name,
++                         "caller": f"{caller.f_code.co_filename}:{caller.f_lineno}",
++                         "arguments": copy.deepcopy({k: v for k, v in kwargs.items() if k != "fl_ctx"}),
++                         "free_before": list(cp.rm.resources["gpu"])}
++                try:
++                    result = _original(*args, **kwargs)
++                except BaseException as exc:
++                    entry["error"] = repr(exc)
++                    raise
++                else:
++                    entry["return"] = copy.deepcopy(result)
++                    key = (cp.name, kwargs["token"])
++                    if _operation == "allocate_resources":
++                        self.active[key] = list(result.get("gpu", []))
++                    else:
++                        self.active.pop(key, None)
++                    return result
++                finally:
++                    entry["free_after"] = list(cp.rm.resources["gpu"])
++                    self.calls.append(entry)
++
++            setattr(cp.rm, operation, observed)
++
++    def check_projection(self, event_name):
++        tr = self.env.tracer
++        for cl, cp in self.env.cps.items():
++            if not cp.alive:
++                continue  # CP crash intentionally freezes its waiter and local ownership.
++            for jid in self.env.job_ids:
++                actual = Counter()
++                for (owner, token), units in self.active.items():
++                    if owner == cl and tr.token_info.get((cl, token), (None, None))[1] == jid:
++                        actual.update(units)
++                projected = Counter(tr.starting.get((cl, jid), [])) + Counter(tr.allocated.get((cl, jid), []))
++                self.checks += 1
++                if actual != projected:
++                    mismatch = {"after": event_name, "seq": tr._seq + 1, "client": cl, "job": jid,
++                                "calls_outstanding": dict(actual), "projected": dict(projected)}
++                    self.mismatches.append(mismatch)
++                    tr._harness_error(f"allocation observation differs from event projection: {mismatch}")
+--- adopted/harness/src/run_scenario.py
++++ current/harness/src/run_scenario.py
+@@ -1,4 +1,17 @@
+ #!/usr/bin/env python3
++# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
+ """Run one nvflare-job trace scenario and write traces/<scenario>.ndjson.
+ 
+ Usage: python run_scenario.py <scenario> --out <trace.ndjson> [--root <tmpdir>] [--report <report.json>]
+@@ -8,6 +21,7 @@
+ """
+ 
+ import argparse
++import hashlib
+ import json
+ import logging
+ import os
+@@ -16,6 +30,7 @@
+ import threading
+ import time
+ import traceback
++from pathlib import Path
+ 
+ HERE = os.path.dirname(os.path.abspath(__file__))
+ sys.path.insert(0, HERE)
+@@ -23,7 +38,7 @@
+ import nvflare  # noqa: E402
+ 
+ EXPECTED = os.environ.get("NVF_INSTRUMENTED_ROOT")
+-if not EXPECTED or not os.path.realpath(nvflare.__file__).startswith(os.path.realpath(EXPECTED)):
++if not EXPECTED or not Path(nvflare.__file__).resolve().is_relative_to(Path(EXPECTED).resolve()):
+     sys.exit(f"refusing to run: nvflare imported from {nvflare.__file__}, expected the instrumented copy under {EXPECTED}")
+ 
+ from nvflare.fuel.utils import tla_hooks  # noqa: E402
+@@ -48,7 +63,14 @@
+     fn = nvf_scenarios.SCENARIOS.get(a.scenario)
+     if fn is None:
+         sys.exit(f"unknown scenario {a.scenario}; known: {sorted(nvf_scenarios.SCENARIOS)}")
+-    report = {"scenario": a.scenario, "root": root, "nvflare": nvflare.__file__}
++    harness = Path(HERE).parent
++    source_files = [*Path(HERE).glob("*.py"), *harness.glob("*.sh"), harness / "patches/instrumentation.patch"]
++    report = {"scenario": a.scenario, "root": root, "nvflare": nvflare.__file__,
++              "python": sys.executable, "python_version": sys.version, "command": [sys.executable, *sys.argv],
++              "started_ns": time.time_ns(),
++              "build_provenance": (harness / "build/PROVENANCE").read_text(),
++              "harness_sha256": {str(p.relative_to(harness)): hashlib.sha256(p.read_bytes()).hexdigest()
++                                 for p in sorted(source_files)}}
+     t0 = time.time()
+     env = None
+     rc = 0
+@@ -64,21 +86,53 @@
+     report["seconds"] = round(time.time() - t0, 2)
+     if env is not None:
+         tr = env.tracer
+-        # settle: give in-flight deliveries a moment, then stop tracing so late threads cannot write
+-        env.net.quiesce(timeout=3.0)
+-        time.sleep(0.3)
++        # Stop admissions through the real stop flag, settle deliveries, then freeze the writer.
++        # Sleeping product threads/fake crash waiters are ended by the process boundary below.
++        env.runner.stop()
++        report["network_quiesced"] = env.net.quiesce(timeout=15.0)
+         tla_hooks.uninstall()
++        tr.close()
+         report["events"] = tr.count()
+         report["harness_errors"] = tr.errors
+         report["thread_deaths"] = tr.thread_deaths
+         report["runner_exception"] = getattr(env, "runner_result", {}).get("exception")
++        expected = {"delete_held_job_kills_runner": "AttributeError:",
++                    "delete_during_scan": "StorageException:"}.get(a.scenario)
++        report["expected_runner_exception"] = expected
++        errors = []
++        observed = report["runner_exception"]
++        if expected:
++            if not observed or not observed.startswith(expected) or env.runner_thread.is_alive():
++                errors.append(f"expected completed runner failure {expected}, got {observed!r}")
++        elif observed:
++            errors.append(f"unexpected runner failure: {observed}")
++        if tr.thread_deaths:
++            errors.append(f"unexpected thread deaths: {tr.thread_deaths}")
++        if not report["network_quiesced"]:
++            errors.append("network handlers did not settle")
++        report["assertion_errors"] = errors
++        if errors:
++            rc = rc or 2
++        report["resource_observation"] = {"checks": env.resource_observer.checks,
++                                        "mismatches": env.resource_observer.mismatches,
++                                        "calls": env.resource_observer.calls}
++        report["scenario_config"] = env.cfg
++        report["network_observation"] = env.net.audit
++        report["final_status"] = {env.jname(j): (env.read_meta(j) or {}).get("status", "DELETED")
++                                  for j in env.job_ids}
++        report["traced_prefix_end"] = "after scenario assertions and network drain; not global shutdown"
+         names = {}
+         for e in tr.events:
+             names[e["name"]] = names.get(e["name"], 0) + 1
+         report["event_counts"] = names
+-        tr.close()
+         if tr.errors:
+             rc = rc or 2
++    if Path(a.out).is_file():
++        report["trace_sha256"] = hashlib.sha256(Path(a.out).read_bytes()).hexdigest()
++    report["finished_ns"] = time.time_ns()
++    report["exit_code"] = rc
++    if rc and report["result"] == "ok":
++        report["result"] = "FAILED: harness/result assertions (see report)"
+     text = json.dumps(report, indent=2, default=str)
+     print(text)
+     if a.report:
+--- adopted/harness/src/run_unit_controls.py
++++ current/harness/src/run_unit_controls.py
+@@ -0,0 +1,61 @@
++# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++"""Repeat existing scoped product tests on pristine and patched copies, retaining exact outcomes."""
++import json
++import os
++import re
++import subprocess
++from pathlib import Path
++
++h = Path(__file__).resolve().parents[1]
++source = Path(os.environ['NVF_SOURCE'])
++python = os.environ['NVF_PYTHON']
++output = h / 'evidence/continuation/unit-tests'
++output.mkdir(parents=True, exist_ok=True)
++tests = '''apis/impl/job_def_manager_test.py
++app_common/job_schedulers/job_scheduler_test.py
++app_common/resource_managers/list_resource_manager_test.py
++app_common/storages/storage_test.py
++private/fed/client/client_executor_test.py
++private/fed/client/scheduler_cmds_test.py
++private/fed/client/communicator_test.py
++private/fed/server/fed_server_test.py
++private/fed/server/job_cmds_test.py
++private/fed/server/job_runner_deploy_test.py
++private/fed/server/job_runner_test.py
++private/fed/server/server_engine_test.py
++private/fed/server/test_job_runner_sig_verify.py'''.splitlines()
++rows = []
++for mode in ('pristine', 'patched-disabled', 'patched-noop'):
++    root = source if mode == 'pristine' else h / 'build/nvflare_src'
++    env = dict(os.environ, PYTHONPATH=f'{root}:{source}:{h / "src"}', EXPECT_NVFLARE_ROOT=str(root),
++               NVF_HOOK_CONTROL='noop' if mode == 'patched-noop' else 'off', PYTHONDONTWRITEBYTECODE='1')
++    command = [python, '-m', 'pytest', '-q', '-rA', f'--rootdir={output}', '-c', '/dev/null',
++               '--import-mode=importlib', '-p', 'no:cacheprovider', '-p', 'pytest_import_control',
++               *[str(source / 'tests/unit_test' / t) for t in tests]]
++    log = output / f'{mode}.log'
++    with log.open('w') as f:
++        completed = subprocess.run(['timeout', '180', *command], env=env, cwd=output, stdout=f,
++                                   stderr=subprocess.STDOUT, check=False)
++    outcomes = sorted(re.findall(r'^(?:PASSED|FAILED|ERROR|SKIPPED|XFAIL|XPASS) \S[^\n]*', log.read_text(), re.M))
++    row = {'mode': mode, 'command': command, 'nvflare_root': str(root), 'exit_code': completed.returncode,
++           'log': str(log), 'outcomes': outcomes}
++    rows.append(row)
++    print(mode, completed.returncode, len(outcomes), flush=True)
++    if completed.returncode == 124:
++        break  # retain timeout; do not retry a potential deadlock
++result = {'runs': rows, 'all_passed': len(rows) == 3 and all(r['exit_code'] == 0 for r in rows),
++          'identical_outcomes': len(rows) == 3 and all(r['outcomes'] == rows[0]['outcomes'] for r in rows)}
++(output / 'results.json').write_text(json.dumps(result, indent=2) + '\n')
++raise SystemExit(0 if result['all_passed'] and result['identical_outcomes'] else 1)
+--- adopted/harness/src/tla_hooks.py
++++ current/harness/src/tla_hooks.py
+@@ -14,9 +14,7 @@
+ """Specula TLA+ trace-validation observation hooks (harness-only; copied in by harness/apply.sh).
+ 
+ Every function here is a no-op unless a tracer has been installed with ``install()``.  Product code
+-calls these hooks at the instrumentation points listed in harness/INSTRUMENTATION.md.  The hooks never
+-change control flow, locking or return values of the product code; the only effects when a tracer is
+-installed are: (1) serialising traced steps under one process-wide trace lock, (2) appending one NDJSON
++calls these hooks at the instrumentation points listed in harness/INSTRUMENTATION.md.  With no tracer, hooks are no-ops. With a tracer, scheduling is restricted by: (1) serialising traced steps under one process-wide trace lock, (2) appending one NDJSON
+ line per traced step and (3) optional reproduction gates that pause a thread at a named point.
+ 
+ Section model (implemented by the tracer):
+--- adopted/harness/src/trace_contract.py
++++ current/harness/src/trace_contract.py
+@@ -0,0 +1,210 @@
++# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++"""Strict input checks before Trace.tla, whose JSON reader otherwise filters records."""
++
++import argparse
++import collections
++import hashlib
++import json
++import re
++import time
++from pathlib import Path
++
++
++class TraceInputError(ValueError):
++    pass
++
++
++def require(ok, message):
++    if not ok:
++        raise TraceInputError(message)
++
++
++def keys(value, expected, where):
++    require(isinstance(value, dict) and set(value) == set(expected.split()), f"{where}: wrong fields")
++
++
++def integer(value, minimum=0):
++    return type(value) is int and value >= minimum
++
++
++def boolean(value, where):
++    require(type(value) is bool, f"{where}: expected boolean")
++
++
++def members(value, domain, where, unique=True):
++    require(isinstance(value, list), f"{where}: expected list")
++    require(all(isinstance(x, str) and x in domain for x in value), f"{where}: unknown value")
++    require(not unique or len(value) == len(set(value)), f"{where}: duplicate set member")
++
++
++def known_events(spec_dir):
++    return set(re.findall(r'(?:Plain|IsEvent|JobEv|ClEv|MsgEv|CJEv)\("(\w+)"',
++                          (Path(spec_dir) / "Trace.tla").read_text()))
++
++
++def validate_trace(path, spec_dir, report_path=None):
++    path = Path(path)
++    raw = path.read_bytes()
++    require(raw.endswith(b"\n"), "trace is missing its final newline")
++    lines = raw.splitlines()
++    require(len(lines) >= 2 and all(lines), "empty trace or blank record")
++    records = [json.loads(line) for line in lines]
++    cfg = records[0]
++    require(cfg.get("tag") == "config", "first record must be config")
++    for field in ("jobs", "clients", "units"):
++        v = cfg.get(field)
++        require(isinstance(v, list) and all(isinstance(x, str) for x in v), f"config.{field}: expected names")
++        require(len(v) == len(set(v)), f"config.{field}: duplicate name")
++    jobs, clients, units = map(set, (cfg["jobs"], cfg["clients"], cfg["units"]))
++    require(jobs and clients and "None" not in jobs | clients | units, "empty/invalid topology")
++    for field in ("need", "max_jobs", "max_schedule_count", "expiry"):
++        require(integer(cfg.get(field), 0 if field == "need" else 1), f"config.{field}: invalid integer")
++    for field in ("deploy_sites", "min_sites", "required", "real_job_ids"):
++        require(isinstance(cfg.get(field), dict) and set(cfg[field]) == jobs, f"config.{field}: incomplete job map")
++    require(set(cfg.get("real_clients", {})) == clients, "config.real_clients: incomplete client map")
++    for j in jobs:
++        members(cfg["deploy_sites"][j], clients, "config.deploy_sites")
++        members(cfg["required"][j], set(cfg["deploy_sites"][j]), "config.required")
++        require(integer(cfg["min_sites"][j]), "config.min_sites: invalid integer")
++    actions = known_events(spec_dir)
++    require(len(actions) > 0, "no Trace wrappers found")
++    counts = collections.Counter()
++    statuses = {"SUBMITTED", "DISPATCHED", "RUNNING", "DELETED", "FINISHED:COMPLETED", "FINISHED:ABORTED",
++                "FINISHED:FAILED_TO_RUN", "FINISHED:EXECUTION_EXCEPTION", "FINISHED:ABNORMAL",
++                "FINISHED:CAN_NOT_SCHEDULE"}
++    msg_actions = {"SpUpdateRunStatus", "SpProcessJobFailure", "SjHandleAbort", "CpCheckResource",
++                   "CpCancelResource", "CpStartAllocate", "CpStartAllocateAppMissing", "CpAbortApp", "LoseMsg"}
++    arg_actions = {"RunnerDeployJob", "SjFinish", "CjExit"}
++    previous_ts = 0
++    for i, row in enumerate(records):
++        ts = row.get("ts")
++        require(isinstance(ts, str) and ts.isdigit(), f"line {i+1}: missing real timestamp")
++        now = int(ts)
++        require(1_577_836_800_000_000_000 < now < time.time_ns() + 60_000_000_000,
++                f"line {i+1}: timestamp outside wall-clock range")
++        require(now >= previous_ts, f"line {i+1}: timestamp moved backwards")
++        previous_ts = now
++        if i == 0:
++            continue
++        require(row.get("tag") == "trace", f"line {i+1}: record would be filtered by Trace.tla")
++        require(type(row.get("seq")) is int and row["seq"] == i, f"line {i+1}: noncontiguous sequence")
++        require(isinstance(row.get("thread"), str) and row["thread"], f"line {i+1}: missing emitting thread")
++        e = row.get("event")
++        require(isinstance(e, dict), f"line {i+1}: missing event")
++        name = e.get("name")
++        require(name in actions, f"event {i}: unknown action {name}")
++        counts[name] += 1
++        require(e.get("job") in jobs | {"None"} and e.get("cl") in clients | {"None"},
++                f"event {i}: unknown job/client")
++        if name in msg_actions:
++            m = e.get("msg")
++            require(isinstance(m, dict), f"event {i}: missing message")
++            require({"type", "job", "cl", "att", "ok", "code", "flag"} <= set(m), f"event {i}: incomplete message")
++            require(m["type"] in {"CHECK", "CHECK_REP", "START", "START_REP", "ABORT", "CANCEL",
++                                  "REPORT", "RUNSTATUS", "SJABORT"}, f"event {i}: unknown message type")
++            require(m["job"] in jobs and m["cl"] in clients | {"None"}, f"event {i}: invalid message mapping")
++            require(integer(m["att"]) and integer(m["code"]), f"event {i}: invalid message integer")
++            boolean(m["ok"], "message.ok")
++            boolean(m["flag"], "message.flag")
++        if name in arg_actions:
++            a = e.get("arg")
++            require(isinstance(a, dict), f"event {i}: missing action arguments")
++            if name == "RunnerDeployJob":
++                members(a.get("failed"), clients, "arg.failed")
++            else:
++                require(integer(a.get("rc")), "arg.rc: invalid integer")
++                boolean(a.get("execution_error" if name == "SjFinish" else "descendants"), "arg.boolean")
++        s = e.get("state")
++        keys(s, "tagged scheduled_jobs running_jobs sessions jobs clients", f"event {i} state")
++        for field in ("tagged", "scheduled_jobs", "running_jobs"):
++            members(s[field], jobs, field)
++        members(s["sessions"], clients, "sessions")
++        require(set(s["jobs"]) == jobs and set(s["clients"]) == clients, f"event {i}: incomplete state domain")
++        for j, t in s["jobs"].items():
++            keys(t, "status schedule_count run_aborted pending latched run_process exception_process sj", j)
++            require(t["status"] in statuses, f"{j}: unknown status")
++            require(integer(t["schedule_count"]), f"{j}: invalid schedule_count")
++            boolean(t["run_aborted"], j + ".run_aborted")
++            keys(t["pending"], "present set", "pending")
++            boolean(t["pending"]["present"], "pending.present")
++            members(t["pending"]["set"], clients, "pending.set")
++            require(t["latched"] in statuses | {"None"}, "unknown latch")
++            require(t["sj"] in {"None", "Running", "Exited"}, "unknown SJ state")
++            for field in ("run_process", "exception_process"):
++                r = t[field]
++                keys(r, "present finished exe_error rc parts", field)
++                for b in ("present", "finished", "exe_error"):
++                    boolean(r[b], field + "." + b)
++                require(integer(r["rc"]), field + ": invalid rc")
++                members(r["parts"], clients, field + ".parts")
++        for c, t in s["clients"].items():
++            if t.get("alive") is False:
++                keys(t, "alive", c)
++                continue
++            keys(t, "alive free reserved jobs", c)
++            boolean(t["alive"], c + ".alive")
++            members(t["free"], units, c + ".free", unique=False)
++            require(isinstance(t["reserved"], list), c + ": missing reservations")
++            for r in t["reserved"]:
++                keys(r, "att job units ttl", "reservation")
++                require(integer(r["att"], 1) and r["job"] in jobs and integer(r["ttl"], 1),
++                        "invalid reservation identity/TTL")
++                members(r["units"], units, "reserved.units")
++            require(set(t["jobs"]) == jobs, c + ": incomplete jobs")
++            for j, cj in t["jobs"].items():
++                keys(cj, "registration starting allocated cj", c + "." + j)
++                r = cj["registration"]
++                keys(r, "present st attached abort_req", "registration")
++                for b in ("present", "attached", "abort_req"):
++                    boolean(r[b], "registration." + b)
++                require(r["st"] in {"None", "NOT_STARTED", "STARTING", "STARTED", "STOPPED", "EXCEPTION"},
++                        "unknown registration status")
++                keys(cj["starting"], "present units", "starting")
++                boolean(cj["starting"]["present"], "starting.present")
++                members(cj["starting"]["units"], units, "starting.units")
++                members(cj["allocated"], units, "allocated")
++                require(cj["cj"] in {"None", "Alive", "Exited"}, "unknown CJ state")
++    digest = hashlib.sha256(raw).hexdigest()
++    if report_path is not None:
++        report = json.loads(Path(report_path).read_text())
++        require(report["result"] == "ok" and report["exit_code"] == 0, "scenario did not succeed")
++        require(report["trace_sha256"] == digest, "trace differs from the frozen scenario report")
++        require(report["events"] == len(records) - 1 and report["event_counts"] == dict(counts),
++                "trace event count differs from the scenario report")
++        require(not report["harness_errors"] and not report["thread_deaths"], "unexpected harness/thread errors")
++        require(report["network_quiesced"], "scenario ended with active network handlers")
++        require(report["started_ns"] <= int(records[0]["ts"]) <= int(records[-1]["ts"]) <= report["finished_ns"],
++                "trace timestamps are outside the recorded run")
++        require(report["scenario"] == cfg["scenario"], "scenario/config identity mismatch")
++    return {"trace": str(path.resolve()), "sha256": digest, "events": len(records)-1,
++            "event_counts": dict(sorted(counts.items())), "result": "ok"}
++
++
++def main():
++    ap = argparse.ArgumentParser(description=__doc__)
++    ap.add_argument("trace")
++    ap.add_argument("--report")
++    ap.add_argument("--spec-dir", default=str(Path(__file__).resolve().parents[2] / "spec"))
++    a = ap.parse_args()
++    try:
++        result = validate_trace(a.trace, a.spec_dir, a.report)
++    except (ValueError, KeyError, TypeError, OSError) as e:
++        print(json.dumps({"result": "FAIL", "error": str(e)}))
++        raise SystemExit(1)
++    print(json.dumps(result, indent=2))
++
++
++if __name__ == "__main__":
++    main()
+--- adopted/harness/src/trace_inspect.py
++++ current/harness/src/trace_inspect.py
+@@ -1,4 +1,17 @@
+ #!/usr/bin/env python3
++# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
+ """Inspect an nvflare-job NDJSON trace, optionally around the point where TLC trace validation got stuck.
+ 
+   python3 harness/src/trace_inspect.py traces/<name>.ndjson                 # compact listing of every event
+--- adopted/harness/src/validate_traces.py
++++ current/harness/src/validate_traces.py
+@@ -0,0 +1,97 @@
++# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++"""Strict sequential trace replay using the pinned Specula durable TLC task API."""
++
++import argparse
++import asyncio
++import hashlib
++import json
++import os
++import re
++import shutil
++import sys
++import uuid
++from pathlib import Path
++
++from trace_contract import validate_trace
++
++
++async def main():
++    ap = argparse.ArgumentParser(description=__doc__)
++    ap.add_argument('traces', nargs='+')
++    ap.add_argument('--no-report', action='store_true', help='Only for explicitly labeled negative controls')
++    ap.add_argument('--results', default=None)
++    ap.add_argument('--report-dir', default=None)
++    a = ap.parse_args()
++    out = Path(__file__).resolve().parents[2]
++    framework = Path(os.environ['SPECULA_ROOT'])
++    sys.path.insert(0, str(framework / 'src'))
++    from specula.tlc_tasks import start_tlc, wait_tlc
++
++    spec = out / 'spec'
++    os.environ['SPECULA_WORK_DIR'] = str(out)
++    os.environ.setdefault('SPECULA_TLC_RESOURCE_DIR', str(out / '.tlc-tasks/resources'))
++    scratch = out / 'harness/build/replay' / uuid.uuid4().hex
++    scratch.mkdir(parents=True)
++    os.environ['TLC_STATE_DIR'] = str(scratch)
++    rows = []
++    results = Path(a.results) if a.results else scratch / 'results.json'
++    results.parent.mkdir(parents=True, exist_ok=True)
++    for trace in a.traces:
++        trace = Path(trace).resolve()
++        row = {'trace': str(trace), 'result': 'FAIL'}
++        try:
++            report_dir = Path(a.report_dir) if a.report_dir else out / 'harness/build/reports'
++            report = None if a.no_report else report_dir / (trace.stem + '.json')
++            row['integrity'] = validate_trace(trace, spec, report)
++            work = scratch / trace.stem
++            work.mkdir()
++            for filename in ('base.tla', 'Trace.tla', 'Trace.cfg'):
++                shutil.copy2(spec / filename, work / filename)
++            row['spec_sha256'] = {p.name: hashlib.sha256(p.read_bytes()).hexdigest() for p in work.iterdir()}
++            config = (work / 'Trace.cfg').read_text()
++            if not re.search(r'^\s+TraceMatched\s*$', config, re.M):
++                raise ValueError('TraceMatched is not configured')
++            os.environ['JSON'] = str(trace)
++            options = ['-m', '2G', '-M', '1G', '-w', '1', '-t', '5']
++            task = await start_tlc(str(work), 'Trace.tla', 'Trace.cfg', options)
++            row['task'] = task
++            rows.append(row)
++            results.write_text(json.dumps(rows, indent=2) + '\n')
++            while True:
++                outcome = await wait_tlc([task['task_id']], timeout_seconds=30, mode='all')
++                if outcome['outcome'] == 'finished':
++                    break
++                print(f"WAIT  {trace.stem} task={task['task_id']}", flush=True)
++            final = outcome['tasks'][0]
++            row['outcome'] = final
++            log = Path(final['log_path']).read_text()
++            row['result'] = 'PASS' if (final.get('exit_code') == 0 and
++                                      'Model checking completed. No error has been found' in log) else 'FAIL'
++            row['statistics'] = re.findall(r'^.*(?:states generated|distinct states found|depth of the complete|Finished in).*$', log, re.M)[-4:]
++            if row['result'] == 'FAIL':
++                row['errors'] = re.findall(r'^Error:.*$', log, re.M)[:5]
++            print(f"{row['result']}  {trace.stem} rc={final.get('exit_code')} log={final['log_path']}", flush=True)
++        except (ValueError, KeyError, OSError, TypeError) as exc:
++            row['error'] = str(exc)
++            if row not in rows:
++                rows.append(row)
++            print(f'FAIL  {trace.stem}: {exc}', flush=True)
++        results.write_text(json.dumps(rows, indent=2) + '\n')
++    print(f"{sum(r['result'] == 'PASS' for r in rows)}/{len(rows)} traces passed; results={results}", flush=True)
++    return int(any(r['result'] != 'PASS' for r in rows))
++
++
++if __name__ == '__main__':
++    raise SystemExit(asyncio.run(main()))
+--- adopted/harness/stress.sh
++++ current/harness/stress.sh
+@@ -1,27 +1,33 @@
+ #!/bin/bash
+-# Re-run scenarios N times in parallel (CPU contention varies the interleavings) and TLC-validate every trace.
+-#   bash harness/stress.sh 3                                   # 3 rounds of the default set
+-#   SCENARIOS="random_mix_s7 random_mix_s8" bash harness/stress.sh 2
+-# Traces go to harness/build/stress/round<k>/ (the official traces/ directory is not touched).
+-# Requires a built instrumented copy (bash harness/apply.sh or harness/run.sh).
+-set -uo pipefail
++# Optional additional scheduling variation. Fresh round dirs; up to four scenario processes; serial TLC.
++set -euo pipefail
+ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
++source "$SCRIPT_DIR/paths.sh"
+ ROUNDS="${1:-2}"
+ BUILD="$SCRIPT_DIR/build/nvflare_src"
++[[ "$ROUNDS" =~ ^[1-9][0-9]*$ ]] || exit 2
+ [ -d "$BUILD/nvflare" ] || { echo "run harness/apply.sh first"; exit 1; }
+ DEFAULT="$(sed -n '/^DEFAULT_SCENARIOS="/,/"$/p' "$SCRIPT_DIR/run.sh" | tr -d '\\"' | sed 's/DEFAULT_SCENARIOS=//' | tr '\n' ' ')"
+ SCENARIOS="${SCENARIOS:-$DEFAULT}"
+ export NVF_INSTRUMENTED_ROOT="$BUILD"
+ export PYTHONPATH="$BUILD:$SCRIPT_DIR/src"
++export NVF_STRESS_SCRIPT_DIR="$SCRIPT_DIR"
+ for r in $(seq 1 "$ROUNDS"); do
+-    D="$SCRIPT_DIR/build/stress/round$r"
+-    rm -rf "$D" && mkdir -p "$D"
+-    for s in $SCENARIOS; do
+-        ( timeout 180 python3 "$SCRIPT_DIR/src/run_scenario.py" "$s" --out "$D/$s.ndjson" --root "$D/work-$s" \
+-            --report "$D/$s.json" > "$D/$s.stdout" 2> "$D/$s.stderr" || echo "$s rc=$?" >> "$D/run_failures.txt" ) &
+-    done
+-    wait
+-    [ -f "$D/run_failures.txt" ] && { echo "round $r scenario failures:"; cat "$D/run_failures.txt"; }
+-    bash "$SCRIPT_DIR/validate.sh" "$D"/*.ndjson > "$D/validate.txt" 2>&1
+-    echo "round $r: $(grep -c '^PASS' "$D/validate.txt") pass; fail: $(grep '^FAIL' "$D/validate.txt" | awk '{print $2}' | tr '\n' ' ')"
++    NVF_STRESS_DIR="$(mktemp -d "$SCRIPT_DIR/build/stress-round${r}-XXXXXX")"
++    export NVF_STRESS_DIR
++    printf '%s\n' $SCENARIOS | xargs -r -P 4 -I '{}' bash -c '
++        s="$1"
++        [[ "$s" =~ ^[a-z][a-z0-9_]*$ ]] || exit 2
++        timeout 180 "$NVF_PYTHON" "$NVF_STRESS_SCRIPT_DIR/src/run_scenario.py" "$s" \
++            --out "$NVF_STRESS_DIR/$s.ndjson" --root "$NVF_STRESS_DIR/work-$s" \
++            --report "$NVF_STRESS_DIR/$s.json" > "$NVF_STRESS_DIR/$s.stdout" 2> "$NVF_STRESS_DIR/$s.stderr"
++        rc=$?
++        printf "%s\n" "$rc" > "$NVF_STRESS_DIR/$s.exitcode"
++        [ "$rc" -eq 0 ] || exit "$rc"
++        "$NVF_PYTHON" "$NVF_STRESS_SCRIPT_DIR/src/trace_contract.py" "$NVF_STRESS_DIR/$s.ndjson" \
++            --report "$NVF_STRESS_DIR/$s.json" > "$NVF_STRESS_DIR/$s.integrity.json"
++    ' _ '{}'
++    bash "$SCRIPT_DIR/validate.sh" --report-dir "$NVF_STRESS_DIR" "$NVF_STRESS_DIR"/*.ndjson \
++        --results "$NVF_STRESS_DIR/replay-results.json" > "$NVF_STRESS_DIR/validate.txt" 2>&1
++    echo "round $r complete: $NVF_STRESS_DIR"
+ done
+--- adopted/harness/validate.sh
++++ current/harness/validate.sh
+@@ -1,36 +1,6 @@
+ #!/bin/bash
+-# Quick TLC trace validation of one or more NDJSON traces against spec/Trace.tla + spec/Trace.cfg.
+-#   bash harness/validate.sh traces/<name>.ndjson [more traces...]
+-# Runs TLC directly with a -metadir inside harness/build (the shared /tmp/tlc_validation path is not writable here).
+-# Resource bounds: one TLC at a time, 1 worker, -Xmx4g (well inside the 64 GiB / 16-worker ceiling).
+-set -uo pipefail
+-
++# Schema + scenario integrity, then one budgeted TLC task at a time (2 GiB heap, 1 GiB offheap, 1 worker).
++set -euo pipefail
+ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+-OUT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+-SPEC_DIR="$OUT_DIR/spec"
+-LIB="${SPECULA_LIB:-/home/experiment/repos/specula/lib}"
+-TLA_JAR="${TLA_JAR:-$LIB/tla2tools.jar}"
+-CM_JAR="${CM_JAR:-$LIB/CommunityModules-deps.jar}"
+-META="$SCRIPT_DIR/build/tlc-meta"
+-LOGS="$SCRIPT_DIR/build/validation-logs"
+-TTRACE="$SCRIPT_DIR/build/tlc-ttrace"   # counterexample trace-explorer specs (kept out of spec/)
+-mkdir -p "$META" "$LOGS" "$TTRACE"
+-
+-status=0
+-for t in "$@"; do
+-    tr="$(cd "$(dirname "$t")" && pwd)/$(basename "$t")"
+-    name="$(basename "$t" .ndjson)"
+-    log="$LOGS/$name.log"
+-    (cd "$SPEC_DIR" && JSON="$tr" timeout 1800 java -XX:+UseParallelGC -Xmx4g \
+-        -cp "$TLA_JAR:$CM_JAR" tlc2.TLC -config Trace.cfg Trace.tla \
+-        -metadir "$META/$name-$$" -teSpecOutDir "$TTRACE" -workers 1 -cleanup > "$log" 2>&1)
+-    rc=$?
+-    if grep -q "Model checking completed. No error has been found" "$log"; then
+-        echo "PASS  $name  ($(grep -m1 'states generated' "$log" | sed 's/^ *//'))"
+-    else
+-        echo "FAIL  $name  (rc=$rc, log: $log)"
+-        grep -E "Error:|violated|is not|Temporal properties|Assumption|Exception" "$log" | head -5 | sed 's/^/      /'
+-        status=1
+-    fi
+-done
+-exit $status
++source "$SCRIPT_DIR/paths.sh"
++exec "$NVF_PYTHON" "$SCRIPT_DIR/src/validate_traces.py" "$@"

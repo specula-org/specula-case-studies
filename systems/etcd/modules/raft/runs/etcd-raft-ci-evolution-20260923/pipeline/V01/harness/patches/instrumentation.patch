@@ -1,0 +1,129 @@
+diff --git a/node.go b/node.go
+index ddfce04..0add66b 100644
+--- a/node.go
++++ b/node.go
+@@ -335,6 +335,7 @@ func (n *node) run(rn *RawNode) {
+ 			lead = r.lead
+ 		}
+ 
++		speculaNodeLoop(r, rn.prevHardSt, rn.prevSoftSt, lead, propc != nil)
+ 		select {
+ 		// TODO: maybe buffer the config propose if there exists one (the way
+ 		// described in raft dissertation)
+diff --git a/raft.go b/raft.go
+index 16174f2..e14b04b 100644
+--- a/raft.go
++++ b/raft.go
+@@ -425,6 +425,7 @@ func (r *raft) send(m pb.Message) {
+ 			m.Term = r.Term
+ 		}
+ 	}
++	speculaObserve("send", r, m, nil)
+ 	r.msgs = append(r.msgs, m)
+ }
+ 
+@@ -600,6 +601,7 @@ func (r *raft) maybeCommit() bool {
+ }
+ 
+ func (r *raft) reset(term uint64) {
++	defer speculaObserve("reset", r, pb.Message{}, nil)
+ 	if r.Term != term {
+ 		r.Term = term
+ 		r.Vote = None
+@@ -648,6 +650,7 @@ func (r *raft) appendEntry(es ...pb.Entry) (accepted bool) {
+ 	// use latest "last" index after truncate/append
+ 	li = r.raftLog.append(es...)
+ 	r.prs.Progress[r.id].MaybeUpdate(li)
++	speculaObserve("self-append", r, pb.Message{}, nil)
+ 	// Regardless of maybeCommit's return, our caller will call bcastAppend.
+ 	r.maybeCommit()
+ 	return true
+@@ -1004,9 +1007,11 @@ func stepLeader(r *raft, m pb.Message) error {
+ 			// If we are not currently a member of the range (i.e. this node
+ 			// was removed from the configuration while serving as leader),
+ 			// drop any new proposals.
++			speculaObserve("DropRemoved", r, m, nil)
+ 			return ErrProposalDropped
+ 		}
+ 		if r.leadTransferee != None {
++			speculaObserve("DropTransfer", r, m, nil)
+ 			r.logger.Debugf("%x [term %d] transfer leadership to %x is in progress; dropping proposal", r.id, r.Term, r.leadTransferee)
+ 			return ErrProposalDropped
+ 		}
+@@ -1025,8 +1030,10 @@ func stepLeader(r *raft, m pb.Message) error {
+ 		}
+ 
+ 		if !r.appendEntry(m.Entries...) {
++			speculaObserve("DropQuota", r, m, nil)
+ 			return ErrProposalDropped
+ 		}
++		speculaObserve("Accepted", r, m, nil)
+ 		r.bcastAppend()
+ 		return nil
+ 	case pb.MsgReadIndex:
+@@ -1046,6 +1053,7 @@ func stepLeader(r *raft, m pb.Message) error {
+ 				r.readOnly.addRequest(r.raftLog.committed, m)
+ 				// The local node automatically acks the request.
+ 				r.readOnly.recvAck(r.id, m.Entries[0].Data)
++				speculaObserve("read-add", r, m, nil)
+ 				r.bcastHeartbeatWithCtx(m.Entries[0].Data)
+ 			case ReadOnlyLeaseBased:
+ 				ri := r.raftLog.committed
+@@ -1056,6 +1064,7 @@ func stepLeader(r *raft, m pb.Message) error {
+ 				}
+ 			}
+ 		} else { // only one voting member (the leader) in the cluster
++			speculaObserve("read-singleton", r, m, nil)
+ 			if m.From == None || m.From == r.id { // from leader itself
+ 				r.readStates = append(r.readStates, ReadState{Index: r.raftLog.committed, RequestCtx: m.Entries[0].Data})
+ 			} else { // from learner member
+@@ -1089,6 +1098,7 @@ func stepLeader(r *raft, m pb.Message) error {
+ 		} else {
+ 			oldPaused := pr.IsPaused()
+ 			if pr.MaybeUpdate(m.Index) {
++				speculaObserve("match", r, m, nil)
+ 				switch {
+ 				case pr.State == tracker.StateProbe:
+ 					pr.BecomeReplicate()
+@@ -1147,7 +1157,9 @@ func stepLeader(r *raft, m pb.Message) error {
+ 			return nil
+ 		}
+ 
++		speculaObserve("read-confirm", r, m, nil)
+ 		rss := r.readOnly.advance(m)
++		speculaObserve("read-release", r, m, rss)
+ 		for _, rs := range rss {
+ 			req := rs.req
+ 			if req.From == None || req.From == r.id { // from local member
+@@ -1234,6 +1246,7 @@ func stepCandidate(r *raft, m pb.Message) error {
+ 	}
+ 	switch m.Type {
+ 	case pb.MsgProp:
++		speculaObserve("DropNoLeader", r, m, nil)
+ 		r.logger.Infof("%x no leader at term %d; dropping proposal", r.id, r.Term)
+ 		return ErrProposalDropped
+ 	case pb.MsgApp:
+@@ -1271,12 +1284,15 @@ func stepFollower(r *raft, m pb.Message) error {
+ 	switch m.Type {
+ 	case pb.MsgProp:
+ 		if r.lead == None {
++			speculaObserve("DropNoLeader", r, m, nil)
+ 			r.logger.Infof("%x no leader at term %d; dropping proposal", r.id, r.Term)
+ 			return ErrProposalDropped
+ 		} else if r.disableProposalForwarding {
++			speculaObserve("DropForwardDisabled", r, m, nil)
+ 			r.logger.Infof("%x not forwarding to leader %x at term %d; dropping proposal", r.id, r.lead, r.Term)
+ 			return ErrProposalDropped
+ 		}
++		speculaObserve("Forwarded", r, m, nil)
+ 		m.To = r.lead
+ 		r.send(m)
+ 	case pb.MsgApp:
+@@ -1425,6 +1441,7 @@ func (r *raft) restore(s pb.Snapshot) bool {
+ 	pr := r.prs.Progress[r.id]
+ 	pr.MaybeUpdate(pr.Next - 1) // TODO(tbg): this is untested and likely unneeded
+ 
++	speculaObserve("restore", r, pb.Message{Snapshot: s}, nil)
+ 	r.logger.Infof("%x [commit: %d, lastindex: %d, lastterm: %d] restored snapshot [index: %d, term: %d]",
+ 		r.id, r.raftLog.committed, r.raftLog.lastIndex(), r.raftLog.lastTerm(), s.Metadata.Index, s.Metadata.Term)
+ 	return true

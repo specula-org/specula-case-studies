@@ -1,0 +1,61 @@
+{
+  "schema_version": "2",
+  "system": "cometbft",
+  "generated_by": "consolidate",
+  "findings": [
+    {
+      "id": "CR-1",
+      "title": "Parameter update validation and installation",
+      "source": "code-review",
+      "scenario": "Scenario 1",
+      "severity": "High",
+      "invariant": null,
+      "config": null,
+      "counterexample": null,
+      "affected_code": [
+        "types/params.go:143-205",
+        "types/params.go:208-229",
+        "types/params.go:256-286",
+        "internal/state/execution.go:611-631"
+      ],
+      "summary": "FinalizeBlock may return a complete or partial consensus-parameter update whose response is durable before the candidate is validated and installed. ConsensusParams.Update copies the current parameters and replaces each non-nil subrecord, after which ValidateBasic and ValidateUpdate gate acceptance. A rejected candidate should leave the input state unchanged even though its FinalizeBlock response may already be persisted, while an accepted candidate should become active at height H+1. Confirmation should examine the validation and error paths through updateState and BlockExecutor.ApplyBlock."
+    },
+    {
+      "id": "CR-2",
+      "title": "Ordered durable boundaries during block application",
+      "source": "code-review",
+      "scenario": "Scenario 2",
+      "severity": "High",
+      "invariant": null,
+      "config": null,
+      "counterexample": null,
+      "affected_code": [
+        "internal/consensus/state.go:1781-1817",
+        "internal/state/execution.go:219-256",
+        "internal/state/execution.go:278-299",
+        "internal/state/store.go:562-601",
+        "internal/state/store.go:204-243"
+      ],
+      "summary": "Block application crosses several ordered durable boundaries: the decided block is stored, FinalizeBlock runs, its response is saved, the application commits, and CometBFT state is saved. A process crash can therefore expose different combinations of block-store, response, application, and state-store progress. The state store persists the latest response separately from the later batch that records state and next-height consensus parameters. Confirmation should inspect each crash window for inconsistent height or parameter state at restart."
+    },
+    {
+      "id": "CR-3",
+      "title": "Height-matrix startup replay",
+      "source": "code-review",
+      "scenario": "Scenario 3",
+      "severity": "High",
+      "invariant": null,
+      "config": null,
+      "counterexample": null,
+      "affected_code": [
+        "node/node.go:304-361",
+        "node/setup.go:187-203",
+        "internal/consensus/replay.go:240-277",
+        "internal/consensus/replay.go:358-438",
+        "internal/consensus/replay.go:441-501",
+        "internal/consensus/replay.go:504-521"
+      ],
+      "summary": "Startup selects among app-only replay, real-application last-block replay, saved-response mock replay, and no replay according to application, block-store, and state-store heights. Unsupported height relationships are rejected, while supported cases take different paths for application progress and CometBFT state mutation. Historical app-only replay uses ExecCommitBlock, whereas a final state-mutating replay reuses ApplyBlock and may consume the persisted FinalizeBlock response. Confirmation should exercise the height matrix and verify that normal operation begins only after the durable heights and consensus-parameter state are synchronized."
+    }
+  ]
+}

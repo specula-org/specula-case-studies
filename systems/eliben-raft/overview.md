@@ -9,6 +9,6 @@ Specula analyzed and tested eliben/raft's Raft core, including elections, heartb
 Specula found 4 new bugs:
 
 - **Fixed:** `startElection` changes `currentTerm` and `votedFor` without persisting them, so a crash can let the node vote again in the same term; see PR #26.
-- `persistToStorage` writes the term, vote, and log separately, creating partial-persistence crash states that can permit double voting.
+- `persistToStorage` writes the term, vote, and log separately, creating partial-persistence crash states that can permit double voting. Merged [PR #29](https://github.com/eliben/raft/pull/29) documents the example's storage atomicity assumption; it does not replace the implementation with an atomic storage operation.
 - **Fixed:** Vote-reply handlers compare against a captured election term instead of the current term, allowing stale replies to be counted in a later election; see PR #27.
 - **Fixed:** `becomeFollower` clears `votedFor` even on same-term transitions, erasing the vote record and permitting a second vote in that term; see PR #27.

@@ -13,3 +13,7 @@ Specula found 1 new bug:
 Specula also found 1 previously known bug:
 
 - **Fixed:** Lease-based reads can return stale data from a partitioned former leader before `CheckQuorum` expires its lease; see Issues #166 and #99.
+
+## Historical CI evaluation
+
+The [September 2026 evolution collection](modules/raft/runs/etcd-raft-ci-evolution-20260923/README.md) studies historical versions, including per-version finding dispositions and model/invariant evolution. Historical rediscoveries, repeated confirmations, and model-only candidates are kept separate from the bug counts above.

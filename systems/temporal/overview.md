@@ -15,7 +15,7 @@ Specula recorded 15 new findings: 13 product findings, 1 executor guard gap, and
 - A failed workflow-close fallback can publish terminal Update failure before the close write commits, allowing the same Update ID to succeed later.
 - A duplicate request with a completion callback can prevent an unprocessed sent Update from reaching terminal rejection.
 - An unsafe history-scanner minimum age can delete a new history branch before execution metadata is published, leaving an acknowledged run without its history; the default 60-day age prevents this schedule.
-- **Reported:** Retrying an identical Reset request can create a second run and terminate the first Reset-created run; see [PR #12042](https://github.com/temporalio/temporal/pull/12042).
+- **Reported:** Retrying an identical Reset request can create a second run and terminate the first Reset-created run; see [PR #12042](https://github.com/temporalio/temporal/pull/12042). As of 2026-10-03, it remains Draft and depends on [API PR #873](https://github.com/temporalio/api/pull/873) to preserve request identity through history rebuild and both replication modes.
 - Reset reapplication merges Continue-As-New histories into one run and rejects Update IDs legitimately reused in different source runs.
 - **Test observer, masked:** The test history-task recorder omits tasks when persistence commits but returns a timeout; independent readbacks compensate for the missing observations.
 - With optional fairness enabled, concurrent Matching reader replacement and eviction can advance the durable acknowledgement past a task that restart reads then skip.

@@ -10,7 +10,7 @@ Specula found 4 new bugs and 2 previously known bugs:
 
 - Cleanup can start while submission evaluation is in flight, losing the grade from the published result and reopening mitigation after the application is removed.
 - A delayed diagnosis duplicate can cross the mutable stage boundary and be graded as mitigation, finalizing a false result before the legitimate mitigation is submitted.
-- A transient Kubernetes list failure during baseline capture can be persisted as an authoritative empty set, causing cleanup to delete legitimate cluster state.
+- **Fixed:** A transient Kubernetes list failure during baseline capture can be persisted as an authoritative empty set, causing cleanup to delete legitimate cluster state; [PR #1046](https://github.com/SREGym/SREGym/pull/1046) merged on 2026-09-24.
 - An accepted Chaos apply can complete after noise cleanup and affect readiness evaluation, leaving a false stored result.
 - **Known:** a persisted baseline can be reused after cluster replacement and destructively reconcile the replacement cluster (PR #767).
 - **Known, masked:** after a pod restart, diagnosis remains available while the replacement PID is temporarily fault-free; the normal reinjection monitor later restores the fault (issue #568).

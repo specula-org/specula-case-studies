@@ -1,0 +1,115 @@
+diff --git a/openraft/Cargo.toml b/openraft/Cargo.toml
+--- a/openraft/Cargo.toml
++++ b/openraft/Cargo.toml
+@@ -45,6 +45,10 @@ serde_json        = { workspace = true }
+ [features]
+ default = ["tokio-rt", "adapt-network-v1"]
+ 
++# Enables the test-only Specula NDJSON trace harness copied in by
++# `.specula-output/harness/apply.sh`.
++specula-trace = []
++
+ # Enable the default Tokio runtime
+ tokio-rt = ["dep:tokio"]
+ 
+diff --git a/openraft/src/engine/engine_impl.rs b/openraft/src/engine/engine_impl.rs
+--- a/openraft/src/engine/engine_impl.rs
++++ b/openraft/src/engine/engine_impl.rs
+@@ -230,6 +230,9 @@ where C: RaftTypeConfig
+         });
+ 
+         self.server_state_handler().update_server_state_if_changed();
++
++        #[cfg(all(test, feature = "specula-trace"))]
++        crate::tla_trace::emit_engine("HandleElectionTimeout", self, serde_json::json!({}));
+     }
+ 
+     pub(crate) fn leader_ref(&self) -> Option<&Leader<C, LeaderQuorumSet<C>>> {
+@@ -331,6 +334,16 @@ where C: RaftTypeConfig
+ 
+         tracing::info!(req = display(&req), result = debug(&res), "handle vote request result");
+ 
++        #[cfg(all(test, feature = "specula-trace"))]
++        if res.is_ok() {
++            let candidate = crate::tla_trace::node_id::<C>(req.vote.leader_id().node_id());
++            crate::tla_trace::emit_engine(
++                "EngineHandleVoteRequest",
++                self,
++                serde_json::json!({"candidate": candidate}),
++            );
++        }
++
+         // Return the updated vote, this way the candidate knows which vote is granted, in case
+         // the candidate's vote is changed after sending the vote request.
+         VoteResponse::new(self.state.vote_ref(), self.state.last_log_id().cloned(), res.is_ok())
+@@ -814,6 +827,7 @@ where C: RaftTypeConfig
+ 
+     pub(crate) fn snapshot_handler(&mut self) -> SnapshotHandler<'_, '_, C> {
+         SnapshotHandler {
++            id: &self.config.id,
+             state: &mut self.state,
+             output: &mut self.output,
+         }
+diff --git a/openraft/src/engine/handler/following_handler/mod.rs b/openraft/src/engine/handler/following_handler/mod.rs
+--- a/openraft/src/engine/handler/following_handler/mod.rs
++++ b/openraft/src/engine/handler/following_handler/mod.rs
+@@ -333,6 +333,7 @@ where C: RaftTypeConfig
+ 
+     fn snapshot_handler(&mut self) -> SnapshotHandler<'_, '_, C> {
+         SnapshotHandler {
++            id: &self.config.id,
+             state: self.state,
+             output: self.output,
+         }
+diff --git a/openraft/src/engine/handler/snapshot_handler/mod.rs b/openraft/src/engine/handler/snapshot_handler/mod.rs
+--- a/openraft/src/engine/handler/snapshot_handler/mod.rs
++++ b/openraft/src/engine/handler/snapshot_handler/mod.rs
+@@ -18,6 +18,7 @@ mod update_snapshot_test;
+ pub(crate) struct SnapshotHandler<'st, 'out, C>
+ where C: RaftTypeConfig
+ {
++    pub(crate) id: &'st C::NodeId,
+     pub(crate) state: &'st mut RaftState<C>,
+     pub(crate) output: &'out mut EngineOutput<C>,
+ }
+@@ -40,6 +41,14 @@ where C: RaftTypeConfig
+         self.state.io_state.set_building_snapshot(true);
+ 
+         self.output.push_command(Command::from(sm::Command::build_snapshot()));
++
++        #[cfg(all(test, feature = "specula-trace"))]
++        crate::tla_trace::emit_state(
++            "SnapshotHandlerTriggerSnapshot",
++            self.id,
++            self.state,
++            serde_json::json!({}),
++        );
+         true
+     }
+ 
+diff --git a/openraft/src/engine/mod.rs b/openraft/src/engine/mod.rs
+--- a/openraft/src/engine/mod.rs
++++ b/openraft/src/engine/mod.rs
+@@ -56,6 +56,9 @@ mod tests {
+ #[cfg(test)]
+ pub(crate) mod testing;
+ 
++#[cfg(all(test, feature = "specula-trace"))]
++mod specula_trace_scenarios;
++
+ pub(crate) use command::Command;
+ pub(crate) use command::Condition;
+ pub(crate) use command::Respond;
+diff --git a/openraft/src/lib.rs b/openraft/src/lib.rs
+--- a/openraft/src/lib.rs
++++ b/openraft/src/lib.rs
+@@ -47,6 +47,9 @@ mod runtime;
+ mod summary;
+ mod try_as_ref;
+ 
++#[cfg(all(test, feature = "specula-trace"))]
++pub(crate) mod tla_trace;
++
+ pub(crate) mod engine;
+ pub(crate) mod log_id_range;
+ pub(crate) mod proposer;

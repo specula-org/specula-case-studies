@@ -71,3 +71,7 @@ See the [import notes](modules/syscall-semantics/runs/asterinas-findings-pack-20
 for the checked upstream links and historical-metadata qualifications, and the
 [reproduction guide](modules/syscall-semantics/runs/asterinas-findings-pack-2026-09-24/docs/running-reproducers.md)
 for environment and result-marker requirements.
+
+## Upstream updates
+
+As of 2026-10-03, [PR #3875](https://github.com/asterinas/asterinas/pull/3875) has merged (2026-09-29). It fixes AST-14 and the empty-write subcase of AST-02. AST-02 also covers zero-progress copy faults, so the entire entry is not marked fixed. [PR #3778](https://github.com/asterinas/asterinas/pull/3778), associated with AST-05/AST-10, remains open. Original reports and their historical source dispositions are unchanged.

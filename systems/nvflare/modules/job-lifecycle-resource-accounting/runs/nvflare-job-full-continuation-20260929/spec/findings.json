@@ -1,0 +1,248 @@
+{
+  "schema_version": "2",
+  "system": "nvflare-job",
+  "generated_by": "validation-workflow",
+  "findings": [
+    {
+      "id": "MC-1",
+      "source": "model-checking",
+      "title": "Queued cancellation can be overwritten by concurrent lifecycle writes",
+      "scenario": "S1 / F1 and strict status-writer variants",
+      "severity": "High",
+      "invariant": "AbortHonored",
+      "config": "MC_seed_F1.cfg",
+      "counterexample": "spec/output/continuation-S3-F1/tlc.out",
+      "affected_code": [
+        "nvflare/private/fed/server/job_cmds.py:1058",
+        "nvflare/private/fed/server/job_cmds.py:1063",
+        "nvflare/private/fed/server/job_runner.py:661",
+        "nvflare/private/fed/server/job_runner.py:670",
+        "nvflare/private/fed/server/job_runner.py:697",
+        "nvflare/private/fed/server/job_runner.py:711",
+        "nvflare/fuel/flare_api/flare_api.py:569"
+      ],
+      "summary": "The queued-abort handler reads a submitted/dispatched status and acknowledges FINISHED:ABORTED without synchronizing with the runner's earlier status check and subsequent writes. A deployment already past its check can write DISPATCHED over that acknowledgment and later launch the job. The fresh model and controlled implementation trace independently exercise this source-derived F1 mechanism; full local-deployment confirmation remains separate."
+    },
+    {
+      "id": "MC-2",
+      "source": "model-checking",
+      "title": "Deleting a listed job can terminate the only scheduling thread",
+      "scenario": "S2 / F2 and RS-8",
+      "severity": "High",
+      "invariant": "RunnerAliveInv",
+      "config": "MC_seed_F2.cfg",
+      "counterexample": "spec/output/continuation-S3-F2/tlc.out",
+      "affected_code": [
+        "nvflare/apis/impl/job_def_manager.py:520",
+        "nvflare/apis/impl/job_def_manager.py:527",
+        "nvflare/app_common/storages/filesystem_storage.py:327",
+        "nvflare/private/fed/server/job_runner.py:650"
+      ],
+      "summary": "The job manager lists storage objects and later reads each object's metadata without handling concurrent deletion. FilesystemStorage raises when a listed job has disappeared, and JobRunner calls this scan outside its deployment exception handler. The exception escapes the sole scheduling thread, preventing a later eligible job from being considered. This is a source-seeded F2/RS-8 rediscovery; the five-state minimal model path establishes thread death rather than an already-held admission-slot leak."
+    },
+    {
+      "id": "MC-3",
+      "source": "model-checking",
+      "title": "A late RUNNING write can replace an already-published terminal outcome",
+      "scenario": "S1 / F3",
+      "severity": "Medium",
+      "invariant": "TerminalStable",
+      "config": "MC_seed_F3.cfg",
+      "counterexample": "spec/output/continuation-S3-F3/tlc.out",
+      "affected_code": [
+        "nvflare/private/fed/server/job_runner.py:710",
+        "nvflare/private/fed/server/job_runner.py:711",
+        "nvflare/private/fed/server/job_runner.py:444",
+        "nvflare/private/fed/server/job_runner.py:524"
+      ],
+      "summary": "The runner inserts running_jobs before writing RUNNING to persistent metadata. The completion thread can observe that insertion, classify an already-exited server process and publish a terminal status before the runner resumes its unconditional RUNNING write. The model reproduces the source-derived F3 race with a nonzero early SJ exit; the fresh controlled trace also observes completion removal before the late write. This leaves misleading persisted lifecycle state and still requires independent real-deployment confirmation."
+    },
+    {
+      "id": "MC-4",
+      "source": "model-checking",
+      "title": "An early authoritative client failure can make START collection raise KeyError",
+      "scenario": "S2/S4 / F5",
+      "severity": "Medium",
+      "invariant": "NoStartKeyError",
+      "config": "MC_seed_F5_keyerror.cfg",
+      "counterexample": "spec/output/continuation-S3-F5_keyerror/tlc.out",
+      "affected_code": [
+        "nvflare/private/fed/server/job_runner.py:309",
+        "nvflare/private/fed/server/job_runner.py:360",
+        "nvflare/private/fed/server/job_runner.py:720",
+        "nvflare/private/fed/server/job_runner.py:841",
+        "nvflare/private/fed/client/client_executor.py:635"
+      ],
+      "summary": "A client can fail after its process launch succeeds but before all START replies are collected. While the server process entry exists, fail_run records an authoritative failure and removes the pending-outcome entry; START collection later indexes that removed entry directly. The resulting KeyError sends the runner through its generic FAILED_TO_RUN path instead of preserving the authoritative outcome. Both the direct KeyError oracle and outcome oracle reproduce this source-derived F5 mechanism using the real generic-exit remapping rule."
+    },
+    {
+      "id": "MC-5",
+      "source": "model-checking",
+      "title": "A metadata refresh can restore SUBMITTED after a successful abort",
+      "scenario": "S1/S3 / F16 and deployment-metadata variant",
+      "severity": "High",
+      "invariant": "NoRefreshWriteOverwrite",
+      "config": "MC_seed_F16_refresh.cfg",
+      "counterexample": "spec/output/continuation-S3-F16_refresh/tlc.out",
+      "affected_code": [
+        "nvflare/app_common/job_schedulers/job_scheduler.py:303",
+        "nvflare/apis/impl/job_def_manager.py:484",
+        "nvflare/app_common/storages/filesystem_storage.py:273",
+        "nvflare/app_common/storages/filesystem_storage.py:275",
+        "nvflare/private/fed/server/job_cmds.py:1063",
+        "nvflare/private/fed/server/job_runner.py:674"
+      ],
+      "summary": "FilesystemStorage implements a partial metadata update by reading and rewriting the whole metadata dictionary without serializing that read/write interval. A scheduler refresh for a resource-blocked job can capture SUBMITTED, overlap a successful FINISHED:ABORTED update, and then write its old status back. The dedicated F16 probe independently reaches the refresh writer; the generic F16 configuration only finds the shallower F1 deployment race. The fresh controlled trace additionally observes later launch after the lost cancellation."
+    },
+    {
+      "id": "MC-6",
+      "source": "model-checking",
+      "title": "Competing cleanup paths can terminate the completion thread with KeyError",
+      "scenario": "S2 / historical MC-D and RS-7",
+      "severity": "High",
+      "invariant": "CompletionAlive",
+      "config": "MC_hunt_s2_slots.cfg",
+      "counterexample": "spec/output/continuation-H4-s2_slots/tlc.out",
+      "affected_code": [
+        "nvflare/private/fed/server/job_runner.py:524",
+        "nvflare/private/fed/server/job_runner.py:532",
+        "nvflare/private/fed/server/job_runner.py:711",
+        "nvflare/private/fed/server/job_runner.py:715",
+        "nvflare/private/fed/server/job_cmds.py:516"
+      ],
+      "summary": "Completion publishes a terminal status before removing running_jobs, while the startup thread can still be pending at its RUNNING write. A previously authorized deletion makes that late status write raise, and runner exception cleanup removes the same running entry that completion subsequently deletes without a presence check. The unchecked deletion raises KeyError outside a protecting loop handler and kills completion before lifecycle release events. The final C8 38-state counterexample rechecks historical MC-D; it does not constitute a fresh real-code reproduction."
+    },
+    {
+      "id": "MC-7",
+      "source": "model-checking",
+      "title": "Concurrent process removal can terminate dead-client cleanup",
+      "scenario": "S2 / F7 run-process iterator",
+      "severity": "High",
+      "invariant": "SweeperAlive",
+      "config": "MC_hunt_s2_sweeper.cfg",
+      "counterexample": "spec/output/continuation-H4-s2_sweeper/tlc.out",
+      "affected_code": [
+        "nvflare/private/fed/server/fed_server.py:296",
+        "nvflare/private/fed/server/fed_server.py:323",
+        "nvflare/private/fed/server/fed_server.py:1109",
+        "nvflare/private/fed/server/server_engine.py:233"
+      ],
+      "summary": "Dead-client notification iterates the live server run_processes dictionary while its body can wait on a child RPC. A process waiter can remove an entry during that wait, causing the iterator's next advance to raise RuntimeError outside the RPC helper's catch. BaseServer.client_cleanup does not catch that exception around remove_dead_clients, so its cleanup thread terminates and later expired clients can remain unprocessed. The model reproduces this source-derived F7 variant; live-client-map and stale-token variants remain separate source-only confirmation candidates."
+    },
+    {
+      "id": "MC-8",
+      "source": "model-checking",
+      "title": "Client resources can be freed while same-group descendants remain alive",
+      "scenario": "S3 / source-seeded F10 and CL-5",
+      "severity": "High",
+      "invariant": "NoFreeWhileGroupAlive",
+      "config": "MC_hunt_s3_groups.cfg",
+      "counterexample": "spec/output/continuation-H4-s3_groups/tlc.out",
+      "affected_code": [
+        "nvflare/private/fed/client/client_executor.py:628",
+        "nvflare/private/fed/client/client_executor.py:676",
+        "nvflare/private/fed/client/client_executor.py:581",
+        "nvflare/utils/process_utils.py:256",
+        "nvflare/utils/process_utils.py:301"
+      ],
+      "summary": "The client waiter treats leader exit as the point to release the job resources and remove its process registration. Same-process-group descendants can still be alive, while termination either returns after registration disappearance or cannot recover the group through the reaped leader PID. The repaired C8 model witnesses resource release after actual possible SJ/CJ synchronization, leaving the sole unit free while a descendant uses it. This is a source-derived F10 candidate; real local process-group behavior, a supported cooperative subprocess pattern and a later-job allocation control remain mandatory confirmation requirements."
+    },
+    {
+      "id": "MC-9",
+      "source": "model-checking",
+      "title": "Running-job abort can succeed while the final status is COMPLETED",
+      "scenario": "S4 / historical MC-E; stop-before-marker race",
+      "severity": "Medium",
+      "invariant": "NoStoppedSuccess",
+      "config": "MC_hunt_probe_stop_success.cfg",
+      "counterexample": "spec/output/continuation-H4-probe_stop_success/tlc.out",
+      "affected_code": [
+        "nvflare/private/fed/server/job_runner.py:798",
+        "nvflare/private/fed/server/job_runner.py:802",
+        "nvflare/private/fed/server/job_runner.py:484",
+        "nvflare/private/fed/server/job_runner.py:489",
+        "nvflare/private/fed/server/job_runner.py:524"
+      ],
+      "summary": "stop_run sends cleanup and abort RPCs before marking the tracked Job as aborted. Completion can observe the resulting clean SJ exit, read the old abort marker, and publish COMPLETED while the handler is still waiting to mark the job. In the final C8 35-state witness, mark_run_aborted then finds the still-tracked Job and returns success without changing that published outcome. This independently rechecks historical MC-E; the earlier C5 witness placed the marker between the abort read and latch. A real abort/RPC/completion schedule and passing nonoverlap control remain separate confirmation obligations."
+    },
+    {
+      "id": "MC-10",
+      "source": "model-checking",
+      "title": "An authoritative client failure recorded after the completion outcome read can be published as success",
+      "scenario": "S4 / continuation counterexample for the source-review V04 finalization gap",
+      "severity": "Medium",
+      "invariant": "FinalMatchesOutcomeNovel",
+      "config": "MC_hunt_s4_outcome.cfg",
+      "counterexample": "spec/output/continuation-H4-s4_outcome/tlc.out",
+      "affected_code": [
+        "nvflare/private/fed/server/fed_server.py:933",
+        "nvflare/private/fed/server/fed_server.py:951",
+        "nvflare/private/fed/server/job_runner.py:484",
+        "nvflare/private/fed/server/job_runner.py:492",
+        "nvflare/private/fed/server/job_runner.py:524",
+        "nvflare/private/fed/server/job_runner.py:817",
+        "nvflare/private/fed/server/job_runner.py:837",
+        "nvflare/private/fed/server/job_runner.py:575"
+      ],
+      "summary": "The report handler can pass the pending-outcome check just before completion expires the client-outcome barrier. Completion reads a successful outcome, and fail_run then records an authoritative infrastructure failure while the job is still tracked, but completion latches and publishes its earlier read. This is distinct from an intentionally ignored report after final removal: the implementation accepts and records the active-job failure. The 37-state C8 counterexample refines the source-review V04 concern; actual deadline/handler timing and independent local-deployment reproduction remain required."
+    },
+    {
+      "id": "MC-11",
+      "source": "model-checking",
+      "title": "A client failure accepted in the startup tracking gap can be lost before success is published",
+      "scenario": "S4 / historical MC-U1 independently rediscovered",
+      "severity": "Medium",
+      "invariant": "NoInactiveFailureSuccess",
+      "config": "MC_hunt_u1_startup_gap.cfg",
+      "counterexample": "spec/output/continuation-H4-u1_startup_gap/tlc.out",
+      "affected_code": [
+        "nvflare/private/fed/server/job_runner.py:304",
+        "nvflare/private/fed/server/job_runner.py:308",
+        "nvflare/private/fed/server/job_runner.py:710",
+        "nvflare/private/fed/server/job_runner.py:817",
+        "nvflare/private/fed/server/fed_server.py:933",
+        "nvflare/private/fed/server/fed_server.py:951",
+        "nvflare/private/fed/server/fed_server.py:957"
+      ],
+      "summary": "The pending-client table becomes active before running_jobs is populated, while an early-exited SJ can already have been removed from run_processes. A failure report can therefore pass the pending check but reach fail_run while neither active map contains the job, causing the failure to be ignored. The runner later inserts the job and completion publishes success without that failure record. The guarded 37-state C8 counterexample independently rechecks historical MC-U1; real supported fast-workflow timing, process failure, deadline/resolution variants and passing active-tracking controls remain confirmation obligations."
+    },
+    {
+      "id": "MC-12",
+      "source": "model-checking",
+      "title": "Stale delete authorization can strand a running job and its admission slot",
+      "scenario": "S2 / historical MC-C and source stale-delete lead",
+      "severity": "High",
+      "invariant": "NoDeletedTrackedSlot",
+      "config": "MC_hunt_probe_deleted_slot.cfg",
+      "counterexample": "spec/output/continuation-H4-probe_deleted_slot/tlc.out",
+      "affected_code": [
+        "nvflare/private/fed/server/job_cmds.py:516",
+        "nvflare/private/fed/server/job_cmds.py:527",
+        "nvflare/private/fed/server/job_runner.py:524",
+        "nvflare/private/fed/server/job_runner.py:530",
+        "nvflare/private/fed/server/job_runner.py:532",
+        "nvflare/app_common/job_schedulers/job_scheduler.py:263"
+      ],
+      "summary": "The delete handler checks the status of an earlier Job snapshot, so a request authorized while SUBMITTED can remove storage after START has succeeded and the job is tracked as RUNNING. When completion later publishes its terminal status, the missing store object makes every retry fail before map removal and lifecycle release. With the concurrency limit occupied, later eligible work cannot be admitted. The fresh 27-state C8 counterexample independently rechecks historical MC-C and excludes the benign interval after successful terminal publication; live completion retry and later-job controls remain confirmation obligations."
+    },
+    {
+      "id": "MC-13",
+      "source": "model-checking",
+      "title": "Accepted noncanonical min_clients can repeatedly starve a later eligible job",
+      "scenario": "S2 / source-seeded F4; pre-reservation numeric-string case",
+      "severity": "High",
+      "invariant": "AdmissionProgress",
+      "config": "MC_hunt_live_admission.cfg",
+      "counterexample": "spec/output/continuation-H4-live_admission/tlc.out",
+      "affected_code": [
+        "nvflare/private/fed/server/job_meta_validator.py:240",
+        "nvflare/apis/job_def.py:241",
+        "nvflare/app_common/job_schedulers/job_scheduler.py:166",
+        "nvflare/app_common/job_schedulers/job_scheduler.py:292",
+        "nvflare/app_common/job_schedulers/job_scheduler.py:344",
+        "nvflare/app_common/job_schedulers/job_scheduler.py:365"
+      ],
+      "summary": "Job validation accepts a numeric string for min_clients by converting it locally, but leaves the original string in persisted metadata, which Job construction retains unchanged. The scheduler then raises TypeError before updating its retry history; its outer catch abandons the whole candidate list. Each later scan retries the same oldest job, so a well-formed later job remains SUBMITTED despite free capacity. The C8 temporal counterexample has five listed states with a loop back to state 1 (seven distinct reachable states) and satisfies the modeled fairness assumptions. This is the original source-seeded F4 mechanism; real public submission, later-job impact and a numeric-value control remain independent confirmation obligations."
+    }
+  ]
+}

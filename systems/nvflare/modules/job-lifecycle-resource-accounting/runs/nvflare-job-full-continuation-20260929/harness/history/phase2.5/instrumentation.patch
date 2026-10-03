@@ -1,0 +1,994 @@
+diff --git a/nvflare/apis/impl/job_def_manager.py b/nvflare/apis/impl/job_def_manager.py
+index 45c986b..e14a008 100644
+--- a/nvflare/apis/impl/job_def_manager.py
++++ b/nvflare/apis/impl/job_def_manager.py
+@@ -43,6 +43,7 @@ from nvflare.apis.utils.job_submit_token import (
+     submitter_to_dict,
+ )
+ from nvflare.fuel.utils import fobs
++from nvflare.fuel.utils import tla_hooks as _tla
+ from nvflare.fuel.utils.zip_utils import unzip_all_from_bytes, zip_directory_to_bytes
+ 
+ _OBJ_TAG_SCHEDULED = "scheduled"
+@@ -511,12 +512,20 @@ class SimpleJobDefManager(JobDefManagerSpec):
+ 
+     def get_jobs_to_schedule(self, fl_ctx: FLContext) -> List[Job]:
+         job_filter = _ScheduleJobFilter(self._get_job_store(fl_ctx))
+-        self._scan(job_filter, fl_ctx, skip_tag=_OBJ_TAG_SCHEDULED)
++        with _tla.context("runner_scan"):  # TLA-TRACE: marks the JobRunner scan for the hooks in _scan
++            self._scan(job_filter, fl_ctx, skip_tag=_OBJ_TAG_SCHEDULED)
+         return job_filter.result
+ 
+     def _scan(self, job_filter: _JobFilter, fl_ctx: FLContext, skip_tag=None):
+         store = self._get_job_store(fl_ctx)
+-        obj_uris = store.list_objects(self.uri_root, without_tag=skip_tag)
++        with _tla.section("RunnerScanList", when="runner_scan"):  # TLA-TRACE: RunnerScanList (list_objects)
++            obj_uris = store.list_objects(self.uri_root, without_tag=skip_tag)
++        _tla_scan = _tla.in_context("runner_scan")
++        if _tla_scan:
++            _tla.gate("runner.after_scan_list")  # TLA-TRACE reproduction gate
++            # TLA-TRACE: RunnerScanRead covers the meta reads and "scheduled" tags below; it is ended right after
++            # DefaultJobScheduler._exceed_max_jobs (job_scheduler.py).
++            _tla.begin("RunnerScanRead")
+         self.log_debug(fl_ctx, f"objects to scan: {len(obj_uris)}")
+         if not obj_uris:
+             return
+@@ -524,7 +533,13 @@ class SimpleJobDefManager(JobDefManagerSpec):
+         for uri in obj_uris:
+             jid = pathlib.PurePath(uri).name
+             job_uri = self.job_uri(jid)
+-            meta = store.get_meta(job_uri)
++            try:
++                meta = store.get_meta(job_uri)
++            except BaseException:
++                if _tla_scan:  # TLA-TRACE: RunnerScanReadDeleted (listed object vanished; run() dies)
++                    _tla.rename("RunnerScanReadDeleted")
++                    _tla.end("RunnerScanReadDeleted")
++                raise
+             if meta:
+                 ok = job_filter.filter_job(JobInfo(meta, jid, job_uri))
+                 if not ok:
+diff --git a/nvflare/app_common/job_schedulers/job_scheduler.py b/nvflare/app_common/job_schedulers/job_scheduler.py
+index 97abd1b..0fccba2 100644
+--- a/nvflare/app_common/job_schedulers/job_scheduler.py
++++ b/nvflare/app_common/job_schedulers/job_scheduler.py
+@@ -26,6 +26,7 @@ from nvflare.apis.job_def_manager_spec import JobDefManagerSpec
+ from nvflare.apis.job_scheduler_spec import DispatchInfo, JobSchedulerSpec
+ from nvflare.apis.server_engine_spec import ServerEngineSpec
+ from nvflare.apis.utils.job_utils import get_event_job_id
++from nvflare.fuel.utils import tla_hooks as _tla
+ from nvflare.private.fed.utils.fed_utils import extract_participants
+ from nvflare.security.study_registry import StudyRegistryService
+ from nvflare.utils.job_launcher_utils import get_resource_manager_spec
+@@ -196,6 +197,9 @@ class DefaultJobScheduler(JobSchedulerSpec, FLComponent):
+             self.log_info(fl_ctx, f"Job {job.job_id} can't be scheduled: {block_reason}")
+             return SCHEDULE_RESULT_NO_RESOURCE, None, block_reason
+ 
++        # TLA-TRACE: RunnerTryNext (CHECK branch) just before CHECK_RESOURCE is sent; the tracer assigns the attempt id
++        _tla.note("try_check_sent", True)
++        _tla.event("RunnerTryNext", job=job.job_id, check=True)
+         resource_check_results = self._check_client_resources(job=job, resource_reqs=resource_reqs, fl_ctx=fl_ctx)
+         fl_ctx.set_prop(FLContextKey.RESOURCE_CHECK_RESULT, resource_check_results, private=True, sticky=False)
+         self.fire_event(EventType.AFTER_CHECK_CLIENT_RESOURCES, fl_ctx)
+@@ -270,6 +274,7 @@ class DefaultJobScheduler(JobSchedulerSpec, FLComponent):
+                     f"is greater than max_jobs ({self.max_jobs})",
+                 )
+                 exceed_limit = True
++        _tla.end("RunnerScanRead")  # TLA-TRACE: RunnerScanRead (opened in SimpleJobDefManager._scan) ends here
+         return exceed_limit
+ 
+     def handle_event(self, event_type: str, fl_ctx: FLContext):
+@@ -292,6 +297,9 @@ class DefaultJobScheduler(JobSchedulerSpec, FLComponent):
+         try:
+             ready_job, dispatch_info = self._do_schedule_job(job_candidates, fl_ctx, failed_jobs, blocked_jobs)
+         except:
++            _tla_job = _tla.take("try_job")
++            if _tla_job is not None and not _tla.take("try_check_sent", False):
++                _tla.event("RunnerTryNext", job=_tla_job)  # TLA-TRACE: _try_job raised before CHECK_RESOURCE
+             self.log_exception(fl_ctx, "error scheduling job")
+             ready_job, dispatch_info = None, None
+ 
+@@ -300,12 +308,15 @@ class DefaultJobScheduler(JobSchedulerSpec, FLComponent):
+             if failed_jobs:
+                 # set the try count
+                 for job in failed_jobs:
+-                    job_manager.refresh_meta(job, self._get_update_meta_keys(), fl_ctx)
++                    with _tla.context("rmw:RunnerRefresh"):  # TLA-TRACE: RunnerRefreshRead / RunnerRefreshWrite
++                        job_manager.refresh_meta(job, self._get_update_meta_keys(), fl_ctx)
+ 
+             if blocked_jobs:
+                 for job in blocked_jobs:
+-                    job_manager.refresh_meta(job, self._get_update_meta_keys(), fl_ctx)
+-                    job_manager.set_status(job.job_id, RunStatus.FINISHED_CANT_SCHEDULE, fl_ctx)
++                    with _tla.context("rmw:RunnerRefresh"):  # TLA-TRACE: RunnerRefreshRead / RunnerRefreshWrite
++                        job_manager.refresh_meta(job, self._get_update_meta_keys(), fl_ctx)
++                    with _tla.section("RunnerSetCantSched", job=job.job_id):  # TLA-TRACE: after set_status or raise
++                        job_manager.set_status(job.job_id, RunStatus.FINISHED_CANT_SCHEDULE, fl_ctx)
+         except:
+             self.log_exception(fl_ctx, "error updating scheduling info in job store")
+         return ready_job, dispatch_info
+@@ -351,6 +362,7 @@ class DefaultJobScheduler(JobSchedulerSpec, FLComponent):
+                 )
+                 blocked_jobs.append(job)
+                 self._update_schedule_history(job, f"exceeded max schedule count {self.max_schedule_count}", fl_ctx)
++                _tla.event("RunnerTryNext", job=job.job_id)  # TLA-TRACE: blocked (max schedule count)
+                 continue
+ 
+             last_schedule_time = job.meta.get(JobMetaKey.LAST_SCHEDULE_TIME.value, 0.0)
+@@ -359,10 +371,16 @@ class DefaultJobScheduler(JobSchedulerSpec, FLComponent):
+             required_interval = min(self.max_schedule_interval, (2**n) * self.min_schedule_interval)
+             if time_since_last_schedule < required_interval:
+                 # do not schedule again too soon
++                _tla.event("RunnerBackoffSkip", job=job.job_id)  # TLA-TRACE
+                 continue
+ 
+             with engine.new_context() as ctx:
++                _tla.note("try_check_sent", False)
++                _tla.note("try_job", job.job_id)
+                 rc, sites_dispatch_info, result = self._try_job(job, ctx)
++                _tla.take("try_job")
++                if not _tla.take("try_check_sent", False):
++                    _tla.event("RunnerTryNext", job=job.job_id)  # TLA-TRACE: evaluated without CHECK_RESOURCE
+                 self.log_debug(ctx, f"Try to schedule job {job.job_id}, get result: {rc}, {sites_dispatch_info}.")
+                 if not result:
+                     result = "scheduled"
+@@ -374,6 +392,8 @@ class DefaultJobScheduler(JobSchedulerSpec, FLComponent):
+                 else:
+                     blocked_jobs.append(job)
+ 
++        if job_candidates:
++            _tla.event("RunnerTryDone")  # TLA-TRACE: candidate loop exhausted
+         self.log_debug(fl_ctx, "No job is scheduled.")
+         return None, None
+ 
+diff --git a/nvflare/app_common/resource_managers/auto_clean_resource_manager.py b/nvflare/app_common/resource_managers/auto_clean_resource_manager.py
+index 8346771..cd53ba1 100644
+--- a/nvflare/app_common/resource_managers/auto_clean_resource_manager.py
++++ b/nvflare/app_common/resource_managers/auto_clean_resource_manager.py
+@@ -21,6 +21,7 @@ from nvflare.apis.event_type import EventType
+ from nvflare.apis.fl_component import FLComponent
+ from nvflare.apis.fl_context import FLContext
+ from nvflare.apis.resource_manager_spec import ResourceManagerSpec
++from nvflare.fuel.utils import tla_hooks as _tla
+ 
+ 
+ class AutoCleanResourceManager(ResourceManagerSpec, FLComponent, ABC):
+@@ -102,6 +103,7 @@ class AutoCleanResourceManager(ResourceManagerSpec, FLComponent, ABC):
+     def _check_expired(self):
+         while not self._stop_event.is_set():
+             time.sleep(self._check_period)
++            _tla.begin("CpTick", rm=self)  # TLA-TRACE: one expiry tick (no event when nothing is reserved)
+             with self._lock:
+                 tokens_to_remove = []
+                 for k in self.reserved_resources:
+@@ -115,6 +117,7 @@ class AutoCleanResourceManager(ResourceManagerSpec, FLComponent, ABC):
+                     reserved_resources, _ = self.reserved_resources.pop(token)
+                     self._deallocate(resources=reserved_resources)
+                 self.logger.debug(f"current resources: {self.resources}, reserved_resources {self.reserved_resources}.")
++            _tla.end("CpTick")  # TLA-TRACE
+ 
+     def check_resources(self, resource_requirement: dict, fl_ctx: FLContext):
+         if not isinstance(resource_requirement, dict):
+diff --git a/nvflare/app_common/storages/filesystem_storage.py b/nvflare/app_common/storages/filesystem_storage.py
+index 9b5866d..ca9860e 100644
+--- a/nvflare/app_common/storages/filesystem_storage.py
++++ b/nvflare/app_common/storages/filesystem_storage.py
+@@ -24,6 +24,7 @@ from zipfile import ZipFile
+ 
+ from nvflare.apis.storage import DATA, META, StorageException, StorageSpec
+ from nvflare.apis.utils.format_check import validate_class_methods_args
++from nvflare.fuel.utils import tla_hooks as _tla
+ from nvflare.fuel.utils.zip_utils import get_all_file_paths, normpath_for_zip
+ from nvflare.security.logging import secure_format_exception
+ 
+@@ -264,15 +265,22 @@ class FilesystemStorage(StorageSpec):
+         """
+         full_uri = self._object_path(uri)
+ 
+-        if not _object_exists(full_uri):
+-            raise StorageException("object {} does not exist".format(uri))
++        # TLA-TRACE: the unlocked read-modify-write is traced as two steps (RunnerRefreshRead/Write, RunnerMetaRead/Write)
++        # when the caller marked it with an "rmw:<prefix>" context; otherwise these sections are no-ops/absorbed.
++        with _tla.section("@rmw.read", uri=uri, when="rmw"):
++            if not _object_exists(full_uri):
++                raise StorageException("object {} does not exist".format(uri))
++
++            if not replace:
++                prev_meta = self.get_meta(uri)
+ 
+         if replace:
+             _write(os.path.join(full_uri, META), _encode_meta(meta))
+         else:
+-            prev_meta = self.get_meta(uri)
++            _tla.gate("rmw.between", uri=uri)  # TLA-TRACE reproduction gate
+             prev_meta.update(meta)
+-            _write(os.path.join(full_uri, META), _encode_meta(prev_meta))
++            with _tla.section("@rmw.write", uri=uri, when="rmw"):
++                _write(os.path.join(full_uri, META), _encode_meta(prev_meta))
+ 
+     def list_objects(self, path: str, without_tag=None) -> List[str]:
+         """List all objects in the specified path.
+diff --git a/nvflare/private/fed/client/client_engine.py b/nvflare/private/fed/client/client_engine.py
+index 894e176..a748d23 100644
+--- a/nvflare/private/fed/client/client_engine.py
++++ b/nvflare/private/fed/client/client_engine.py
+@@ -30,6 +30,7 @@ from nvflare.apis.workspace import Workspace
+ from nvflare.fuel.f3.cellnet.cell import Cell
+ from nvflare.fuel.f3.cellnet.defs import CellChannel, MessageHeaderKey, ReturnCode
+ from nvflare.fuel.f3.message import Message as CellMessage
++from nvflare.fuel.utils import tla_hooks as _tla
+ from nvflare.fuel.utils.log_utils import get_obj_logger
+ from nvflare.private.aux_runner import AuxMsgTarget, AuxRunner
+ from nvflare.private.defs import ERROR_MSG_PREFIX, ClientStatusKey, new_cell_message
+@@ -356,6 +357,7 @@ class ClientEngine(ClientEngineInternalSpec, StreamableEngine):
+     ) -> str:
+         status = self.client_executor.get_status(job_id)
+         if status == ClientStatus.STARTED:
++            _tla.end("CpStartAllocate", branch="already_started")  # TLA-TRACE: allocation not handed on
+             return "Client app already started."
+ 
+         workspace = Workspace(
+@@ -364,7 +366,10 @@ class ClientEngine(ClientEngineInternalSpec, StreamableEngine):
+         )
+         app_root = workspace.get_app_dir(job_id)
+         if not os.path.exists(app_root):
++            _tla.rename("CpStartAllocateAppMissing")  # TLA-TRACE (unsupported trigger)
++            _tla.end("CpStartAllocateAppMissing")
+             return f"{ERROR_MSG_PREFIX}: Client app does not exist. Please deploy it before starting client."
++        _tla.end("CpStartAllocate")  # TLA-TRACE: allocation handed to the start path
+ 
+         self.logger.info("Starting client app. rank: {}".format(self.rank))
+ 
+@@ -388,18 +393,23 @@ class ClientEngine(ClientEngineInternalSpec, StreamableEngine):
+         return self.client.client_name
+ 
+     def abort_app(self, job_id: str, heartbeat_cleanup: bool = False) -> str:
++        # TLA-TRACE: CpAbortApp, ended once the request is recorded (in JobExecutor.abort_app before the join)
++        _tla.begin("CpAbortApp", engine=self, job=job_id, hb=heartbeat_cleanup)
+         status = self.client_executor.get_status(job_id)
+         # A CJ reports STOPPED after its runner returns, before process-local
+         # archival and communication teardown finish.  Keep treating it as a
+         # live job while the executor still owns its handle so a server-side
+         # failure can reclaim a CJ that hangs in that final teardown window.
+         if status == ClientStatus.STOPPED and job_id not in self.client_executor.get_run_processes_keys():
++            _tla.end("CpAbortApp")
+             return "Client app already stopped."
+ 
+         if status == ClientStatus.NOT_STARTED:
++            _tla.end("CpAbortApp")
+             return "Client app has not started."
+ 
+         self.client_executor.abort_app(job_id, heartbeat_cleanup=heartbeat_cleanup)
++        _tla.end("CpAbortApp")  # TLA-TRACE: no-op unless JobExecutor.abort_app left it open
+ 
+         return "Abort signal has been sent to the client App."
+ 
+diff --git a/nvflare/private/fed/client/client_executor.py b/nvflare/private/fed/client/client_executor.py
+index aff148a..827e948 100644
+--- a/nvflare/private/fed/client/client_executor.py
++++ b/nvflare/private/fed/client/client_executor.py
+@@ -30,6 +30,7 @@ from nvflare.fuel.common.exit_codes import PROCESS_EXIT_REASON, ProcessExitCode
+ from nvflare.fuel.f3.cellnet.core_cell import FQCN
+ from nvflare.fuel.f3.cellnet.defs import MessageHeaderKey, ReturnCode
+ from nvflare.fuel.f3.message import Message as CellMessage
++from nvflare.fuel.utils import tla_hooks as _tla
+ from nvflare.fuel.utils.config_service import ConfigService
+ from nvflare.fuel.utils.log_utils import get_obj_logger
+ from nvflare.private.defs import CellChannel, CellChannelTopic, JobFailureMsgKey, new_cell_message
+@@ -297,6 +298,9 @@ class JobExecutor(ClientExecutor):
+ 
+         fl_ctx.set_prop(key=FLContextKey.JOB_PROCESS_ARGS, value=job_args, private=True, sticky=False)
+         pending_handle = _PendingJobHandle()
++        # TLA-TRACE: CpStartRegister (STARTING registration); the "still registered" raise is closed by
++        # StartJobProcessor after it frees the allocation.
++        _tla.begin("CpStartRegister", executor=self, job=job_id)
+         with self.lock:
+             if job_id in self.run_processes:
+                 raise RuntimeError(f"client app for job '{job_id}' is still registered")
+@@ -305,11 +309,16 @@ class JobExecutor(ClientExecutor):
+                 RunProcessKey.STATUS: ClientStatus.STARTING,
+                 _ABORT_REQUESTED_KEY: False,
+             }
++        _tla.end("CpStartRegister")
++        # TLA-TRACE: CpStartLaunch = launch + attach + waiter start; CpStartLaunchFail when launch raises (closed by
++        # StartJobProcessor after the free).
++        _tla.begin("CpStartLaunch", executor=self, job=job_id)
+         try:
+             job_handle = job_launcher.launch_job(job_meta, fl_ctx)
+             if job_handle is None:
+                 raise RuntimeError(f"job launcher returned no job handle for job '{job_id}'")
+         except BaseException:
++            _tla.rename("CpStartLaunchFail")
+             with self.lock:
+                 if self.run_processes.get(job_id, {}).get(RunProcessKey.JOB_HANDLE) is pending_handle:
+                     self.run_processes.pop(job_id, None)
+@@ -332,6 +341,7 @@ class JobExecutor(ClientExecutor):
+             args=(client, job_id, allocated_resource, token, resource_manager, args.workspace, fl_ctx),
+         )
+         thread.start()
++        _tla.end("CpStartLaunch", units=allocated_resource)  # TLA-TRACE: after the waiter thread starts
+ 
+     def _get_job_launcher(self, job_meta: dict, fl_ctx: FLContext) -> JobLauncherSpec:
+         engine = fl_ctx.get_engine()
+@@ -509,6 +519,7 @@ class JobExecutor(ClientExecutor):
+                             job_handle.terminate(heartbeat_cleanup=True)
+                         else:
+                             job_handle.terminate()
++                        _tla.end("CpAbortApp")  # TLA-TRACE
+                         break
+                     if process_status == ClientStatus.STOPPED:
+                         # STOPPED means the runner returned, not that the OS
+@@ -517,6 +528,7 @@ class JobExecutor(ClientExecutor):
+                         # still-registered owned process.
+                         t = threading.Thread(target=self._terminate_job, args=[job_handle, job_id, heartbeat_cleanup])
+                         t.start()
++                        _tla.end("CpAbortApp")  # TLA-TRACE: request recorded, before the join
+                         t.join()
+                         break
+                     request = new_cell_message({}, {})
+@@ -530,9 +542,11 @@ class JobExecutor(ClientExecutor):
+                     self.logger.debug("abort sent to worker")
+                     t = threading.Thread(target=self._terminate_job, args=[job_handle, job_id, heartbeat_cleanup])
+                     t.start()
++                    _tla.end("CpAbortApp")  # TLA-TRACE: request recorded, before the join
+                     t.join()
+                     break
+                 except Exception as e:
++                    _tla.end("CpAbortApp")  # TLA-TRACE
+                     if retry == 0:
+                         self.logger.error(
+                             f"abort_worker_process execution exception: {secure_format_exception(e)} for run: {job_id}."
+@@ -541,6 +555,7 @@ class JobExecutor(ClientExecutor):
+                     retry -= 1
+                     time.sleep(5.0)
+             else:
++                _tla.end("CpAbortApp")  # TLA-TRACE
+                 self.logger.info(f"Client worker process for run: {job_id} was already terminated.")
+                 break
+ 
+@@ -582,22 +597,27 @@ class JobExecutor(ClientExecutor):
+         max_wait = 10.0
+         start = time.time()
+         while True:
++            # TLA-TRACE: CpTerminateJob covers the final registration check (early return) or the terminate()
++            _tla.begin("CpTerminateJob", executor=self, job=job_id)
+             with self.lock:
+                 process = self.run_processes.get(job_id)
+             if not process:
+                 # already finished gracefully
++                _tla.end("CpTerminateJob")
+                 return
+ 
+             if time.time() - start > max_wait:
+                 # waited enough
+                 break
+ 
++            _tla.cancel("CpTerminateJob")
+             time.sleep(0.05)  # we want to quickly check
+ 
+         if heartbeat_cleanup:
+             job_handle.terminate(heartbeat_cleanup=True)
+         else:
+             job_handle.terminate()
++        _tla.end("CpTerminateJob")
+         self.logger.info(f"run ({job_id}): child worker process terminated")
+ 
+     def abort_task(self, job_id):
+@@ -626,6 +646,8 @@ class JobExecutor(ClientExecutor):
+         job_handle = self.run_processes.get(job_id, {}).get(RunProcessKey.JOB_HANDLE)
+         if job_handle:
+             job_handle.wait()
++            # TLA-TRACE: CpChildFinished = reap .. rc remap .. report .. free .. pop
++            _tla.begin("CpChildFinished", executor=self, job=job_id)
+ 
+             return_code = get_return_code(job_handle, job_id, workspace, self.logger)
+ 
+@@ -679,6 +701,7 @@ class JobExecutor(ClientExecutor):
+             )
+         with self.lock:
+             self.run_processes.pop(job_id, None)
++        _tla.end("CpChildFinished")  # TLA-TRACE: after run_processes.pop
+         self.logger.debug(f"run ({job_id}): child worker resources freed.")
+ 
+         engine = fl_ctx.get_engine()
+diff --git a/nvflare/private/fed/client/scheduler_cmds.py b/nvflare/private/fed/client/scheduler_cmds.py
+index 33cee17..b663934 100644
+--- a/nvflare/private/fed/client/scheduler_cmds.py
++++ b/nvflare/private/fed/client/scheduler_cmds.py
+@@ -20,6 +20,7 @@ from nvflare.apis.event_type import EventType
+ from nvflare.apis.fl_constant import FLContextKey, ReturnCode, ServerCommandKey, SystemComponents
+ from nvflare.apis.resource_manager_spec import ResourceConsumerSpec, ResourceManagerSpec
+ from nvflare.apis.shareable import Shareable
++from nvflare.fuel.utils import tla_hooks as _tla
+ from nvflare.private.admin_defs import Message
+ from nvflare.private.defs import ERROR_MSG_PREFIX, RequestHeader, SysCommandTopic, TrainingTopic
+ from nvflare.private.fed.client.admin import RequestProcessor
+@@ -64,28 +65,33 @@ class CheckResourceProcessor(RequestProcessor):
+         resource_manager = _get_resource_manager(engine)
+         is_resource_enough, token = False, ""
+ 
+-        with engine.new_context() as fl_ctx:
+-            try:
+-                job_id = req.get_header(RequestHeader.JOB_ID, "")
+-                resource_spec = req.body
+-                fl_ctx.set_prop(key=FLContextKey.CLIENT_RESOURCE_SPECS, value=resource_spec, private=True, sticky=False)
+-
+-                fl_ctx.set_prop(FLContextKey.CURRENT_JOB_ID, job_id, private=True, sticky=False)
+-                shared_fl_ctx = req.get_header(ServerCommandKey.PEER_FL_CONTEXT)
+-                fl_ctx.set_peer_context(shared_fl_ctx)
+-
+-                engine.fire_event(EventType.BEFORE_CHECK_RESOURCE_MANAGER, fl_ctx)
+-                block_reason = fl_ctx.get_prop(FLContextKey.JOB_BLOCK_REASON)
+-                if block_reason:
+-                    is_resource_enough = False
+-                    token = block_reason
+-                else:
+-                    is_resource_enough, token = resource_manager.check_resources(
+-                        resource_requirement=resource_spec, fl_ctx=fl_ctx
++        # TLA-TRACE: CpCheckResource, after check_resources returns (reservation visible in the snapshot)
++        with _tla.section("CpCheckResource", msg=req, engine=engine) as _tla_sec:
++            with engine.new_context() as fl_ctx:
++                try:
++                    job_id = req.get_header(RequestHeader.JOB_ID, "")
++                    resource_spec = req.body
++                    fl_ctx.set_prop(
++                        key=FLContextKey.CLIENT_RESOURCE_SPECS, value=resource_spec, private=True, sticky=False
+                     )
+-            except Exception as e:
+-                logger.error(f"Job {job_id}: resource check failed: {secure_format_exception(e)}")
+-                token = "resource manager raised an exception; see site log"
++
++                    fl_ctx.set_prop(FLContextKey.CURRENT_JOB_ID, job_id, private=True, sticky=False)
++                    shared_fl_ctx = req.get_header(ServerCommandKey.PEER_FL_CONTEXT)
++                    fl_ctx.set_peer_context(shared_fl_ctx)
++
++                    engine.fire_event(EventType.BEFORE_CHECK_RESOURCE_MANAGER, fl_ctx)
++                    block_reason = fl_ctx.get_prop(FLContextKey.JOB_BLOCK_REASON)
++                    if block_reason:
++                        is_resource_enough = False
++                        token = block_reason
++                    else:
++                        is_resource_enough, token = resource_manager.check_resources(
++                            resource_requirement=resource_spec, fl_ctx=fl_ctx
++                        )
++                except Exception as e:
++                    logger.error(f"Job {job_id}: resource check failed: {secure_format_exception(e)}")
++                    token = "resource manager raised an exception; see site log"
++            _tla_sec.set(token=token, ok=is_resource_enough)
+ 
+         result.set_header(ShareableHeader.IS_RESOURCE_ENOUGH, is_resource_enough)
+         result.set_header(ShareableHeader.RESOURCE_RESERVE_TOKEN, token)
+@@ -112,10 +118,14 @@ class StartJobProcessor(RequestProcessor):
+             return Message(topic=f"reply_{req.topic}", body=msg)
+ 
+         try:
++            # TLA-TRACE: CpStartAllocate covers allocate_resources .. ClientEngine.start_app's status checks (ended there);
++            # a failure is closed after the free in the except block below.
++            _tla.begin("CpStartAllocate", msg=req, engine=engine)
+             with engine.new_context() as fl_ctx:
+                 allocated_resources = resource_manager.allocate_resources(
+                     resource_requirement=resource_spec, token=token, fl_ctx=fl_ctx
+                 )
++            _tla.set_fields(units=allocated_resources)
+             if allocated_resources:
+                 resource_consumer = _get_resource_consumer(engine)
+                 resource_consumer.consume(allocated_resources)
+@@ -131,6 +141,8 @@ class StartJobProcessor(RequestProcessor):
+             if allocated_resources:
+                 with engine.new_context() as fl_ctx:
+                     resource_manager.free_resources(resources=allocated_resources, token=token, fl_ctx=fl_ctx)
++            # TLA-TRACE: emit the failed step (CpStartAllocate / CpStartRegister / CpStartLaunchFail) after the free
++            _tla.end_open()
+ 
+         if not result:
+             result = "OK"
+@@ -146,13 +158,14 @@ class CancelResourceProcessor(RequestProcessor):
+         result = Shareable()
+         resource_manager = _get_resource_manager(engine)
+ 
+-        with engine.new_context() as fl_ctx:
+-            try:
+-                resource_spec = req.body
+-                token = req.get_header(ShareableHeader.RESOURCE_RESERVE_TOKEN)
+-                resource_manager.cancel_resources(resource_requirement=resource_spec, token=token, fl_ctx=fl_ctx)
+-            except Exception:
+-                result.set_return_code(ReturnCode.EXECUTION_EXCEPTION)
++        with _tla.section("CpCancelResource", msg=req, engine=engine):  # TLA-TRACE: after cancel_resources
++            with engine.new_context() as fl_ctx:
++                try:
++                    resource_spec = req.body
++                    token = req.get_header(ShareableHeader.RESOURCE_RESERVE_TOKEN)
++                    resource_manager.cancel_resources(resource_requirement=resource_spec, token=token, fl_ctx=fl_ctx)
++                except Exception:
++                    result.set_return_code(ReturnCode.EXECUTION_EXCEPTION)
+ 
+         return Message(topic="reply_" + req.topic, body=result)
+ 
+diff --git a/nvflare/private/fed/server/fed_server.py b/nvflare/private/fed/server/fed_server.py
+index 4e41f77..645a8a4 100644
+--- a/nvflare/private/fed/server/fed_server.py
++++ b/nvflare/private/fed/server/fed_server.py
+@@ -58,6 +58,7 @@ from nvflare.fuel.f3.cellnet.net_agent import NetAgent
+ from nvflare.fuel.f3.drivers.driver_params import DriverParams
+ from nvflare.fuel.f3.mpm import MainProcessMonitor as mpm
+ from nvflare.fuel.sec.authn import add_authentication_headers
++from nvflare.fuel.utils import tla_hooks as _tla
+ from nvflare.fuel.utils.config_service import ConfigService
+ from nvflare.fuel.utils.log_utils import get_obj_logger
+ from nvflare.private import defs as private_defs
+@@ -314,7 +315,9 @@ class BaseServer(ABC):
+             if client.last_connect_time < time.time() - self.heart_beat_timeout:
+                 delete.append(token)
+         for token in delete:
+-            client = self.logout_client(token)
++            # TLA-TRACE: SweepEnd after notify_dead_client's run_processes loop (SweepBegin is emitted inside it)
++            with _tla.section("SweepEnd"):
++                client = self.logout_client(token)
+             self.logger.info(
+                 "Remove the dead Client. Name: {}.  Total clients: {}".format(
+                     client.name, len(self.client_manager.get_clients())
+@@ -593,15 +596,16 @@ class FederatedServer(BaseServer):
+             return make_cellnet_reply(F3ReturnCode.OK, "", return_data)
+         elif command == ServerCommandNames.UPDATE_RUN_STATUS:
+             execution_error = data.get("execution_error")
+-            with self.lock:
+-                run_process_info = self.engine.run_processes.get(job_id)
+-                if run_process_info is not None:
+-                    if execution_error:
+-                        run_process_info[RunProcessKey.PROCESS_EXE_ERROR] = True
+-                        self.engine.exception_run_processes[job_id] = run_process_info
+-                    run_process_info[RunProcessKey.PROCESS_FINISHED] = True
+-                reply = make_cellnet_reply(F3ReturnCode.OK, "", None)
+-                return reply
++            with _tla.section("SpUpdateRunStatus", msg=request):  # TLA-TRACE: before returning the reply
++                with self.lock:
++                    run_process_info = self.engine.run_processes.get(job_id)
++                    if run_process_info is not None:
++                        if execution_error:
++                            run_process_info[RunProcessKey.PROCESS_EXE_ERROR] = True
++                            self.engine.exception_run_processes[job_id] = run_process_info
++                        run_process_info[RunProcessKey.PROCESS_FINISHED] = True
++                    reply = make_cellnet_reply(F3ReturnCode.OK, "", None)
++                    return reply
+         elif command == ServerCommandNames.HEARTBEAT:
+             if job_id not in self.engine.run_processes:
+                 self.engine.abort_app_on_server(job_id)
+@@ -904,6 +908,11 @@ class FederatedServer(BaseServer):
+             return self._generate_reply(headers=headers, payload=None, fl_ctx=fl_ctx)
+ 
+     def process_job_failure(self, request: Message):
++        # TLA-TRACE: SpProcessJobFailure covers the whole handler (drop paths, fail_run / stop_run, resolve)
++        with _tla.section("SpProcessJobFailure", msg=request):
++            return self._tla_process_job_failure(request)
++
++    def _tla_process_job_failure(self, request: Message):
+         payload = request.payload
+         client = request.get_header(key=MessageHeaderKey.ORIGIN)
+ 
+@@ -1104,6 +1113,7 @@ class FederatedServer(BaseServer):
+         """
+         for job_id in self.engine.job_runner.get_client_outcome_jobs(client.name):
+             self._resolve_missing_client_outcome(client, job_id, "client dead")
++        _tla.emit("SweepBegin", cl=client.name)  # TLA-TRACE: after the pending-outcome loop
+ 
+         # find all RUNs that this client is participating
+         for job_id, process_info in self.engine.run_processes.items():
+diff --git a/nvflare/private/fed/server/job_cmds.py b/nvflare/private/fed/server/job_cmds.py
+index d4c34db..989184d 100644
+--- a/nvflare/private/fed/server/job_cmds.py
++++ b/nvflare/private/fed/server/job_cmds.py
+@@ -66,6 +66,7 @@ from nvflare.fuel.hci.reg import CommandModule, CommandModuleSpec, CommandSpec
+ from nvflare.fuel.hci.server.authz import PreAuthzReturnCode
+ from nvflare.fuel.hci.server.binary_transfer import BinaryTransfer
+ from nvflare.fuel.hci.server.constants import ConnProps
++from nvflare.fuel.utils import tla_hooks as _tla
+ from nvflare.fuel.utils.argument_utils import SafeArgumentParser
+ from nvflare.fuel.utils.log_utils import get_obj_logger
+ from nvflare.private.admin_defs import MsgHeader
+@@ -296,7 +297,11 @@ class JobCommandModule(CommandModule, CommandUtil, BinaryTransfer):
+         job_def_manager = engine.job_def_manager
+ 
+         with engine.new_context() as fl_ctx:
+-            job = job_def_manager.get_job(job_id, fl_ctx)
++            # TLA-TRACE: AdminDeleteAuthorize (delete_job authorization snapshot; only in the admin_delete context)
++            with _tla.section("AdminDeleteAuthorize", job=job_id, when="admin_delete") as _tla_sec:
++                job = job_def_manager.get_job(job_id, fl_ctx)
++                if not job:
++                    _tla_sec.cancel()
+ 
+         if not job:
+             _append_no_such_job_error(conn, job_id)
+@@ -505,6 +510,11 @@ class JobCommandModule(CommandModule, CommandUtil, BinaryTransfer):
+         conn.append_success("")
+ 
+     def delete_job(self, conn: Connection, args: List[str]):
++        # TLA-TRACE: AdminDeleteExec, after the refusal or after job_def_manager.delete
++        with _tla.section("AdminDeleteExec", job=conn.get_prop(self.JOB_ID), when="admin_delete"):
++            return self._tla_delete_job(conn, args)
++
++    def _tla_delete_job(self, conn: Connection, args: List[str]):
+         job = conn.get_prop(self.JOB)
+         if not job:
+             conn.append_error(
+@@ -1056,10 +1066,19 @@ class JobCommandModule(CommandModule, CommandUtil, BinaryTransfer):
+             job_id = conn.get_prop(self.JOB_ID)
+             with engine.new_context() as fl_ctx:
+                 job_manager = engine.job_def_manager
+-                job = job_manager.get_job(job_id, fl_ctx)
+-                job_status = job.meta.get(JobMetaKey.STATUS)
++                # TLA-TRACE: AdminAbortBegin after get_job and the status read (only SUBMITTED/DISPATCHED/RUNNING)
++                with _tla.section("AdminAbortBegin", job=job_id, on_error="cancel") as _tla_sec:
++                    job = job_manager.get_job(job_id, fl_ctx)
++                    job_status = job.meta.get(JobMetaKey.STATUS)
++                    if job_status not in [
++                        RunStatus.SUBMITTED.value,
++                        RunStatus.DISPATCHED.value,
++                        RunStatus.RUNNING.value,
++                    ]:
++                        _tla_sec.cancel()
+                 if job_status in [RunStatus.SUBMITTED.value, RunStatus.DISPATCHED.value]:
+-                    job_manager.set_status(job.job_id, RunStatus.FINISHED_ABORTED, fl_ctx)
++                    with _tla.section("AdminAbortWrite", job=job_id):  # TLA-TRACE: after set_status or raise
++                        job_manager.set_status(job.job_id, RunStatus.FINISHED_ABORTED, fl_ctx)
+                     message = f"Aborted the job {job_id} before running it."
+                     conn.append_string(message)
+                     conn.append_success("", meta=make_meta(MetaStatusValue.OK, message))
+diff --git a/nvflare/private/fed/server/job_runner.py b/nvflare/private/fed/server/job_runner.py
+index e07c873..c1fc9ff 100644
+--- a/nvflare/private/fed/server/job_runner.py
++++ b/nvflare/private/fed/server/job_runner.py
+@@ -37,6 +37,7 @@ from nvflare.apis.job_launcher_spec import JobReturnCode
+ from nvflare.apis.job_scheduler_spec import DispatchInfo
+ from nvflare.apis.workspace import Workspace
+ from nvflare.fuel.common.exit_codes import ProcessExitCode
++from nvflare.fuel.utils import tla_hooks as _tla
+ from nvflare.fuel.utils.config_service import ConfigService
+ from nvflare.lighter.tool_consts import NVFLARE_SIG_FILE
+ from nvflare.lighter.utils import verify_folder_signature
+@@ -223,6 +224,7 @@ class JobRunner(FLComponent):
+ 
+                 if invalid_inputs:
+                     deploy_detail.append("invalid_clients: {}".format(",".join(invalid_inputs)))
++                    _tla.event("RunnerDeployJob", job=job.job_id, arg={"failed": []})  # TLA-TRACE: unknown clients
+                     raise RuntimeError(f"unknown clients: {invalid_inputs}.")
+ 
+                 for c in clients:
+@@ -279,9 +281,11 @@ class JobRunner(FLComponent):
+                             deploy_detail.append(f"failed to deploy to required client {c}")
+ 
+         if abort_job:
++            _tla.event("RunnerDeployJob", job=job.job_id, arg={"failed": list(failed_clients)})  # TLA-TRACE
+             raise RuntimeError("deploy failure", deploy_detail)
+ 
+         self.fire_event(EventType.JOB_DEPLOYED, fl_ctx)
++        _tla.event("RunnerDeployJob", job=job.job_id, arg={"failed": list(failed_clients)})  # TLA-TRACE
+         return run_number, failed_clients
+ 
+     def _start_run(self, job_id: str, job: Job, client_sites: Dict[str, DispatchInfo], fl_ctx: FLContext):
+@@ -292,6 +296,9 @@ class JobRunner(FLComponent):
+             client_sites: participating sites
+             fl_ctx: FLContext
+         """
++        # TLA-TRACE: RunnerStartServerApp = SJ launch + run_processes registration + pending outcomes (renamed
++        # RunnerStartServerAppFail by the stub launcher when it raises); an exception is closed by run()'s handler.
++        _tla.begin("RunnerStartServerApp", job=job_id)
+         engine = fl_ctx.get_engine()
+         job_clients = engine.get_job_clients(client_sites)
+ 
+@@ -307,7 +314,12 @@ class JobRunner(FLComponent):
+ 
+         with self.lock:
+             self._pending_client_outcomes[job_id] = set(client_sites)
++        _tla.end("RunnerStartServerApp")
+         replies = engine.start_client_job(job, client_sites, fl_ctx)
++        _tla.gate("runner.after_start_client_job", job=job_id)  # TLA-TRACE reproduction gate
++        # TLA-TRACE: RunnerStartCollect (every START reply received) / RunnerStartTimeout, from here to JOB_STARTED;
++        # a raise below is closed by run()'s exception handler.
++        _tla.begin("RunnerStartCollect", job=job_id, replies=replies)
+         all_client_sites = list(client_sites.keys())
+         active_client_sites = list(all_client_sites)
+         strict_start_reply_check = ConfigService.get_bool_var(
+@@ -362,6 +374,7 @@ class JobRunner(FLComponent):
+ 
+         self.log_info(fl_ctx, f"Started run: {job_id} for clients: {display_sites}")
+         self._fire_job_lifecycle_event(EventType.JOB_STARTED, job_id, fl_ctx)
++        _tla.end()  # TLA-TRACE: emits RunnerStartCollect / RunnerStartTimeout
+ 
+     def _fire_job_lifecycle_event(self, event_type: str, job_id: str, fl_ctx: FLContext):
+         self.fire_event_with_data(
+@@ -442,6 +455,9 @@ class JobRunner(FLComponent):
+         job_manager = engine.get_component(SystemComponents.JOB_MANAGER)
+         while not self.ask_to_stop:
+             for job_id in list(self.running_jobs.keys()):
++                # TLA-TRACE: CmpFinalizeBegin covers the pre-checks, outcome barrier and latch; it is cancelled when the
++                # job still has a run process, vanished, or is still waiting for client outcomes.
++                _tla.begin("CmpFinalizeBegin", job=job_id)
+                 if job_id not in engine.run_processes.keys():
+                     job = self.running_jobs.get(job_id)
+                     if job:
+@@ -469,9 +485,11 @@ class JobRunner(FLComponent):
+                                     job_id, now + self.client_outcome_wait_timeout
+                                 )
+                                 if now < deadline:
++                                    _tla.cancel("CmpFinalizeBegin")
+                                     continue
+                                 unresolved = sorted(pending)
+                                 pending.clear()
++                                _tla.emit("CmpOutcomeDeadline", job=job_id)  # TLA-TRACE: after pending.clear()
+                             else:
+                                 unresolved = None
+                         if unresolved:
+@@ -490,6 +508,7 @@ class JobRunner(FLComponent):
+                                 finished_state = _FinishedJobState(status=status)
+                                 self._finished_job_states[job.job_id] = finished_state
+                             status = finished_state.status
++                            _tla.end("CmpFinalizeBegin")  # TLA-TRACE: latch held, before archival
+                             # Publish terminal status only after artifacts are ready for download.
+                             if not finished_state.workspace_archival_complete:
+                                 try:
+@@ -521,13 +540,16 @@ class JobRunner(FLComponent):
+                                         )
+                                 finished_state.workspace_archival_complete = True
+                             try:
+-                                job_manager.set_status(job.job_id, status, completion_ctx)
++                                with _tla.section("CmpPublish", job=job_id):  # TLA-TRACE: after set_status or raise
++                                    job_manager.set_status(job.job_id, status, completion_ctx)
+                             except Exception as e:
+                                 self.log_exception(
+                                     completion_ctx,
+                                     f"Failed to publish finished status for job ({job.job_id}): {secure_format_exception(e)}",
+                                 )
+                                 continue
++                            # TLA-TRACE: CmpRemove = del running_jobs .. JOB_ABORTED/JOB_COMPLETED .. remove_exception_process
++                            _tla.begin("CmpRemove", job=job_id)
+                             with self.lock:
+                                 del self.running_jobs[job_id]
+                                 self._finished_job_states.pop(job_id, None)
+@@ -537,7 +559,10 @@ class JobRunner(FLComponent):
+                                 self._fire_job_lifecycle_event(EventType.JOB_ABORTED, job_id, completion_ctx)
+                             self._fire_job_lifecycle_event(EventType.JOB_COMPLETED, job_id, completion_ctx)
+                             self.log_debug(completion_ctx, f"Finished running job:{job.job_id}")
++                    _tla.cancel("CmpFinalizeBegin")  # TLA-TRACE: job vanished from running_jobs
+                     engine.remove_exception_process(job_id)
++                    _tla.end("CmpRemove")  # TLA-TRACE
++                _tla.cancel("CmpFinalizeBegin")  # TLA-TRACE: SJ still in run_processes
+             time.sleep(1.0)
+ 
+     @staticmethod
+@@ -658,6 +683,7 @@ class JobRunner(FLComponent):
+                     )
+ 
+                     if ready_job:
++                        _tla.gate("runner.before_check_submitted", job=ready_job.job_id)  # TLA-TRACE reproduction gate
+                         if self._check_job_status(job_manager, ready_job.job_id, RunStatus.SUBMITTED, fl_ctx):
+                             self.log_info(fl_ctx, f"Job: {ready_job.job_id} is not in SUBMITTED. It won't be deployed.")
+                             continue
+@@ -667,26 +693,29 @@ class JobRunner(FLComponent):
+                             self.log_info(fl_ctx, f"Got the job: {ready_job.job_id} from the scheduler to run")
+                             fl_ctx.set_prop(FLContextKey.CURRENT_JOB_ID, ready_job.job_id)
+                             job_id, failed_clients = self._deploy_job(ready_job, sites, fl_ctx)
+-                            job_manager.set_status(ready_job.job_id, RunStatus.DISPATCHED, fl_ctx)
++                            _tla.gate("runner.after_deploy", job=ready_job.job_id)  # TLA-TRACE reproduction gate
++                            with _tla.section("RunnerSetDispatched", job=ready_job.job_id):  # TLA-TRACE
++                                job_manager.set_status(ready_job.job_id, RunStatus.DISPATCHED, fl_ctx)
+ 
+                             deploy_detail = fl_ctx.get_prop(FLContextKey.JOB_DEPLOY_DETAIL)
+                             if deploy_detail:
+-                                job_manager.update_meta(
+-                                    ready_job.job_id,
+-                                    {
+-                                        JobMetaKey.JOB_DEPLOY_DETAIL.value: deploy_detail,
+-                                        JobMetaKey.SCHEDULE_COUNT.value: ready_job.meta[
+-                                            JobMetaKey.SCHEDULE_COUNT.value
+-                                        ],
+-                                        JobMetaKey.LAST_SCHEDULE_TIME.value: ready_job.meta[
+-                                            JobMetaKey.LAST_SCHEDULE_TIME.value
+-                                        ],
+-                                        JobMetaKey.SCHEDULE_HISTORY.value: ready_job.meta[
+-                                            JobMetaKey.SCHEDULE_HISTORY.value
+-                                        ],
+-                                    },
+-                                    fl_ctx,
+-                                )
++                                with _tla.context("rmw:RunnerMeta"):  # TLA-TRACE: RunnerMetaRead / RunnerMetaWrite
++                                    job_manager.update_meta(
++                                        ready_job.job_id,
++                                        {
++                                            JobMetaKey.JOB_DEPLOY_DETAIL.value: deploy_detail,
++                                            JobMetaKey.SCHEDULE_COUNT.value: ready_job.meta[
++                                                JobMetaKey.SCHEDULE_COUNT.value
++                                            ],
++                                            JobMetaKey.LAST_SCHEDULE_TIME.value: ready_job.meta[
++                                                JobMetaKey.LAST_SCHEDULE_TIME.value
++                                            ],
++                                            JobMetaKey.SCHEDULE_HISTORY.value: ready_job.meta[
++                                                JobMetaKey.SCHEDULE_HISTORY.value
++                                            ],
++                                        },
++                                        fl_ctx,
++                                    )
+                                 self.log_info(fl_ctx, f"Updated the schedule history of Job: {job_id}")
+ 
+                             if failed_clients:
+@@ -694,6 +723,7 @@ class JobRunner(FLComponent):
+                             else:
+                                 deployable_clients = client_sites
+ 
++                            _tla.gate("runner.before_check_dispatched", job=ready_job.job_id)  # TLA-TRACE gate
+                             if self._check_job_status(job_manager, ready_job.job_id, RunStatus.DISPATCHED, fl_ctx):
+                                 self.log_info(
+                                     fl_ctx, f"Job: {ready_job.job_id} is not in DISPATCHED. It won't be start to run."
+@@ -706,19 +736,27 @@ class JobRunner(FLComponent):
+                                 client_sites=deployable_clients,
+                                 fl_ctx=fl_ctx,
+                             )
+-                            with self.lock:
+-                                self.running_jobs[job_id] = ready_job
+-                            job_manager.set_status(ready_job.job_id, RunStatus.RUNNING, fl_ctx)
++                            with _tla.section("RunnerInsertRunning", job=job_id):  # TLA-TRACE
++                                with self.lock:
++                                    self.running_jobs[job_id] = ready_job
++                            _tla.gate("runner.before_set_running", job=job_id)  # TLA-TRACE reproduction gate
++                            with _tla.section("RunnerSetRunning", job=ready_job.job_id):  # TLA-TRACE
++                                job_manager.set_status(ready_job.job_id, RunStatus.RUNNING, fl_ctx)
+                             self.log_info(fl_ctx, f"Job: {job_id} started to run, status changed to RUNNING.")
+                         except Exception as e:
++                            _tla.end_open()  # TLA-TRACE: emit the step that raised (e.g. RunnerStartCollect)
++                            _tla.begin("RunnerExceptStop", job=ready_job.job_id)  # TLA-TRACE: after _stop_run
+                             if job_id:
+                                 with self.lock:
+                                     if job_id in self.running_jobs:
+                                         del self.running_jobs[job_id]
+                                     self._pending_client_outcomes.pop(job_id, None)
+                                 self._stop_run(job_id, fl_ctx)
+-                            job_manager.set_status(ready_job.job_id, RunStatus.FAILED_TO_RUN, fl_ctx)
++                            _tla.end("RunnerExceptStop")
++                            with _tla.section("RunnerExceptSetFailed", job=ready_job.job_id):  # TLA-TRACE
++                                job_manager.set_status(ready_job.job_id, RunStatus.FAILED_TO_RUN, fl_ctx)
+ 
++                            _tla.begin("RunnerExceptMeta", job=ready_job.job_id)  # TLA-TRACE: until JOB_ABORTED
+                             deploy_detail = fl_ctx.get_prop(FLContextKey.JOB_DEPLOY_DETAIL)
+                             if deploy_detail:
+                                 job_manager.update_meta(
+@@ -726,6 +764,7 @@ class JobRunner(FLComponent):
+                                 )
+ 
+                             self._fire_job_lifecycle_event(EventType.JOB_ABORTED, ready_job.job_id, fl_ctx)
++                            _tla.end("RunnerExceptMeta")
+                             self.log_error(
+                                 fl_ctx, f"Failed to run the Job ({ready_job.job_id}): {secure_format_exception(e)}"
+                             )
+@@ -735,8 +774,12 @@ class JobRunner(FLComponent):
+ 
+     @staticmethod
+     def _check_job_status(job_manager, job_id, job_run_status, fl_ctx: FLContext):
+-        reload_job = job_manager.get_job(job_id, fl_ctx)
+-        return reload_job.meta.get(JobMetaKey.STATUS) != job_run_status
++        # TLA-TRACE: RunnerCheckSubmitted (:661) / RunnerCheckDispatched (:697), after the check evaluates or raises
++        with _tla.section(
++            "RunnerCheckSubmitted" if job_run_status == RunStatus.SUBMITTED else "RunnerCheckDispatched", job=job_id
++        ):
++            reload_job = job_manager.get_job(job_id, fl_ctx)
++            return reload_job.meta.get(JobMetaKey.STATUS) != job_run_status
+ 
+     def stop(self):
+         self.ask_to_stop = True
+@@ -796,8 +839,11 @@ class JobRunner(FLComponent):
+         return job_manager.get_jobs_by_status([RunStatus.RUNNING, RunStatus.DISPATCHED], fl_ctx)
+ 
+     def stop_run(self, job_id: str, fl_ctx: FLContext):
+-        self._stop_run(job_id, fl_ctx)
+-        return self.mark_run_aborted(job_id, fl_ctx)
++        # TLA-TRACE: AdminStopRun / AdminMarkAborted (absorbed when called inside SpProcessJobFailure)
++        with _tla.section("AdminStopRun", job=job_id):
++            self._stop_run(job_id, fl_ctx)
++        with _tla.section("AdminMarkAborted", job=job_id):
++            return self.mark_run_aborted(job_id, fl_ctx)
+ 
+     def mark_run_aborted(self, job_id: str, fl_ctx: FLContext):
+         job = self.running_jobs.get(job_id)
+diff --git a/nvflare/private/fed/server/server_engine.py b/nvflare/private/fed/server/server_engine.py
+index eea18ec..6bb125a 100644
+--- a/nvflare/private/fed/server/server_engine.py
++++ b/nvflare/private/fed/server/server_engine.py
+@@ -53,6 +53,7 @@ from nvflare.fuel.f3.cellnet.defs import MessageHeaderKey
+ from nvflare.fuel.f3.cellnet.defs import ReturnCode as CellMsgReturnCode
+ from nvflare.fuel.f3.cellnet.fqcn import FQCN
+ from nvflare.fuel.f3.message import Message as CellMessage
++from nvflare.fuel.utils import tla_hooks as _tla
+ from nvflare.fuel.utils.argument_utils import parse_vars
+ from nvflare.fuel.utils.log_utils import get_obj_logger
+ from nvflare.fuel.utils.zip_utils import zip_directory_to_bytes
+@@ -215,22 +216,25 @@ class ServerEngine(ServerEngineInternalSpec, StreamableEngine):
+                     self.logger.debug(f"Job:{job_id} UPDATE_RUN_STATUS didn't finish fast enough.")
+                     break
+                 time.sleep(0.1)
+-            with self.lock:
+-                return_code = get_return_code(process, job_id, workspace, self.logger)
+-                # if process exit but with Execution exception
+-                if return_code and return_code != 0:
+-                    self.logger.info(f"Job: {job_id} child process exit with return code {return_code}")
+-                    if job_id in self.exception_run_processes:
+-                        # An external path (e.g. fail_run from a client failure
+-                        # report) has already recorded an authoritative return
+-                        # code for this run. Don't let the SJ's secondary exit
+-                        # code (e.g. ABORTED from the abort signal we sent)
+-                        # overwrite that signal.
+-                        pass
+-                    else:
+-                        run_process_info[RunProcessKey.PROCESS_RETURN_CODE] = return_code
+-                        self.exception_run_processes[job_id] = run_process_info
+-                self.run_processes.pop(job_id, None)
++            with _tla.section("SpWaitForComplete", job=job_id):  # TLA-TRACE: after run_processes.pop
++                with self.lock:
++                    return_code = get_return_code(process, job_id, workspace, self.logger)
++                    # if process exit but with Execution exception
++                    if return_code and return_code != 0:
++                        self.logger.info(f"Job: {job_id} child process exit with return code {return_code}")
++                        if job_id in self.exception_run_processes:
++                            # An external path (e.g. fail_run from a client failure
++                            # report) has already recorded an authoritative return
++                            # code for this run. Don't let the SJ's secondary exit
++                            # code (e.g. ABORTED from the abort signal we sent)
++                            # overwrite that signal.
++                            pass
++                        else:
++                            run_process_info[RunProcessKey.PROCESS_RETURN_CODE] = return_code
++                            self.exception_run_processes[job_id] = run_process_info
++                    self.run_processes.pop(job_id, None)
++        else:
++            _tla.event("SpWaitForComplete", job=job_id)  # TLA-TRACE: entry already popped
+         self.engine_info.status = MachineStatus.STOPPED
+ 
+     def _start_runner_process(self, job, job_clients, snapshot, fl_ctx: FLContext):
+@@ -399,14 +403,15 @@ class ServerEngine(ServerEngineInternalSpec, StreamableEngine):
+                 break
+             time.sleep(0.1)
+ 
+-        if job_handle is not None:
+-            try:
+-                job_handle.terminate()
+-                self.logger.debug(f"job {job_id}: terminated job handle after abort cleanup")
+-            except Exception as e:
+-                self.logger.error(f"job {job_id}: failed to terminate job handle: {secure_format_exception(e)}")
+-        with self.lock:
+-            self.run_processes.pop(job_id, None)
++        with _tla.section("SpRemoveRunProcesses", job=job_id):  # TLA-TRACE: terminate() + final pop
++            if job_handle is not None:
++                try:
++                    job_handle.terminate()
++                    self.logger.debug(f"job {job_id}: terminated job handle after abort cleanup")
++                except Exception as e:
++                    self.logger.error(f"job {job_id}: failed to terminate job handle: {secure_format_exception(e)}")
++            with self.lock:
++                self.run_processes.pop(job_id, None)
+ 
+     def check_app_start_readiness(self, job_id: str) -> str:
+         if job_id not in self.run_processes.keys():
+@@ -622,11 +627,12 @@ class ServerEngine(ServerEngineInternalSpec, StreamableEngine):
+         for client_name in client_names:
+             try:
+                 already_disabled = self.server.client_manager.is_client_disabled(client_name)
+-                removed_tokens = self.server.client_manager.disable_client(client_name)
+-                for token in removed_tokens:
+-                    self.server.remove_client_data(token)
+-                    if self.server.admin_server:
+-                        self.server.admin_server.client_dead(token)
++                with _tla.section("AdminDisable", cl=client_name):  # TLA-TRACE: after the tokens are removed
++                    removed_tokens = self.server.client_manager.disable_client(client_name)
++                    for token in removed_tokens:
++                        self.server.remove_client_data(token)
++                        if self.server.admin_server:
++                            self.server.admin_server.client_dead(token)
+                 results.append(
+                     {
+                         "client_name": client_name,
+@@ -1021,6 +1027,8 @@ class ServerEngine(ServerEngineInternalSpec, StreamableEngine):
+         replies = []
+         if requests:
+             replies = self._send_admin_requests(requests, fl_ctx, 15)
++            # TLA-TRACE: RunnerCheckCollect (a reply from every CHECK target) / RunnerCheckTimeout (named by the tracer)
++            _tla.event("RunnerCheckCollect", replies=replies, requests=requests)
+         result = {}
+         for r in replies:
+             site_name = r.client_name

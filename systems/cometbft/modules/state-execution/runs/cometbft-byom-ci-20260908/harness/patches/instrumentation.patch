@@ -1,0 +1,569 @@
+diff --git a/internal/consensus/replay.go b/internal/consensus/replay.go
+index 19c7eb5..8de087f 100644
+--- a/internal/consensus/replay.go
++++ b/internal/consensus/replay.go
+@@ -11,6 +11,7 @@ import (
+ 
+ 	abci "github.com/cometbft/cometbft/abci/types"
+ 	"github.com/cometbft/cometbft/crypto/merkle"
++	"github.com/cometbft/cometbft/internal/speculatrace"
+ 	sm "github.com/cometbft/cometbft/internal/state"
+ 	"github.com/cometbft/cometbft/libs/log"
+ 	"github.com/cometbft/cometbft/proxy"
+@@ -250,6 +251,30 @@ func (h *Handshaker) Handshake(ctx context.Context, proxyApp proxy.AppConns) err
+ 		return fmt.Errorf("got a negative last block height (%d) from the app", blockHeight)
+ 	}
+ 	appHash := res.LastBlockAppHash
++	if speculatrace.Enabled() {
++		_ = speculatrace.Reset()
++		speculatrace.SetAppHeight(blockHeight)
++		storeHeight := h.store.Height()
++		stateHeight := h.initialState.LastBlockHeight
++		if storeHeight == stateHeight+1 {
++			if saved, loadErr := h.stateStore.LoadLastFinalizeBlockResponse(storeHeight); loadErr == nil {
++				param := speculatrace.NoParam
++				if saved.ConsensusParamUpdates != nil {
++					next := h.initialState.ConsensusParams.Update(saved.ConsensusParamUpdates)
++					param = speculatrace.Fingerprint(next)
++				}
++				speculatrace.SetResponse(storeHeight, param)
++			}
++		}
++		_ = speculatrace.Emit("HandshakeStart", h.speculaLifecycleState(
++			h.initialState, "handshake", 0, speculatrace.NoParam, "none",
++		), map[string]any{
++			"appHeight":        blockHeight,
++			"blockStoreBase":   h.store.Base(),
++			"blockStoreHeight": storeHeight,
++			"stateStoreHeight": stateHeight,
++		})
++	}
+ 
+ 	h.logger.Info("ABCI Handshake App Info",
+ 		"height", blockHeight,
+@@ -268,6 +293,15 @@ func (h *Handshaker) Handshake(ctx context.Context, proxyApp proxy.AppConns) err
+ 	if err != nil {
+ 		return fmt.Errorf("error on replay: %v", err)
+ 	}
++	if speculatrace.Enabled() {
++		if syncedState, loadErr := h.stateStore.Load(); loadErr == nil {
++			speculatrace.SetReplay(false)
++			speculatrace.SetAppHeight(h.store.Height())
++			_ = speculatrace.Emit("HandshakeComplete", h.speculaLifecycleState(
++				syncedState, "normal", 0, speculatrace.NoParam, "none",
++			), map[string]any{"height": syncedState.LastBlockHeight})
++		}
++	}
+ 
+ 	h.logger.Info("Completed ABCI Handshake - CometBFT and App are synced",
+ 		"appHeight", blockHeight, "appHash", log.NewLazySprintf("%X", appHash))
+@@ -411,6 +445,7 @@ func (h *Handshaker) ReplayBlocks(
+ 			// NOTE: We could instead use the cs.WAL on cs.Start,
+ 			// but we'd have to allow the WAL to replay a block that wrote it's #ENDHEIGHT
+ 			h.logger.Info("Replay last block using real app")
++			h.speculaStartStateReplay(state, storeBlockHeight, "real")
+ 			state, err = h.replayBlock(state, storeBlockHeight, proxyApp.Consensus())
+ 			return state.AppHash, err
+ 
+@@ -429,6 +464,7 @@ func (h *Handshaker) ReplayBlocks(
+ 			}
+ 			mockApp := newMockProxyApp(finalizeBlockResponse)
+ 			h.logger.Info("Replay last block using mock app")
++			h.speculaStartStateReplay(state, storeBlockHeight, "mock")
+ 			state, err = h.replayBlock(state, storeBlockHeight, mockApp)
+ 			return state.AppHash, err
+ 		}
+@@ -484,12 +520,19 @@ func (h *Handshaker) replayBlocks(
+ 		if err != nil {
+ 			return nil, err
+ 		}
++		if speculatrace.Enabled() {
++			speculatrace.SetAppHeight(i)
++			_ = speculatrace.Emit("ReplayAppBlock", h.speculaLifecycleState(
++				state, "handshake", 0, speculatrace.NoParam, "none",
++			), map[string]any{"height": i})
++		}
+ 
+ 		h.nBlocks++
+ 	}
+ 
+ 	if mutateState {
+ 		// sync the final block
++		h.speculaStartStateReplay(state, storeBlockHeight, "real")
+ 		state, err = h.replayBlock(state, storeBlockHeight, proxyApp.Consensus())
+ 		if err != nil {
+ 			return nil, err
+@@ -501,6 +544,39 @@ func (h *Handshaker) replayBlocks(
+ 	return appHash, nil
+ }
+ 
++func (h *Handshaker) speculaLifecycleState(
++	state sm.State,
++	phase string,
++	pendingBlockHeight int64,
++	pendingParam string,
++	validationOutcome string,
++) map[string]any {
++	param := speculatrace.Fingerprint(state.ConsensusParams)
++	return speculatrace.LifecycleState(
++		h.store.Height(),
++		state.LastBlockHeight,
++		state.LastBlockHeight,
++		param,
++		param,
++		state.LastHeightConsensusParamsChanged,
++		state.LastHeightConsensusParamsChanged,
++		phase,
++		pendingBlockHeight,
++		pendingParam,
++		validationOutcome,
++	)
++}
++
++func (h *Handshaker) speculaStartStateReplay(state sm.State, height int64, mode string) {
++	if !speculatrace.Enabled() {
++		return
++	}
++	speculatrace.SetReplay(true)
++	_ = speculatrace.Emit("ReplayStateBlockStart", h.speculaLifecycleState(
++		state, "blockStored", height, speculatrace.NoParam, "none",
++	), map[string]any{"height": height, "mode": mode})
++}
++
+ // ApplyBlock on the proxyApp with the last block.
+ func (h *Handshaker) replayBlock(state sm.State, height int64, proxyApp proxy.AppConnConsensus) (sm.State, error) {
+ 	block, meta := h.store.LoadBlock(height)
+diff --git a/internal/state/execution.go b/internal/state/execution.go
+index 6b3411b..25d15d5 100644
+--- a/internal/state/execution.go
++++ b/internal/state/execution.go
+@@ -10,6 +10,7 @@ import (
+ 	cmtproto "github.com/cometbft/cometbft/api/cometbft/types/v1"
+ 	cryptoenc "github.com/cometbft/cometbft/crypto/encoding"
+ 	"github.com/cometbft/cometbft/internal/fail"
++	"github.com/cometbft/cometbft/internal/speculatrace"
+ 	"github.com/cometbft/cometbft/libs/log"
+ 	"github.com/cometbft/cometbft/mempool"
+ 	"github.com/cometbft/cometbft/proxy"
+@@ -211,6 +212,18 @@ func (blockExec *BlockExecutor) ValidateBlock(state State, block *types.Block) e
+ func (blockExec *BlockExecutor) ApplyBlock(
+ 	state State, blockID types.BlockID, block *types.Block,
+ ) (State, error) {
++	persistedState := state
++	if speculatrace.Enabled() {
++		if !speculatrace.IsReplay() {
++			speculatrace.SetAppHeight(state.LastBlockHeight)
++			_ = speculatrace.Emit("BlockStored", blockExec.speculaLifecycleState(
++				state, persistedState, "blockStored", block.Height, speculatrace.NoParam, "none",
++			), map[string]any{"height": block.Height})
++		}
++		_ = speculatrace.Emit("ApplyBlockStart", blockExec.speculaLifecycleState(
++			state, persistedState, "applying", block.Height, speculatrace.NoParam, "none",
++		), map[string]any{"height": block.Height})
++	}
+ 	if err := validateBlock(state, block); err != nil {
+ 		return state, ErrInvalidBlock(err)
+ 	}
+@@ -232,6 +245,20 @@ func (blockExec *BlockExecutor) ApplyBlock(
+ 		blockExec.logger.Error("error in proxyAppConn.FinalizeBlock", "err", err)
+ 		return state, err
+ 	}
++	proposedParam := speculatrace.NoParam
++	if abciResponse.ConsensusParamUpdates != nil {
++		nextParams := state.ConsensusParams.Update(abciResponse.ConsensusParamUpdates)
++		proposedParam = speculatrace.Fingerprint(nextParams)
++	}
++	if speculatrace.Enabled() {
++		_ = speculatrace.Emit("FinalizeBlock", blockExec.speculaLifecycleState(
++			state, persistedState, "finalized", block.Height, proposedParam, "none",
++		), map[string]any{
++			"height":        block.Height,
++			"updatePresent": abciResponse.ConsensusParamUpdates != nil,
++			"proposedParam": proposedParam,
++		})
++	}
+ 
+ 	blockExec.logger.Info(
+ 		"finalized block",
+@@ -254,6 +281,12 @@ func (blockExec *BlockExecutor) ApplyBlock(
+ 	if err := blockExec.store.SaveFinalizeBlockResponse(block.Height, abciResponse); err != nil {
+ 		return state, err
+ 	}
++	if speculatrace.Enabled() {
++		speculatrace.SetResponse(block.Height, proposedParam)
++		_ = speculatrace.Emit("SaveFinalizeBlockResponse", blockExec.speculaLifecycleState(
++			state, persistedState, "responseSaved", block.Height, proposedParam, "none",
++		), map[string]any{"height": block.Height})
++	}
+ 
+ 	fail.Fail() // XXX
+ 
+@@ -278,14 +311,38 @@ func (blockExec *BlockExecutor) ApplyBlock(
+ 	// Update the state with the block and responses.
+ 	state, err = updateState(state, blockID, &block.Header, abciResponse, validatorUpdates)
+ 	if err != nil {
++		if speculatrace.Enabled() {
++			_ = speculatrace.Emit("UpdateStateRejected", blockExec.speculaLifecycleState(
++				state, persistedState, "rejected", block.Height, proposedParam, "rejected",
++			), map[string]any{
++				"height":        block.Height,
++				"updatePresent": abciResponse.ConsensusParamUpdates != nil,
++				"proposedParam": proposedParam,
++			})
++		}
+ 		return state, fmt.Errorf("commit failed for application: %w", err)
+ 	}
++	if speculatrace.Enabled() {
++		_ = speculatrace.Emit("UpdateStateAccepted", blockExec.speculaLifecycleState(
++			state, persistedState, "updated", block.Height, proposedParam, "accepted",
++		), map[string]any{
++			"height":        block.Height,
++			"updatePresent": abciResponse.ConsensusParamUpdates != nil,
++			"proposedParam": proposedParam,
++		})
++	}
+ 
+ 	// Lock mempool, commit app state, update mempoool.
+ 	retainHeight, err := blockExec.Commit(state, block, abciResponse)
+ 	if err != nil {
+ 		return state, fmt.Errorf("commit failed for application: %w", err)
+ 	}
++	if speculatrace.Enabled() {
++		speculatrace.SetAppHeight(block.Height)
++		_ = speculatrace.Emit("CommitApp", blockExec.speculaLifecycleState(
++			state, persistedState, "committed", block.Height, proposedParam, "accepted",
++		), map[string]any{"height": block.Height})
++	}
+ 
+ 	// Update evpool with the latest state.
+ 	blockExec.evpool.Update(state, block.Evidence.Evidence)
+@@ -297,6 +354,15 @@ func (blockExec *BlockExecutor) ApplyBlock(
+ 	if err := blockExec.store.Save(state); err != nil {
+ 		return state, err
+ 	}
++	if speculatrace.Enabled() {
++		phase := "normal"
++		if speculatrace.IsReplay() {
++			phase = "handshake"
++		}
++		_ = speculatrace.Emit("SaveState", blockExec.speculaLifecycleState(
++			state, state, phase, 0, speculatrace.NoParam, "none",
++		), map[string]any{"height": block.Height})
++	}
+ 
+ 	fail.Fail() // XXX
+ 
+@@ -315,6 +381,33 @@ func (blockExec *BlockExecutor) ApplyBlock(
+ 	return state, nil
+ }
+ 
++// speculaLifecycleState captures the complete abstract state used by the V0
++// model. Consensus parameter records are represented by stable fingerprints;
++// equality and installation are preserved without serializing Go-only detail
++// into TLA+ values.
++func (blockExec *BlockExecutor) speculaLifecycleState(
++	current State,
++	persisted State,
++	phase string,
++	pendingBlockHeight int64,
++	pendingParam string,
++	validationOutcome string,
++) map[string]any {
++	return speculatrace.LifecycleState(
++		blockExec.blockStore.Height(),
++		persisted.LastBlockHeight,
++		current.LastBlockHeight,
++		speculatrace.Fingerprint(current.ConsensusParams),
++		speculatrace.Fingerprint(persisted.ConsensusParams),
++		current.LastHeightConsensusParamsChanged,
++		persisted.LastHeightConsensusParamsChanged,
++		phase,
++		pendingBlockHeight,
++		pendingParam,
++		validationOutcome,
++	)
++}
++
+ func (blockExec *BlockExecutor) ExtendVote(
+ 	ctx context.Context,
+ 	vote *types.Vote,
+diff --git a/internal/speculatrace/trace.go b/internal/speculatrace/trace.go
+new file mode 100644
+index 0000000..fe40cdb
+--- /dev/null
++++ b/internal/speculatrace/trace.go
+@@ -0,0 +1,169 @@
++// Package speculatrace provides opt-in NDJSON tracing for the Specula V0
++// harness. When SPECULA_TRACE_FILE is unset every operation is a no-op.
++package speculatrace
++
++import (
++	"crypto/sha256"
++	"encoding/hex"
++	"encoding/json"
++	"os"
++	"sync"
++	"time"
++)
++
++const NoParam = "NoParam"
++
++var traceState struct {
++	sync.Mutex
++	file           *os.File
++	path           string
++	replay         bool
++	appHeight      int64
++	responseHeight int64
++	responseParam  string
++}
++
++// Enabled reports whether this process was launched for trace collection.
++func Enabled() bool {
++	return os.Getenv("SPECULA_TRACE_FILE") != ""
++}
++
++// Reset truncates the configured trace file. It is used at the real Handshake
++// entry point so test-fixture setup does not contaminate recovery traces.
++func Reset() error {
++	path := os.Getenv("SPECULA_TRACE_FILE")
++	if path == "" {
++		return nil
++	}
++	traceState.Lock()
++	defer traceState.Unlock()
++	if traceState.file != nil {
++		_ = traceState.file.Close()
++	}
++	f, err := os.OpenFile(path, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
++	if err != nil {
++		return err
++	}
++	traceState.file = f
++	traceState.path = path
++	traceState.replay = false
++	traceState.appHeight = 0
++	traceState.responseHeight = 0
++	traceState.responseParam = NoParam
++	return nil
++}
++
++// Fingerprint gives a stable symbolic identity to a complete consensus
++// parameter value without baking its large Go representation into the model.
++func Fingerprint(v any) string {
++	b, err := json.Marshal(v)
++	if err != nil {
++		return "marshal-error"
++	}
++	sum := sha256.Sum256(b)
++	return hex.EncodeToString(sum[:])
++}
++
++func SetReplay(v bool) {
++	traceState.Lock()
++	defer traceState.Unlock()
++	traceState.replay = v
++}
++
++func IsReplay() bool {
++	traceState.Lock()
++	defer traceState.Unlock()
++	return traceState.replay
++}
++
++func SetAppHeight(h int64) {
++	traceState.Lock()
++	defer traceState.Unlock()
++	traceState.appHeight = h
++}
++
++func AppHeight() int64 {
++	traceState.Lock()
++	defer traceState.Unlock()
++	return traceState.appHeight
++}
++
++func SetResponse(height int64, param string) {
++	traceState.Lock()
++	defer traceState.Unlock()
++	traceState.responseHeight = height
++	traceState.responseParam = param
++}
++
++func Response() (int64, string) {
++	traceState.Lock()
++	defer traceState.Unlock()
++	return traceState.responseHeight, traceState.responseParam
++}
++
++// LifecycleState constructs the state object consumed by Trace.tla.
++func LifecycleState(
++	blockStoreHeight, stateStoreHeight, inMemoryStateHeight int64,
++	activeParam, persistedParam string,
++	lastParamChange, persistedLastParamChange int64,
++	phase string,
++	pendingBlockHeight int64,
++	pendingParam, validationOutcome string,
++) map[string]any {
++	traceState.Lock()
++	defer traceState.Unlock()
++	return map[string]any{
++		"blockStoreHeight":         blockStoreHeight,
++		"appHeight":                traceState.appHeight,
++		"stateStoreHeight":         stateStoreHeight,
++		"stateHeight":              inMemoryStateHeight,
++		"activeParam":              activeParam,
++		"persistedParam":           persistedParam,
++		"lastParamChange":          lastParamChange,
++		"persistedLastParamChange": persistedLastParamChange,
++		"phase":                    phase,
++		"replayMutatesState":       traceState.replay,
++		"responseHeight":           traceState.responseHeight,
++		"responseParam":            traceState.responseParam,
++		"pendingBlockHeight":       pendingBlockHeight,
++		"pendingParam":             pendingParam,
++		"validationOutcome":        validationOutcome,
++	}
++}
++
++// Emit appends one mutex-serialized event with a real wall-clock timestamp.
++// Instrumentation deliberately ignores its returned error at call sites so it
++// cannot change the system's functional error paths.
++func Emit(name string, state map[string]any, msg map[string]any) error {
++	path := os.Getenv("SPECULA_TRACE_FILE")
++	if path == "" {
++		return nil
++	}
++	traceState.Lock()
++	defer traceState.Unlock()
++	if traceState.file == nil || traceState.path != path {
++		if traceState.file != nil {
++			_ = traceState.file.Close()
++		}
++		f, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
++		if err != nil {
++			return err
++		}
++		traceState.file = f
++		traceState.path = path
++	}
++	event := map[string]any{
++		"tag": "trace",
++		"ts":  time.Now().UnixNano(),
++		"event": map[string]any{
++			"name":  name,
++			"nid":   "node",
++			"state": state,
++			"msg":   msg,
++		},
++	}
++	if err := json.NewEncoder(traceState.file).Encode(event); err != nil {
++		return err
++	}
++	return traceState.file.Sync()
++}
+diff --git a/internal/state/specula_trace_test.go b/internal/state/specula_trace_test.go
+new file mode 100644
+index 0000000..8cb9033
+--- /dev/null
++++ b/internal/state/specula_trace_test.go
+@@ -0,0 +1,99 @@
++package state_test
++
++import (
++	"context"
++	"testing"
++
++	"github.com/stretchr/testify/mock"
++	"github.com/stretchr/testify/require"
++
++	dbm "github.com/cometbft/cometbft-db"
++	abci "github.com/cometbft/cometbft/abci/types"
++	cmtproto "github.com/cometbft/cometbft/api/cometbft/types/v1"
++	"github.com/cometbft/cometbft/internal/speculatrace"
++	sm "github.com/cometbft/cometbft/internal/state"
++	"github.com/cometbft/cometbft/internal/store"
++	"github.com/cometbft/cometbft/libs/log"
++	mpmocks "github.com/cometbft/cometbft/mempool/mocks"
++	"github.com/cometbft/cometbft/proxy"
++	"github.com/cometbft/cometbft/types"
++)
++
++type speculaInvalidParamsApp struct {
++	abci.BaseApplication
++}
++
++func (speculaInvalidParamsApp) FinalizeBlock(
++	_ context.Context,
++	req *abci.FinalizeBlockRequest,
++) (*abci.FinalizeBlockResponse, error) {
++	txResults := make([]*abci.ExecTxResult, len(req.Txs))
++	for i := range txResults {
++		txResults[i] = &abci.ExecTxResult{Code: abci.CodeTypeOK}
++	}
++	return &abci.FinalizeBlockResponse{
++		TxResults: txResults,
++		ConsensusParamUpdates: &cmtproto.ConsensusParams{
++			Block: &cmtproto.BlockParams{MaxBytes: 0, MaxGas: 1},
++		},
++	}, nil
++}
++
++func speculaApplyOneBlock(
++	t *testing.T,
++	app abci.Application,
++) (sm.State, sm.Store, error) {
++	t.Helper()
++	require.NoError(t, speculatrace.Reset())
++
++	clientCreator := proxy.NewLocalClientCreator(app)
++	proxyApp := proxy.NewAppConns(clientCreator, proxy.NopMetrics())
++	require.NoError(t, proxyApp.Start())
++	t.Cleanup(func() { require.NoError(t, proxyApp.Stop()) })
++
++	state, stateDB, _ := makeState(1, 1)
++	stateStore := sm.NewStore(stateDB, sm.StoreOptions{DiscardABCIResponses: false})
++	blockStore := store.NewBlockStore(dbm.NewMemDB())
++
++	mp := &mpmocks.Mempool{}
++	mp.On("Lock").Return()
++	mp.On("Unlock").Return()
++	mp.On("FlushAppConn", mock.Anything).Return(nil)
++	mp.On("Update", mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(nil)
++
++	blockExec := sm.NewBlockExecutor(
++		stateStore,
++		log.TestingLogger(),
++		proxyApp.Consensus(),
++		mp,
++		sm.EmptyEvidencePool{},
++		blockStore,
++	)
++	block := makeBlock(state, 1, new(types.Commit))
++	parts, err := block.MakePartSet(testPartSize)
++	require.NoError(t, err)
++	blockID := types.BlockID{Hash: block.Hash(), PartSetHeader: parts.Header()}
++	seenCommit := &types.Commit{Height: block.Height, BlockID: blockID}
++	blockStore.SaveBlock(block, parts, seenCommit)
++
++	newState, err := blockExec.ApplyBlock(state, blockID, block)
++	return newState, stateStore, err
++}
++
++func TestSpeculaTraceApplyValidUpdate(t *testing.T) {
++	state, _, err := speculaApplyOneBlock(t, &testApp{})
++	require.NoError(t, err)
++	require.EqualValues(t, 1, state.LastBlockHeight)
++	require.EqualValues(t, 1, state.Version.Consensus.App)
++	require.EqualValues(t, 2, state.LastHeightConsensusParamsChanged)
++}
++
++func TestSpeculaTraceApplyRejectedUpdate(t *testing.T) {
++	state, stateStore, err := speculaApplyOneBlock(t, speculaInvalidParamsApp{})
++	require.Error(t, err)
++	require.EqualValues(t, 0, state.LastBlockHeight)
++	persisted, loadErr := stateStore.Load()
++	require.NoError(t, loadErr)
++	require.EqualValues(t, 0, persisted.LastBlockHeight)
++	require.Equal(t, persisted.ConsensusParams, state.ConsensusParams)
++}

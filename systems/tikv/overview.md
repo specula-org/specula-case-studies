@@ -10,7 +10,7 @@ Specula found 3 new bugs:
 
 - Automatic exit from joint consensus is proposed only by the current leader, so if the leader crashes before applying enter-joint and the joint configuration includes unreachable nodes, the remaining nodes can stay stuck in joint consensus.
 - **Approved:** A leader removed from the voter set remains leader and continues sending heartbeats that suppress elections on the remaining voters.
-- Leader transfer to a lower-priority node can fail because transfer elections bypass the lease check but not the priority check, leaving the cluster without a leader.
+- **Reported:** With equal logs and enough higher-priority voters to block election, an explicit transfer to a lower-priority node can fail because transfer votes bypass the lease check but not the priority check. The old leader steps down, leaving a leaderless term; [PR #597](https://github.com/tikv/raft-rs/pull/597) remains open as of 2026-10-03. The demonstrated consequence is availability loss, not a data-safety violation.
 
 Specula also found 1 previously known bug:
 

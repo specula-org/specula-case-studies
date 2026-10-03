@@ -29,3 +29,7 @@ Specula also found 5 previously known bugs:
 - **Open:** Late precommits from the previous height can enter `LastCommit` without application-level vote-extension verification; see Issue #2523.
 - **Open:** `DoubleSignCheckHeight=1` performs no historical look-back because of an off-by-one loop bound; see Issue #5435.
 - **Open:** Early catch-up block parts are silently dropped when the proposal part set is not initialized, with no buffering or re-request; see Issue #3340.
+
+## Additional CI evaluation
+
+The [2026-09-08 BYOM CI evaluation](modules/state-execution/runs/cometbft-byom-ci-20260908/README.md) investigated state execution and recovery. Its three candidates were false positives; it adds no bugs to the count above.

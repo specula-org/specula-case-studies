@@ -8,7 +8,7 @@ Specula analyzed and tested vsr-rs's Viewstamped Replication implementation, inc
 
 Specula found 4 new bugs:
 
-- An invalid or unreadable view file is treated as first initialization, allowing a reused replica identity to start in view 0 and acknowledge conflicting history.
-- A one-replica configuration checks quorum only after a peer `PrepareOk`, so client requests never commit despite the primary's self-acknowledgement.
-- A connected peer that stops reading can block the shared sender's `write_all`, delaying queued traffic to healthy destinations until that peer resumes.
-- Clean EOF after a prefix of a `PREPARE` frame is accepted as a complete peer message, allowing surviving replicas to commit altered operation content.
+- **Fixed:** An invalid or unreadable view file is treated as first initialization, allowing a reused replica identity to start in view 0 and acknowledge conflicting history. See [PR #17](https://github.com/penberg/vsr-rs/pull/17).
+- **Fixed:** A one-replica configuration checks quorum only after a peer `PrepareOk`, so client requests never commit despite the primary's self-acknowledgement. See [PR #18](https://github.com/penberg/vsr-rs/pull/18) (rejects configurations with fewer than three replicas).
+- **Fixed:** A connected peer that stops reading can block the shared sender's `write_all`, delaying queued traffic to healthy destinations until that peer resumes. See [PR #19](https://github.com/penberg/vsr-rs/pull/19).
+- **Fixed:** Clean EOF after a prefix of a `PREPARE` frame is accepted as a complete peer message, allowing surviving replicas to commit altered operation content. See [PR #16](https://github.com/penberg/vsr-rs/pull/16).

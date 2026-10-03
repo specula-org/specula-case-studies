@@ -1,0 +1,87 @@
+{
+  "schema_version": "2",
+  "system": "openraft",
+  "generated_by": "consolidate",
+  "findings": [
+    {
+      "id": "CR-1",
+      "title": "Restored Leadership Before Application Recovery",
+      "source": "code-review",
+      "scenario": "Scenario 1",
+      "severity": "High",
+      "invariant": null,
+      "config": null,
+      "counterexample": null,
+      "affected_code": [
+        "openraft/src/storage/helper.rs:87-148",
+        "openraft/src/engine/engine_impl.rs:145-159",
+        "openraft/src/storage/v2/raft_log_storage.rs:57-85"
+      ],
+      "summary": "A persisted committed self-vote may restore Leader state before the state machine and optional persisted committed pointer recover all state previously observed by clients. Startup recovers vote, commit metadata, snapshot, and state-machine state separately, while Engine::startup can immediately restore a persisted leader. Confirmation should determine whether a documented ReadIndex or lease-read path can complete during this recovery window and expose stale application state."
+    },
+    {
+      "id": "CR-2",
+      "title": "Persistence-before-Ack in the Decoupled I/O Pipeline",
+      "source": "code-review",
+      "scenario": "Scenario 2",
+      "severity": "High",
+      "invariant": null,
+      "config": null,
+      "counterexample": null,
+      "affected_code": [
+        "openraft/src/core/raft_core.rs:1837-1863",
+        "openraft/src/engine/command.rs:270-324",
+        "openraft/src/core/raft_core.rs:1920-1929"
+      ],
+      "summary": "Engine state, durable vote and log state, cluster commit, saved commit, state-machine application, and externally visible responses advance at separate atomicity boundaries. Command execution marks append submission before an asynchronous callback, protocol replies wait on IOFlushed conditions, and committed state is persisted before apply dispatch. Confirmation should test whether any crash or callback interleaving releases a client or RPC response before the durability promised by that response is established."
+    },
+    {
+      "id": "CR-3",
+      "title": "Extended Membership Transactions and Session Fencing",
+      "source": "code-review",
+      "scenario": "Scenario 3",
+      "severity": "High",
+      "invariant": null,
+      "config": null,
+      "counterexample": null,
+      "affected_code": [
+        "openraft/src/raft/api/management.rs:61-124",
+        "openraft/src/raft_state/membership_state/mod.rs:21-51",
+        "openraft/src/engine/handler/replication_handler/mod.rs:56-112"
+      ],
+      "summary": "A membership change becomes effective when appended, commits later, and may span joint and uniform entries while concurrent API requests retain distinct intent. The management API releases control between the two phases, membership state tracks committed and effective configurations, and replication sessions are rebuilt after effective changes. Confirmation should determine whether request interleaving, leader change, recovery, or stale replication progress can commit a successor not owned by the initiating request or violate quorum coherence."
+    },
+    {
+      "id": "CR-4",
+      "title": "Snapshot, Membership, and Purge Lifecycle",
+      "source": "code-review",
+      "scenario": "Scenario 4",
+      "severity": "High",
+      "invariant": null,
+      "config": null,
+      "counterexample": null,
+      "affected_code": [
+        "openraft/src/engine/handler/following_handler/mod.rs:249-302",
+        "openraft/src/engine/engine_impl.rs:524-565",
+        "openraft/src/core/raft_core.rs:737-747"
+      ],
+      "summary": "Snapshot build and install, membership reconciliation, log truncation, and purge are scheduled separately and can observe different logical and durable frontiers. Installation updates in-memory snapshot and membership state before worker completion, background builds can race other snapshot advancement, and policy bookkeeping precedes trigger acceptance. Confirmation should probe whether a crash or interleaving can purge the only durable source of a committed entry or leave snapshot membership inconsistent with retained state."
+    },
+    {
+      "id": "CR-5",
+      "title": "Independent Heartbeat, Replication, and Read Paths",
+      "source": "code-review",
+      "scenario": "Scenario 5",
+      "severity": "Medium",
+      "invariant": null,
+      "config": null,
+      "counterexample": null,
+      "affected_code": [
+        "openraft/src/core/heartbeat/worker.rs:26-49",
+        "openraft/src/core/raft_core.rs:1742-1762",
+        "openraft/src/core/raft_core.rs:305-444"
+      ],
+      "summary": "Heartbeat, replication, and ReadIndex run through independent tasks that enforce related leader, vote, and session rules along different paths. Per-peer heartbeat workers, replication-progress fencing, and separate read-quorum tasks allow delayed or reordered notifications to cross leadership or membership-session changes. Confirmation should determine whether stale feedback can still establish a quorum acknowledgment, leader lease, or linearizable-read result after the originating session is obsolete."
+    }
+  ]
+}
