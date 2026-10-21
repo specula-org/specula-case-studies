@@ -1,0 +1,87 @@
+# MC-1 reproduction evidence — collected 2026-10-03T18:33:52Z
+
+## Test
+Source: repro/test_bugMC-1_seal_readonly_admission.c (self-contained C, public syscalls only)
+
+## Run 1 — Linux host (control, expected Linux contract)
+Command: gcc -O2 -Wall -o test_bugMC-1_seal_readonly_admission-linux test_bugMC-1_seal_readonly_admission.c && timeout 60 ./test_bugMC-1_seal_readonly_admission-linux
+Host: Linux 7.2.8
+
+kernel: Linux 7.2.8
+
+[S] unsealed control (same handle, no seals)
+  memfd_create(MFD_ALLOW_SEALING)                      -> ret=3       errno=0(0)
+  mmap(PROT_READ, MAP_SHARED, rw_fd)                   -> ret=0       errno=0(0)
+  mmap(PROT_READ|PROT_WRITE, MAP_SHARED, rw_fd)        -> ret=0       errno=0(0)
+  wrote 0x42 through the writable mapping
+  fcntl(F_ADD_SEALS, F_SEAL_WRITE) after unmap         -> ret=0       errno=0(0)
+
+[A] WRITE seal, then PROT_READ MAP_SHARED via the O_RDWR fd
+  memfd_create(MFD_ALLOW_SEALING)                      -> ret=3       errno=0(0)
+  setup state (A)                                      -> fd mode=O_RDWR seals=0x0
+  fcntl(F_ADD_SEALS, F_SEAL_WRITE) via O_RDWR fd       -> ret=0       errno=0(0)
+  mmap(PROT_READ, MAP_SHARED, rw_fd)                   -> ret=0       errno=0(0)
+  ok: read-only shared mapping admitted (Linux contract)
+  read back first byte: 0x00
+  mprotect(PROT_READ|PROT_WRITE) upgrade control       -> ret=-1      errno=Permission denied(13)
+  open(/proc/self/fd/N, O_RDONLY) control              -> ret=4       errno=0(0)
+  mmap(PROT_READ, MAP_SHARED, ro_fd) control           -> ret=0       errno=0(0)
+  mprotect upgrade via ro_fd control                   -> ret=-1      errno=Permission denied(13)
+  fcntl(F_GET_SEALS) final (A)                         -> ret=8       errno=0(0)
+
+[B] FUTURE_WRITE seal, PROT_READ MAP_SHARED via rw fd, then F_SEAL_WRITE
+  memfd_create(MFD_ALLOW_SEALING)                      -> ret=3       errno=0(0)
+  setup state (B)                                      -> fd mode=O_RDWR seals=0x0
+  fcntl(F_ADD_SEALS, F_SEAL_FUTURE_WRITE)              -> ret=0       errno=0(0)
+  mmap(PROT_READ, MAP_SHARED, rw_fd)                   -> ret=0       errno=0(0)
+  mprotect(PROT_READ|PROT_WRITE) upgrade control       -> ret=-1      errno=Permission denied(13)
+  fcntl(F_ADD_SEALS, F_SEAL_WRITE) with only ro mapping -> ret=0       errno=0(0)
+  ok: WRITE seal added (Linux contract)
+  fcntl(F_ADD_SEALS, F_SEAL_WRITE) after munmap control -> ret=0       errno=0(0)
+  fcntl(F_GET_SEALS) final (B)                         -> ret=24      errno=0(0)
+
+manifestation A (post-WRITE-seal READ map -> EPERM): not triggered
+manifestation B (post-FUTURE_WRITE READ map -> false EBUSY): not triggered
+MC1_REPRO: NOT_TRIGGERED (kernel matches the Linux contract)
+exit=0
+
+## Run 2 — Asterinas guest (target)
+Build: pristine worktree at 0c60537098f4c2949ad2d382aaf499de72263d76 (git-verified; only OSDK.toml 'specula_memfd' scheme differs — pure QEMU/boot config),
+  built in asterinas/dev:0.18.1-20260926 via cargo osdk build (vmm-direct/multiboot, KVM, 2 vCPU/2GiB),
+  static test + init in initramfs, booted via 'cargo osdk run' (see repro-build/logs/guest.log, kernel-build.log, source-commit.txt).
+
+kernel: Linux 5.13.0
+
+[S] unsealed control (same handle, no seals)
+  memfd_create(MFD_ALLOW_SEALING)                      -> ret=3       errno=0(0)
+  mmap(PROT_READ, MAP_SHARED, rw_fd)                   -> ret=0       errno=0(0)
+  mmap(PROT_READ|PROT_WRITE, MAP_SHARED, rw_fd)        -> ret=0       errno=0(0)
+  wrote 0x42 through the writable mapping
+  fcntl(F_ADD_SEALS, F_SEAL_WRITE) after unmap         -> ret=0       errno=0(0)
+
+[A] WRITE seal, then PROT_READ MAP_SHARED via the O_RDWR fd
+  memfd_create(MFD_ALLOW_SEALING)                      -> ret=3       errno=0(0)
+  setup state (A)                                      -> fd mode=O_RDWR seals=0x0
+  fcntl(F_ADD_SEALS, F_SEAL_WRITE) via O_RDWR fd       -> ret=0       errno=0(0)
+  mmap(PROT_READ, MAP_SHARED, rw_fd)                   -> ret=-1      errno=Operation not permitted(1)
+  BUG A: read-only shared mapping rejected with EPERM (Linux admits it)
+  open(/proc/self/fd/N, O_RDONLY) control              -> ret=4       errno=0(0)
+  mmap(PROT_READ, MAP_SHARED, ro_fd) control           -> ret=0       errno=0(0)
+  mprotect upgrade via ro_fd control                   -> ret=-1      errno=Permission denied(13)
+  fcntl(F_GET_SEALS) final (A)                         -> ret=8       errno=0(0)
+
+[B] FUTURE_WRITE seal, PROT_READ MAP_SHARED via rw fd, then F_SEAL_WRITE
+  memfd_create(MFD_ALLOW_SEALING)                      -> ret=3       errno=0(0)
+  setup state (B)                                      -> fd mode=O_RDWR seals=0x0
+  fcntl(F_ADD_SEALS, F_SEAL_FUTURE_WRITE)              -> ret=0       errno=0(0)
+  mmap(PROT_READ, MAP_SHARED, rw_fd)                   -> ret=0       errno=0(0)
+  mprotect(PROT_READ|PROT_WRITE) upgrade control       -> ret=-1      errno=Permission denied(13)
+  fcntl(F_ADD_SEALS, F_SEAL_WRITE) with only ro mapping -> ret=-1      errno=Device or resource busy(16)
+  BUG B: false EBUSY from a non-upgradeable read-only mapping (Linux adds the seal)
+  fcntl(F_ADD_SEALS, F_SEAL_WRITE) after munmap control -> ret=0       errno=0(0)
+  fcntl(F_GET_SEALS) final (B)                         -> ret=24      errno=0(0)
+
+manifestation A (post-WRITE-seal READ map -> EPERM): TRIGGERED
+manifestation B (post-FUTURE_WRITE READ map -> false EBUSY): TRIGGERED
+MC1_REPRO: TRIGGERED (A+B)
+SPECULA_TEST_EXIT 42

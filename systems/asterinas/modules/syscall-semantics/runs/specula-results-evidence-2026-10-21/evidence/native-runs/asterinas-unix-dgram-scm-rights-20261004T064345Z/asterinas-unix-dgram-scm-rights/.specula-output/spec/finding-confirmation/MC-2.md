@@ -1,0 +1,135 @@
+# MC-2
+
+Status: REPRODUCED
+Run: asterinas-unix-dgram-scm-rights-20261004T064345Z
+
+Warning: Extension package "/home/chin39/.pi/agent/npm/node_modules/pi-slopchop/package.json": Host-provided extension packages must be declared in peerDependencies with a "*" range, not dependencies: @earendil-works/pi-tui. Installed copies can bypass the extension loader and create duplicate runtime modules.
+Warning: Extension package "/home/chin39/.pi/agent/npm/node_modules/@tintinweb/pi-subagents/package.json": Host-provided extension packages must be declared in peerDependencies with a "*" range, not dependencies: @sinclair/typebox, typebox. Installed copies can bypass the extension loader and create duplicate runtime modules.
+Warning: Extension package "/home/chin39/.pi/agent/npm/node_modules/@tintinweb/pi-tasks/package.json": Host-provided extension packages must be declared in peerDependencies with a "*" range, not dependencies: typebox. Installed copies can bypass the extension loader and create duplicate runtime modules.
+reading /home/chin39/Documents/play/Specula/skills/bug-confirmation/SKILL.md
+reading /home/chin39/Documents/play/Specula/skills/bug-confirmation/guide.md
+reading /home/chin39/Documents/play/Specula/skills/bug-confirmation/phases/01-investigation.md
+reading /home/chin39/Documents/play/Specula/skills/bug-confirmation/phases/02-reproduction.md
+running cat /home/chin39/Documents/play/specula-profile/reports/parallel-scopes-2026-10-04/resources.json 2>/dev/null; echo "---"; ls /home/chin39/Documents/play/Spe...
+running ls /home/chin39/Documents/play/Specula/runs/asterinas-unix-dgram-scm-rights-20261004T064345Z/asterinas-unix-dgram-scm-rights/.specula-output/spec/ 2>/dev/nul...
+running cd /home/chin39/Documents/play/Specula/runs/asterinas-unix-dgram-scm-rights-20261004T064345Z/asterinas-unix-dgram-scm-rights/.specula-output/confirmation/MC-...
+running cd /home/chin39/Documents/play/Specula/runs/asterinas-unix-dgram-scm-rights-20261004T064345Z/asterinas-unix-dgram-scm-rights/.specula-output && cat confirmat...
+running ls -la /home/chin39/Documents/play/Specula/runs/asterinas-unix-dgram-scm-rights-20261004T064345Z/asterinas-unix-dgram-scm-rights/.specula-output/repro/ 2>/de...
+running find /home/chin39/Documents/play/Specula/runs/asterinas-unix-dgram-scm-rights-20261004T064345Z/asterinas-unix-dgram-scm-rights/.specula-output -name "*MC-2*"...
+running cd /home/chin39/Documents/play/Specula/runs/asterinas-unix-dgram-scm-rights-20261004T064345Z/asterinas-unix-dgram-scm-rights/.specula-output/confirmation/MC-...
+The previous incarnation of this turn completed Phase 1 and Phase 2 but failed pipeline validation on the `issue.json` proposal ("issues linked to model actions/invariants require model dependencies"), and the repro test source file is now missing from `repro/`. Let me verify the state of everything, then fix and re-execute properly.
+reading /home/chin39/Documents/play/Specula/skills/bug-confirmation/references/persistent-findings.md
+running sed -n '340,470p' /home/chin39/Documents/play/Specula/src/specula/persistent_findings.py
+Now let me check the worktrees, search for any surviving copy of the test source, and verify the counterexample log:
+running cd /home/chin39/Documents/play/Specula/runs/asterinas-unix-dgram-scm-rights-20261004T064345Z/asterinas-unix-dgram-scm-rights && grep -rl "MC2_RESULT" --inclu...
+running cd /home/chin39/Documents/play/Specula/runs/asterinas-unix-dgram-scm-rights-20261004T064345Z/asterinas-unix-dgram-scm-rights/.specula-output/spec/output/vali...
+The counterexample trace matches the finding exactly (Lock → Select → Copy → `payloadResult="Fault"`, `returnValue="EFAULT"`, `faultRetained=TRUE` → Unlock → Drop → Done with the message still queued). Let me check the head of the log for the invariant statement and inspect the worktrees:
+running head -80 /home/chin39/Documents/play/Specula/runs/asterinas-unix-dgram-scm-rights-20261004T064345Z/asterinas-unix-dgram-scm-rights/.specula-output/spec/outpu...
+running cd /home/chin39/Documents/play/Specula/runs/asterinas-unix-dgram-scm-rights-20261004T064345Z/asterinas-unix-dgram-scm-rights/.specula-output/confirmation/MC-...
+The worktree situation is clear: `worktree-1` is the fresh git worktree for this turn (pin `0c6053709` + trace-only instrumentation, no warm `target/` yet); the old `worktree` is a stale remnant. Now let me verify the cited code in `worktree-1` (Phase 1 audit verification):
+running cd /home/chin39/Documents/play/Specula/runs/asterinas-unix-dgram-scm-rights-20261004T064345Z/asterinas-unix-dgram-scm-rights/.specula-output/confirmation/MC-...
+Code audit verified in `worktree-1`: upstream `try_recv` at pin `0c6053709` does `let len = writer.write(...)?;` — the `?` returns the fault to the caller *before* the `will_consume_data()` → `pop_front()` dequeue; the instrumented worktree keeps identical control flow (trace-only diff). Let me spot-check two call-chain links, then reconstruct the lost repro test from the surviving binary's debug info:
+running cd /home/chin39/Documents/play/Specula/runs/asterinas-unix-dgram-scm-rights-20261004T064345Z/asterinas-unix-dgram-scm-rights/.specula-output/confirmation/MC-...
+The binary retains the exact output formats. Let me extract the test's own function structure from DWARF:
+running cd /home/chin39/Documents/play/Specula/runs/asterinas-unix-dgram-scm-rights-20261004T064345Z/asterinas-unix-dgram-scm-rights/.specula-output/confirmation/MC-...
+running grep -n "DW_AT_name : scenario\|DW_AT_name : main" /tmp/mc2_dwarf.txt | head; echo ---; awk '/DW_AT_name.*: scenario/{found=1} found{print; n++} n>60{exit}'...
+running awk '/DW_AT_name.*: scenario/{found=1} found{print; n++} n>400{exit}' /tmp/mc2_dwarf.txt | grep -E "DW_AT_name|DW_AT_decl_line" | head -70
+I have the full variable structure of the original test from DWARF. Before reconstructing, let me check whether the previous session's transcript (which would contain the exact original source) survives in pi's session storage:
+running grep -rl "test_bugMC-2_payload_fault_retain" /home/chin39/.pi 2>/dev/null | head -5; echo "---"; grep -rl "MC2_SCENARIO" /home/chin39/.pi 2>/dev/null | head -5
+The previous session's transcript survives. Let me extract the exact original test source from its `write` tool call:
+running python3 - <<'EOF' import json path = "/home/chin39/.pi/agent/sessions/--home-chin39-Documents-play-Specula-runs-asterinas-unix-dgram-scm-rights-20261004T0643...
+running python3 - <<'EOF' import json, re path = "/home/chin39/.pi/agent/sessions/--home-chin39-Documents-play-Specula-runs-asterinas-unix-dgram-scm-rights-20261004T...
+The exact original test source is recovered (11,409 bytes, from the previous incarnation's `write` call). Now let me check the `source` tree's instrumentation state and how dependency roots resolve, before restoring the file and re-running:
+running T=/home/chin39/Documents/play/Specula/runs/asterinas-unix-dgram-scm-rights-20261004T064345Z/asterinas-unix-dgram-scm-rights; grep -n "let len = match result"...
+running grep -n "_dependency_bytes" -A 40 /home/chin39/Documents/play/Specula/src/specula/persistent_findings.py | sed -n '1,50p'
+`$T/source` is the instrumented tree and `worktree-1` is content-identical to it, so the issue.json source spans resolve correctly. Now let me read the recovered test source in full before restoring it:
+reading /tmp/mc2_original_test.c
+The recovered source is complete and self-consistent with the observed output formats (including the `MC2_LEAK` behavior: guest-as-init has no inherited fds, the host control prints its inherited fds). Now I'll restore the test file and prepare the re-run:
+running cp /tmp/mc2_original_test.c /home/chin39/Documents/play/Specula/runs/asterinas-unix-dgram-scm-rights-20261004T064345Z/asterinas-unix-dgram-scm-rights/.specul...
+running /home/chin39/Documents/play/specula-profile-local-artifacts/parallel-scopes-2026-10-04/effective-mem-gib.sh; echo "threshold for kernel build: 10 GiB"; sudo...
+Memory OK (47.86 GiB ≥ 10), Docker OK, test restored. Now update `run-repro.sh` for `worktree-1` (the assigned repo; content-identical to `$T/source`, so the warm step only syncs mtimes + copies the cargo caches) and preserve the previous binary for the byte-identity check:
+editing /home/chin39/Documents/play/Specula/runs/asterinas-unix-dgram-scm-rights-20261004T064345Z/asterinas-unix-dgram-scm-rights/.specula-output/confirmation/MC-2/run-repro.sh
+running cd /home/chin39/Documents/play/Specula/runs/asterinas-unix-dgram-scm-rights-20261004T064345Z/asterinas-unix-dgram-scm-rights/.specula-output/confirmation/MC-...
+Now execute the full reproduction (blocking, with outer timeout):
+running cd /home/chin39/Documents/play/Specula/runs/asterinas-unix-dgram-scm-rights-20261004T064345Z/asterinas-unix-dgram-scm-rights/.specula-output/confirmation/MC-...
+The reproduction re-ran successfully in this session — Asterinas retains the datagram after an ordinary EFAULT (`ordinary_fault_retained=1, invariant_matches_linux=0`), Linux consumes it (`retained=0, invariant_matches_linux=1`), PEEK retains in both. Now verify the restored source is byte-identical to what the previous incarnation compiled (proving provenance), and capture the full logs:
+running cd /home/chin39/Documents/play/Specula/runs/asterinas-unix-dgram-scm-rights-20261004T064345Z/asterinas-unix-dgram-scm-rights/.specula-output/confirmation/MC-...
+Byte-identical binary (sha256 `02ae1824…`) — the restored source is provably the original, and the fresh outputs match the previous run exactly. Now fix the `issue.json` validation failure: add the required model dependencies (`root: "work"` selectors). First verify the source-span boundaries are unique in the source tree:
+running T=/home/chin39/Documents/play/Specula/runs/asterinas-unix-dgram-scm-rights-20261004T064345Z/asterinas-unix-dgram-scm-rights; cd $T/source && for pair in "ker...
+`skip_some` is ambiguous (appears in both `MultiRead` and `MultiWrite`). Let me check the trait layout to pick a unique boundary:
+running T=/home/chin39/Documents/play/Specula/runs/asterinas-unix-dgram-scm-rights-20261004T064345Z/asterinas-unix-dgram-scm-rights; grep -n "trait MultiWrite" -A 30...
+running T=/home/chin39/Documents/play/Specula/runs/asterinas-unix-dgram-scm-rights-20261004T064345Z/asterinas-unix-dgram-scm-rights; grep -n "fn sum_lens\|Skips the...
+Now rewrite `issue.json` with the corrected `iovec.rs` boundary and the required model dependencies:
+editing /home/chin39/Documents/play/Specula/runs/asterinas-unix-dgram-scm-rights-20261004T064345Z/asterinas-unix-dgram-scm-rights/.specula-output/confirmation/MC-2/issue.json
+running cd /home/chin39/Documents/play/Specula && PYTHONPATH=/home/chin39/Documents/play/Specula/src python3 - <<'EOF' from pathlib import Path from specula.persiste...
+Validation passes. Now let me independently verify the Phase-1 developer-knowledge and novelty claims (git history + contracts + a fresh upstream tracker search) before finalizing:
+running cd /home/chin39/Documents/play/Specula/runs/asterinas-unix-dgram-scm-rights-20261004T064345Z/asterinas-unix-dgram-scm-rights/.specula-output/confirmation/MC-...
+running grep -n -B3 -A8 "AST-36" /home/chin39/Documents/play/specula-profile/reports/parallel-scopes-2026-10-04/scm-rights/contracts.md | head -60
+Contracts confirm the prior-dataset mapping (SCM-13 = "existing AST-36" boundary control; "Recon analysis MC-2/T-3 is AST-36"). Let me check the dataset id-map for the exact citation, the MSG_PEEK commit's stated intent, and do a fresh upstream tracker check:
+running grep -n -i "AST-36" /home/chin39/Documents/play/specula-profile/reports/asterinas-bug-findings-2026-08/id-map.md 2>/dev/null | head -5; ls /home/chin39/Docum...
+running curl -s --max-time 30 "https://api.github.com/search/issues?q=repo:asterinas-project/asterinas+recvmsg+EFAULT&per_page=10" | python3 -c "import json,sys; d=j...
+running curl -s --max-time 30 -o /tmp/gh1.json "https://api.github.com/search/issues?q=repo:asterinas-project/asterinas+recvmsg+EFAULT&per_page=10"; curl -s --max-ti...
+running head -c 300 /tmp/gh1.json; echo; echo "--- try web tool instead ---"
+running cd /home/chin39/Documents/play/Specula/runs/asterinas-unix-dgram-scm-rights-20261004T064345Z/asterinas-unix-dgram-scm-rights/.specula-output/confirmation/MC-...
+running T=/home/chin39/Documents/play/Specula/runs/asterinas-unix-dgram-scm-rights-20261004T064345Z/asterinas-unix-dgram-scm-rights; grep -r "github.com" $T/source/....
+using web_search
+The upstream search confirms no issue/PR reports this mechanism at this site (nearest hit: vsock PR #3122 discusses EFAULT queue-retention for *vsock* — a different socket family). Now let me append the resume addendum to `investigation.md` and check the fresh build log:
+running cd /home/chin39/Documents/play/Specula/runs/asterinas-unix-dgram-scm-rights-20261004T064345Z/asterinas-unix-dgram-scm-rights/.specula-output/confirmation/MC-...
+running grep -E "Finished .release|Compiling asterinas v" /home/chin39/Documents/play/Specula/runs/asterinas-unix-dgram-scm-rights-20261004T064345Z/asterinas-unix-dg...
+editing /home/chin39/Documents/play/Specula/runs/asterinas-unix-dgram-scm-rights-20261004T064345Z/asterinas-unix-dgram-scm-rights/.specula-output/confirmation/MC-2/investigation.md
+running tail -8 /home/chin39/Documents/play/Specula/runs/asterinas-unix-dgram-scm-rights-20261004T064345Z/asterinas-unix-dgram-scm-rights/.specula-output/confirmatio...
+editing /home/chin39/Documents/play/Specula/runs/asterinas-unix-dgram-scm-rights-20261004T064345Z/asterinas-unix-dgram-scm-rights/.specula-output/confirmation/MC-2/investigation.md
+Final artifact-chain validation:
+running cd /home/chin39/Documents/play/Specula && PYTHONPATH=/home/chin39/Documents/play/Specula/src python3 - <<'EOF' from pathlib import Path from specula.persiste...
+# MC-2 Confirmation — AST-36: Ordinary payload faults retain the datagram
+
+- **Source**: MC (real counterexample: `spec/output/validation-20261010T015405Z/MC_hunt_AST36.log` — trace re-verified directly this session: `MCSendBegin(message1, rights <<fileA,fileB,fileA,fileB>>)` → `MCRecvBegin(<<r1,1>>,"Recv","Full",FALSE)` → Lock → Select → Copy → `payloadResult="Fault"`, `returnValue="EFAULT"`, `faultRetained=TRUE` → Unlock → Drop → Done with `queue.msg="message1"`, `consumed=0`)
+- **Novelty**: KNOWN (cite: Specula dataset `asterinas-bug-findings-2026-08`, id-map MC-2/T-3 → AST-36 "Analysis-only candidate"; fix-status: unfixed at pin 0c6053709 — the early return before dequeue is still present and the fresh guest run reproduces retention). Upstream tracker search (issues + PRs, three query shapes) found no report of this mechanism at this site; nearest hits are vsock PR #3122 (EFAULT queue-retention for a different socket family) and feature-gap tracking issues #2112/#1851.
+- **Location**: `kernel/core/src/net/socket/unix/datagram/message.rs:291-299` (instrumented pin 0c6053709; upstream pin lines 195-202: `let len = writer.write(&mut VmReader::from(msg.bytes.as_slice()))?;` returns the fault before the `will_consume_data()` → `pop_front()` dequeue)
+
+## Description
+
+`MessageReceiver::try_recv` copies the datagram payload to the user buffer **before** dequeueing the message. When that copy faults (a payload page mapped `PROT_READ` write-faults mid-copy), the `?`/`Err` branch returns `EFAULT` while the message is still the queue front, so the datagram and its `SCM_RIGHTS` references stay queued. Linux's `__unix_dgram_recvmsg` unlinks the skb for an ordinary (non-PEEK) receive **before** the payload copy (`__skb_try_recv_from_queue` → `__skb_unlink`) and frees it on fault (`out_free: skb_free_datagram`), consuming the datagram and releasing its references. PEEK retains the message in both implementations. The result is an observable Linux-compatibility divergence: after an ordinary `recvmsg` fails with `EFAULT`, Asterinas re-delivers the same datagram (and its four `SCM_RIGHTS` FDs) on retry, where Linux returns `EAGAIN` with the message destroyed. References remain attributable (no leak: post-retry queue empty, FD scan clean), so the defect is the consumption-semantics divergence itself, not a reference imbalance.
+
+## Trigger scenario
+
+Level 0, public syscalls only: `socketpair(AF_UNIX, SOCK_DGRAM|SOCK_NONBLOCK)` → open two marker files A/B → `sendmsg` one nonempty datagram with `SCM_RIGHTS {A,B,A,B}` → `mmap` a page, `mprotect` it `PROT_READ` → ordinary `recvmsg` (flags 0) with the payload iovec pointing at that page and a valid writable control buffer → returns `-1/EFAULT` with the control buffer untouched and 0 FDs installed → retry `recvmsg` with a good buffer. On Asterinas the retry returns the same datagram and delivers 4 FDs naming A,B,A,B; on Linux the retry returns `-1/EAGAIN`. A faulting `MSG_PEEK` followed by an ordinary retry delivers in both (PEEK retains in both — the control). This maps 1:1 to the MC counterexample steps (`MCSendBegin` → `MCRecvBegin` with `payloadGood=FALSE` → `faultRetained=TRUE`).
+
+## Developer intent
+
+No commit message on the file's history states any intent about fault-consumption semantics: `fe1d4fe15` "Support UNIX datagram sockets" introduced copy-then-dequeue, `485f2189c` "Implement MSG_PEEK for UNIX datagram sockets" introduced `will_consume_data()` but kept the copy first (one-line commit body, no fault-semantics rationale), `e645c038d` removed a warn only. No comment near the site mentions EFAULT or Linux fault-path compatibility. Upstream tests exercise `recvmsg` EFAULT on UDP (`udp_err.c:390`) but never assert queue state afterwards, so nothing shows the developers chose or endorsed retain-on-fault for unix datagrams. The run's contracts file records this exact site as the known AST-36 boundary control ("A3 returns before normal dequeue on a payload fault… L3 unlinks a normal receive before payload copy and releases it on fault. Do not assume that every failed receive restores the message.") — a retained compatibility check, not a documented intended behavior.
+
+## Reproduction result
+
+Test: `repro/test_bugMC-2_payload_fault_retain.c` (self-contained C; runs as guest init on Asterinas and as the same-program host Linux control). Runner: `confirmation/MC-2/run-repro.sh` (this turn's `worktree-1`, pin 0c6053709 + trace-only instrumentation, warm cargo cache, Docker `asterinas/kernel-dev:0.18.1-20260926`, `osdk build --scheme scm-trace`, QEMU/KVM boot). Executed this session: `build_status=0`, `guest_status=33`, `linux_control_status=0`, run exit 0. (The first incarnation of this turn had run the same test; its source file was lost from `repro/` before the resume — I recovered the exact original from that session's transcript, and the recompiled binary is byte-identical, sha256 `02ae18247dbbe294c9aec111c0b1e7fd4a1fee1c3ad8c533e7994d6bc288fd1b`, proving the restored source is the one originally executed.)
+
+Guest (Asterinas, real kernel boot, `/init`):
+```
+MC2_SYS {"sysname":"Linux","release":"5.13.0","machine":"x86_64"}
+MC2_SCENARIO {"kind":"ordinary","fault":{"ret":-1,"errno":14},"control_touched":0,"fault_installed_fds":0,"retry":{"ret":1,"errno":0},"retained":1,"fds_delivered":4,"markers_ok":1,"post_retry_empty":1}
+MC2_SCENARIO {"kind":"peek","fault":{"ret":-1,"errno":14},"control_touched":0,"fault_installed_fds":0,"retry":{"ret":1,"errno":0},"retained":1,"fds_delivered":4,"markers_ok":1,"post_retry_empty":1}
+MC2_RESULT ordinary_fault_retained=1 peek_fault_retained=1 invariant_matches_linux=0 consistent=1
+```
+
+Host (Linux 7.2.8 control, same binary):
+```
+MC2_SYS {"sysname":"Linux","release":"7.2.8","machine":"x86_64"}
+MC2_SCENARIO {"kind":"ordinary","fault":{"ret":-1,"errno":14},"control_touched":0,"fault_installed_fds":0,"retry":{"ret":-1,"errno":11},"retained":0,"fds_delivered":0,"markers_ok":0,"post_retry_empty":1}
+MC2_SCENARIO {"kind":"peek","fault":{"ret":-1,"errno":14},"control_touched":0,"fault_installed_fds":0,"retry":{"ret":1,"errno":0},"retained":1,"fds_delivered":4,"markers_ok":1,"post_retry_empty":1}
+MC2_RESULT ordinary_fault_retained=0 peek_fault_retained=1 invariant_matches_linux=1 consistent=1
+MC2_LEAK fd=26
+MC2_LEAK fd=30
+```
+
+The `MC2_LEAK` lines on the host are fds inherited from the invoking shell (informational; the guest-as-init scan is clean). The lines that demonstrate the bug: guest `MC2_SCENARIO "kind":"ordinary"` → `"retry":{"ret":1,...},"retained":1,"fds_delivered":4,"markers_ok":1` and `MC2_RESULT ordinary_fault_retained=1 invariant_matches_linux=0`, versus the Linux control's `"retry":{"ret":-1,"errno":11},"retained":0` and `invariant_matches_linux=1`. Expected (Linux) behavior after an ordinary EFAULT receive: the datagram is consumed, retry gets EAGAIN, the SCM_RIGHTS references are released undelivered. PEEK behaves identically in both (retained → delivered on retry), confirming the right bug and not an adjacent one.
+
+## Recommendation
+
+Make `try_recv` consume the datagram on a payload-copy fault for ordinary receives, matching Linux: unlink/dequeue the front message before (or on failure of) the payload copy, and on fault drop it, releasing its `AuxiliaryData` SCM_RIGHTS references without delivering them — e.g. pop the front message first, attempt the copy, and on `Err` drop the popped message (and its aux) before returning `EFAULT`; PEEK keeps the current retain-on-fault behavior. A minimal in-kernel test to add alongside: unix-dgram `recvmsg` EFAULT followed by a retry must observe `EAGAIN` (ordinary) and success (PEEK). Until fixed, document the divergence, since applications ported from Linux that retry after EFAULT will see messages reappear and receive FD deliveries Linux would have destroyed.
+
+## REPRODUCED checklist
+
+1. **Level 0 or Level 1 alone?** Yes — Level 0 alone triggered it: only public syscalls (`socketpair`, `open`, `write`, `sendmsg`, `mmap`, `mprotect`, `recvmsg`, `close`), no failpoints, no state injection, no source modification, no timing assistance; deterministic across both runs.
+2. N/A — Level 2/3 were never used. (The injected pre-condition — a `PROT_READ` payload page — is itself produced by the real-API sequence `mmap` + `mprotect`, and corresponds to the admissible counterexample step `MCRecvBegin(..., payloadGood=FALSE)`.)
+3. **Real consumer/caller:** the user-space receiver calling `recvmsg(2)` (kernel entry `sys_recvmsg`, `kernel/core/src/syscall/recvmsg.rs:15` → `UnixDatagramSocket::recvmsg`, `socket.rs:299` → `try_recv`). In the reproduction the consumer is the test process itself at its retry `recvmsg` (`repro/test_bugMC-2_payload_fault_retain.c`, scenario "Attempt 2"): it observes `ret=1` with 4 SCM_RIGHTS FDs delivered (markers A,B,A,B verified by `pread`) where Linux gives `-1/EAGAIN`. The consequence is observed live in the guest run, not argued-only.
+4. **Permanent or masked?** Permanent until the application itself acts — no downstream mechanism reconciles it: no caller guard consumes the message after the fault, nothing re-delivers or discards it, and the queue mutex is simply dropped. The retained datagram persists until a later successful receive or socket close (which is exactly the harm: a message Linux destroyed remains receivable). Not a transient snapshot a safeguard fixes; no leak either (post-retry queue empty, guest FD scan clean, all references attributable to the queue while retained).

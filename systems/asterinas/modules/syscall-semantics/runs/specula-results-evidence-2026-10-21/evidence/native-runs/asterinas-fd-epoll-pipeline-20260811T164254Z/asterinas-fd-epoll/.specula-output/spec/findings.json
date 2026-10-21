@@ -1,0 +1,99 @@
+{
+  "schema_version": "2",
+  "system": "Asterinas FD Lifecycle and Epoll",
+  "generated_by": "validation-workflow",
+  "findings": [
+    {
+      "id": "MC-1",
+      "title": "epoll EFAULT loses edge-triggered readiness",
+      "source": "model-checking",
+      "scenario": "S2 copyout atomicity",
+      "severity": "High",
+      "invariant": "MCDeliveryCommitOnCopyout",
+      "config": "MC_hunt_s2_copyout.cfg",
+      "counterexample": "spec/output/MC_hunt_s2_copyout_round2_bfs.out",
+      "affected_code": [
+        "kernel/core/src/syscall/epoll.rs:129",
+        "kernel/core/src/events/epoll/file.rs:244"
+      ],
+      "summary": "EpollFile::wait removes an edge-triggered ready entry before sys_epoll_wait copies it to user memory. If that copy faults, the syscall returns EFAULT but the ready edge is not restored, so a later valid epoll_wait sees no event. The bounded model reaches the lost-undelivered epoch in nine states and the public eventfd reproduction observes the missing redelivery in an SMP=2 Asterinas VM."
+    },
+    {
+      "id": "MC-2",
+      "title": "epoll EFAULT disables one-shot interest before delivery",
+      "source": "model-checking",
+      "scenario": "S2 one-shot delivery",
+      "severity": "High",
+      "invariant": "MCOneShotDisabledIffDelivered",
+      "config": "MC_hunt_s2_oneshot.cfg",
+      "counterexample": "spec/output/MC_hunt_s2_oneshot_round2_bfs.out",
+      "affected_code": [
+        "kernel/core/src/events/epoll/entry.rs:136",
+        "kernel/core/src/syscall/epoll.rs:145"
+      ],
+      "summary": "Entry::poll disables an EPOLLONESHOT observer when it observes readiness, before the selected event is copied to user memory. A copyout EFAULT therefore leaves an event that was never delivered permanently disabled until EPOLL_CTL_MOD. The ten-state model trace and the SMP=2 public eventfd test both show this behavior."
+    },
+    {
+      "id": "MC-3",
+      "title": "final close leaves a dead epoll interest entry",
+      "source": "model-checking",
+      "scenario": "S2 epoll lifecycle",
+      "severity": "Medium",
+      "invariant": "MCNoDeadInterest",
+      "config": "MC_hunt_s2_epoll_delivery.cfg",
+      "counterexample": "spec/output/MC_hunt_s2_epoll_delivery_round2_bfs.out",
+      "affected_code": [
+        "kernel/core/src/fs/file/file_table.rs:196",
+        "kernel/core/src/events/epoll/file.rs:259",
+        "kernel/core/src/events/epoll/entry.rs:46"
+      ],
+      "summary": "The epoll key includes the weak file-object identity, preventing descriptor-number reuse from retargeting a watch, but final close has no immediate epoll cleanup hook. The dead weak entry remains in the interest set until a later ready-list scan notices it. The seven-state model trace is directly observable through a stale /proc/self/fdinfo entry in the SMP=2 VM test."
+    },
+    {
+      "id": "MC-4",
+      "title": "consumed timerfd remains ready through the poll cache",
+      "source": "model-checking",
+      "scenario": "S3 readiness cache",
+      "severity": "High",
+      "invariant": "MCCachedReadinessSound",
+      "config": "MC_hunt_s3_cache.cfg",
+      "counterexample": "spec/output/MC_hunt_s3_cache_round2_bfs.out",
+      "affected_code": [
+        "kernel/core/src/time/timerfd.rs:177",
+        "kernel/core/src/process/signal/poll.rs:106"
+      ],
+      "summary": "Timerfd expiration invalidates and caches readiness, but a successful read clears ticks without invalidating the shared Pollee cache. A subsequent zero-timeout poll can report POLLIN even though the next read returns EAGAIN. The nine-state model trace and public timerfd reproduction both show stale readiness."
+    },
+    {
+      "id": "MC-5",
+      "title": "signalfd mask update does not publish readiness",
+      "source": "model-checking",
+      "scenario": "S4 signal-mask transition",
+      "severity": "High",
+      "invariant": "MCRegisteredTransitionNotLost",
+      "config": "MC_hunt_s4_mask_transition.cfg",
+      "counterexample": "spec/output/MC_hunt_s4_mask_transition_round2_bfs.out",
+      "affected_code": [
+        "kernel/core/src/syscall/signalfd.rs:103",
+        "kernel/core/src/syscall/signalfd.rs:161",
+        "kernel/core/src/process/posix_thread/mod.rs:266"
+      ],
+      "summary": "Updating an existing signalfd mask only stores the new mask. A signal that was already pending can become readable under that new mask without notifying the thread or process signal-queue poller registered by epoll. The temporal counterexample reaches the lost transition in eight states and the SMP=2 signalfd test times out instead of receiving the pending signal."
+    },
+    {
+      "id": "MC-6",
+      "title": "poll returns timeout after timerfd becomes readable",
+      "source": "model-checking",
+      "scenario": "S5 timeout arbitration",
+      "severity": "High",
+      "invariant": "MCVisibleReadyWinsTerminalRace",
+      "config": "MC_hunt_s5_arbitration.cfg",
+      "counterexample": "spec/output/MC_hunt_s5_arbitration_round2_bfs.out",
+      "affected_code": [
+        "kernel/core/src/syscall/poll.rs:108",
+        "kernel/core/src/process/signal/pause.rs:171"
+      ],
+      "summary": "The timeout return path in do_poll does not rescan descriptors after the waiting primitive returns ETIME. A timerfd can increment its readable tick counter at the timeout boundary, yet poll returns zero; an immediate read then succeeds. The six-state model trace is reproduced in repeated SMP=2 timerfd stress runs."
+    }
+  ]
+}

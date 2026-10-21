@@ -1,0 +1,1673 @@
+diff --git a/OSDK.toml b/OSDK.toml
+index 064fd551a..586642751 100644
+--- a/OSDK.toml
++++ b/OSDK.toml
+@@ -29,6 +29,11 @@ args = "$(./tools/qemu_args.sh test)"
+ 
+ # Other Schemes
+ 
++[scheme."specula_memfd"]
++boot.method = "vmm-direct"
++grub.boot_protocol = "multiboot"
++qemu.args = "-machine q35,kernel-irqchip=split -cpu Icelake-Server,+x2apic,+vmx -smp 2 -m 2G -accel kvm -nographic -display none -monitor none -serial stdio -no-reboot -device isa-debug-exit,iobase=0xf4,iosize=0x04"
++
+ [scheme."microvm"]
+ boot.method = "vmm-direct"
+ build.strip_elf = true
+diff --git a/kernel/core/src/fs/fs_impls/ramfs/memfd.rs b/kernel/core/src/fs/fs_impls/ramfs/memfd.rs
+index 8be83ecca..a1f58d246 100644
+--- a/kernel/core/src/fs/fs_impls/ramfs/memfd.rs
++++ b/kernel/core/src/fs/fs_impls/ramfs/memfd.rs
+@@ -44,49 +44,142 @@ pub(crate) struct MemfdInode {
+ 
+ impl MemfdInode {
+     pub(self) fn add_seals(&self, mut new_seals: FileSeals) -> Result<()> {
++        let trace_start = crate::tla_trace::now();
+         let mut seals = self.seals.lock();
++        crate::tla_trace::emit(
++            "MemfdAddSealsLock",
++            "seal_check",
++            trace_start,
++            crate::tla_trace::now(),
++            |_, e| e.seals = Some(seals.bits()),
++        );
++        let result = (|| {
++            let trace_start = crate::tla_trace::now();
++            if seals.contains(FileSeals::F_SEAL_SEAL) {
++                crate::tla_trace::emit(
++                    "MemfdAddSealsCheck",
++                    "seal_unlock",
++                    trace_start,
++                    crate::tla_trace::now(),
++                    |b, e| {
++                        b.local.result = "EPERM";
++                        e.seals = Some(seals.bits());
++                    },
++                );
++                return_errno_with_message!(Errno::EPERM, "the file is sealed against sealing");
++            }
+ 
+-        if seals.contains(FileSeals::F_SEAL_SEAL) {
+-            return_errno_with_message!(Errno::EPERM, "the file is sealed against sealing");
+-        }
+-
+-        // Reference: <https://elixir.bootlin.com/linux/v6.16.5/source/mm/memfd.c#L262-L266>
+-        if new_seals.contains(FileSeals::F_SEAL_EXEC)
+-            && self.mode().unwrap().intersects(mkmod!(a+x))
+-        {
+-            new_seals |= FileSeals::F_SEAL_SHRINK
+-                | FileSeals::F_SEAL_GROW
+-                | FileSeals::F_SEAL_WRITE
+-                | FileSeals::F_SEAL_FUTURE_WRITE;
+-        }
+-
+-        if new_seals.contains(FileSeals::F_SEAL_WRITE) {
+-            let page_cache = self.page_cache().unwrap();
+-            page_cache.writable_mapping_status().deny()?;
+-        }
++            // Reference: <https://elixir.bootlin.com/linux/v6.16.5/source/mm/memfd.c#L262-L266>
++            if new_seals.contains(FileSeals::F_SEAL_EXEC)
++                && self.mode().unwrap().intersects(mkmod!(a+x))
++            {
++                new_seals |= FileSeals::F_SEAL_SHRINK
++                    | FileSeals::F_SEAL_GROW
++                    | FileSeals::F_SEAL_WRITE
++                    | FileSeals::F_SEAL_FUTURE_WRITE;
++            }
+ 
+-        *seals |= new_seals;
++            crate::tla_trace::emit(
++                "MemfdAddSealsCheck",
++                if new_seals.contains(FileSeals::F_SEAL_WRITE) {
++                    "deny"
++                } else {
++                    "publish"
++                },
++                trace_start,
++                crate::tla_trace::now(),
++                |_, e| e.seals = Some(seals.bits()),
++            );
++            if new_seals.contains(FileSeals::F_SEAL_WRITE) {
++                let page_cache = self.page_cache().unwrap();
++                page_cache.writable_mapping_status().deny()?;
++            }
+ 
+-        Ok(())
++            let trace_start = crate::tla_trace::now();
++            *seals |= new_seals;
++            crate::tla_trace::emit(
++                "MemfdPublishSeals",
++                "seal_unlock",
++                trace_start,
++                crate::tla_trace::now(),
++                |b, e| {
++                    b.local.result = "OK";
++                    e.seals = Some(seals.bits());
++                },
++            );
++            Ok(())
++        })();
++        let trace_seals = seals.bits();
++        let trace_start = crate::tla_trace::now();
++        drop(seals);
++        crate::tla_trace::emit(
++            "MemfdAddSealsUnlock",
++            "return",
++            trace_start,
++            crate::tla_trace::now(),
++            |b, e| {
++                b.local.result = crate::tla_trace::result(&result);
++                e.seals = Some(trace_seals);
++            },
++        );
++        result
+     }
+ 
+     pub(self) fn get_seals(&self) -> FileSeals {
+-        *self.seals.lock()
++        let trace_start = crate::tla_trace::now();
++        let guard = self.seals.lock();
++        let seals = *guard;
++        crate::tla_trace::emit(
++            "MemfdGetSeals",
++            "return",
++            trace_start,
++            crate::tla_trace::now(),
++            |b, e| {
++                b.local.observed = seals.bits();
++                b.local.result = "OK";
++                e.seals = Some(seals.bits());
++            },
++        );
++        seals
+     }
+ 
+     /// Checks whether writing to this memfd inode is allowed.
+     ///
+     /// This method restricts the `may_perms` if needed.
+     pub(crate) fn check_writable(&self, perms: VmPerms, may_perms: &mut VmPerms) -> Result<()> {
++        let trace_start = crate::tla_trace::now();
+         let seals = self.seals.lock();
+-        if seals.intersects(FileSeals::F_SEAL_WRITE | FileSeals::F_SEAL_FUTURE_WRITE) {
+-            if perms.contains(VmPerms::WRITE) {
+-                return_errno_with_message!(Errno::EPERM, "the file is sealed against writing");
++        let result = (|| {
++            if seals.intersects(FileSeals::F_SEAL_WRITE | FileSeals::F_SEAL_FUTURE_WRITE) {
++                if perms.contains(VmPerms::WRITE) {
++                    return_errno_with_message!(Errno::EPERM, "the file is sealed against writing");
++                }
++                // Reference: <https://elixir.bootlin.com/linux/v6.16.5/source/mm/memfd.c#L356>
++                may_perms.remove(VmPerms::MAY_WRITE);
+             }
+-            // Reference: <https://elixir.bootlin.com/linux/v6.16.5/source/mm/memfd.c#L356>
+-            may_perms.remove(VmPerms::MAY_WRITE);
+-        }
+-        Ok(())
++            Ok(())
++        })();
++        crate::tla_trace::emit(
++            "MemfdCheckWritable",
++            if result.is_ok() {
++                "mapped_new"
++            } else {
++                "vmar_unlock"
++            },
++            trace_start,
++            crate::tla_trace::now(),
++            |b, e| {
++                b.local.checked = true;
++                b.local.tracked = true;
++                b.local.observed = seals.bits();
++                b.local.may = (may_perms.bits() >> 3) & 7;
++                if result.is_err() {
++                    b.local.result = crate::tla_trace::result(&result);
++                }
++                e.seals = Some(seals.bits());
++            },
++        );
++        result
+     }
+ 
+     pub(self) fn name(&self) -> &str {
+diff --git a/kernel/core/src/lib.rs b/kernel/core/src/lib.rs
+index 5e65ce6a5..b57c1c2b0 100644
+--- a/kernel/core/src/lib.rs
++++ b/kernel/core/src/lib.rs
+@@ -40,6 +40,7 @@ macro_rules! __log_prefix {
+ #[cfg_attr(target_arch = "loongarch64", path = "arch/loongarch/mod.rs")]
+ #[cfg_attr(target_arch = "aarch64", path = "arch/arm/mod.rs")]
+ mod arch;
++pub(crate) mod tla_trace;
+ 
+ pub mod context;
+ mod cpu;
+diff --git a/kernel/core/src/process/posix_thread/thread_local.rs b/kernel/core/src/process/posix_thread/thread_local.rs
+index 086034566..7afdd2ee6 100644
+--- a/kernel/core/src/process/posix_thread/thread_local.rs
++++ b/kernel/core/src/process/posix_thread/thread_local.rs
+@@ -21,6 +21,7 @@ use crate::{
+ 
+ /// Local data for a POSIX thread.
+ pub(crate) struct ThreadLocal {
++    pub(crate) tla_trace: RefCell<crate::tla_trace::Buffer>,
+     // TID pointers.
+     // https://man7.org/linux/man-pages/man2/set_tid_address.2.html
+     set_child_tid: Cell<Vaddr>,
+@@ -71,6 +72,7 @@ impl ThreadLocal {
+         ns_proxy: Arc<NsProxy>,
+     ) -> Self {
+         Self {
++            tla_trace: RefCell::new(crate::tla_trace::Buffer::default()),
+             set_child_tid: Cell::new(set_child_tid),
+             clear_child_tid: Cell::new(clear_child_tid),
+             vmar: RefCell::new(Some(vmar)),
+diff --git a/kernel/core/src/syscall/mmap.rs b/kernel/core/src/syscall/mmap.rs
+index a9868870f..d43b37e46 100644
+--- a/kernel/core/src/syscall/mmap.rs
++++ b/kernel/core/src/syscall/mmap.rs
+@@ -125,17 +125,20 @@ fn do_sys_mmap(
+             let mut file_table = ctx.thread_local.borrow_file_table_mut();
+             let file = get_file_fast!(&mut file_table, raw_fd.try_into()?).into_owned();
+ 
++            let trace_start = crate::tla_trace::now();
+             let access_mode = file.access_mode();
+             if vm_perms.contains(VmPerms::READ) && !access_mode.is_readable() {
+                 return_errno_with_message!(Errno::EACCES, "the file is not opened readable");
+             }
+             if option.typ() == MMapType::Shared && !access_mode.is_writable() {
+                 if vm_perms.contains(VmPerms::WRITE) {
++                    crate::tla_trace::fd_mode(vm_may_perms, true, trace_start);
+                     return_errno_with_message!(Errno::EACCES, "the file is not opened writable");
+                 }
+                 vm_may_perms.remove(VmPerms::MAY_WRITE);
+             }
+ 
++            crate::tla_trace::fd_mode(vm_may_perms, false, trace_start);
+             options = options
+                 .may_perms(vm_may_perms)
+                 .mappable(&file)?
+diff --git a/kernel/core/src/syscall/mod.rs b/kernel/core/src/syscall/mod.rs
+index 2b5dfbef6..d193cc3c6 100644
+--- a/kernel/core/src/syscall/mod.rs
++++ b/kernel/core/src/syscall/mod.rs
+@@ -383,6 +383,7 @@ impl SyscallArgument {
+ 
+ pub(crate) fn handle_syscall(ctx: &Context, user_ctx: &mut UserContext) {
+     let syscall_frame = SyscallArgument::new_from_context(user_ctx);
++    crate::tla_trace::enter(syscall_frame.syscall_number, syscall_frame.args);
+     let syscall_return = arch::syscall_dispatch(
+         syscall_frame.syscall_number,
+         syscall_frame.args,
+@@ -393,12 +394,14 @@ pub(crate) fn handle_syscall(ctx: &Context, user_ctx: &mut UserContext) {
+     match syscall_return {
+         Ok(return_value) => {
+             if let SyscallReturn::Return(return_value) = return_value {
++                crate::tla_trace::syscall_return(return_value);
+                 user_ctx.set_syscall_ret(return_value as usize);
+             }
+         }
+         Err(err) => {
+             debug!("syscall return error: {:?}", err);
+             let errno = err.error() as i32;
++            crate::tla_trace::syscall_return(-isize::try_from(errno).unwrap());
+             user_ctx.set_syscall_ret((-errno) as usize)
+         }
+     }
+diff --git a/kernel/core/src/syscall/prctl.rs b/kernel/core/src/syscall/prctl.rs
+index c26b3ef6a..9e45d97f7 100644
+--- a/kernel/core/src/syscall/prctl.rs
++++ b/kernel/core/src/syscall/prctl.rs
+@@ -20,6 +20,10 @@ pub(super) fn sys_prctl(
+     arg5: u64,
+     ctx: &Context,
+ ) -> Result<SyscallReturn> {
++    if option == crate::tla_trace::CONTROL {
++        crate::tla_trace::control(arg2 as usize, [arg3, arg4, arg5], ctx)?;
++        return Ok(SyscallReturn::Return(0));
++    }
+     let prctl_cmd = PrctlCmd::from_args(option, arg2, arg3, arg4, arg5)?;
+     debug!("prctl_cmd = {:x?}", prctl_cmd);
+ 
+diff --git a/kernel/core/src/vm/page_cache/vmo/mod.rs b/kernel/core/src/vm/page_cache/vmo/mod.rs
+index dbee3dc32..4d94b40a3 100644
+--- a/kernel/core/src/vm/page_cache/vmo/mod.rs
++++ b/kernel/core/src/vm/page_cache/vmo/mod.rs
+@@ -1193,15 +1193,28 @@ pub(crate) fn get_page_idx_range(vmo_offset_range: &Range<usize>) -> Range<usize
+ pub(crate) struct WritableMappingStatus(AtomicIsize);
+ 
+ impl WritableMappingStatus {
++    pub(crate) fn trace_value(&self) -> isize {
++        self.0.load(Ordering::Relaxed)
++    }
+     /// Builds a new writable mapping.
+     ///
+     /// Fails with `EPERM` if writable mappings have been denied.
+     pub(crate) fn map(&self) -> Result<()> {
+-        // Increase unless negative
+-        self.0
++        let trace_start = crate::tla_trace::now();
++        let result = self
++            .0
+             .try_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                 (v >= 0).then(|| v + 1)
+-            })
++            });
++        let trace_end = crate::tla_trace::now();
++        let old = *result.as_ref().unwrap_or_else(|v| v);
++        crate::tla_trace::save_rmw(
++            trace_start,
++            trace_end,
++            old,
++            if result.is_ok() { old + 1 } else { old },
++        );
++        result
+             .map_err(|_| Error::with_message(Errno::EPERM, "writable mappings have been denied"))?;
+         Ok(())
+     }
+@@ -1210,14 +1223,34 @@ impl WritableMappingStatus {
+     ///
+     /// Fails with `EBUSY` if there are still active writable mappings.
+     pub(crate) fn deny(&self) -> Result<()> {
+-        // Decrease unless positive
+-        self.0
++        let trace_start = crate::tla_trace::now();
++        let result = self
++            .0
+             .try_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                 (v <= 0).then_some(-1)
+-            })
+-            .map_err(|_| {
+-                Error::with_message(Errno::EBUSY, "there are still active writable mappings")
+-            })?;
++            });
++        let trace_end = crate::tla_trace::now();
++        let old = *result.as_ref().unwrap_or_else(|v| v);
++        crate::tla_trace::emit(
++            "WritableMappingDeny",
++            if result.is_ok() {
++                "publish"
++            } else {
++                "seal_unlock"
++            },
++            trace_start,
++            trace_end,
++            |b, e| {
++                b.local.deny_count = old;
++                if result.is_err() {
++                    b.local.result = "EBUSY";
++                }
++                e.counter = Some(if result.is_ok() { -1 } else { old });
++            },
++        );
++        result.map_err(|_| {
++            Error::with_message(Errno::EBUSY, "there are still active writable mappings")
++        })?;
+         Ok(())
+     }
+ 
+@@ -1225,13 +1258,19 @@ impl WritableMappingStatus {
+     ///
+     /// Typically used when splitting an existing mapping, or forking a process.
+     pub(crate) fn increment(&self) {
+-        self.0.fetch_add(1, Ordering::Relaxed);
++        let start = crate::tla_trace::now();
++        let old = self.0.fetch_add(1, Ordering::Relaxed);
++        let end = crate::tla_trace::now();
++        crate::tla_trace::save_rmw(start, end, old, old + 1);
+     }
+ 
+     /// Decrements the writable mapping counter.
+     ///
+     /// Typically used when unmapping a region, exiting a process, or merging mappings.
+     pub(crate) fn decrement(&self) {
+-        self.0.fetch_sub(1, Ordering::Relaxed);
++        let start = crate::tla_trace::now();
++        let old = self.0.fetch_sub(1, Ordering::Relaxed);
++        let end = crate::tla_trace::now();
++        crate::tla_trace::save_rmw(start, end, old, old - 1);
+     }
+ }
+diff --git a/kernel/core/src/vm/vmar/vm_mapping.rs b/kernel/core/src/vm/vmar/vm_mapping.rs
+index fe7ed7875..2d5ddf626 100644
+--- a/kernel/core/src/vm/vmar/vm_mapping.rs
++++ b/kernel/core/src/vm/vmar/vm_mapping.rs
+@@ -56,6 +56,7 @@ use crate::{
+ ///
+ /// [`Vmar`]: crate::vm::vmar::Vmar
+ pub(crate) struct VmMapping {
++    trace_gens: [u64; 3],
+     /// The size of mapping, in bytes. The map size can even be larger than the
+     /// size of VMO. Those pages outside VMO range cannot be read or write.
+     ///
+@@ -121,7 +122,19 @@ impl VmMapping {
+         handle_page_faults_around: bool,
+         perms: VmPerms,
+     ) -> Self {
++        let trace_token = if let MappedMemory::Vmo(vmo) = &mapped_mem {
++            vmo.trace_id
++        } else {
++            0
++        };
++        let mut trace_gens = [0; 3];
++        if trace_token != 0 {
++            let lo = crate::tla_trace::page(map_to_addr);
++            let hi = crate::tla_trace::page(map_to_addr + map_size.get());
++            trace_gens[lo..hi].fill(trace_token);
++        }
+         Self {
++            trace_gens,
+             map_size,
+             map_to_addr,
+             mapped_mem,
+@@ -508,6 +521,14 @@ impl VmMapping {
+                     if self.map_mode.is_shared() || only_reference {
+                         cursor.protect_next(PAGE_SIZE, |flags, _cache| {
+                             *flags |= new_flags;
++                            if crate::tla_trace::active() {
++                                let p = crate::tla_trace::page(page_aligned_addr);
++                                crate::tla_trace::fault_pte(
++                                    page_aligned_addr,
++                                    self.trace_gens[p],
++                                    *flags,
++                                );
++                            }
+                         });
+                         cursor.flusher().issue_tlb_flush(TlbFlushOp::for_range(va));
+                         cursor.flusher().dispatch_tlb_flush();
+@@ -566,6 +587,14 @@ impl VmMapping {
+                     let map_prop = PageProperty::new_user(page_flags, CachePolicy::Writeback);
+ 
+                     cursor.map(frame, map_prop);
++                    if crate::tla_trace::active() {
++                        let p = crate::tla_trace::page(page_aligned_addr);
++                        crate::tla_trace::fault_pte(
++                            page_aligned_addr,
++                            self.trace_gens[p],
++                            map_prop.flags,
++                        );
++                    }
+                     rss_delta.add(self.rss_type(), 1);
+                 }
+             }
+@@ -729,7 +758,29 @@ impl VmMapping {
+         let left_size = at - self.map_to_addr;
+         let right_size = self.map_size.get() - left_size;
+ 
++        let trace_start = crate::tla_trace::now();
+         let r_mapped_mem = self.mapped_mem.dup_at_offset(left_size);
++        let trace_end = crate::tla_trace::now();
++        if crate::tla_trace::active() {
++            let mut owner = self.trace_owner("split");
++            if let MappedMemory::Vmo(vmo) = &r_mapped_mem {
++                owner.id = vmo.trace_id;
++                owner.off = vmo.offset / PAGE_SIZE;
++            }
++            owner.lo = crate::tla_trace::page(at);
++            for p in 0..owner.lo {
++                owner.generations[p] = 0;
++            }
++            crate::tla_trace::owner_event(
++                "MappedVmoDupAtOffset",
++                "split_commit",
++                trace_start,
++                trace_end,
++                owner,
++                |c| c.tmp = owner.id,
++            );
++        }
++        let trace_start = crate::tla_trace::now();
+         let l_mapped_mem = self.mapped_mem;
+ 
+         let left = Self {
+@@ -746,6 +797,13 @@ impl VmMapping {
+             ..self
+         };
+ 
++        let trace_end = crate::tla_trace::now();
++        crate::tla_trace::split_done(
++            left.trace_owner("detached"),
++            right.trace_owner("detached"),
++            trace_start,
++            trace_end,
++        );
+         (left, right)
+     }
+ 
+@@ -765,21 +823,63 @@ impl VmMapping {
+     /// end of the range is not page-aligned.
+     pub(crate) fn split_range(self, range: &Range<Vaddr>) -> (Option<Self>, Self, Option<Self>) {
+         let mapping_range = self.range();
++        let trace_start = crate::tla_trace::now();
+         if range.start <= mapping_range.start && mapping_range.end <= range.end {
+-            // Condition 4.
++            crate::tla_trace::split_decision(
++                "left",
++                crate::tla_trace::page(range.start),
++                false,
++                trace_start,
++            );
++            let trace_start = crate::tla_trace::now();
++            crate::tla_trace::split_decision(
++                "right",
++                crate::tla_trace::page(range.end),
++                false,
++                trace_start,
++            );
+             (None, self, None)
+         } else if mapping_range.start < range.start {
++            crate::tla_trace::split_decision(
++                "left",
++                crate::tla_trace::page(range.start),
++                true,
++                trace_start,
++            );
+             let (left, within) = self.split(range.start);
++            let trace_start = crate::tla_trace::now();
+             if range.end < mapping_range.end {
+-                // Condition 3.
++                crate::tla_trace::split_decision(
++                    "right",
++                    crate::tla_trace::page(range.end),
++                    true,
++                    trace_start,
++                );
+                 let (within, right) = within.split(range.end);
+                 (Some(left), within, Some(right))
+             } else {
+-                // Condition 1.
++                crate::tla_trace::split_decision(
++                    "right",
++                    crate::tla_trace::page(range.end),
++                    false,
++                    trace_start,
++                );
+                 (Some(left), within, None)
+             }
+         } else if mapping_range.contains(&range.end) {
+-            // Condition 2.
++            crate::tla_trace::split_decision(
++                "left",
++                crate::tla_trace::page(range.start),
++                false,
++                trace_start,
++            );
++            let trace_start = crate::tla_trace::now();
++            crate::tla_trace::split_decision(
++                "right",
++                crate::tla_trace::page(range.end),
++                true,
++                trace_start,
++            );
+             let (within, right) = self.split(range.end);
+             (None, within, Some(right))
+         } else {
+@@ -815,6 +915,7 @@ impl VmMapping {
+         };
+ 
+         if let Some(merged) = try_merge(left, right) {
++            crate::tla_trace::set_drop("MappedVmoDropMergeSelf");
+             (merged, Some(vm_mapping.map_to_addr))
+         } else {
+             (self, None)
+@@ -832,9 +933,31 @@ impl VmMapping {
+         let range = self.range();
+         let mut cursor = vm_space.cursor_mut(&preempt_guard, &range).unwrap();
+ 
+-        let num_unmapped = cursor.unmap(range.len());
++        let num_unmapped = cursor.unmap_with_trace(range.len(), |name, range, start, end| {
++            if name == "DispatchTlbFlush" {
++                crate::tla_trace::emit(name, "sync", start, end, |_, _| {});
++                return;
++            }
++            let normalized = range.map(|r| {
++                (
++                    crate::tla_trace::page(r.start),
++                    crate::tla_trace::page(r.end),
++                )
++            });
++            let changed = normalized.map(|(lo, hi)| {
++                if crate::tla_trace::active() {
++                    assert_eq!(hi - lo, 1, "nonordinary trace cursor fragment");
++                }
++                (lo, 0, 0)
++            });
++            crate::tla_trace::cursor("CursorUnmap", normalized, changed, start, end);
++        });
++        // OSTD already recorded the effective dispatch before returning.
+         cursor.flusher().dispatch_tlb_flush();
++        let trace_start = crate::tla_trace::now();
+         cursor.flusher().sync_tlb_flush();
++        crate::tla_trace::simple("SyncTlbFlush", "unmap_drop", trace_start);
++        crate::tla_trace::set_drop("MappedVmoDropUnmapped");
+ 
+         num_unmapped
+     }
+@@ -861,18 +984,75 @@ impl VmMapping {
+         let range = self.range();
+         let mut cursor = vm_space.cursor_mut(&preempt_guard, &range).unwrap();
+ 
+-        let op = |flags: &mut PageFlags, _cache: &mut CachePolicy| *flags = new_flags;
++        let mut trace_completed = false;
+         while cursor.virt_addr() < range.end {
+-            if let Some(va) = cursor.protect_next(range.end - cursor.virt_addr(), op) {
++            let mut trace_old = PageFlags::empty();
++            let op = |flags: &mut PageFlags, _cache: &mut CachePolicy| {
++                trace_old = *flags;
++                *flags = new_flags;
++            };
++            let trace_start = crate::tla_trace::now();
++            let next = cursor.protect_next(range.end - cursor.virt_addr(), op);
++            let trace_end = crate::tla_trace::now();
++            if let Some(va) = next {
++                let lo = crate::tla_trace::page(va.start);
++                let hi = crate::tla_trace::page(va.end);
++                let changed = if crate::tla_trace::active()
++                    && VmPerms::from(trace_old) != VmPerms::from(new_flags)
++                {
++                    assert_eq!(hi - lo, 1);
++                    Some((lo, self.trace_gens[lo], VmPerms::from(new_flags).bits()))
++                } else {
++                    None
++                };
++                crate::tla_trace::cursor(
++                    "CursorProtect",
++                    Some((lo, hi)),
++                    changed,
++                    trace_start,
++                    trace_end,
++                );
+                 cursor.flusher().issue_tlb_flush(TlbFlushOp::for_range(va));
+             } else {
++                crate::tla_trace::cursor("CursorProtect", None, None, trace_start, trace_end);
++                trace_completed = true;
+                 break;
+             }
+         }
++        if !trace_completed {
++            let trace_start = crate::tla_trace::now();
++            crate::tla_trace::cursor(
++                "CursorProtect",
++                None,
++                None,
++                trace_start,
++                crate::tla_trace::now(),
++            );
++        }
++        let trace_start = crate::tla_trace::now();
+         cursor.flusher().dispatch_tlb_flush();
++        crate::tla_trace::simple("DispatchTlbFlush", "sync", trace_start);
++        let trace_start = crate::tla_trace::now();
+         cursor.flusher().sync_tlb_flush();
+-
+-        Self { perms, ..self }
++        crate::tla_trace::simple("SyncTlbFlush", "protect_finish", trace_start);
++
++        let trace_start = crate::tla_trace::now();
++        let protected = Self { perms, ..self };
++        let trace_end = crate::tla_trace::now();
++        let owner = protected.trace_owner("detached");
++        crate::tla_trace::emit(
++            "VmMappingProtect",
++            "merge_check",
++            trace_start,
++            trace_end,
++            |b, e| {
++                e.owners[0] = owner;
++                b.local.done |= crate::tla_trace::span(owner.lo, owner.hi);
++                b.local.anchor = owner.lo;
++                b.local.merge_side = "prev";
++            },
++        );
++        protected
+     }
+ }
+ 
+@@ -931,6 +1111,7 @@ impl MappedMemory {
+ /// that need to be provided to mappings from the VMO.
+ #[derive(Debug)]
+ pub(super) struct MappedVmo {
++    trace_id: u64,
+     vmo: Arc<Vmo>,
+     /// Represents the mapped offset in the VMO for the mapping.
+     offset: usize,
+@@ -947,6 +1128,7 @@ impl MappedVmo {
+         }
+ 
+         Ok(Self {
++            trace_id: crate::tla_trace::token(),
+             vmo,
+             offset,
+             is_writable_tracked,
+@@ -1029,6 +1211,7 @@ impl MappedVmo {
+         }
+ 
+         Self {
++            trace_id: crate::tla_trace::token(),
+             vmo: self.vmo.clone(),
+             offset,
+             is_writable_tracked: self.is_writable_tracked,
+@@ -1038,9 +1221,16 @@ impl MappedVmo {
+ 
+ impl Drop for MappedVmo {
+     fn drop(&mut self) {
++        let trace_start = crate::tla_trace::now();
+         if self.is_writable_tracked {
+             self.vmo.writable_mapping_status().decrement();
+         }
++        crate::tla_trace::dropped(
++            self.trace_id,
++            self.is_writable_tracked,
++            trace_start,
++            crate::tla_trace::now(),
++        );
+     }
+ }
+ 
+@@ -1054,6 +1244,8 @@ impl Drop for MappedVmo {
+ ///
+ /// [`Vmar`]: crate::vm::vmar::Vmar
+ fn try_merge(left: &VmMapping, right: &VmMapping) -> Option<VmMapping> {
++    let trace_neighbor = crate::tla_trace::local().neighbor;
++    let trace_start = crate::tla_trace::now();
+     let is_adjacent = left.map_end() == right.map_to_addr();
+     let is_type_equal = left.map_mode == right.map_mode
+         && left.handle_page_faults_around == right.handle_page_faults_around
+@@ -1065,6 +1257,7 @@ fn try_merge(left: &VmMapping, right: &VmMapping) -> Option<VmMapping> {
+         };
+ 
+     if !is_adjacent || !is_type_equal {
++        crate::tla_trace::merge_check(trace_neighbor, false, trace_start, crate::tla_trace::now());
+         return None;
+     }
+ 
+@@ -1081,10 +1274,34 @@ fn try_merge(left: &VmMapping, right: &VmMapping) -> Option<VmMapping> {
+                 let is_offset_contiguous =
+                     l_vmo_obj.offset() + left.map_size() == r_vmo_obj.offset();
+                 if !is_offset_contiguous {
++                    crate::tla_trace::merge_check(
++                        trace_neighbor,
++                        false,
++                        trace_start,
++                        crate::tla_trace::now(),
++                    );
+                     return None;
+                 }
+-                MappedMemory::Vmo(l_vmo_obj.dup())
++                crate::tla_trace::merge_check(
++                    trace_neighbor,
++                    true,
++                    trace_start,
++                    crate::tla_trace::now(),
++                );
++                let trace_start = crate::tla_trace::now();
++                let duplicate = l_vmo_obj.dup();
++                let trace_end = crate::tla_trace::now();
++                if !l_vmo_obj.is_writable_tracked {
++                    crate::tla_trace::save_owner_box(trace_start, trace_end);
++                }
++                MappedMemory::Vmo(duplicate)
+             } else {
++                crate::tla_trace::merge_check(
++                    trace_neighbor,
++                    false,
++                    trace_start,
++                    crate::tla_trace::now(),
++                );
+                 return None;
+             }
+         }
+@@ -1094,12 +1311,31 @@ fn try_merge(left: &VmMapping, right: &VmMapping) -> Option<VmMapping> {
+ 
+     let map_size = NonZeroUsize::new(left.map_size() + right.map_size()).unwrap();
+ 
+-    Some(VmMapping {
++    let trace_start = crate::tla_trace::now();
++    let mut trace_gens = left.trace_gens;
++    if crate::tla_trace::active() {
++        let lo = crate::tla_trace::page(right.map_to_addr);
++        let hi = crate::tla_trace::page(right.map_end());
++        trace_gens[lo..hi].copy_from_slice(&right.trace_gens[lo..hi]);
++    }
++    let merged = VmMapping {
++        trace_gens,
+         map_size,
+         mapped_mem,
+         file: left.file.clone(),
+         ..*left
+-    })
++    };
++    let trace_end = crate::tla_trace::now();
++    let owner = merged.trace_owner("merge");
++    crate::tla_trace::owner_event(
++        "MappedVmoDupForMerge",
++        "merge_drop_self",
++        trace_start,
++        trace_end,
++        owner,
++        |c| c.tmp = owner.id,
++    );
++    Some(merged)
+ }
+ 
+ fn duplicate_frame(src: &UFrame) -> Result<Frame<()>> {
+@@ -1214,3 +1450,39 @@ impl VmMapping {
+         Ok(())
+     }
+ }
++
++impl VmMapping {
++    pub(super) fn trace_owner(&self, role: &'static str) -> crate::tla_trace::Owner {
++        let MappedMemory::Vmo(vmo) = &self.mapped_mem else {
++            return crate::tla_trace::Owner::EMPTY;
++        };
++        if vmo.trace_id == 0 {
++            return crate::tla_trace::Owner::EMPTY;
++        }
++        let lo = crate::tla_trace::page(self.map_to_addr);
++        let hi = crate::tla_trace::page(self.map_end());
++        let mut generations = self.trace_gens;
++        for (p, g) in generations.iter_mut().enumerate() {
++            if p < lo || p >= hi {
++                *g = 0;
++            }
++        }
++        crate::tla_trace::Owner {
++            id: vmo.trace_id,
++            role,
++            lo,
++            hi,
++            off: vmo.offset / PAGE_SIZE,
++            file: self
++                .file
++                .as_ref()
++                .map_or(0, |f| Arc::as_ptr(f) as *const () as usize),
++            vmo: Arc::as_ptr(&vmo.vmo) as usize,
++            shared: self.map_mode.is_shared(),
++            perms: self.perms.bits() & 7,
++            may: (self.perms.bits() >> 3) & 7,
++            tracked: vmo.is_writable_tracked,
++            generations,
++        }
++    }
++}
+diff --git a/kernel/core/src/vm/vmar/vmar_impls/map.rs b/kernel/core/src/vm/vmar/vmar_impls/map.rs
+index 5bd8e91c8..3de48f82b 100644
+--- a/kernel/core/src/vm/vmar/vmar_impls/map.rs
++++ b/kernel/core/src/vm/vmar/vmar_impls/map.rs
+@@ -266,142 +266,195 @@ impl<'a, 'b> VmarMapOptions<'a, 'b> {
+             handle_page_faults_around,
+         } = self;
+ 
++        let trace_start = crate::tla_trace::now();
+         let mut inner = parent.inner.write();
+-
+-        inner
+-            .check_extra_size_fits_rlimit(map_size)
+-            .or_else(|err| {
+-                if let VmarMapOffset::FixedReplace(map_to_addr) = offset {
+-                    // Overlapping mappings will be removed. Check again after considering this fact.
+-                    let expand_size =
+-                        map_size - inner.count_overlap_size(map_to_addr..map_to_addr + map_size);
+-                    inner.check_extra_size_fits_rlimit(expand_size)
+-                } else {
+-                    Err(err)
++        let trace_end = crate::tla_trace::now();
++        crate::tla_trace::vmar_lock(inner.trace_tree(), trace_start, trace_end);
++        let result = (|| {
++            inner
++                .check_extra_size_fits_rlimit(map_size)
++                .or_else(|err| {
++                    if let VmarMapOffset::FixedReplace(map_to_addr) = offset {
++                        // Overlapping mappings will be removed. Check again after considering this fact.
++                        let expand_size = map_size
++                            - inner.count_overlap_size(map_to_addr..map_to_addr + map_size);
++                        inner.check_extra_size_fits_rlimit(expand_size)
++                    } else {
++                        Err(err)
++                    }
++                })?;
++
++            // Allocates a free region.
++            debug!(
++                "allocate free region, map_size = 0x{:x}, offset = {:x?}, align = 0x{:x}",
++                map_size, offset, align
++            );
++            let map_to_addr = match offset {
++                VmarMapOffset::FixedReplace(map_to_addr) => {
++                    let mut rss_delta = RssDelta::new(parent);
++                    inner.alloc_free_region_exact_truncate(
++                        parent,
++                        map_to_addr,
++                        map_size,
++                        &mut rss_delta,
++                    );
++                    map_to_addr
+                 }
+-            })?;
+-
+-        // Allocates a free region.
+-        debug!(
+-            "allocate free region, map_size = 0x{:x}, offset = {:x?}, align = 0x{:x}",
+-            map_size, offset, align
+-        );
+-        let map_to_addr = match offset {
+-            VmarMapOffset::FixedReplace(map_to_addr) => {
+-                let mut rss_delta = RssDelta::new(parent);
+-                inner.alloc_free_region_exact_truncate(
+-                    parent,
+-                    map_to_addr,
+-                    map_size,
+-                    &mut rss_delta,
+-                );
+-                map_to_addr
+-            }
+-            VmarMapOffset::FixedNoReplace(map_to_addr) => {
+-                inner.alloc_free_region_exact(map_to_addr, map_size)?;
+-                map_to_addr
+-            }
+-            VmarMapOffset::Hint(map_to_addr) => {
+-                if inner.alloc_free_region_exact(map_to_addr, map_size).is_ok() {
++                VmarMapOffset::FixedNoReplace(map_to_addr) => {
++                    inner.alloc_free_region_exact(map_to_addr, map_size)?;
+                     map_to_addr
+-                } else {
+-                    inner.alloc_free_region(map_size, align)?.start
+                 }
+-            }
+-            #[cfg(target_arch = "x86_64")]
+-            VmarMapOffset::Map32Bit(addr_hint) => {
+-                use super::{MAP_32BIT_HIGH_LIMIT, VMAR_LOWEST_ADDR};
+-
+-                if let Some(addr) = addr_hint
+-                    && (VMAR_LOWEST_ADDR..MAP_32BIT_HIGH_LIMIT).contains(&addr)
+-                    && map_size <= MAP_32BIT_HIGH_LIMIT - addr
+-                    && inner.alloc_free_region_exact(addr, map_size).is_ok()
+-                {
+-                    addr
+-                } else {
+-                    inner.alloc_free_region_below_2gib(map_size, align)?.start
++                VmarMapOffset::Hint(map_to_addr) => {
++                    if inner.alloc_free_region_exact(map_to_addr, map_size).is_ok() {
++                        map_to_addr
++                    } else {
++                        inner.alloc_free_region(map_size, align)?.start
++                    }
+                 }
+-            }
+-            VmarMapOffset::Any => inner.alloc_free_region(map_size, align)?.start,
+-        };
+-
+-        // Parse the `Mappable` and prepare the `MappedMemory`.
+-        let (mapped_mem, device_mappable) = match mappable {
+-            Some(MappableObject::Vmo(vmo)) => {
+-                let path = file.as_ref().map(|file| file.path());
+-
+-                if let Some(path) = path {
+-                    debug_assert!(Arc::ptr_eq(&vmo, &path.inode().page_cache().unwrap()));
++                #[cfg(target_arch = "x86_64")]
++                VmarMapOffset::Map32Bit(addr_hint) => {
++                    use super::{MAP_32BIT_HIGH_LIMIT, VMAR_LOWEST_ADDR};
++
++                    if let Some(addr) = addr_hint
++                        && (VMAR_LOWEST_ADDR..MAP_32BIT_HIGH_LIMIT).contains(&addr)
++                        && map_size <= MAP_32BIT_HIGH_LIMIT - addr
++                        && inner.alloc_free_region_exact(addr, map_size).is_ok()
++                    {
++                        addr
++                    } else {
++                        inner.alloc_free_region_below_2gib(map_size, align)?.start
++                    }
+                 }
+-
+-                let is_writable_tracked = if let Some(path) = path
+-                    && let Some(memfd_inode) = path.inode().downcast_ref::<MemfdInode>()
+-                    && map_mode.is_shared()
+-                    && may_perms.contains(VmPerms::MAY_WRITE)
+-                {
+-                    memfd_inode.check_writable(perms, &mut may_perms)?;
+-                    true
+-                } else {
+-                    false
+-                };
+-
+-                let mapped_mem =
+-                    MappedMemory::Vmo(MappedVmo::new(vmo, vmo_offset, is_writable_tracked)?);
+-                (mapped_mem, None)
+-            }
+-            Some(MappableObject::Device(mappable)) => {
+-                if !map_mode.is_shared() {
+-                    return_errno_with_message!(
+-                        Errno::EINVAL,
+-                        "private device mappings are not yet supported"
++                VmarMapOffset::Any => inner.alloc_free_region(map_size, align)?.start,
++            };
++
++            crate::tla_trace::selected(map_to_addr, map_size);
++            // Parse the `Mappable` and prepare the `MappedMemory`.
++            let (mapped_mem, device_mappable) = match mappable {
++                Some(MappableObject::Vmo(vmo)) => {
++                    let path = file.as_ref().map(|file| file.path());
++
++                    if let Some(path) = path {
++                        debug_assert!(Arc::ptr_eq(&vmo, &path.inode().page_cache().unwrap()));
++                    }
++
++                    let is_writable_tracked = if let Some(path) = path
++                        && let Some(memfd_inode) = path.inode().downcast_ref::<MemfdInode>()
++                        && map_mode.is_shared()
++                        && may_perms.contains(VmPerms::MAY_WRITE)
++                    {
++                        memfd_inode.check_writable(perms, &mut may_perms)?;
++                        true
++                    } else {
++                        let trace_start = crate::tla_trace::now();
++                        crate::tla_trace::simple("MemfdCheckWritable", "mapped_new", trace_start);
++                        false
++                    };
++
++                    let trace_start = crate::tla_trace::now();
++                    let mapped_vmo = MappedVmo::new(vmo, vmo_offset, is_writable_tracked);
++                    let trace_end = crate::tla_trace::now();
++                    if !is_writable_tracked {
++                        crate::tla_trace::save_owner_box(trace_start, trace_end);
++                    }
++                    if mapped_vmo.is_err() {
++                        let trace_start = crate::tla_trace::now();
++                        crate::tla_trace::emit(
++                            "MappedVmoNew",
++                            "vmar_unlock",
++                            trace_start,
++                            crate::tla_trace::now(),
++                            |b, e| {
++                                b.local.result = "EPERM";
++                                if let Some(rmw) = b.rmw.take() {
++                                    e.start = rmw.start;
++                                    e.end = rmw.end;
++                                    e.counter = Some(rmw.new);
++                                }
++                            },
++                        );
++                    }
++                    let mapped_mem = MappedMemory::Vmo(mapped_vmo?);
++                    (mapped_mem, None)
++                }
++                Some(MappableObject::Device(mappable)) => {
++                    if !map_mode.is_shared() {
++                        return_errno_with_message!(
++                            Errno::EINVAL,
++                            "private device mappings are not yet supported"
++                        );
++                    }
++
++                    // Note that `MappedMemory::Anonymous` is temporary. This will
++                    // be corrected in `VmMapping::populate_device` below.
++                    (MappedMemory::Anonymous, Some(mappable))
++                }
++                None => (MappedMemory::Anonymous, None),
++            };
++
++            let trace_start = crate::tla_trace::now();
++            // Build the mapping.
++            let mut vm_mapping = VmMapping::new(
++                NonZeroUsize::new(map_size).unwrap(),
++                map_to_addr,
++                mapped_mem,
++                file,
++                map_mode,
++                handle_page_faults_around,
++                perms | may_perms,
++            );
++
++            let trace_end = crate::tla_trace::now();
++            let owner = vm_mapping.trace_owner("reserved");
++            crate::tla_trace::owner_event(
++                "MappedVmoNew",
++                "merge_check",
++                trace_start,
++                trace_end,
++                owner,
++                |c| {
++                    c.cur = owner.id;
++                    c.generation = owner.id;
++                    c.anchor = owner.lo;
++                },
++            );
++            let vmo_for_rmap = vm_mapping.vmo_for_rmap().cloned();
++            let mut rmap = vmo_for_rmap.as_ref().map(|vmo| vmo.rmap().lock());
++
++            // Populate device memory if needed before adding to VMAR.
++            //
++            // We have to map before inserting the `VmMapping` into the tree,
++            // otherwise another traversal is needed for locating the `VmMapping`.
++            // Exchange the operation is ok since we hold the write lock on the
++            // VMAR.
++            if let Some(mappable) = device_mappable {
++                let mut rss_delta = RssDelta::new(parent);
++                if let Err(err) = vm_mapping.populate_device(
++                    parent.vm_space(),
++                    mappable,
++                    vmo_offset,
++                    &mut rss_delta,
++                ) {
++                    // Unmap all populated pages if a failure occurs.
++                    rss_delta.add(
++                        MapHandle::DEVICE_RSS_TYPE,
++                        -(vm_mapping.unmap(parent.vm_space()) as isize),
+                     );
++                    return Err(err);
+                 }
+-
+-                // Note that `MappedMemory::Anonymous` is temporary. This will
+-                // be corrected in `VmMapping::populate_device` below.
+-                (MappedMemory::Anonymous, Some(mappable))
+             }
+-            None => (MappedMemory::Anonymous, None),
+-        };
+-
+-        // Build the mapping.
+-        let mut vm_mapping = VmMapping::new(
+-            NonZeroUsize::new(map_size).unwrap(),
+-            map_to_addr,
+-            mapped_mem,
+-            file,
+-            map_mode,
+-            handle_page_faults_around,
+-            perms | may_perms,
+-        );
+-
+-        let vmo_for_rmap = vm_mapping.vmo_for_rmap().cloned();
+-        let mut rmap = vmo_for_rmap.as_ref().map(|vmo| vmo.rmap().lock());
+-
+-        // Populate device memory if needed before adding to VMAR.
+-        //
+-        // We have to map before inserting the `VmMapping` into the tree,
+-        // otherwise another traversal is needed for locating the `VmMapping`.
+-        // Exchange the operation is ok since we hold the write lock on the
+-        // VMAR.
+-        if let Some(mappable) = device_mappable {
+-            let mut rss_delta = RssDelta::new(parent);
+-            if let Err(err) =
+-                vm_mapping.populate_device(parent.vm_space(), mappable, vmo_offset, &mut rss_delta)
+-            {
+-                // Unmap all populated pages if a failure occurs.
+-                rss_delta.add(
+-                    MapHandle::DEVICE_RSS_TYPE,
+-                    -(vm_mapping.unmap(parent.vm_space()) as isize),
+-                );
+-                return Err(err);
+-            }
+-        }
+-
+-        // Add the mapping to the VMAR.
+-        inner.insert_try_merge(parent, vm_mapping, rmap.as_deref_mut());
+ 
+-        Ok(map_to_addr)
++            // Add the mapping to the VMAR.
++            inner.insert_try_merge(parent, vm_mapping, rmap.as_deref_mut());
++
++            Ok(map_to_addr)
++        })();
++        let tree = inner.trace_tree();
++        let trace_start = crate::tla_trace::now();
++        drop(inner);
++        let trace_end = crate::tla_trace::now();
++        crate::tla_trace::vmar_unlock(tree, trace_start, trace_end, &result);
++        result
+     }
+ 
+     /// Checks whether all options are valid.
+diff --git a/kernel/core/src/vm/vmar/vmar_impls/mod.rs b/kernel/core/src/vm/vmar/vmar_impls/mod.rs
+index 24d030a07..3cc0417f8 100644
+--- a/kernel/core/src/vm/vmar/vmar_impls/mod.rs
++++ b/kernel/core/src/vm/vmar/vmar_impls/mod.rs
+@@ -269,7 +269,13 @@ impl VmarInner {
+                 },
+             );
+         }
++        let owner = vm_mapping.trace_owner("tree");
++        let trace_start = crate::tla_trace::now();
+         self.vm_mappings.insert(vm_mapping);
++        let trace_end = crate::tla_trace::now();
++        if crate::tla_trace::local().pc == "put_rest" {
++            crate::tla_trace::insert_rest(self.trace_tree(), Some(owner), trace_start, trace_end);
++        }
+     }
+ 
+     /// Inserts a `VmMapping` into the `Vmar`, and attempts to merge it with
+@@ -289,26 +295,38 @@ impl VmarInner {
+         let mut vm_mapping = vm_mapping;
+         let addr = vm_mapping.map_to_addr();
+ 
++        let trace_start = crate::tla_trace::now();
+         if let Some(prev) = self.vm_mappings.find_prev(&addr) {
++            crate::tla_trace::change(|b| b.local.neighbor = prev.trace_owner("tree").id);
+             let (new_mapping, to_remove) = vm_mapping.try_merge_with(prev);
+             vm_mapping = new_mapping;
+             if let Some(addr) = to_remove {
++                crate::tla_trace::set_drop("MappedVmoDropMergeNeighbor");
+                 self.vm_mappings.remove(&addr);
++                crate::tla_trace::amend_tree(self.trace_tree());
+                 if let Some(rmap) = rmap.as_deref_mut() {
+                     rmap.remove(vmar.weak_self.clone(), addr);
+                 }
+             }
++        } else {
++            crate::tla_trace::merge_check(0, false, trace_start, crate::tla_trace::now());
+         }
+ 
++        let trace_start = crate::tla_trace::now();
+         if let Some(next) = self.vm_mappings.find_next(&addr) {
++            crate::tla_trace::change(|b| b.local.neighbor = next.trace_owner("tree").id);
+             let (new_mapping, to_remove) = vm_mapping.try_merge_with(next);
+             vm_mapping = new_mapping;
+             if let Some(addr) = to_remove {
++                crate::tla_trace::set_drop("MappedVmoDropMergeNeighbor");
+                 self.vm_mappings.remove(&addr);
++                crate::tla_trace::amend_tree(self.trace_tree());
+                 if let Some(rmap) = rmap.as_deref_mut() {
+                     rmap.remove(vmar.weak_self.clone(), addr);
+                 }
+             }
++        } else {
++            crate::tla_trace::merge_check(0, false, trace_start, crate::tla_trace::now());
+         }
+ 
+         if let Some(rmap) = rmap {
+@@ -321,7 +339,11 @@ impl VmarInner {
+                 },
+             );
+         }
++        let owner = vm_mapping.trace_owner("tree");
++        let trace_start = crate::tla_trace::now();
+         self.vm_mappings.insert(vm_mapping);
++        let trace_end = crate::tla_trace::now();
++        crate::tla_trace::inserted(self.trace_tree(), owner, trace_start, trace_end);
+     }
+ 
+     /// Removes a `VmMapping` based on the provided key from the `Vmar`.
+@@ -389,11 +411,22 @@ impl VmarInner {
+         }
+ 
+         for vm_mapping_addr in mappings_to_remove {
++            let trace_start = crate::tla_trace::now();
+             let (vm_mapping, mut rmap_to_remove) = self.remove(&vm_mapping_addr).unwrap();
+             let mut rmap = rmap_to_remove.remove(vmar, vm_mapping_addr);
+ 
+             let vm_mapping_range = vm_mapping.range();
+             let intersected_range = get_intersected_range(&range, &vm_mapping_range);
++            let trace_end = crate::tla_trace::now();
++            crate::tla_trace::detached(
++                "VmarRemoveNext",
++                self.trace_tree(),
++                Some(vm_mapping.trace_owner("detached")),
++                crate::tla_trace::page(intersected_range.start),
++                crate::tla_trace::page(intersected_range.end),
++                trace_start,
++                trace_end,
++            );
+ 
+             let (left, taken, right) = vm_mapping.split_range(&intersected_range);
+             if let Some(left) = left {
+@@ -403,6 +436,9 @@ impl VmarInner {
+                 self.insert_without_try_merge(vmar, right, rmap.as_deref_mut());
+             }
+ 
++            let trace_start = crate::tla_trace::now();
++            let trace_end = crate::tla_trace::now();
++            crate::tla_trace::insert_rest(self.trace_tree(), None, trace_start, trace_end);
+             // Note that `rmap` must be dropped before `taken`. Otherwise,
+             // there is a possibility of a deadlock because a device mapping
+             // may attempt to access its reverse mappings in `Drop`.
+@@ -411,6 +447,26 @@ impl VmarInner {
+             rss_delta.add(taken.rss_type(), -(taken.unmap(&vmar.vm_space) as isize));
+         }
+ 
++        let is_map = crate::tla_trace::local().request.kind == "map";
++        let trace_start = crate::tla_trace::now();
++        let trace_end = crate::tla_trace::now();
++        let trace_tree = self.trace_tree();
++        crate::tla_trace::emit(
++            "VmarRemoveNext",
++            if is_map {
++                "check_writable"
++            } else {
++                "vmar_unlock"
++            },
++            trace_start,
++            trace_end,
++            |b, e| {
++                if !is_map {
++                    b.local.result = "OK";
++                }
++                e.tree = trace_tree;
++            },
++        );
+         range
+     }
+ 
+@@ -557,3 +613,22 @@ impl VmarInner {
+         Ok(())
+     }
+ }
++
++impl VmarInner {
++    fn trace_tree(&self) -> [crate::tla_trace::Owner; 6] {
++        let mut tree = [crate::tla_trace::Owner::EMPTY; 6];
++        if !crate::tla_trace::active() {
++            return tree;
++        }
++        for (i, m) in self
++            .vm_mappings
++            .find(&(crate::tla_trace::BASE..crate::tla_trace::BASE + 3 * PAGE_SIZE))
++            .enumerate()
++        {
++            assert!(i < tree.len(), "trace owner limit exceeded");
++            tree[i] = m.trace_owner("tree");
++            assert!(tree[i].id != 0, "unregistered mapping in trace window");
++        }
++        tree
++    }
++}
+diff --git a/kernel/core/src/vm/vmar/vmar_impls/page_fault.rs b/kernel/core/src/vm/vmar/vmar_impls/page_fault.rs
+index 2acdafb95..4aeb0f1ab 100644
+--- a/kernel/core/src/vm/vmar/vmar_impls/page_fault.rs
++++ b/kernel/core/src/vm/vmar/vmar_impls/page_fault.rs
+@@ -7,20 +7,43 @@ use crate::{prelude::*, vm::perms::VmPerms};
+ 
+ impl Vmar {
+     pub(crate) fn handle_page_fault(&self, page_fault_info: &PageFaultInfo) -> Result<()> {
++        let trace_start = crate::tla_trace::now();
+         let inner = self.inner.read();
++        let result = (|| {
++            let address = page_fault_info.address;
++            if let Some(vm_mapping) = inner.vm_mappings.find_one(&address) {
++                debug_assert!(vm_mapping.range().contains(&address));
+ 
+-        let address = page_fault_info.address;
+-        if let Some(vm_mapping) = inner.vm_mappings.find_one(&address) {
+-            debug_assert!(vm_mapping.range().contains(&address));
++                let mut rss_delta = RssDelta::new(self);
++                return vm_mapping.handle_page_fault(
++                    &self.vm_space,
++                    page_fault_info,
++                    &mut rss_delta,
++                );
++            }
+ 
+-            let mut rss_delta = RssDelta::new(self);
+-            return vm_mapping.handle_page_fault(&self.vm_space, page_fault_info, &mut rss_delta);
++            return_errno_with_message!(
++                Errno::EACCES,
++                "no VM mappings contain the page fault address"
++            );
++        })();
++        let trace_end = crate::tla_trace::now();
++        if crate::tla_trace::active() && crate::tla_trace::local().request.kind == "fault" {
++            crate::tla_trace::emit(
++                "HandlePageFault",
++                "return",
++                trace_start,
++                trace_end,
++                |b, e| {
++                    b.local.result = crate::tla_trace::result(&result);
++                    if let Some(pte) = b.fault_change.take() {
++                        e.ptes[0] = pte;
++                        e.pte_count = 1;
++                    }
++                },
++            );
+         }
+-
+-        return_errno_with_message!(
+-            Errno::EACCES,
+-            "no VM mappings contain the page fault address"
+-        );
++        result
+     }
+ }
+ 
+diff --git a/kernel/core/src/vm/vmar/vmar_impls/protect.rs b/kernel/core/src/vm/vmar/vmar_impls/protect.rs
+index e2dd5d456..769080d47 100644
+--- a/kernel/core/src/vm/vmar/vmar_impls/protect.rs
++++ b/kernel/core/src/vm/vmar/vmar_impls/protect.rs
+@@ -18,65 +18,146 @@ impl Vmar {
+         debug_assert!(range.start.is_multiple_of(PAGE_SIZE));
+         debug_assert!(range.end.is_multiple_of(PAGE_SIZE));
+ 
++        let trace_start = crate::tla_trace::now();
+         let mut inner = self.inner.write();
++        let trace_end = crate::tla_trace::now();
++        crate::tla_trace::vmar_lock(inner.trace_tree(), trace_start, trace_end);
++        let result = (|| {
++            let mut protect_mappings = Vec::new();
+ 
+-        let mut protect_mappings = Vec::new();
++            for vm_mapping in inner.vm_mappings.find(&range) {
++                protect_mappings.push((vm_mapping.range(), vm_mapping.perms()))
++            }
+ 
+-        for vm_mapping in inner.vm_mappings.find(&range) {
+-            protect_mappings.push((vm_mapping.range(), vm_mapping.perms()))
+-        }
++            let mut last_mapping_end = range.start;
++            for (vm_mapping_range, vm_mapping_perms) in protect_mappings {
++                let trace_start = crate::tla_trace::now();
++                if last_mapping_end < vm_mapping_range.start {
++                    crate::tla_trace::emit(
++                        "VmarProtectCheck",
++                        "vmar_unlock",
++                        trace_start,
++                        crate::tla_trace::now(),
++                        |b, _| b.local.result = "ENOMEM",
++                    );
++                    return_errno_with_message!(
++                        Errno::ENOMEM,
++                        "the range contains pages that are not mapped"
++                    );
++                }
++                last_mapping_end = vm_mapping_range.end;
+ 
+-        let mut last_mapping_end = range.start;
+-        for (vm_mapping_range, vm_mapping_perms) in protect_mappings {
+-            if last_mapping_end < vm_mapping_range.start {
+-                return_errno_with_message!(
+-                    Errno::ENOMEM,
+-                    "the range contains pages that are not mapped"
++                if perms == vm_mapping_perms & VmPerms::ALL_PERMS {
++                    crate::tla_trace::emit(
++                        "VmarProtectCheck",
++                        "protect_check",
++                        trace_start,
++                        crate::tla_trace::now(),
++                        |b, _| {
++                            b.local.last_end = crate::tla_trace::page(last_mapping_end);
++                            b.local.index += 1;
++                            b.local.done |= crate::tla_trace::span(
++                                crate::tla_trace::page(range.start.max(vm_mapping_range.start)),
++                                crate::tla_trace::page(range.end.min(vm_mapping_range.end)),
++                            );
++                        },
++                    );
++                    continue;
++                }
++                let new_perms = perms | (vm_mapping_perms & VmPerms::ALL_MAY_PERMS);
++                let check = new_perms.check();
++                crate::tla_trace::emit(
++                    "VmarProtectCheck",
++                    if check.is_ok() {
++                        "protect_take"
++                    } else {
++                        "vmar_unlock"
++                    },
++                    trace_start,
++                    crate::tla_trace::now(),
++                    |b, _| {
++                        b.local.last_end = crate::tla_trace::page(last_mapping_end);
++                        if check.is_err() {
++                            b.local.result = crate::tla_trace::result(&check);
++                        }
++                    },
+                 );
+-            }
+-            last_mapping_end = vm_mapping_range.end;
++                check?;
+ 
+-            if perms == vm_mapping_perms & VmPerms::ALL_PERMS {
+-                continue;
+-            }
+-            let new_perms = perms | (vm_mapping_perms & VmPerms::ALL_MAY_PERMS);
+-            new_perms.check()?;
++                let trace_start = crate::tla_trace::now();
++                let Some((vm_mapping, mut rmap_to_remove)) = inner.remove(&vm_mapping_range.start)
++                else {
++                    let trace_end = crate::tla_trace::now();
++                    crate::tla_trace::detached(
++                        "VmarProtectTake",
++                        inner.trace_tree(),
++                        None,
++                        crate::tla_trace::page(range.start.max(vm_mapping_range.start)),
++                        crate::tla_trace::page(range.end.min(vm_mapping_range.end)),
++                        trace_start,
++                        trace_end,
++                    );
++                    // This can happen only if the mapping is merged to the previous one (just
++                    // protected before). We can skip this mapping because its property is already
++                    // correct.
++                    continue;
++                };
++                let mut rmap = rmap_to_remove.remove(self, vm_mapping_range.start);
+ 
+-            let Some((vm_mapping, mut rmap_to_remove)) = inner.remove(&vm_mapping_range.start)
+-            else {
+-                // This can happen only if the mapping is merged to the previous one (just
+-                // protected before). We can skip this mapping because its property is already
+-                // correct.
+-                continue;
+-            };
+-            let mut rmap = rmap_to_remove.remove(self, vm_mapping_range.start);
++                let vm_mapping_range = vm_mapping.range();
++                let intersected_range = get_intersected_range(&range, &vm_mapping_range);
++                let trace_end = crate::tla_trace::now();
++                crate::tla_trace::detached(
++                    "VmarProtectTake",
++                    inner.trace_tree(),
++                    Some(vm_mapping.trace_owner("detached")),
++                    crate::tla_trace::page(intersected_range.start),
++                    crate::tla_trace::page(intersected_range.end),
++                    trace_start,
++                    trace_end,
++                );
+ 
+-            let vm_mapping_range = vm_mapping.range();
+-            let intersected_range = get_intersected_range(&range, &vm_mapping_range);
++                // Protects part of the taken `VmMapping`.
++                let (left, taken, right) = vm_mapping.split_range(&intersected_range);
+ 
+-            // Protects part of the taken `VmMapping`.
+-            let (left, taken, right) = vm_mapping.split_range(&intersected_range);
++                // Puts the rest back.
++                if let Some(left) = left {
++                    inner.insert_without_try_merge(self, left, rmap.as_deref_mut());
++                }
++                if let Some(right) = right {
++                    inner.insert_without_try_merge(self, right, rmap.as_deref_mut());
++                }
+ 
+-            // Puts the rest back.
+-            if let Some(left) = left {
+-                inner.insert_without_try_merge(self, left, rmap.as_deref_mut());
++                let trace_start = crate::tla_trace::now();
++                let trace_end = crate::tla_trace::now();
++                crate::tla_trace::insert_rest(inner.trace_tree(), None, trace_start, trace_end);
++                // Protects part of the `VmMapping`.
++                let taken = taken.protect(self.vm_space(), new_perms);
++                inner.insert_try_merge(self, taken, rmap.as_deref_mut());
+             }
+-            if let Some(right) = right {
+-                inner.insert_without_try_merge(self, right, rmap.as_deref_mut());
+-            }
+-
+-            // Protects part of the `VmMapping`.
+-            let taken = taken.protect(self.vm_space(), new_perms);
+-            inner.insert_try_merge(self, taken, rmap.as_deref_mut());
+-        }
+ 
+-        if last_mapping_end < range.end {
+-            return_errno_with_message!(
+-                Errno::ENOMEM,
+-                "the range contains pages that are not mapped"
++            let trace_start = crate::tla_trace::now();
++            let trace_error = last_mapping_end < range.end;
++            crate::tla_trace::emit(
++                "VmarProtectCheck",
++                "vmar_unlock",
++                trace_start,
++                crate::tla_trace::now(),
++                |b, _| b.local.result = if trace_error { "ENOMEM" } else { "OK" },
+             );
+-        }
++            if last_mapping_end < range.end {
++                return_errno_with_message!(
++                    Errno::ENOMEM,
++                    "the range contains pages that are not mapped"
++                );
++            }
+ 
+-        Ok(())
++            Ok(())
++        })();
++        let tree = inner.trace_tree();
++        let trace_start = crate::tla_trace::now();
++        drop(inner);
++        crate::tla_trace::vmar_unlock(tree, trace_start, crate::tla_trace::now(), &result);
++        result
+     }
+ }
+diff --git a/kernel/core/src/vm/vmar/vmar_impls/unmap.rs b/kernel/core/src/vm/vmar/vmar_impls/unmap.rs
+index 0439dd418..16149468b 100644
+--- a/kernel/core/src/vm/vmar/vmar_impls/unmap.rs
++++ b/kernel/core/src/vm/vmar/vmar_impls/unmap.rs
+@@ -45,9 +45,16 @@ impl Vmar {
+         debug_assert!(range.start.is_multiple_of(PAGE_SIZE));
+         debug_assert!(range.end.is_multiple_of(PAGE_SIZE));
+ 
++        let trace_start = crate::tla_trace::now();
+         let mut inner = self.inner.write();
++        let trace_end = crate::tla_trace::now();
++        crate::tla_trace::vmar_lock(inner.trace_tree(), trace_start, trace_end);
+         let mut rss_delta = RssDelta::new(self);
+         inner.alloc_free_region_exact_truncate(self, range.start, range.len(), &mut rss_delta);
++        let tree = inner.trace_tree();
++        let trace_start = crate::tla_trace::now();
++        drop(inner);
++        crate::tla_trace::vmar_unlock(tree, trace_start, crate::tla_trace::now(), &Ok(()));
+     }
+ 
+     /// Discards all pages in the mappings that fall within the specified
+diff --git a/ostd/src/mm/vm_space.rs b/ostd/src/mm/vm_space.rs
+index 1733290b6..e4f761be7 100644
+--- a/ostd/src/mm/vm_space.rs
++++ b/ostd/src/mm/vm_space.rs
+@@ -470,17 +470,46 @@ impl<'a> CursorMut<'a> {
+     ///  - the length is longer than the remaining range of the cursor;
+     ///  - the length is not page-aligned.
+     pub fn unmap(&mut self, len: usize) -> usize {
++        self.unmap_with_trace(len, |_, _, _, _| {})
++    }
++
++    /// Reports actual cursor removals to the instrumentation caller.
++    pub fn unmap_with_trace(
++        &mut self,
++        len: usize,
++        mut trace: impl FnMut(&'static str, Option<Range<Vaddr>>, u64, u64),
++    ) -> usize {
+         let end_va = self.virt_addr() + len;
+         let mut num_unmapped: usize = 0;
+         loop {
++            core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
++            let trace_start = crate::arch::read_tsc();
++            core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+             // SAFETY:
+             // 1. It is safe to unmap memory in the userspace.
+             // 2. We drop the unmapped items only after flushing TLB entries, which is safe.
+             let Some(frag) = (unsafe { self.pt_cursor.take_next(end_va - self.virt_addr()) })
+             else {
++                core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
++                let trace_end = crate::arch::read_tsc();
++                core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
++                trace("CursorUnmap", None, trace_start, trace_end);
+                 break; // No more mappings in the range.
+             };
+-
++            core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
++            let trace_end = crate::arch::read_tsc();
++            core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
++            match &frag {
++                PageTableFrag::Mapped { va, .. } => trace(
++                    "CursorUnmap",
++                    Some(*va..*va + PAGE_SIZE),
++                    trace_start,
++                    trace_end,
++                ),
++                PageTableFrag::StrayPageTable { va, len, .. } => {
++                    trace("CursorUnmap", Some(*va..*va + *len), trace_start, trace_end)
++                }
++            }
+             match frag {
+                 PageTableFrag::Mapped { va, item, .. } => {
+                     // SAFETY: If the item is not a scalar (e.g., a frame
+@@ -532,7 +561,14 @@ impl<'a> CursorMut<'a> {
+             }
+         }
+ 
++        core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
++        let trace_start = crate::arch::read_tsc();
++        core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+         self.flusher.dispatch_tlb_flush();
++        core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
++        let trace_end = crate::arch::read_tsc();
++        core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
++        trace("DispatchTlbFlush", None, trace_start, trace_end);
+ 
+         num_unmapped
+     }

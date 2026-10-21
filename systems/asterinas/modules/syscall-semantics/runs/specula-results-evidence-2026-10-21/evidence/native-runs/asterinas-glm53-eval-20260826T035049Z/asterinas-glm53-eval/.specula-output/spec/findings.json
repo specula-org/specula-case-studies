@@ -1,0 +1,77 @@
+{
+  "schema_version": "2",
+  "system": "asterinas-glm53-eval",
+  "generated_by": "validation-workflow",
+  "findings": [
+    {
+      "id": "MC-1",
+      "title": "A Later readv Fault Can Hide a Positive Copy Prefix",
+      "source": "model-checking",
+      "scenario": "1 - positive progress is collapsed before result and offset commit",
+      "severity": "High",
+      "invariant": "MCReadReturnCoversCopies",
+      "config": "MC_hunt_s1_partial_progress.cfg",
+      "counterexample": "spec/output/MC_hunt_s1_partial_progress_bfs.out",
+      "affected_code": [
+        "ostd/src/mm/io/mod.rs:347",
+        "kernel/core/src/error.rs:209",
+        "kernel/core/src/vm/page_cache/vmo/mod.rs:558",
+        "kernel/core/src/fs/file/inode_handle.rs:298",
+        "kernel/core/src/syscall/preadv.rs:168",
+        "kernel/core/src/syscall/pwritev.rs:164"
+      ],
+      "summary": "A later readv iovec can copy a positive prefix before faulting, but tuple conversion drops that copied count. InodeHandle sees only an error, leaves the shared offset unchanged for the prefix, and the vector loop returns only earlier iovecs. User memory therefore contains more newly copied data than the return value and offset delta report. The trace-valid writev capture shows the corresponding committed-data form of the same progress-erasure mechanism."
+    },
+    {
+      "id": "MC-2",
+      "title": "RamFS and exFAT Cached Reads Copy Beyond Logical EOF",
+      "source": "model-checking",
+      "scenario": "2 - filesystem adapters copy outside logical progress",
+      "severity": "High",
+      "invariant": "MCNoReadPastEOF",
+      "config": "MC_hunt_s2_unbounded_read.cfg",
+      "counterexample": "spec/output/MC_hunt_s2_unbounded_read_bfs.out",
+      "affected_code": [
+        "kernel/core/src/fs/fs_impls/ramfs/fs.rs:704",
+        "kernel/core/src/fs/fs_impls/exfat/inode.rs:649",
+        "kernel/core/src/vm/page_cache/mod.rs:181",
+        "kernel/core/src/vm/page_cache/vmo/mod.rs:534"
+      ],
+      "summary": "RamFS and exFAT compute an EOF-limited result but pass the original destination writer into the page cache. The cache is page-aligned and may be larger than logical EOF, while Vmo::read clips only against that capacity. A read at EOF can consequently alter user memory or fault on an address that should not be accessed, even though the filesystem reports zero logical bytes."
+    },
+    {
+      "id": "MC-3",
+      "title": "A Zero-Progress RamFS Write Can Publish the Full Requested EOF",
+      "source": "model-checking",
+      "scenario": "2 - filesystem adapters publish outside logical progress",
+      "severity": "High",
+      "invariant": "MCNoNominalEOFOnFault",
+      "config": "MC_hunt_s2_prepublished_write.cfg",
+      "counterexample": "spec/output/MC_hunt_s2_prepublished_write_bfs.out",
+      "affected_code": [
+        "kernel/core/src/fs/fs_impls/ramfs/fs.rs:747",
+        "kernel/core/src/fs/fs_impls/ramfs/fs.rs:755",
+        "kernel/core/src/fs/fs_impls/ramfs/fs.rs:761",
+        "kernel/core/src/fs/fs_impls/ramfs/fs.rs:775"
+      ],
+      "summary": "RamFS publishes inode size and cache growth from the full requested write before it copies from user memory. If that fallible copy faults with zero progress, the error path returns EFAULT without restoring the metadata. The file therefore remains extended to the full requested end despite having committed and reported no bytes. A prefix fault can likewise publish an EOF beyond the committed prefix."
+    },
+    {
+      "id": "MC-4",
+      "title": "Vectored I/O Is Not Atomic Against a Shared-Offset Competitor",
+      "source": "model-checking",
+      "scenario": "3 - vectored I/O releases serialization between entries",
+      "severity": "High",
+      "invariant": "MCVectorSingleLinearization",
+      "config": "MC_hunt_s3_vector_linearization.cfg",
+      "counterexample": "spec/output/MC_hunt_s3_vector_linearization_bfs.out",
+      "affected_code": [
+        "kernel/core/src/syscall/preadv.rs:159",
+        "kernel/core/src/syscall/pwritev.rs:155",
+        "kernel/core/src/fs/file/inode_handle.rs:292",
+        "kernel/core/src/fs/file/inode_handle.rs:346"
+      ],
+      "summary": "readv and writev call the scalar file operation separately for every iovec. Each scalar call independently acquires and releases the shared open-description offset lock, so a competing operation can commit between vector entries. The counterexample commit order is readv iovec 1, scalar write, readv iovec 2, which no serial ordering of the two API calls can explain. A deterministic trace-valid writev witness confirms the same unlocked boundary in the implementation."
+    }
+  ]
+}

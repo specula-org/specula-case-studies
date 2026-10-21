@@ -1,0 +1,38 @@
+{
+  "schema_version": "2",
+  "system": "asterinas-local-flock-ownership",
+  "generated_by": "validation-workflow",
+  "findings": [
+    {
+      "id": "MC-1",
+      "title": "Conflicting conversions retain the old shared flock",
+      "source": "model-checking",
+      "scenario": "2 - Conversion retention (C05 and C06)",
+      "severity": "Medium",
+      "invariant": "ConversionOracle",
+      "config": "MC_hunt_2_conversion_oracle.cfg",
+      "counterexample": "spec/output/round1-20261005T202037Z/MC_hunt_2_conversion_oracle-bfs.log",
+      "affected_code": [
+        "kernel/core/src/fs/file/flock.rs:114",
+        "kernel/core/src/fs/file/flock.rs:147"
+      ],
+      "summary": "Asterinas checks a conflicting conversion before removing the caller's existing SH flock, so it can return EAGAIN or wait while retaining the old mode. The fixed generic local Linux v6.16.5 path removes that old mode before conflict handling, and the existing Linux 7.2.8 tmpfs control matches that source oracle. C05 violates ConversionOracle after 80 states, and C06 violates ConvertersDrain after 57 concrete states followed by stuttering. Both results share one source mechanism and are supported by freshly matched runtime histories. This is a source-mapped Case C candidate from bounded checking; separate confirmation and general exhaustive convergence remain incomplete."
+    },
+    {
+      "id": "MC-2",
+      "title": "A final temporary reference can deadlock flock cleanup",
+      "source": "model-checking",
+      "scenario": "5 - Temporary owner reference and final release (C11)",
+      "severity": "High",
+      "invariant": "NoRecursiveListWait",
+      "config": "MC_hunt_5_temporary_last_reference.cfg",
+      "counterexample": "spec/output/round1-20261005T202037Z/MC_hunt_5_temporary_last_reference-bfs.log",
+      "affected_code": [
+        "kernel/core/src/fs/file/flock.rs:166",
+        "kernel/core/src/fs/file/inode_handle.rs:537",
+        "ostd/src/sync/mutex.rs:35"
+      ],
+      "summary": "An unlock scan upgrades another OFD's Weak owner while holding the inode's flock-list Mutex. If another thread removes that OFD's last descriptor and drops ClosedFile, releasing the scan's temporary Arc can synchronously enter InodeHandle::drop while the outer Mutex guard is still held. C11 violates NoRecursiveListWait after 34 states when that destructor attempts the same nonrecursive Mutex, and the matched SMP-2 runtime prefix captures the corresponding reference window and nested attempt. The extra-alias and close-before/close-after controls complete without violations, while FinalReleaseCompletes has no separate C11 verdict because the safety failure stops TLC. This is a source-mapped Case C candidate; separate confirmation and classification were not executed."
+    }
+  ]
+}

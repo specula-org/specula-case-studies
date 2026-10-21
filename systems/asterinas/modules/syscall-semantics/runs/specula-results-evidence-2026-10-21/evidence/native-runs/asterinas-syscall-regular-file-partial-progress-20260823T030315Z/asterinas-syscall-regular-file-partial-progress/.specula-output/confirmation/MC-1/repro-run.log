@@ -1,0 +1,63 @@
+==============================================================
+STEP 1  Linux control (same payload, host kernel 7.1.9)
+==============================================================
+MC-1 repro: positive read prefix exposed but reported as EFAULT
+page=4096 writable_prefix=128 file_bytes=8192
+---- /tmp/mc1-control/file-a (/tmp/mc1-control/file-a) ----
+/tmp/mc1-control/file-a read      : ret=128 errno=0(-) offset_after=128 visible_prefix=128
+/tmp/mc1-control/file-a next read : ret=128 first_byte='Y' (expected 'Y' if the delivered prefix is accounted for, 'A' if it is replayed)
+/tmp/mc1-control/file-a pread     : ret=128 errno=0(-) visible_prefix=128
+/tmp/mc1-control/file-a zero-prefix control: ret=-1 errno=14(Bad address) offset_after=0 (both kernels must report EFAULT here)
+---- /tmp/mc1-control/file-b (/tmp/mc1-control/file-b) ----
+/tmp/mc1-control/file-b read      : ret=128 errno=0(-) offset_after=128 visible_prefix=128
+/tmp/mc1-control/file-b next read : ret=128 first_byte='Y' (expected 'Y' if the delivered prefix is accounted for, 'A' if it is replayed)
+/tmp/mc1-control/file-b pread     : ret=128 errno=0(-) visible_prefix=128
+/tmp/mc1-control/file-b zero-prefix control: ret=-1 errno=14(Bad address) offset_after=0 (both kernels must report EFAULT here)
+MC1_ANOMALIES 0
+MC1_RESULT MATCHES_LINUX
+
+==============================================================
+STEP 2  Asterinas (pristine kernel + same payload as init)
+==============================================================
+--- kernel/ostd modifications in the tree under test (must be empty) ---
+--- end ---
+info: syncing channel updates for nightly-2026-07-21-x86_64-unknown-linux-gnu
+info: latest update on 2026-07-21 for version 1.99.0-nightly (87e5904f5 2026-07-20)
+info: component llvm-tools is up to date
+info: component rust-src is up to date
+info: component rust-std for target x86_64-unknown-none is up to date
+info: component rustc-dev is up to date
+
+  nightly-2026-07-21-x86_64-unknown-linux-gnu unchanged - rustc 1.99.0-nightly (87e5904f5 2026-07-20)
+
+info: checking for self-update (current version: 1.29.0)
+
+--- Asterinas guest output ---
+MC-1 repro: positive read prefix exposed but reported as EFAULT
+page=4096 writable_prefix=128 file_bytes=8192
+---- ramfs (/mc1-regular-file) ----
+ramfs read      : ret=-1 errno=14(Bad address) offset_after=0 visible_prefix=128
+ramfs ANOMALY   : read() reported failure (Bad address) but 128 bytes of the user buffer were already overwritten with file data
+ramfs next read : ret=128 first_byte='A' (expected 'Y' if the delivered prefix is accounted for, 'A' if it is replayed)
+ramfs ANOMALY   : the 128 delivered bytes are replayed by the next read -- a caller that repairs its mapping and retries sees them twice
+ramfs pread     : ret=-1 errno=14(Bad address) visible_prefix=128
+ramfs ANOMALY   : pread() reported failure (Bad address) but 128 bytes of the user buffer were already overwritten with file data
+ramfs zero-prefix control: ret=-1 errno=14(Bad address) offset_after=0 (both kernels must report EFAULT here)
+---- ext2  (/ext2/mc1-regular-file) ----
+ext2  read      : ret=-1 errno=14(Bad address) offset_after=0 visible_prefix=128
+ext2  ANOMALY   : read() reported failure (Bad address) but 128 bytes of the user buffer were already overwritten with file data
+ext2  next read : ret=128 first_byte='A' (expected 'Y' if the delivered prefix is accounted for, 'A' if it is replayed)
+ext2  ANOMALY   : the 128 delivered bytes are replayed by the next read -- a caller that repairs its mapping and retries sees them twice
+ext2  pread     : ret=-1 errno=14(Bad address) visible_prefix=128
+ext2  ANOMALY   : pread() reported failure (Bad address) but 128 bytes of the user buffer were already overwritten with file data
+ext2  zero-prefix control: ret=-1 errno=14(Bad address) offset_after=0 (both kernels must report EFAULT here)
+MC1_ANOMALIES 6
+MC1_RESULT DIVERGES_FROM_LINUX
+MC1_SCENARIO_DONE
+
+==============================================================
+VERDICT
+==============================================================
+Linux host : MC1_RESULT MATCHES_LINUX
+Asterinas  : MC1_RESULT DIVERGES_FROM_LINUX
+MC-1 REPRODUCED

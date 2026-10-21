@@ -1,0 +1,893 @@
+diff --git a/OSDK.toml b/OSDK.toml
+index 064fd551a..c890736a4 100644
+--- a/OSDK.toml
++++ b/OSDK.toml
+@@ -95,3 +95,7 @@ supported_archs = ["aarch64"]
+ boot.method = "vmm-direct"
+ build.strip_elf = false
+ qemu.args = "$(./tools/qemu_args.sh aarch64)"
++
++[scheme."scm-trace"]
++boot.method = "grub-rescue-iso"
++qemu.args = "-bios /root/ovmf/release/OVMF.fd -machine q35,kernel-irqchip=split -m 2G -smp 2 -cpu host -accel kvm -nographic -monitor none -no-reboot -device isa-debug-exit,iobase=0xf4,iosize=0x04"
+diff --git a/kernel/core/src/fs/file/file_table.rs b/kernel/core/src/fs/file/file_table.rs
+index f73004b97..ec2a4e152 100644
+--- a/kernel/core/src/fs/file/file_table.rs
++++ b/kernel/core/src/fs/file/file_table.rs
+@@ -365,6 +365,7 @@ macro_rules! get_file_fast {
+ pub(crate) use get_file_fast;
+ 
+ pub(crate) struct FileTableEntry {
++    pub(crate) scm_origin: [usize; 3],
+     file: Arc<dyn FileLike>,
+     flags: AtomicU8,
+ }
+@@ -374,6 +375,7 @@ impl FileTableEntry {
+         Self {
+             file,
+             flags: AtomicU8::new(flags.bits()),
++            scm_origin: [0; 3],
+         }
+     }
+ 
+@@ -395,6 +397,7 @@ impl Clone for FileTableEntry {
+         Self {
+             file: self.file.clone(),
+             flags: AtomicU8::new(self.flags.load(Ordering::Relaxed)),
++            scm_origin: self.scm_origin,
+         }
+     }
+ }
+diff --git a/kernel/core/src/lib.rs b/kernel/core/src/lib.rs
+index 5e65ce6a5..92d6559b2 100644
+--- a/kernel/core/src/lib.rs
++++ b/kernel/core/src/lib.rs
+@@ -54,6 +54,7 @@ mod net;
+ pub mod prelude;
+ pub mod process;
+ mod sched;
++pub(crate) mod scm_trace;
+ pub mod security;
+ mod syscall;
+ mod thread;
+diff --git a/kernel/core/src/net/socket/unix/ctrl_msg.rs b/kernel/core/src/net/socket/unix/ctrl_msg.rs
+index f7e759aab..d33bc7185 100644
+--- a/kernel/core/src/net/socket/unix/ctrl_msg.rs
++++ b/kernel/core/src/net/socket/unix/ctrl_msg.rs
+@@ -15,6 +15,7 @@ use crate::{
+     net::socket::util::{CControlHeader, ControlMessage, RecvFlags},
+     prelude::*,
+     process::{UserNamespace, credentials::capabilities::CapSet, posix_thread::AsPosixThread},
++    scm_trace as tr,
+     security::lsm::hooks as lsm_hooks,
+     util::net::CSocketOptionLevel,
+ };
+@@ -106,18 +107,40 @@ impl FileMessage {
+         let mut file_table = current.as_thread_local().unwrap().borrow_file_table_mut();
+         for _ in 0..nfiles {
+             let fd = reader.read_val::<i32>()?;
++            let start = tr::stamp();
+             let file = get_file_fast!(&mut file_table, fd.try_into()?).into_owned();
+             files.push(file);
++            let end = tr::stamp();
++            tr::emit(
++                "FileMessageReadFrom",
++                start,
++                end,
++                &[fd as usize, tr::ptr(files.last().unwrap()), files.len()],
++            );
+         }
+ 
+         Ok(FileMessage { files })
+     }
+ 
+     fn write_to(&self, writer: &mut VmWriter) -> Result<(CControlHeader, RecvFlags)> {
+-        let nfiles = self
+-            .files
+-            .len()
+-            .min(CControlHeader::payload_len_from_total(writer.avail())? / size_of::<i32>());
++        let start = tr::stamp();
++        let capacity = CControlHeader::payload_len_from_total(writer.avail());
++        if capacity.is_err() {
++            tr::emit(
++                "FileMessageWriteCapacity",
++                start,
++                tr::stamp(),
++                &[0, writer.avail()],
++            );
++        }
++        let nfiles = self.files.len().min(capacity? / size_of::<i32>());
++        let end = tr::stamp();
++        tr::emit(
++            "FileMessageWriteCapacity",
++            start,
++            end,
++            &[nfiles, writer.avail()],
++        );
+         if nfiles == 0 {
+             return_errno_with_message!(Errno::EINVAL, "the control message buffer is too small");
+         }
+@@ -132,20 +155,66 @@ impl FileMessage {
+             CControlType::SCM_RIGHTS as i32,
+             nfiles * size_of::<i32>(),
+         );
+-        writer.write_val::<CControlHeader>(&header)?;
++        let start = tr::stamp();
++        let result = writer.write_val_observed::<CControlHeader>(&header);
++        let end = tr::stamp();
++        tr::emit(
++            "FileMessageWriteHeader",
++            start,
++            end,
++            &[
++                result.is_ok() as usize,
++                result
++                    .as_ref()
++                    .err()
++                    .map_or(size_of::<CControlHeader>(), |(_, n)| *n),
++                writer.cursor() as usize,
++                header.total_len(),
++            ],
++        );
++        result.map_err(|(err, _)| err)?;
+ 
+         let current = Task::current().unwrap();
+         let file_table = current.as_thread_local().unwrap().borrow_file_table();
+-        for file in self.files[..nfiles].iter() {
++        for (index, file) in self.files[..nfiles].iter().enumerate() {
+             // TODO: Deal with the `O_CLOEXEC` flag.
+-            let fd = file_table
+-                .unwrap()
+-                .write()
+-                .insert(file.clone(), FdFlags::empty());
++            let fd = {
++                let mut table = file_table.unwrap().write();
++                let start = tr::stamp();
++                let fd = table.insert(file.clone(), FdFlags::empty());
++                let end = tr::stamp();
++                table.get_entry_mut(fd).unwrap().scm_origin = tr::origin(index + 1);
++                tr::emit(
++                    "FileTableInsert",
++                    start,
++                    end,
++                    &[
++                        usize::from(fd),
++                        tr::ptr(table.get_file(fd).unwrap()),
++                        index + 1,
++                    ],
++                );
++                fd
++            };
+             // Perhaps we should remove the inserted files from the file table if we cannot write
+             // the file descriptor back to user space? However, even Linux cannot handle every
+             // corner case (https://elixir.bootlin.com/linux/v6.15.2/source/net/core/scm.c#L357).
+-            writer.write_val::<i32>(&(fd.into()))?;
++            let start = tr::stamp();
++            let result = writer.write_val_observed::<i32>(&(fd.into()));
++            let end = tr::stamp();
++            tr::emit(
++                "VmWriterWriteFd",
++                start,
++                end,
++                &[
++                    result.is_ok() as usize,
++                    result.as_ref().err().map_or(4, |(_, n)| *n),
++                    writer.cursor() as usize,
++                    index + 1,
++                    usize::from(fd),
++                ],
++            );
++            result.map_err(|(err, _)| err)?;
+         }
+ 
+         Ok((header, output_flags))
+@@ -217,7 +286,38 @@ pub(super) struct AuxiliaryData {
+     cred: Option<SocketCred>,
+ }
+ 
++fn trace_ids(files: &[Arc<dyn FileLike>]) -> [usize; 4] {
++    let mut ids = [0; 4];
++    for (dest, file) in ids.iter_mut().zip(files) {
++        *dest = tr::ptr(file);
++    }
++    ids
++}
++
++impl Drop for FileMessage {
++    fn drop(&mut self) {
++        if tr::enabled() {
++            for file in self.files.drain(..) {
++                tr::release(file, false);
++            }
++        }
++    }
++}
++
++impl Drop for AuxiliaryData {
++    fn drop(&mut self) {
++        if tr::enabled() {
++            for file in self.files.drain(..) {
++                tr::release(file, tr::mode() == 0);
++            }
++        }
++    }
++}
++
+ impl AuxiliaryData {
++    pub(super) fn trace_ids(&self) -> [usize; 4] {
++        trace_ids(&self.files)
++    }
+     /// Builds the auxiliary data from the control messages.
+     pub(super) fn from_control(ctrl_msgs: Vec<ControlMessage>) -> Result<Self> {
+         let mut files = Vec::new();
+@@ -228,16 +328,19 @@ impl AuxiliaryData {
+             // TODO: What should we do if there are control messages of other protocols?
+ 
+             match unix_ctrl_msg.0 {
+-                Message::Files(FileMessage {
+-                    files: mut msg_files,
+-                }) => {
++                Message::Files(mut msg) => {
++                    let msg_files = &mut msg.files;
+                     if msg_files.len() > MAX_NR_FILES - files.len() {
+                         return_errno_with_message!(
+                             Errno::EINVAL,
+                             "the SCM_RIGHTS message is too large"
+                         );
+                     }
+-                    files.append(&mut msg_files);
++                    let start = tr::stamp();
++                    files.append(msg_files);
++                    let end = tr::stamp();
++                    let ids = trace_ids(&files);
++                    tr::emit("AuxiliaryDataFromControl", start, end, &ids);
+                 }
+                 Message::Cred(CredMessage { cred: msg_cred }) => {
+                     let cur_cred = SocketCred::<ReadOp>::new_current();
+@@ -302,11 +405,30 @@ impl AuxiliaryData {
+         }
+ 
+         if !files.is_empty() {
+-            let files = match behavior {
++            let before = trace_ids(files);
++            let start = tr::stamp();
++            let generated = match behavior {
+                 ReceiveBehavior::Recv => mem::take(files),
+                 ReceiveBehavior::Peek => files.clone(),
+             };
+-            let unix_ctrl_msg = UnixControlMessage(Message::Files(FileMessage { files }));
++            let end = tr::stamp();
++            let after = trace_ids(files);
++            let copied = trace_ids(&generated);
++            let mut data = [0; 12];
++            data[..4].copy_from_slice(&before);
++            data[4..8].copy_from_slice(&after);
++            data[8..].copy_from_slice(&copied);
++            tr::emit(
++                match behavior {
++                    ReceiveBehavior::Recv => "AuxiliaryDataGenerateControlRecv",
++                    ReceiveBehavior::Peek => "AuxiliaryDataGenerateControlPeek",
++                },
++                start,
++                end,
++                &data,
++            );
++            let unix_ctrl_msg =
++                UnixControlMessage(Message::Files(FileMessage { files: generated }));
+             ctrl_msgs.push(ControlMessage::Unix(unix_ctrl_msg));
+         }
+ 
+diff --git a/kernel/core/src/net/socket/unix/datagram/message.rs b/kernel/core/src/net/socket/unix/datagram/message.rs
+index ad00487f3..f39e97d1d 100644
+--- a/kernel/core/src/net/socket/unix/datagram/message.rs
++++ b/kernel/core/src/net/socket/unix/datagram/message.rs
+@@ -20,6 +20,7 @@ use crate::{
+     },
+     prelude::*,
+     process::signal::Pollee,
++    scm_trace as tr,
+     util::{MultiRead, MultiWrite},
+ };
+ 
+@@ -32,17 +33,38 @@ pub(super) struct MessageQueue {
+ }
+ 
+ struct Inner {
++    trace_enqueued: usize,
++    trace_consumed: usize,
++    trace_disposed: usize,
+     messages: VecDeque<Message>,
+     total_length: usize,
+     is_shutdown: bool,
+ }
+ 
+ struct Message {
++    trace_generation: usize,
+     bytes: Vec<u8>,
+     aux: AuxiliaryData,
+     src: UnixSocketAddr,
+ }
+ 
++impl Inner {
++    fn trace(&self, queue: usize) -> [usize; 16] {
++        let mut v = [0; 16];
++        v[0] = queue;
++        v[1] = self.messages.len();
++        if let Some(message) = self.messages.front() {
++            v[2] = message.trace_generation;
++            v[3..7].copy_from_slice(&message.aux.trace_ids());
++            v[10] = message.bytes.len();
++        }
++        v[7] = self.trace_enqueued;
++        v[8] = self.trace_consumed;
++        v[9] = self.trace_disposed;
++        v
++    }
++}
++
+ impl MessageQueue {
+     /// Looks up a message queue bound to the specific address in the global table.
+     pub(super) fn lookup_bound(addr: &UnixSocketAddrKey) -> Result<Arc<MessageQueue>> {
+@@ -57,10 +79,14 @@ impl MessageQueue {
+         aux_data: &mut AuxiliaryData,
+         source: &MessageReceiver,
+     ) -> Result<usize> {
+-        let mut inner = self.inner.lock();
+-        let Some(inner) = inner.as_mut() else {
++        let qid = self as *const Self as usize;
++        tr::queue(qid, true);
++        let mut guard = self.inner.lock();
++        let locked = tr::stamp();
++        let Some(inner) = guard.as_mut() else {
+             return_errno_with_message!(Errno::ECONNREFUSED, "the target socket is closed");
+         };
++        tr::emit("MessageQueueTrySendLock", locked, locked, &inner.trace(qid));
+         if inner.is_shutdown {
+             return_errno_with_message!(Errno::EPIPE, "the target socket is shut down");
+         }
+@@ -76,10 +102,31 @@ impl MessageQueue {
+             );
+         }
+ 
++        let enqueue_start;
+         let msg = {
+             let mut bytes = vec![0; len];
+-            reader.read(&mut VmWriter::from(bytes.as_mut_slice()))?;
++            let start = tr::stamp();
++            let result = reader.read(&mut VmWriter::from(bytes.as_mut_slice()));
++            let end = tr::stamp();
++            tr::emit(
++                "MessageQueueTrySendCopy",
++                start,
++                end,
++                &[
++                    result.is_ok() as usize,
++                    result.as_ref().copied().unwrap_or_else(|(_, n)| *n),
++                ],
++            );
++            if let Err(err) = result {
++                let snapshot = inner.trace(qid);
++                let start = tr::stamp();
++                drop(guard);
++                let end = tr::stamp();
++                tr::emit("MessageQueueTrySendUnlock", start, end, &snapshot);
++                return Err(err.into());
++            }
+ 
++            enqueue_start = tr::stamp();
+             let mut aux = core::mem::take(aux_data);
+             if self.is_pass_cred.load(Ordering::Relaxed)
+                 || source.queue.is_pass_cred.load(Ordering::Relaxed)
+@@ -89,14 +136,31 @@ impl MessageQueue {
+ 
+             let src = source.queue.addr();
+ 
+-            Message { bytes, aux, src }
++            Message {
++                bytes,
++                aux,
++                src,
++                trace_generation: inner.trace_enqueued + 1,
++            }
+         };
+ 
+         inner.total_length += msg.bytes.len();
+         inner.messages.push_back(msg);
++        let enqueue_end = tr::stamp();
++        inner.trace_enqueued += 1;
++        tr::emit(
++            "MessageQueueTrySendEnqueue",
++            enqueue_start,
++            enqueue_end,
++            &inner.trace(qid),
++        );
+ 
+         self.pollee.notify(IoEvents::IN);
+-
++        let snapshot = inner.trace(qid);
++        let start = tr::stamp();
++        drop(guard);
++        let end = tr::stamp();
++        tr::emit("MessageQueueTrySendUnlock", start, end, &snapshot);
+         Ok(len)
+     }
+ 
+@@ -137,6 +201,9 @@ pub(super) struct MessageReceiver {
+ impl MessageReceiver {
+     pub(super) fn new() -> MessageReceiver {
+         let inner = Inner {
++            trace_enqueued: 0,
++            trace_consumed: 0,
++            trace_disposed: 0,
+             messages: VecDeque::new(),
+             total_length: 0,
+             is_shutdown: false,
+@@ -176,11 +243,33 @@ impl MessageReceiver {
+         writer: &mut dyn MultiWrite,
+         flags: RecvFlags,
+     ) -> Result<(RecvOutput, Vec<ControlMessage>, UnixSocketAddr)> {
+-        let mut inner = self.queue.inner.lock();
+-        let inner = inner.as_mut().unwrap();
+-
+-        let Some(msg) = inner.messages.front() else {
++        let qid = Arc::as_ptr(&self.queue) as usize;
++        tr::queue(qid, true);
++        let mut guard = self.queue.inner.lock();
++        let locked = tr::stamp();
++        let inner = guard.as_mut().unwrap();
++        tr::emit(
++            "MessageReceiverTryRecvLock",
++            locked,
++            locked,
++            &inner.trace(qid),
++        );
++        let select_start = tr::stamp();
++        let selected = inner.messages.front();
++        let select_end = tr::stamp();
++        tr::emit(
++            "MessageReceiverTryRecvSelect",
++            select_start,
++            select_end,
++            &inner.trace(qid),
++        );
++        let Some(msg) = selected else {
+             if !inner.is_shutdown {
++                let snapshot = inner.trace(qid);
++                let start = tr::stamp();
++                drop(guard);
++                let end = tr::stamp();
++                tr::emit("MessageReceiverTryRecvUnlock", start, end, &snapshot);
+                 return_errno_with_message!(Errno::EAGAIN, "the receive buffer is empty");
+             } else {
+                 return Ok((
+@@ -192,15 +281,39 @@ impl MessageReceiver {
+         };
+ 
+         let message_len = msg.bytes.len();
+-        let len = writer.write(&mut VmReader::from(msg.bytes.as_slice()))?;
++        let start = tr::stamp();
++        let result = writer.write(&mut VmReader::from(msg.bytes.as_slice()));
++        let end = tr::stamp();
++        let mut snapshot = inner.trace(qid);
++        snapshot[11] = result.is_ok() as usize;
++        snapshot[12] = result.as_ref().copied().unwrap_or_else(|(_, n)| *n);
++        tr::emit("MessageReceiverTryRecvCopy", start, end, &snapshot);
++        let len = match result {
++            Ok(len) => len,
++            Err(err) => {
++                let snapshot = inner.trace(qid);
++                let start = tr::stamp();
++                drop(guard);
++                let end = tr::stamp();
++                tr::emit("MessageReceiverTryRecvUnlock", start, end, &snapshot);
++                return Err(err.into());
++            }
++        };
+ 
+         let is_pass_cred = self.queue.is_pass_cred.load(Ordering::Relaxed);
+         let src = msg.src.clone();
+ 
+         let behavior = flags.receive_behavior();
+         let ctrl_msgs = if behavior.will_consume_data() {
++            let start = tr::stamp();
+             let mut message = inner.messages.pop_front().unwrap();
+             inner.total_length -= message.bytes.len();
++            let end = tr::stamp();
++            inner.trace_consumed += 1;
++            let mut snapshot = inner.trace(qid);
++            snapshot[11..15].copy_from_slice(&message.aux.trace_ids());
++            snapshot[15] = message.trace_generation;
++            tr::emit("MessageReceiverTryRecvDequeue", start, end, &snapshot);
+ 
+             self.queue.pollee.invalidate();
+             // A writer may still fail if the free space is not enough.
+@@ -214,6 +327,11 @@ impl MessageReceiver {
+         };
+ 
+         let output = RecvOutput::new_for_packet(flags, len, message_len);
++        let snapshot = inner.trace(qid);
++        let start = tr::stamp();
++        drop(guard);
++        let end = tr::stamp();
++        tr::emit("MessageReceiverTryRecvUnlock", start, end, &snapshot);
+         Ok((output, ctrl_msgs, src))
+     }
+ 
+@@ -265,7 +383,22 @@ impl Drop for MessageReceiver {
+             QUEUE_TABLE.remove_queue(&addr.to_key());
+         }
+ 
+-        *self.queue.inner.lock() = None;
++        let qid = Arc::as_ptr(&self.queue) as usize;
++        if tr::queue(qid, false) {
++            let mut guard = self.queue.inner.lock();
++            let start = tr::stamp();
++            let old = guard.take();
++            let end = tr::stamp();
++            let snapshot = old.as_ref().unwrap().trace(qid);
++            tr::emit("MessageReceiverDropBegin", start, end, &snapshot);
++            drop(old);
++            let start = tr::stamp();
++            drop(guard);
++            let end = tr::stamp();
++            tr::emit("MessageReceiverDropComplete", start, end, &[qid]);
++        } else {
++            *self.queue.inner.lock() = None;
++        }
+         self.queue.send_wait_queue.wake_all();
+     }
+ }
+diff --git a/kernel/core/src/net/socket/util/message_header.rs b/kernel/core/src/net/socket/util/message_header.rs
+index c4357679c..ef3ac6cf5 100644
+--- a/kernel/core/src/net/socket/util/message_header.rs
++++ b/kernel/core/src/net/socket/util/message_header.rs
+@@ -126,6 +126,13 @@ impl ControlMessage {
+             len += padding_len;
+         }
+ 
++        let t = crate::scm_trace::stamp();
++        crate::scm_trace::emit(
++            "ControlMessageWriteAllTo",
++            t,
++            t,
++            &[len, output_flags.bits() as usize, writer.cursor() as usize],
++        );
+         (len, output_flags)
+     }
+ 
+diff --git a/kernel/core/src/process/posix_thread/thread_local.rs b/kernel/core/src/process/posix_thread/thread_local.rs
+index 086034566..63db604d7 100644
+--- a/kernel/core/src/process/posix_thread/thread_local.rs
++++ b/kernel/core/src/process/posix_thread/thread_local.rs
+@@ -21,6 +21,7 @@ use crate::{
+ 
+ /// Local data for a POSIX thread.
+ pub(crate) struct ThreadLocal {
++    pub(crate) scm_trace: RefCell<Option<crate::scm_trace::Buffer>>,
+     // TID pointers.
+     // https://man7.org/linux/man-pages/man2/set_tid_address.2.html
+     set_child_tid: Cell<Vaddr>,
+@@ -71,6 +72,7 @@ impl ThreadLocal {
+         ns_proxy: Arc<NsProxy>,
+     ) -> Self {
+         Self {
++            scm_trace: RefCell::new(None),
+             set_child_tid: Cell::new(set_child_tid),
+             clear_child_tid: Cell::new(clear_child_tid),
+             vmar: RefCell::new(Some(vmar)),
+diff --git a/kernel/core/src/syscall/close.rs b/kernel/core/src/syscall/close.rs
+index 8beca9c70..41d668e8d 100644
+--- a/kernel/core/src/syscall/close.rs
++++ b/kernel/core/src/syscall/close.rs
+@@ -19,12 +19,34 @@ bitflags! {
+ pub(super) fn sys_close(raw_fd: RawFileDesc, ctx: &Context) -> Result<SyscallReturn> {
+     debug!("raw_fd = {}", raw_fd);
+ 
++    let mut trace_object = 0;
+     let closed_file = {
+         let fd = raw_fd.try_into()?;
+         let file_table = ctx.thread_local.borrow_file_table();
+         let mut file_table_locked = file_table.unwrap().write();
+-        let _ = file_table_locked.get_file(fd)?;
+-        file_table_locked.close_file(fd).unwrap()
++        let file = file_table_locked.get_file(fd)?;
++        if crate::scm_trace::ordinary(file) {
++            trace_object = crate::scm_trace::ptr(file);
++        }
++        let origin = file_table_locked.get_entry(fd)?.scm_origin;
++        let start = crate::scm_trace::stamp();
++        let closed = file_table_locked.close_file(fd).unwrap();
++        let end = crate::scm_trace::stamp();
++        if trace_object != 0 {
++            crate::scm_trace::emit(
++                "FileTableCloseFile",
++                start,
++                end,
++                &[
++                    raw_fd as usize,
++                    trace_object,
++                    origin[0],
++                    origin[1],
++                    origin[2],
++                ],
++            );
++        }
++        closed
+     };
+ 
+     // Cleanup work needs to be done in the `Drop` impl.
+@@ -32,7 +54,17 @@ pub(super) fn sys_close(raw_fd: RawFileDesc, ctx: &Context) -> Result<SyscallRet
+     // We don't mind the races between closing the file descriptor and using the file descriptor,
+     // because such races are explicitly allowed in the man pages. See the "Multithreaded processes
+     // and close()" section in <https://man7.org/linux/man-pages/man2/close.2.html>.
++    let start = crate::scm_trace::stamp();
+     drop(closed_file);
++    let end = crate::scm_trace::stamp();
++    if trace_object != 0 {
++        crate::scm_trace::emit(
++            "ClosedFileDrop",
++            start,
++            end,
++            &[raw_fd as usize, trace_object],
++        );
++    }
+ 
+     // Linux has error codes for the close() system call for diagnostic and remedial purposes, but
+     // only for a small subset of file systems such as NFS. We currently have no support for such
+diff --git a/kernel/core/src/syscall/dup.rs b/kernel/core/src/syscall/dup.rs
+index b2733e36e..099f5c1b8 100644
+--- a/kernel/core/src/syscall/dup.rs
++++ b/kernel/core/src/syscall/dup.rs
+@@ -77,7 +77,19 @@ fn do_dup3(
+     let file_table = ctx.thread_local.borrow_file_table();
+     let replaced_file = {
+         let mut file_table_locked = file_table.unwrap().write();
+-        file_table_locked.dup_exact(old_fd, new_fd, flags)?
++        let start = crate::scm_trace::stamp();
++        let replaced = file_table_locked.dup_exact(old_fd, new_fd, flags)?;
++        let end = crate::scm_trace::stamp();
++        let file = file_table_locked.get_file(new_fd)?;
++        if crate::scm_trace::ordinary(file) {
++            crate::scm_trace::emit(
++                "SenderReuse",
++                start,
++                end,
++                &[usize::from(new_fd), crate::scm_trace::ptr(file)],
++            );
++        }
++        replaced
+     };
+     drop(replaced_file);
+ 
+diff --git a/kernel/core/src/syscall/prctl.rs b/kernel/core/src/syscall/prctl.rs
+index c26b3ef6a..63de7c6bb 100644
+--- a/kernel/core/src/syscall/prctl.rs
++++ b/kernel/core/src/syscall/prctl.rs
+@@ -20,6 +20,10 @@ pub(super) fn sys_prctl(
+     arg5: u64,
+     ctx: &Context,
+ ) -> Result<SyscallReturn> {
++    if (0x53504300..=0x53504305).contains(&option) {
++        return crate::scm_trace::control(option, arg2, arg3, arg4, arg5, ctx)
++            .map(|value| SyscallReturn::Return(value as _));
++    }
+     let prctl_cmd = PrctlCmd::from_args(option, arg2, arg3, arg4, arg5)?;
+     debug!("prctl_cmd = {:x?}", prctl_cmd);
+ 
+diff --git a/kernel/core/src/syscall/recvmsg.rs b/kernel/core/src/syscall/recvmsg.rs
+index 0ff25d8c0..f4689b7b0 100644
+--- a/kernel/core/src/syscall/recvmsg.rs
++++ b/kernel/core/src/syscall/recvmsg.rs
+@@ -16,6 +16,8 @@ pub(super) fn sys_recvmsg(
+     flags: i32,
+     ctx: &Context,
+ ) -> Result<SyscallReturn> {
++    let _trace_complete = crate::scm_trace::Complete(true);
++    crate::scm_trace::begin(true);
+     let user_space = ctx.user_space();
+     let mut c_user_msghdr: CUserMsgHdr = user_space.read_val(user_msghdr_ptr)?;
+     let flags = RecvFlags::from_bits_truncate(flags);
+@@ -42,7 +44,10 @@ pub(super) fn sys_recvmsg(
+ 
+     // Writing control messages may access the file table, so it should be called after dropping
+     // the file table borrow.
++    let trace_start = crate::scm_trace::stamp();
+     drop(file_table);
++    let trace_end = crate::scm_trace::stamp();
++    crate::scm_trace::emit("SysRecvmsgReleaseBorrow", trace_start, trace_end, &[]);
+ 
+     let addr = message_header.addr();
+     c_user_msghdr.msg_namelen = c_user_msghdr.write_socket_addr_to_user(addr)?;
+@@ -53,7 +58,19 @@ pub(super) fn sys_recvmsg(
+     c_user_msghdr.msg_controllen = control_len as _;
+     c_user_msghdr.msg_flags = (output.flags() | control_flags).bits().cast_unsigned();
+ 
++    let trace_start = crate::scm_trace::stamp();
+     user_space.write_val(user_msghdr_ptr, &c_user_msghdr)?;
++    let trace_end = crate::scm_trace::stamp();
++    crate::scm_trace::emit(
++        "SysRecvmsgWriteback",
++        trace_start,
++        trace_end,
++        &[
++            control_len as usize,
++            control_flags.bits() as usize,
++            output.len(),
++        ],
++    );
+ 
+     Ok(SyscallReturn::Return(output.len() as _))
+ }
+diff --git a/kernel/core/src/syscall/sendmsg.rs b/kernel/core/src/syscall/sendmsg.rs
+index 974a761fd..02714c78a 100644
+--- a/kernel/core/src/syscall/sendmsg.rs
++++ b/kernel/core/src/syscall/sendmsg.rs
+@@ -19,6 +19,8 @@ pub(super) fn sys_sendmsg(
+     flags: i32,
+     ctx: &Context,
+ ) -> Result<SyscallReturn> {
++    let _trace_complete = crate::scm_trace::Complete(false);
++    crate::scm_trace::begin(false);
+     let user_space = ctx.user_space();
+     let c_user_msghdr: CUserMsgHdr = user_space.read_val(user_msghdr_ptr)?;
+     let flags = SendFlags::from_bits_truncate(flags);
+diff --git a/kernel/core/src/util/net/socket.rs b/kernel/core/src/util/net/socket.rs
+index 1a2493058..1d1ff5069 100644
+--- a/kernel/core/src/util/net/socket.rs
++++ b/kernel/core/src/util/net/socket.rs
+@@ -148,10 +148,25 @@ impl CUserMsgHdr {
+             } else {
+                 RecvFlags::MSG_CTRUNC
+             };
++            let t = crate::scm_trace::stamp();
++            crate::scm_trace::emit(
++                "CUserMsgHdrWriteControl",
++                t,
++                t,
++                &[1, self.msg_controllen, output_flags.bits() as usize],
++            );
+             return Ok((0, output_flags));
+         }
+ 
++        let start = crate::scm_trace::stamp();
+         let mut writer = user_space.writer(self.msg_control, self.msg_controllen)?;
++        let end = crate::scm_trace::stamp();
++        crate::scm_trace::emit(
++            "CUserMsgHdrWriteControl",
++            start,
++            end,
++            &[0, self.msg_controllen, self.msg_control],
++        );
+         let (write_len, output_flags) = ControlMessage::write_all_to(control_messages, &mut writer);
+         Ok((write_len as u32, output_flags))
+     }
+diff --git a/ostd/src/arch/x86/mod.rs b/ostd/src/arch/x86/mod.rs
+index ab9fb40ef..30a4c8967 100644
+--- a/ostd/src/arch/x86/mod.rs
++++ b/ostd/src/arch/x86/mod.rs
+@@ -141,6 +141,8 @@ pub fn read_tsc() -> u64 {
+     unsafe { _rdtsc() }
+ }
+ 
++pub use timer::hpet::{init_trace_clock, read_trace_clock, trace_clock_period};
++
+ /// Reads a hardware generated 64-bit random value.
+ ///
+ /// Returns `None` if no random value was generated.
+diff --git a/ostd/src/arch/x86/timer/hpet.rs b/ostd/src/arch/x86/timer/hpet.rs
+index 856f8b762..5a25a32e2 100644
+--- a/ostd/src/arch/x86/timer/hpet.rs
++++ b/ostd/src/arch/x86/timer/hpet.rs
+@@ -15,12 +15,65 @@ use crate::{
+         irq::{IRQ_CHIP, MappedIrqLine},
+         kernel::acpi::get_acpi_tables,
+     },
++    io::IoMem,
+     irq::IrqLine,
+-    mm::paddr_to_vaddr,
++    mm::{VmIoOnce, paddr_to_vaddr},
+ };
+ 
+ static HPET_INSTANCE: Once<Hpet> = Once::new();
+ 
++struct TraceClock {
++    registers: IoMem,
++    period: u32,
++}
++
++static TRACE_CLOCK: Once<TraceClock> = Once::new();
++
++/// Enables the shared HPET counter before the private tracing fixture starts.
++pub fn init_trace_clock() {
++    TRACE_CLOCK.call_once(|| {
++        let info = HpetInfo::new(get_acpi_tables().unwrap()).unwrap();
++        let base = info.base_address;
++        // MMIO is outside the RAM direct map and needs its own uncached mapping.
++        let registers = IoMem::acquire(base..base + 4096).unwrap();
++        let capabilities = registers.read_once::<u32>(0).unwrap();
++        assert_ne!(capabilities & 0x2000, 0);
++        let period = registers.read_once::<u32>(4).unwrap();
++        let configuration = registers.read_once::<u32>(0x10).unwrap();
++        // The fixture must not enable firmware timer interrupts or legacy routing.
++        assert_eq!(configuration & 2, 0);
++        for timer in 0..=((capabilities >> 8) & 31) {
++            assert_eq!(
++                registers
++                    .read_once::<u32>(0x100 + timer as usize * 0x20)
++                    .unwrap()
++                    & 4,
++                0
++            );
++        }
++        registers.write_once(0x10, &(configuration | 1)).unwrap();
++        TraceClock { registers, period }
++    });
++}
++
++/// Returns the hardware counter period in femtoseconds.
++pub fn trace_clock_period() -> u32 {
++    TRACE_CLOCK.get().unwrap().period
++}
++
++/// Reads the shared counter without a tracing lock or software sequence number.
++pub fn read_trace_clock() -> u64 {
++    let Some(clock) = TRACE_CLOCK.get() else {
++        return 0;
++    };
++    // SAFETY: MFENCE orders memory effects around the single, uncached MMIO read.
++    unsafe { core::arch::x86_64::_mm_mfence() };
++    let value = clock.registers.read_once::<u64>(0xf0).unwrap();
++    // SAFETY: The fence has no memory-safety preconditions.
++    unsafe { core::arch::x86_64::_mm_mfence() };
++    value
++}
++
+ const OFFSET_ID_REGISTER: usize = 0x000;
+ const OFFSET_CONFIGURATION_REGISTER: usize = 0x010;
+ const OFFSET_INTERRUPT_STATUS_REGISTER: usize = 0x020;
+diff --git a/ostd/src/arch/x86/timer/mod.rs b/ostd/src/arch/x86/timer/mod.rs
+index 2c130450d..16d9f4296 100644
+--- a/ostd/src/arch/x86/timer/mod.rs
++++ b/ostd/src/arch/x86/timer/mod.rs
+@@ -10,7 +10,7 @@ macro_rules! __log_prefix {
+ }
+ 
+ mod apic;
+-mod hpet;
++pub(super) mod hpet;
+ pub(in crate::arch) mod pit;
+ 
+ use spin::Once;
+diff --git a/ostd/src/mm/io/mod.rs b/ostd/src/mm/io/mod.rs
+index 820051fde..f8ab477e8 100644
+--- a/ostd/src/mm/io/mod.rs
++++ b/ostd/src/mm/io/mod.rs
+@@ -793,17 +793,24 @@ impl VmWriter<'_, Fallible> {
+     /// and the current writer's cursor remains pointing to
+     /// the original starting position.
+     pub fn write_val<T: Pod>(&mut self, new_val: &T) -> Result<()> {
++        self.write_val_observed(new_val).map_err(|(err, _)| err)
++    }
++
++    /// Reports the copied prefix before restoring the cursor on a failed value copy.
++    pub fn write_val_observed<T: Pod>(
++        &mut self,
++        new_val: &T,
++    ) -> core::result::Result<(), (Error, usize)> {
+         if self.avail() < size_of::<T>() {
+-            return Err(Error::InvalidArgs);
++            return Err((Error::InvalidArgs, 0));
+         }
+ 
+         let mut reader = VmReader::from(new_val.as_bytes());
+         self.write_fallible(&mut reader)
+             .map_err(|(err, copied_len)| {
+-                // The `copied_len` is the number of bytes written so far.
+-                // So the `cursor` can be moved back to the original position.
++                // Preserve both the covered bytes and the original rewind.
+                 self.cursor = self.cursor.wrapping_sub(copied_len);
+-                err
++                (err, copied_len)
+             })?;
+         Ok(())
+     }

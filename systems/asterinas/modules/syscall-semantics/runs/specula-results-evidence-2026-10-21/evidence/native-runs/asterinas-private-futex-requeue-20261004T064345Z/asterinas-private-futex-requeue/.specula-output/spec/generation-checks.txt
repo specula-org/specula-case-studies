@@ -1,0 +1,76 @@
+# Futex round-2 generation checks
+
+The round-2 review findings were the only input to this revision. The approved brief, analysis and source remain unchanged. The source pin is `0c60537098f4c2949ad2d382aaf499de72263d76`, tree `4693fdec88cd7da14bed4f1541eba593f123059c`. The workspace baseline is `f59cca904d60c5e418c8492d0e74b6e45fa6728e`. No commit was made.
+
+All runs use the round-1 Java and jars, at most 2 GiB heap, two workers, one TLC process at a time and a 1,200-second wall limit. Metadata is under `states/`. No configuration bound or enabled property was changed. New logs end in `-round2.log`; all round-1 logs remain unchanged.
+
+## Criteria
+
+| Criterion | Status | Command from workspace root | Evidence |
+|---|---|---|---|
+| R1-heap | PASS | `python3 spec/generation-checks/audit_suite.py --manifest` | [audit-round2.log](generation-checks/audit-round2.log), [review-heap-reversed-round2.log](generation-checks/review-heap-reversed-round2.log), [probe-equal-deadlines-round2.log](generation-checks/probe-equal-deadlines-round2.log) |
+| R2-callbacks | PASS | `python3 spec/generation-checks/run_checks.py timer --suffix=-round2` | [timer-runner-round2.log](generation-checks/timer-runner-round2.log), [review-callbacks-reversed-round2.log](generation-checks/review-callbacks-reversed-round2.log), [audit-round2.log](generation-checks/audit-round2.log) |
+| R3-parse | PASS | `python3 spec/generation-checks/run_checks.py parse --suffix=-round2` | [sany-base-round2.log](generation-checks/sany-base-round2.log), [sany-MC-round2.log](generation-checks/sany-MC-round2.log), [sany-Trace-round2.log](generation-checks/sany-Trace-round2.log) |
+| R4-review-fixtures | PASS | `python3 spec/generation-checks/run_checks.py review --suffix=-round2` | [review-control-round2.log](generation-checks/review-control-round2.log), [review-heap-reversed-round2.log](generation-checks/review-heap-reversed-round2.log), [review-callbacks-reversed-round2.log](generation-checks/review-callbacks-reversed-round2.log), [replay-evidence-round2.json](generation-checks/replay-evidence-round2.json) |
+| R5-mc | PASS | `python3 spec/generation-checks/run_checks.py mc --suffix=-round2` | [mc-runner-round2.log](generation-checks/mc-runner-round2.log), [results-round2.json](generation-checks/results-round2.json) |
+| R6-trace | PASS | `python3 spec/generation-checks/run_checks.py trace --suffix=-round2` | [trace-valid-round2.log](generation-checks/trace-valid-round2.log), [trace-corrupted-round2.log](generation-checks/trace-corrupted-round2.log), [replay-evidence-round2.json](generation-checks/replay-evidence-round2.json) |
+| R7-records | PASS | `python3 spec/generation-checks/audit_suite.py --manifest` | [audit-round2.log](generation-checks/audit-round2.log) |
+
+R1-heap: HeapHeads, TimerCollect and TimerCollectEnd enforce the minimum original deadline for every pop, including cancelled nodes. TraceTimerCollect calls that action and the mapping specifies peek/pop evidence. Source: timer.rs:207-215,253-255,299-304.
+
+R2-callbacks: TimerCollectEnd preserves each invocation vector. TimerCallbackUpgrade starts only its head. Failed upgrade or TimerCallbackFinish advances that vector. Trace batchOwners retains the execution pid and batch until draining, and all callback rows require batch and pending. Source: timer.rs:220-221,262-281.
+
+R3-parse: SANY parses and semantically analyzes all three final modules without errors.
+
+R4-review-fixtures: The equivalent filename-only wrapper accepts control in 75 states. Reversed heap and callback orders are rejected after 29 and 32 reachable prefix states, with empty queues. The v3 copies preserve all original events and old fields.
+
+R5-mc: All 16 original configurations were rerun: 6 completed without violation, 7 reported source-backed model candidates, and 3 stopped at 1200 seconds as INCOMPLETE. PASS records execution and reporting, not a general safety or liveness proof. Bounds and all enabled checks are unchanged.
+
+R6-trace: The regenerated 76-event valid input is accepted by a 77-state complete witness. The corrupted input is rejected after 29 reachable prefix states with an empty queue. Removing only v3 fields recovers each original fixture exactly.
+
+R7-records: Coverage, checks, manifest and the new revision record contain the current outcomes, source checks, hashes and complete changed-file inventory. The round-2 findings were the only input. All round-1 evidence remains unchanged.
+
+## MC outcomes
+
+All 16 MC configurations were rerun with the final model. Six searches completed without violation, seven reported model candidates and three reached the 1,200-second limit. The incomplete counts below are the last reported progress values. They are not exhaustive results.
+
+| Configuration | Outcome | Log |
+|---|---|---|
+| `MC.cfg` | INCOMPLETE. 21,264,677 distinct, 20,866,538 queued, depth 6. | [log](generation-checks/MC-round2.log) |
+| `MC_hunt_completion.cfg` | INCOMPLETE. 2,018,117 distinct, 2,008,050 queued, depth 5. | [log](generation-checks/MC_hunt_completion-round2.log) |
+| `MC_hunt_s1_mismatch.cfg` | Complete without violation. 31 distinct states. | [log](generation-checks/MC_hunt_s1_mismatch-round2.log) |
+| `MC_hunt_s1_registration.cfg` | Complete without violation. 289 distinct states. | [log](generation-checks/MC_hunt_s1_registration-round2.log) |
+| `MC_hunt_s2_quotas.cfg` | Candidate: `RequeueQuotaAndResult`. 19 states (18 transitions). | [log](generation-checks/MC_hunt_s2_quotas-round2.log) |
+| `MC_hunt_s2_return_count.cfg` | Candidate: `RequeueReturnCount`. 30 states (29 transitions). | [log](generation-checks/MC_hunt_s2_return_count-round2.log) |
+| `MC_hunt_s2_same_address.cfg` | Candidate: `RequeueReturnCount`. 24 states (23 transitions). | [log](generation-checks/MC_hunt_s2_same_address-round2.log) |
+| `MC_hunt_s2_unrelated_first.cfg` | Complete without violation. 1,390 distinct states. | [log](generation-checks/MC_hunt_s2_unrelated_first-round2.log) |
+| `MC_hunt_s2_wake_zero_control.cfg` | Complete without violation. 620 distinct states. | [log](generation-checks/MC_hunt_s2_wake_zero_control-round2.log) |
+| `MC_hunt_s2_zero_move_cross_bucket.cfg` | Complete without violation. 772 distinct states. | [log](generation-checks/MC_hunt_s2_zero_move_cross_bucket-round2.log) |
+| `MC_hunt_s2_zero_move_same_bucket.cfg` | Candidate: `RequeueMoveQuota`. 22 states (21 transitions). | [log](generation-checks/MC_hunt_s2_zero_move_same_bucket-round2.log) |
+| `MC_hunt_s2_zero_wake.cfg` | Candidate: `RequeueWakeQuota`. 20 states (19 transitions). | [log](generation-checks/MC_hunt_s2_zero_wake-round2.log) |
+| `MC_hunt_s3_opposite.cfg` | INCOMPLETE. 5,566,834 distinct, 1,008,198 queued, depth 82. | [log](generation-checks/MC_hunt_s3_opposite-round2.log) |
+| `MC_hunt_s3_owner.cfg` | Candidate: `ResourceAccountingBalance`. 56 states (55 transitions). | [log](generation-checks/MC_hunt_s3_owner-round2.log) |
+| `MC_hunt_s3_same_bucket.cfg` | Complete without violation. 57,330 distinct states. | [log](generation-checks/MC_hunt_s3_same_bucket-round2.log) |
+| `MC_hunt_s4_live_migration.cfg` | Candidate: `LiveMigrationExhaustion`. 93 states (92 transitions). | [log](generation-checks/MC_hunt_s4_live_migration-round2.log) |
+
+## Synthetic replay
+
+| Fixture | Result | Reachable states | Log |
+|---|---|---|---|
+| `trace-valid` | ACCEPTED | 77 | [log](generation-checks/trace-valid-round2.log) |
+| `trace-corrupted` | REJECTED | 29 | [log](generation-checks/trace-corrupted-round2.log) |
+| `review-control` | ACCEPTED | 75 | [log](generation-checks/review-control-round2.log) |
+| `review-heap-reversed` | REJECTED | 29 | [log](generation-checks/review-heap-reversed-round2.log) |
+| `review-callbacks-reversed` | REJECTED | 32 | [log](generation-checks/review-callbacks-reversed-round2.log) |
+| `probe-batches-overlap` | ACCEPTED | 77 | [log](generation-checks/probe-batches-overlap-round2.log) |
+| `probe-same-context-overlap` | REJECTED | 32 | [log](generation-checks/probe-same-context-overlap-round2.log) |
+| `probe-callback-wrong-batch` | REJECTED | 32 | [log](generation-checks/probe-callback-wrong-batch-round2.log) |
+| `probe-callback-wrong-context` | REJECTED | 32 | [log](generation-checks/probe-callback-wrong-context-round2.log) |
+| `probe-callbacks-overlap` | REJECTED | 33 | [log](generation-checks/probe-callbacks-overlap-round2.log) |
+| `probe-equal-deadlines` | ACCEPTED | 75 | [log](generation-checks/probe-equal-deadlines-round2.log) |
+
+Fixture generation command: `python3 spec/generation-checks/generate_traces.py --suffix=-round2`. Its log is `generation-checks/fixtures-round2.log`. The v3 inputs preserve the original five schedules and every preexisting event field. `ReviewRound2.tla` overrides only the input filename. The first unmatched events are the non-head pop and the out-of-order callback upgrade. Complete cursor and rejection evidence is in `generation-checks/replay-evidence-round2.json`.
+
+The seven candidates are source-backed implementation histories. Current call states are in `generation-checks/quota-evidence-round2.json`. Current ownership histories and timer-order checks are in `generation-checks/ownership-evidence-round2.json`. No property or implementation action was changed to remove a candidate. Kernel instrumentation, implementation traces, guest execution, Linux controls and runtime confirmation are NOT RUN.
+
+`REVISION-2026-10-05-round2.md` contains every changed file and why it changed. `generation-manifest.json` records the current artifact hashes, excluding itself and the hash-audit log to avoid self-reference. The initial SANY spacing diagnostic is retained as superseded evidence. Only the final `sany-*-round2.log` files establish R3.

@@ -1,0 +1,439 @@
+diff --git a/Makefile b/Makefile
+index ba3b23eb6..1b44611e5 100644
+--- a/Makefile
++++ b/Makefile
+@@ -59,6 +59,8 @@ XFSTESTS_TEST_DEV ?= /dev/vdd
+ XFSTESTS_SCRATCH_DEV ?= /dev/vde
+ # Specify whether to build regression tests under `test/initramfs/src/regression`.
+ ENABLE_REGRESSION_TEST ?= false
++# Specify whether to build the isolated Specula FD/epoll trace harness.
++ENABLE_SPECULA_TRACE ?= false
+ # End of auto test features.
+ 
+ # Network settings
+@@ -107,6 +109,11 @@ CARGO_OSDK_BUILD_ARGS += --kcmd-args="earlycon"
+ CARGO_OSDK_BUILD_ARGS += --kcmd-args="console=$(CONSOLE)"
+ CARGO_OSDK_TEST_ARGS :=
+ 
++ifneq ($(SPECULA_INIT),)
++ENABLE_SPECULA_TRACE := true
++CARGO_OSDK_BUILD_ARGS += --init-args="$(SPECULA_INIT)"
++endif
++
+ ifeq ($(AUTO_TEST), conformance)
+ ENABLE_CONFORMANCE_TEST := true
+ CARGO_OSDK_BUILD_ARGS += --kcmd-args="CONFORMANCE_TEST_SUITE=$(CONFORMANCE_TEST_SUITE)"
+diff --git a/kernel/core/src/events/epoll/file.rs b/kernel/core/src/events/epoll/file.rs
+index 7ebd08eb8..9dc21f8fe 100644
+--- a/kernel/core/src/events/epoll/file.rs
++++ b/kernel/core/src/events/epoll/file.rs
+@@ -63,6 +63,7 @@ impl EpollFile {
+ 
+     /// Controls the interest list of the epoll file.
+     pub fn control(&self, thread_local: &ThreadLocal, cmd: &EpollCtl) -> Result<()> {
++        let capture_span = crate::tla_trace::begin_current();
+         let fd = match cmd {
+             EpollCtl::Add(fd, ..) => *fd,
+             EpollCtl::Del(fd) => *fd,
+@@ -73,7 +74,29 @@ impl EpollFile {
+         let file = get_file_fast!(&mut file_table, fd).into_owned();
+         drop(file_table);
+ 
+-        match *cmd {
++        let (trace_command, trace_trigger) = match *cmd {
++            EpollCtl::Add(_, _, ep_flags) => {
++                let trigger = if ep_flags.contains(EpollFlags::ONE_SHOT) {
++                    crate::tla_trace::EPOLL_TRIGGER_ONESHOT
++                } else if ep_flags.contains(EpollFlags::EDGE_TRIGGER) {
++                    crate::tla_trace::EPOLL_TRIGGER_ET
++                } else {
++                    crate::tla_trace::EPOLL_TRIGGER_LT
++                };
++                (crate::tla_trace::EPOLL_COMMAND_ADD, trigger)
++            }
++            EpollCtl::Del(_) | EpollCtl::Mod(..) => (0, crate::tla_trace::EPOLL_TRIGGER_LT),
++        };
++        crate::tla_trace::record_epoll_capture(
++            capture_span,
++            self as *const Self as usize,
++            fd,
++            &file,
++            trace_command,
++            trace_trigger,
++        );
++
++        let result = match *cmd {
+             EpollCtl::Add(fd, ep_event, ep_flags) => {
+                 self.add_interest(fd, file, ep_event, ep_flags)
+             }
+@@ -81,7 +104,13 @@ impl EpollFile {
+             EpollCtl::Mod(fd, ep_event, ep_flags) => {
+                 self.mod_interest(fd, file, ep_event, ep_flags)
+             }
++        };
++        if result.is_ok() {
++            crate::tla_trace::epoll_control_finish(self as *const Self as usize);
++        } else {
++            crate::tla_trace::epoll_control_abort();
+         }
++        result
+     }
+ 
+     fn add_interest(
+@@ -105,7 +134,9 @@ impl EpollFile {
+             }
+ 
+             let entry = Entry::new(fd, Arc::downgrade(&file).into(), self.ready.clone());
++            let update_span = crate::tla_trace::begin_current();
+             let events = entry.update(ep_event, ep_flags);
++            crate::tla_trace::record_entry_update(update_span, !events.is_empty());
+ 
+             let ready_entry = if !events.is_empty() {
+                 Some(entry.clone())
+@@ -113,11 +144,14 @@ impl EpollFile {
+                 None
+             };
+ 
++            let insert_span = crate::tla_trace::begin_current();
+             let inserted = interest.insert(entry.into());
+             assert!(inserted);
++            crate::tla_trace::record_epoll_add(insert_span);
+ 
+             ready_entry
+         };
++        crate::tla_trace::epoll_terminal_begin();
+ 
+         // Add the new entry to the ready list if the file is ready
+         if let Some(entry) = ready_entry {
+diff --git a/kernel/core/src/lib.rs b/kernel/core/src/lib.rs
+index 85ab76734..852aa3369 100644
+--- a/kernel/core/src/lib.rs
++++ b/kernel/core/src/lib.rs
+@@ -56,6 +56,7 @@ mod security;
+ mod syscall;
+ mod thread;
+ mod time;
++mod tla_trace;
+ mod util;
+ // TODO: Add vDSO support for other architectures.
+ #[cfg(any(target_arch = "x86_64", target_arch = "riscv64"))]
+diff --git a/kernel/core/src/syscall/close.rs b/kernel/core/src/syscall/close.rs
+index 1edf9cc1b..c9bb5261b 100644
+--- a/kernel/core/src/syscall/close.rs
++++ b/kernel/core/src/syscall/close.rs
+@@ -26,8 +26,11 @@ pub fn sys_close(raw_fd: RawFileDesc, ctx: &Context) -> Result<SyscallReturn> {
+         let fd = raw_fd.try_into()?;
+         let file_table = ctx.thread_local.borrow_file_table();
+         let mut file_table_locked = file_table.unwrap().write();
++        let span = crate::tla_trace::begin(ctx.posix_thread.tid());
+         let _ = file_table_locked.get_file(fd)?;
+-        file_table_locked.close_file(fd).unwrap()
++        let closed_file = file_table_locked.close_file(fd).unwrap();
++        crate::tla_trace::record_close_remove(span, fd, closed_file.file());
++        closed_file
+     };
+ 
+     fs::vfs::notify::on_close(closed_file.file());
+@@ -37,7 +40,11 @@ pub fn sys_close(raw_fd: RawFileDesc, ctx: &Context) -> Result<SyscallReturn> {
+     // We don't mind the races between closing the file descriptor and using the file descriptor,
+     // because such races are explicitly allowed in the man pages. See the "Multithreaded processes
+     // and close()" section in <https://man7.org/linux/man-pages/man2/close.2.html>.
++    let closed_ofd = crate::tla_trace::mapped_ofd(closed_file.file()).unwrap_or(3);
++    let alive_after = Arc::strong_count(closed_file.file()) > 1;
++    let drop_span = crate::tla_trace::begin(ctx.posix_thread.tid());
+     drop(closed_file);
++    crate::tla_trace::record_closed_drop(drop_span, closed_ofd, alive_after);
+ 
+     // Linux has error codes for the close() system call for diagnostic and remedial purposes, but
+     // only for a small subset of file systems such as NFS. We currently have no support for such
+@@ -85,6 +92,10 @@ pub fn sys_close_range(
+             return Ok(SyscallReturn::Return(0));
+         }
+         let actual_last = last.min(table_len - 1);
++        let cloexec_span = flags
++            .contains(CloseRangeFlags::CLOEXEC)
++            .then(|| crate::tla_trace::begin(ctx.posix_thread.tid()))
++            .flatten();
+ 
+         for fd in first..=actual_last {
+             // This is a valid FD as it is smaller than `file_table_locked.len()`.
+@@ -98,6 +109,10 @@ pub fn sys_close_range(
+                 files_to_drop.push(file);
+             }
+         }
++
++        if flags.contains(CloseRangeFlags::CLOEXEC) {
++            crate::tla_trace::record_close_range_cloexec(cloexec_span, first, actual_last);
++        }
+     }
+ 
+     drop(files_to_drop);
+diff --git a/kernel/core/src/syscall/dup.rs b/kernel/core/src/syscall/dup.rs
+index b0ba72a91..d60820e7b 100644
+--- a/kernel/core/src/syscall/dup.rs
++++ b/kernel/core/src/syscall/dup.rs
+@@ -10,10 +10,13 @@ use crate::{
+ pub fn sys_dup(old_fd: RawFileDesc, ctx: &Context) -> Result<SyscallReturn> {
+     debug!("old_fd = {}", old_fd);
+ 
++    let old_fd = old_fd.try_into()?;
+     let file_table = ctx.thread_local.borrow_file_table();
+     let mut file_table_locked = file_table.unwrap().write();
+-    let new_fd =
+-        file_table_locked.dup_ceil(old_fd.try_into()?, FileDesc::ZERO, FdFlags::empty())?;
++    let span = crate::tla_trace::begin(ctx.posix_thread.tid());
++    let new_fd = file_table_locked.dup_ceil(old_fd, FileDesc::ZERO, FdFlags::empty())?;
++    let new_file = file_table_locked.get_file(new_fd)?;
++    crate::tla_trace::record_dup_ceil(span, old_fd, new_fd, new_file, FdFlags::empty());
+ 
+     Ok(SyscallReturn::Return(new_fd.into()))
+ }
+@@ -23,7 +26,10 @@ pub fn sys_dup2(old_fd: RawFileDesc, new_fd: RawFileDesc, ctx: &Context) -> Resu
+ 
+     if old_fd == new_fd {
+         let mut file_table = ctx.thread_local.borrow_file_table_mut();
+-        let _file = get_file_fast!(&mut file_table, old_fd.try_into()?);
++        let fd = old_fd.try_into()?;
++        let span = crate::tla_trace::begin(ctx.posix_thread.tid());
++        let file = get_file_fast!(&mut file_table, fd);
++        crate::tla_trace::record_dup2_equal(span, fd, &file);
+         return Ok(SyscallReturn::Return(new_fd as _));
+     }
+ 
+@@ -53,6 +59,7 @@ fn do_dup3(
+     flags: FdFlags,
+     ctx: &Context,
+ ) -> Result<SyscallReturn> {
++    let validate_span = crate::tla_trace::begin(ctx.posix_thread.tid());
+     let old_fd = FileDesc::try_from(old_fd)?;
+     let new_fd = FileDesc::try_from(new_fd)?;
+ 
+@@ -69,13 +76,28 @@ fn do_dup3(
+     {
+         return_errno!(Errno::EBADF);
+     }
++    crate::tla_trace::record_dup3_validate(validate_span, old_fd, new_fd, flags);
+ 
+     let file_table = ctx.thread_local.borrow_file_table();
+     let replaced_file = {
+         let mut file_table_locked = file_table.unwrap().write();
+-        file_table_locked.dup_exact(old_fd, new_fd, flags)?
++        let span = crate::tla_trace::begin(ctx.posix_thread.tid());
++        let replaced_file = file_table_locked.dup_exact(old_fd, new_fd, flags)?;
++        let source_file = file_table_locked.get_file(old_fd)?;
++        crate::tla_trace::record_dup_exact(
++            span,
++            source_file,
++            replaced_file.as_ref().map(|file| file.file()),
++        );
++        replaced_file
+     };
+-    drop(replaced_file);
++    if let Some(replaced_file) = replaced_file {
++        let replaced_ofd = crate::tla_trace::mapped_ofd(replaced_file.file()).unwrap_or(3);
++        let alive_after = Arc::strong_count(replaced_file.file()) > 1;
++        let span = crate::tla_trace::begin(ctx.posix_thread.tid());
++        drop(replaced_file);
++        crate::tla_trace::record_dup_cleanup(span, replaced_ofd, alive_after);
++    }
+ 
+     Ok(SyscallReturn::Return(new_fd.into()))
+ }
+diff --git a/kernel/core/src/syscall/eventfd.rs b/kernel/core/src/syscall/eventfd.rs
+index d7c3dc043..7e13752ec 100644
+--- a/kernel/core/src/syscall/eventfd.rs
++++ b/kernel/core/src/syscall/eventfd.rs
+@@ -130,6 +130,7 @@ impl EventFile {
+         }
+ 
+         // Copy the value from the counter and set the new counter value
++        let counter_span = crate::tla_trace::begin_current();
+         if self.is_semaphore {
+             writer.write_fallible(&mut 1u64.as_bytes().into())?;
+             *counter -= 1;
+@@ -137,8 +138,15 @@ impl EventFile {
+             writer.write_fallible(&mut (*counter).as_bytes().into())?;
+             *counter = 0;
+         }
++        crate::tla_trace::record_eventfd_read(counter_span, self as *const Self as usize, *counter);
+ 
++        let notify_span = crate::tla_trace::begin_current();
+         self.pollee.notify(IoEvents::OUT);
++        crate::tla_trace::record_eventfd_notify_return(
++            notify_span,
++            self as *const Self as usize,
++            *counter,
++        );
+         self.write_wait_queue.wake_all();
+ 
+         Ok(())
+@@ -154,8 +162,20 @@ impl EventFile {
+         if let Some(new_value) = (*counter).checked_add(val)
+             && new_value <= Self::MAX_COUNTER_VALUE
+         {
++            let counter_span = crate::tla_trace::begin_current();
+             *counter = new_value;
++            crate::tla_trace::record_eventfd_add(
++                counter_span,
++                self as *const Self as usize,
++                *counter,
++            );
++            let notify_span = crate::tla_trace::begin_current();
+             self.pollee.notify(IoEvents::IN);
++            crate::tla_trace::record_eventfd_notify_return(
++                notify_span,
++                self as *const Self as usize,
++                *counter,
++            );
+             return Ok(());
+         }
+ 
+diff --git a/kernel/core/src/syscall/fcntl.rs b/kernel/core/src/syscall/fcntl.rs
+index 86285828b..3249f009e 100644
+--- a/kernel/core/src/syscall/fcntl.rs
++++ b/kernel/core/src/syscall/fcntl.rs
+@@ -68,7 +68,9 @@ fn handle_setfd(fd: FileDesc, arg: u64, ctx: &Context) -> Result<SyscallReturn>
+ 
+     let mut file_table = ctx.thread_local.borrow_file_table_mut();
+     file_table.read_with(|inner| {
++        let span = crate::tla_trace::begin(ctx.posix_thread.tid());
+         inner.get_entry(fd)?.set_flags(flags);
++        crate::tla_trace::record_fcntl_setfd(span, fd, flags.contains(FdFlags::CLOEXEC));
+         Ok(SyscallReturn::Return(0))
+     })
+ }
+@@ -85,11 +87,20 @@ fn handle_getfl(fd: FileDesc, ctx: &Context) -> Result<SyscallReturn> {
+ }
+ 
+ fn handle_setfl(fd: FileDesc, arg: u64, ctx: &Context) -> Result<SyscallReturn> {
++    let new_flags = StatusFlags::from_bits_truncate(arg as _);
+     let mut file_table = ctx.thread_local.borrow_file_table_mut();
++    let capture_span = crate::tla_trace::begin(ctx.posix_thread.tid());
+     let file = get_file_fast!(&mut file_table, fd);
++    crate::tla_trace::record_fcntl_setfl_capture(
++        capture_span,
++        fd,
++        &file,
++        new_flags.contains(StatusFlags::O_NONBLOCK),
++    );
+ 
+-    let new_flags = StatusFlags::from_bits_truncate(arg as _);
++    let use_span = crate::tla_trace::begin(ctx.posix_thread.tid());
+     file.update_status_flags(StatusFlagsUpdate::replace(new_flags))?;
++    crate::tla_trace::record_fcntl_setfl_use(use_span);
+ 
+     Ok(SyscallReturn::Return(0))
+ }
+diff --git a/kernel/core/src/syscall/prctl.rs b/kernel/core/src/syscall/prctl.rs
+index 2df850952..f50691f40 100644
+--- a/kernel/core/src/syscall/prctl.rs
++++ b/kernel/core/src/syscall/prctl.rs
+@@ -66,6 +66,7 @@ pub fn sys_prctl(
+             let mut name_bytes = [0u8; ThreadName::MAX_BYTES];
+             ctx.user_space().read_bytes(read_addr, &mut name_bytes)?;
+             *ctx.posix_thread.thread_name().lock() = ThreadName::from_bytes_until_nul(&name_bytes);
++            crate::tla_trace::control_name(ctx, &name_bytes);
+         }
+         PrctlCmd::PR_GET_NAME(write_to_addr) => {
+             let thread_name = ctx.posix_thread.thread_name().lock();
+diff --git a/kernel/core/src/syscall/signalfd.rs b/kernel/core/src/syscall/signalfd.rs
+index 9cc792f48..4db7576be 100644
+--- a/kernel/core/src/syscall/signalfd.rs
++++ b/kernel/core/src/syscall/signalfd.rs
+@@ -112,7 +112,9 @@ fn update_existing_signalfd(
+         .downcast_ref::<SignalFile>()
+         .ok_or_else(|| Error::with_message(Errno::EINVAL, "the file is not a signal file"))?;
+ 
++    let span = crate::tla_trace::begin(ctx.posix_thread.tid());
+     signal_file.update_signal_mask(new_mask);
++    crate::tla_trace::record_signalfd_mask(span, &file, !new_mask.is_empty());
+     signal_file.set_non_blocking(non_blocking);
+     Ok(raw_fd)
+ }
+diff --git a/test/initramfs/Makefile b/test/initramfs/Makefile
+index ebe5a34db..b2d708a80 100644
+--- a/test/initramfs/Makefile
++++ b/test/initramfs/Makefile
+@@ -7,6 +7,7 @@ ENABLE_CONFORMANCE_TEST ?= false
+ CONFORMANCE_TEST_SUITE ?= ltp
+ CONFORMANCE_TEST_WORKDIR ?= /tmp
+ ENABLE_REGRESSION_TEST ?= false
++ENABLE_SPECULA_TRACE ?= false
+ # Specify platform macros when building regression tests (supported: asterinas, linux).
+ # - asterinas: Define both `__asterinas__` and `__linux__`. Tests may fail in Linux.
+ # - linux: Define only `__linux__`. Tests may fail in Asterinas.
+@@ -76,6 +77,7 @@ $(INITRAMFS_IMAGE): $(INITRAMFS)
+ 		--arg enableBenchmarkTest $(ENABLE_BENCHMARK_TEST) \
+ 		--arg enableConformanceTest $(ENABLE_CONFORMANCE_TEST) \
+ 		--arg enableRegressionTest $(ENABLE_REGRESSION_TEST) \
++		--arg enableSpeculaTrace $(ENABLE_SPECULA_TRACE) \
+ 		--argstr conformanceTestSuite $(CONFORMANCE_TEST_SUITE) \
+ 		--argstr conformanceTestWorkDir $(CONFORMANCE_TEST_WORKDIR) \
+ 		--argstr regressionTestPlatform $(REGRESSION_TEST_PLATFORM) \
+@@ -93,6 +95,7 @@ $(INITRAMFS):
+ 		--arg enableBenchmarkTest $(ENABLE_BENCHMARK_TEST) \
+ 		--arg enableConformanceTest $(ENABLE_CONFORMANCE_TEST) \
+ 		--arg enableRegressionTest $(ENABLE_REGRESSION_TEST) \
++		--arg enableSpeculaTrace $(ENABLE_SPECULA_TRACE) \
+ 		--argstr conformanceTestSuite $(CONFORMANCE_TEST_SUITE) \
+ 		--argstr conformanceTestWorkDir $(CONFORMANCE_TEST_WORKDIR) \
+ 		--argstr regressionTestPlatform $(REGRESSION_TEST_PLATFORM) \
+diff --git a/test/initramfs/nix/default.nix b/test/initramfs/nix/default.nix
+index 2c508c0eb..50d1d79c8 100644
+--- a/test/initramfs/nix/default.nix
++++ b/test/initramfs/nix/default.nix
+@@ -1,5 +1,6 @@
+ { target ? "x86_64", enableBenchmarkTest ? false, enableConformanceTest ? false
+-, enableRegressionTest ? false, conformanceTestSuite ? "ltp"
+-, conformanceTestWorkDir ? "/tmp", regressionTestPlatform ? "asterinas"
+-, dnsServer ? "none", smp ? 1, initramfsCompressed ? true, }:
++, enableRegressionTest ? false, enableSpeculaTrace ? false
++, conformanceTestSuite ? "ltp", conformanceTestWorkDir ? "/tmp"
++, regressionTestPlatform ? "asterinas", dnsServer ? "none", smp ? 1
++, initramfsCompressed ? true, }:
+ let
+@@ -32,12 +33,14 @@ in rec {
+   };
+   regression =
+     pkgs.callPackage ./regression { testPlatform = regressionTestPlatform; };
++  specula = pkgs.callPackage ./specula { };
+ 
+   initramfs = pkgs.callPackage ./initramfs.nix {
+     inherit busybox;
+     benchmark = if enableBenchmarkTest then benchmark else null;
+     conformance = if enableConformanceTest then conformance else null;
+     regression = if enableRegressionTest then regression else null;
++    specula = if enableSpeculaTrace then specula else null;
+     dnsServer = dnsServer;
+   };
+   initramfs-image = pkgs.callPackage ./initramfs-image.nix {
+diff --git a/test/initramfs/nix/initramfs.nix b/test/initramfs/nix/initramfs.nix
+index 3bf35a8be..7765236ff 100644
+--- a/test/initramfs/nix/initramfs.nix
++++ b/test/initramfs/nix/initramfs.nix
+@@ -1,5 +1,5 @@
+ { lib, pkgs, stdenvNoCC, fetchFromGitHub, hostPlatform, writeClosure, busybox
+-, benchmark, conformance, regression, dnsServer, }:
++, benchmark, conformance, regression, specula, dnsServer, }:
+ let
+   boot_hello = builtins.path { path = ./../src/boot_hello.sh; };
+   init = builtins.path { path = ./../src/init; };
+@@ -22,6 +22,7 @@ let
+     ++ lib.optionals (benchmark != null) [ benchmark.package ]
+     ++ lib.optionals (conformance != null) [ conformance.package ]
+     ++ lib.optionals (regression != null) [ regression.package ]
++    ++ lib.optionals (specula != null) [ specula ]
+     ++ lib.optionals is_evtest_included [ pkgs.evtest ];
+ in stdenvNoCC.mkDerivation {
+   name = "initramfs";
+@@ -49,6 +50,10 @@ in stdenvNoCC.mkDerivation {
+       cp -r ${regression.package}/* $out/test/
+     ''}
+ 
++    ${lib.optionalString (specula != null) ''
++      cp -r ${specula}/* $out/test/
++    ''}
++
+     ${lib.optionalString (benchmark != null) ''
+       cp -r "${benchmark.package}"/* $out/benchmark/
+     ''}

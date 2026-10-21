@@ -1,0 +1,41 @@
+{
+  "schema_version": "2",
+  "system": "asterinas-memfd-seal-mapping-admission",
+  "generated_by": "validation-workflow",
+  "findings": [
+    {
+      "id": "MC-1",
+      "title": "Post-seal read-only mappings retain writable accounting",
+      "source": "model-checking",
+      "scenario": "1: Admission determines eligibility and accounting",
+      "severity": "Medium",
+      "invariant": "ReadOnlyAdmissionCompatibility",
+      "config": "MC_hunt_scenario1.cfg",
+      "counterexample": "spec/output/validation/MC_hunt_scenario1.out",
+      "affected_code": [
+        "kernel/core/src/vm/vmar/vmar_impls/map.rs:337",
+        "kernel/core/src/fs/fs_impls/ramfs/memfd.rs:80",
+        "kernel/core/src/vm/vmar/vm_mapping.rs:944",
+        "kernel/core/src/vm/page_cache/vmo/mod.rs:1199"
+      ],
+      "summary": "At source commit 0c60537098f4c2949ad2d382aaf499de72263d76, shared READ admission through an O_RDWR handle keeps writable tracking after check_writable removes MAY_WRITE. After WRITE sealing, owner acquisition fails with EPERM; after FUTURE_WRITE sealing, it increments the counter and later causes false EBUSY when WRITE sealing sees no semantically eligible owner. The independent TV1a and TV1b hunts expose the same cause, matching known TV-1 / AST-73 rather than a new defect. Existing Asterinas/Linux harness evidence records the different outcomes, and this phase revalidated its trace correspondence without rerunning the kernels."
+    },
+    {
+      "id": "MC-2",
+      "title": "Seal-rejected fixed replacement removes the existing mapping",
+      "source": "model-checking",
+      "scenario": "4: Rejected operations have operation-specific effects",
+      "severity": "Medium",
+      "invariant": "SealRejectedReplacement",
+      "config": "MC_hunt_TV2.cfg",
+      "counterexample": "spec/output/validation/MC_hunt_TV2.out",
+      "affected_code": [
+        "kernel/core/src/vm/vmar/vmar_impls/map.rs:289",
+        "kernel/core/src/vm/vmar/vmar_impls/mod.rs:377",
+        "kernel/core/src/vm/vmar/vm_mapping.rs:830",
+        "kernel/core/src/fs/fs_impls/ramfs/memfd.rs:80"
+      ],
+      "summary": "At source commit 0c60537098f4c2949ad2d382aaf499de72263d76, VmarMapOptions::build removes the old MAP_FIXED range before checking the incoming memfd mapping against an already active FUTURE_WRITE seal. Ordinary removal completes and drops the old owner, then check_writable rejects the shared WRITE request with EPERM, leaving the old range absent. Linux v6.18 performs the selected seal check before replacement, and existing full/partial differential traces record the observable difference. This is known TV-2 / AST-75, independently exposed by the 31-state TLC counterexample; no kernel repair was performed."
+    }
+  ]
+}

@@ -1,0 +1,96 @@
+{
+  "schema_version": "2",
+  "system": "asterinas-memfd-seal-mapping-admission",
+  "generated_by": "consolidate",
+  "findings": [
+    {
+      "id": "MC-1",
+      "title": "Post-seal read-only mappings retain writable accounting",
+      "source": "model-checking",
+      "scenario": "1: Admission determines eligibility and accounting",
+      "severity": "Medium",
+      "invariant": "ReadOnlyAdmissionCompatibility",
+      "config": "MC_hunt_scenario1.cfg",
+      "counterexample": "spec/output/validation/MC_hunt_scenario1.out",
+      "affected_code": [
+        "kernel/core/src/vm/vmar/vmar_impls/map.rs:337",
+        "kernel/core/src/fs/fs_impls/ramfs/memfd.rs:80",
+        "kernel/core/src/vm/vmar/vm_mapping.rs:944",
+        "kernel/core/src/vm/page_cache/vmo/mod.rs:1199"
+      ],
+      "summary": "At source commit 0c60537098f4c2949ad2d382aaf499de72263d76, shared READ admission through an O_RDWR handle keeps writable tracking after check_writable removes MAY_WRITE. After WRITE sealing, owner acquisition fails with EPERM; after FUTURE_WRITE sealing, it increments the counter and later causes false EBUSY when WRITE sealing sees no semantically eligible owner. The independent TV1a and TV1b hunts expose the same cause, matching known TV-1 / AST-73 rather than a new defect. Existing Asterinas/Linux harness evidence records the different outcomes, and this phase revalidated its trace correspondence without rerunning the kernels.",
+      "dedup_note": "also covers code-review Scenario 1 (same mechanism: the admission tracking decision diverges from seal-checked eligibility; the brief's TV-1 lead with both of its manifestations is this finding's root cause)"
+    },
+    {
+      "id": "MC-2",
+      "title": "Seal-rejected fixed replacement removes the existing mapping",
+      "source": "model-checking",
+      "scenario": "4: Rejected operations have operation-specific effects",
+      "severity": "Medium",
+      "invariant": "SealRejectedReplacement",
+      "config": "MC_hunt_TV2.cfg",
+      "counterexample": "spec/output/validation/MC_hunt_TV2.out",
+      "affected_code": [
+        "kernel/core/src/vm/vmar/vmar_impls/map.rs:289",
+        "kernel/core/src/vm/vmar/vmar_impls/mod.rs:377",
+        "kernel/core/src/vm/vmar/vm_mapping.rs:830",
+        "kernel/core/src/fs/fs_impls/ramfs/memfd.rs:80"
+      ],
+      "summary": "At source commit 0c60537098f4c2949ad2d382aaf499de72263d76, VmarMapOptions::build removes the old MAP_FIXED range before checking the incoming memfd mapping against an already active FUTURE_WRITE seal. Ordinary removal completes and drops the old owner, then check_writable rejects the shared WRITE request with EPERM, leaving the old range absent. Linux v6.18 performs the selected seal check before replacement, and existing full/partial differential traces record the observable difference. This is known TV-2 / AST-75, independently exposed by the 31-state TLC counterexample; no kernel repair was performed.",
+      "dedup_note": "also covers code-review Scenario 4's rejected-fixed-replacement arm (same removal-before-seal-check mechanism); the scenario's protection-prefix and busy-seal-addition arms have no MC violation and are emitted separately as CR-3"
+    },
+    {
+      "id": "CR-1",
+      "title": "Overlapping FUTURE_WRITE publication may misclassify mapping write eligibility",
+      "source": "code-review",
+      "scenario": "2: Seal publication overlaps admission and retained eligibility",
+      "severity": "High",
+      "invariant": null,
+      "config": null,
+      "counterexample": null,
+      "affected_code": [
+        "kernel/core/src/fs/fs_impls/ramfs/memfd.rs:46-89",
+        "kernel/core/src/vm/page_cache/vmo/mod.rs:1199-1235",
+        "kernel/core/src/vm/vmar/vmar_impls/map.rs:269",
+        "kernel/core/src/vm/vmar/vmar_impls/map.rs:337-349",
+        "kernel/core/src/vm/vmar/vmar_impls/map.rs:402",
+        "kernel/core/src/vm/vmar/vmar_impls/protect.rs:39-43"
+      ],
+      "summary": "F_ADD_SEALS serializes on the inode mutex while mmap admission holds the VMAR lock and takes that mutex only briefly, and WRITE exclusion is arbitrated by the writable-mapping counter RMW. The hypothesis is that a FUTURE_WRITE publication overlapping map admission or an old mapping's mprotect could let a new mapping acquire forbidden write access or wrongly strip a pre-existing mapping's retained eligibility, violating the distinction between existing eligibility and new access; a mapping returning after the seal may legally have checked eligibility before it, so return order alone is not a violation. Bounded model checking found no violation for this overlap: MC_hunt_scenario2.cfg (6,466 distinct states, depth 88) and MC_hunt_scenario2_default_seal.cfg (1,984 distinct states, depth 84) both passed RetainedWriteEligibility and SealPublicationAndFreeze. MC-1's TV-1b false EBUSY shares the FUTURE_WRITE counter surface but is caused by admission-time tracking retention rather than overlap ordering, so it does not represent this hypothesis. A real defect here must live outside the modeled bounds (two syscall threads, three page slots, six owner IDs) or outside the ordinary-TLB substrate assumption, and confirmation must judge it without a counterexample."
+    },
+    {
+      "id": "CR-2",
+      "title": "Mapping ownership may not survive split, merge, protection and unmap transitions",
+      "source": "code-review",
+      "scenario": "3: Ownership survives representation changes and revocation",
+      "severity": "High",
+      "invariant": null,
+      "config": null,
+      "counterexample": null,
+      "affected_code": [
+        "kernel/core/src/vm/vmar/vm_mapping.rs:725-788",
+        "kernel/core/src/vm/vmar/vm_mapping.rs:808-875",
+        "kernel/core/src/vm/vmar/vm_mapping.rs:1026-1102",
+        "kernel/core/src/vm/vmar/vmar_impls/mod.rs:292-324",
+        "kernel/core/src/vm/vmar/vmar_impls/mod.rs:391-411",
+        "kernel/core/src/vm/vmar/vmar_impls/page_fault.rs:9-17"
+      ],
+      "summary": "Split, merge, protect and unmap rewrite the VMAR representation while MappedVmo ownership and hardware access have different lifetimes: a split duplicates the owner before transferring it, a merge duplicates before dropping both inputs, and a removed piece stays counted until ordinary PTE/TLB revocation completes. The hypothesis is that partial protection, splitting, merging or unmapping could incorrectly retain or release the write eligibility that blocks WRITE sealing, for example dropping the final eligible owner before revocation completes or leaving a detached owner counted so a later WRITE seal falsely fails with EBUSY. The priority checks are the final remaining eligible mapping and completion of ordinary unmapping. Bounded model checking found no violation: MC_hunt_scenario3.cfg exhausted 32,382 distinct states to depth 157 with TypeAndIdentity, TrackedOwnershipConservation, RetainedWriteEligibility and RevocationBeforeOwnerRelease all passing. Saved issues #2917/#2209/#682 in this area are fixed historical context rather than live leads, so confirmation must look for lifetime defects outside the modeled bounds or abstraction."
+    },
+    {
+      "id": "CR-3",
+      "title": "Failed mprotect prefix and busy seal addition may leave inconsistent observable effects",
+      "source": "code-review",
+      "scenario": "4: Rejected operations have operation-specific effects (protection-prefix and busy-seal arms)",
+      "severity": "Medium",
+      "invariant": null,
+      "config": null,
+      "counterexample": null,
+      "affected_code": [
+        "kernel/core/src/fs/fs_impls/ramfs/memfd.rs:49-68",
+        "kernel/core/src/vm/vmar/vmar_impls/protect.rs:21-77"
+      ],
+      "summary": "The modeling brief observes that a busy seal addition, a partly completed multi-segment mprotect and a rejected fixed replacement have different observable failure boundaries, and the Linux contract preserves operation-specific partial effects rather than requiring syscall-wide rollback. The rejected-fixed-replacement arm is already carried by MC-2 (TV-2 / AST-75); this candidate covers the remaining arms, where a protection change that succeeds on early segments and then fails with EACCES or ENOMEM could wrongly discard the successful prefix or grant permissions beyond a segment's MAY bits, and a busy combined WRITE/FUTURE/SEAL addition could publish seal bits despite failing. Bounded model checking found no violation for these arms: MC_hunt_scenario4.cfg (223 distinct states, depth 68) passed ProtectionPrefixEffects and RevocationBeforeOwnerRelease, and SealPublicationAndFreeze passed in every hunt configuration. Any real deviation must lie outside the modeled bounds, and confirmation must judge it without a counterexample."
+    }
+  ]
+}

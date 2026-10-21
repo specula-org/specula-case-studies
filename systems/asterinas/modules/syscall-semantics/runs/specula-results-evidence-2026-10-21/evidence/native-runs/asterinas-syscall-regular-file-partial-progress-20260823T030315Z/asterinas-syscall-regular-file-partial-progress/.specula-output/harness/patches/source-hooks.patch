@@ -1,0 +1,1658 @@
+diff --git a/Makefile b/Makefile
+index 0ee7af9..5c1bdaa 100644
+--- a/Makefile
++++ b/Makefile
+@@ -62,6 +62,8 @@ XFSTESTS_TEST_DEV ?= /dev/vdd
+ XFSTESTS_SCRATCH_DEV ?= /dev/vde
+ # Specify whether to build regression tests under `test/initramfs/src/regression`.
+ ENABLE_REGRESSION_TEST ?= false
++# Build the isolated Specula regular-file trace harness.
++ENABLE_SPECULA_TRACE ?= false
+ # End of auto test features.
+ 
+ # Network settings
+@@ -113,6 +115,11 @@ CARGO_OSDK_BUILD_ARGS += $(foreach arg,$(CMDLINE),--kcmd-args="$(arg)")
+ endif
+ CARGO_OSDK_TEST_ARGS :=
+ 
++ifneq ($(SPECULA_INIT),)
++ENABLE_SPECULA_TRACE := true
++CARGO_OSDK_BUILD_ARGS += --init-args="$(SPECULA_INIT)"
++endif
++
+ ifeq ($(AUTO_TEST), conformance)
+ ENABLE_CONFORMANCE_TEST := true
+ CARGO_OSDK_BUILD_ARGS += --kcmd-args="CONFORMANCE_TEST_SUITE=$(CONFORMANCE_TEST_SUITE)"
+diff --git a/kernel/core/comps/block/src/bio.rs b/kernel/core/comps/block/src/bio.rs
+index 7e0237d..ed4ed9f 100644
+--- a/kernel/core/comps/block/src/bio.rs
++++ b/kernel/core/comps/block/src/bio.rs
+@@ -1,6 +1,7 @@
+ // SPDX-License-Identifier: MPL-2.0
+ 
+ use alloc::boxed::Box;
++use core::{hint::spin_loop, sync::atomic::AtomicU64};
+ 
+ use align_ext::AlignExt;
+ use aster_util::mem_obj_slice::Slice;
+@@ -38,6 +39,7 @@ pub struct Bio {
+     metadata: Arc<BioMetadata>,
+     complete_fn: Option<BioCompleteFn>,
+     segments: Vec<BioSegment>,
++    trace_identity: Option<crate::tla_trace::TraceIdentity>,
+ }
+ 
+ /// The completion function type for BIO operations.
+@@ -68,12 +70,26 @@ impl Bio {
+             type_,
+             sid_range: start_sid..start_sid + nsectors,
+             status: AtomicU32::new(BioStatus::Init as u32),
++            trace_submit_order: AtomicU64::new(0),
+             wait_queue: WaitQueue::new(),
+         });
+         Self {
+             metadata,
+             complete_fn,
+             segments,
++            trace_identity: None,
++        }
++    }
++
++    /// Attaches test-only completion identity before submission.
++    pub fn set_trace_identity(&mut self, identity: crate::tla_trace::TraceIdentity) {
++        self.trace_identity = Some(identity);
++    }
++
++    /// Returns a handle used to publish the submit event's semantic order.
++    pub fn trace_submit_handle(&self) -> TraceSubmitHandle {
++        TraceSubmitHandle {
++            metadata: self.metadata.clone(),
+         }
+     }
+ 
+@@ -116,6 +132,7 @@ impl Bio {
+             metadata,
+             complete_fn,
+             segments,
++            trace_identity,
+         } = self;
+ 
+         // Change the status from "Init" to "Submit".
+@@ -133,6 +150,7 @@ impl Bio {
+             sid_offset: 0,
+             complete_fn,
+             segments,
++            trace_identity,
+         };
+         if let Err(e) = block_device.enqueue(submitted_bio) {
+             // Fail to submit, revert the status.
+@@ -203,6 +221,21 @@ pub struct SubmittedBio {
+     sid_offset: u64,
+     complete_fn: Option<BioCompleteFn>,
+     segments: Vec<BioSegment>,
++    trace_identity: Option<crate::tla_trace::TraceIdentity>,
++}
++
++/// Submit-side synchronization for completion trace ordering.
++pub struct TraceSubmitHandle {
++    metadata: Arc<BioMetadata>,
++}
++
++impl TraceSubmitHandle {
++    /// Publishes the already-buffered `BioSubmit` event order.
++    pub fn publish_submit_order(self, order: u64) {
++        self.metadata
++            .trace_submit_order
++            .store(order, Ordering::Release);
++    }
+ }
+ 
+ impl SubmittedBio {
+@@ -245,6 +278,8 @@ impl SubmittedBio {
+     pub fn complete(self, status: BioStatus) {
+         assert!(status != BioStatus::Init && status != BioStatus::Submit);
+ 
++        let trace_span = crate::tla_trace::begin_completion(self.trace_identity);
++
+         let Self {
+             metadata,
+             complete_fn,
+@@ -267,6 +302,13 @@ impl SubmittedBio {
+         assert!(result.is_ok());
+ 
+         metadata.wait_queue.wake_all();
++
++        if trace_span.is_some() {
++            while metadata.trace_submit_order.load(Ordering::Acquire) == 0 {
++                spin_loop();
++            }
++        }
++        crate::tla_trace::finish_completion(trace_span);
+     }
+ }
+ 
+@@ -288,6 +330,8 @@ struct BioMetadata {
+     sid_range: Range<Sid>,
+     /// The I/O status
+     status: AtomicU32,
++    /// Semantic order of the corresponding traced submit event, or zero.
++    trace_submit_order: AtomicU64,
+     /// The wait queue for I/O completion
+     wait_queue: WaitQueue,
+ }
+diff --git a/kernel/core/comps/block/src/impl_block_device.rs b/kernel/core/comps/block/src/impl_block_device.rs
+index bdf198c..cc9bcbf 100644
+--- a/kernel/core/comps/block/src/impl_block_device.rs
++++ b/kernel/core/comps/block/src/impl_block_device.rs
+@@ -6,7 +6,7 @@ use ostd::mm::{VmIo, VmReader, VmWriter};
+ 
+ use super::{
+     BLOCK_SIZE, BlockDevice, SECTOR_SIZE,
+-    bio::{Bio, BioCompleteFn, BioEnqueueError, BioSegment, BioStatus, BioType},
++    bio::{Bio, BioCompleteFn, BioEnqueueError, BioSegment, BioStatus, BioType, TraceSubmitHandle},
+     id::{Bid, Sid},
+ };
+ use crate::{
+@@ -74,6 +74,27 @@ impl dyn BlockDevice {
+         bio.submit(self, io_batch)
+     }
+ 
++    /// Submits a write carrying test-only completion identity.
++    pub fn write_blocks_async_traced(
++        &self,
++        bid: Bid,
++        bio_segment: BioSegment,
++        complete_fn: Option<BioCompleteFn>,
++        io_batch: &mut IoBatch,
++        identity: crate::tla_trace::TraceIdentity,
++    ) -> Result<TraceSubmitHandle, BioEnqueueError> {
++        let mut bio = Bio::new(
++            BioType::Write,
++            Sid::from(bid),
++            vec![bio_segment],
++            complete_fn,
++        );
++        bio.set_trace_identity(identity);
++        let handle = bio.trace_submit_handle();
++        bio.submit(self, io_batch)?;
++        Ok(handle)
++    }
++
+     /// Issues a sync request
+     pub fn sync(&self) -> Result<BioStatus, BioEnqueueError> {
+         let bio = Bio::new(BioType::Flush, Sid::from(Bid::from_offset(0)), vec![], None);
+diff --git a/kernel/core/comps/block/src/lib.rs b/kernel/core/comps/block/src/lib.rs
+index 973c7b8..6192d19 100644
+--- a/kernel/core/comps/block/src/lib.rs
++++ b/kernel/core/comps/block/src/lib.rs
+@@ -46,6 +46,7 @@ mod impl_block_device;
+ mod partition;
+ mod prelude;
+ pub mod request_queue;
++pub mod tla_trace;
+ 
+ use ::device_id::DeviceId;
+ use component::{ComponentInitError, init_component};
+diff --git a/kernel/core/src/fs/file/inode_handle.rs b/kernel/core/src/fs/file/inode_handle.rs
+index 99e0cd9..d42a688 100644
+--- a/kernel/core/src/fs/file/inode_handle.rs
++++ b/kernel/core/src/fs/file/inode_handle.rs
+@@ -275,19 +275,56 @@ impl FileLike for InodeHandle {
+             return_errno_with_message!(Errno::EBADF, "the file is not opened readable");
+         }
+ 
+-        let (file_ops, is_offset_aware) = self.file_ops_and_is_offset_aware();
++        let (normal_file_ops, is_offset_aware) = self.file_ops_and_is_offset_aware();
++        let file_ops =
++            crate::tla_trace::reference_file_ops_if_target(self).unwrap_or(normal_file_ops);
+         let status_flags = self.status_flags();
+ 
+         if !is_offset_aware {
+             return file_ops.read_at(0, writer, status_flags);
+         }
+ 
++        let acquire_span = crate::tla_trace::begin_handle(self);
+         let mut offset = self.offset.lock();
+-
+-        let len = file_ops.read_at(*offset, writer, status_flags)?;
+-        *offset += len;
+-
+-        Ok(len)
++        crate::tla_trace::record_offset_acquire(
++            acquire_span,
++            crate::tla_trace::EVENT_INODE_READ_ACQUIRE_OFFSET,
++            *offset,
++        );
++
++        let result = file_ops.read_at(*offset, writer, status_flags);
++        let return_span = crate::tla_trace::begin_handle(self);
++        match result {
++            Ok(len) => {
++                *offset += len;
++                let post_offset = *offset;
++                let stamped = crate::tla_trace::stamp(return_span);
++                drop(offset);
++                crate::tla_trace::record_inode_return(
++                    stamped,
++                    crate::tla_trace::EVENT_INODE_READ_RETURN_OK,
++                    true,
++                    len,
++                    post_offset,
++                    false,
++                );
++                Ok(len)
++            }
++            Err(err) => {
++                let post_offset = *offset;
++                let stamped = crate::tla_trace::stamp(return_span);
++                drop(offset);
++                crate::tla_trace::record_inode_return(
++                    stamped,
++                    crate::tla_trace::EVENT_INODE_READ_RETURN_ERROR,
++                    false,
++                    0,
++                    post_offset,
++                    false,
++                );
++                Err(err)
++            }
++        }
+     }
+ 
+     fn write(&self, reader: &mut VmReader) -> Result<usize> {
+@@ -298,41 +335,116 @@ impl FileLike for InodeHandle {
+             clear_file_priv(self.path().inode().as_ref())?;
+         }
+ 
+-        let (file_ops, is_offset_aware) = self.file_ops_and_is_offset_aware();
++        let (normal_file_ops, is_offset_aware) = self.file_ops_and_is_offset_aware();
++        let file_ops =
++            crate::tla_trace::reference_file_ops_if_target(self).unwrap_or(normal_file_ops);
+         let status_flags = self.status_flags();
+ 
+         if !is_offset_aware {
+             return file_ops.write_at(0, reader, status_flags);
+         }
+ 
++        let acquire_span = crate::tla_trace::begin_handle(self);
+         let mut offset = self.offset.lock();
++        crate::tla_trace::record_offset_acquire(
++            acquire_span,
++            crate::tla_trace::EVENT_INODE_WRITE_ACQUIRE_OFFSET,
++            *offset,
++        );
+ 
+         // FIXME: How can we deal with the `O_APPEND` flag if `open_file` is set?
+         if status_flags.contains(StatusFlags::O_APPEND) && self.open_file.is_none() {
+             // FIXME: `O_APPEND` should ensure that new content is appended even if another process
+             // is writing to the file concurrently.
++            let append_span = crate::tla_trace::begin_handle(self);
++            let old_offset = *offset;
+             *offset = self.path().size();
++            crate::tla_trace::record_append(append_span, old_offset, *offset);
++        }
++
++        let result = file_ops.write_at(*offset, reader, status_flags);
++        let return_span = crate::tla_trace::begin_handle(self);
++        match result {
++            Ok(len) => {
++                *offset += len;
++                let post_offset = *offset;
++                let stamped = crate::tla_trace::stamp(return_span);
++                drop(offset);
++                crate::tla_trace::record_inode_return(
++                    stamped,
++                    crate::tla_trace::EVENT_INODE_WRITE_RETURN_OK,
++                    true,
++                    len,
++                    post_offset,
++                    false,
++                );
++                Ok(len)
++            }
++            Err(err) => {
++                let post_offset = *offset;
++                let stamped = crate::tla_trace::stamp(return_span);
++                drop(offset);
++                crate::tla_trace::record_inode_return(
++                    stamped,
++                    crate::tla_trace::EVENT_INODE_WRITE_RETURN_ERROR,
++                    false,
++                    0,
++                    post_offset,
++                    false,
++                );
++                Err(err)
++            }
+         }
+-
+-        let len = file_ops.write_at(*offset, reader, status_flags)?;
+-        *offset += len;
+-
+-        Ok(len)
+     }
+ 
+     fn read_at(&self, offset: usize, writer: &mut VmWriter) -> Result<usize> {
+-        let file_ops = self.file_ops_for_positional_io()?;
++        let normal_file_ops = self.file_ops_for_positional_io()?;
++        let file_ops =
++            crate::tla_trace::reference_file_ops_if_target(self).unwrap_or(normal_file_ops);
+         if self.status_flags().contains(StatusFlags::O_PATH) || !self.access_mode().is_readable() {
+             return_errno_with_message!(Errno::EBADF, "the file is not opened readable");
+         }
+ 
+         let status_flags = self.status_flags();
+ 
+-        file_ops.read_at(offset, writer, status_flags)
++        crate::tla_trace::record_positional_begin(
++            crate::tla_trace::begin_handle(self),
++            crate::tla_trace::EVENT_INODE_READ_AT_BEGIN,
++            offset,
++        );
++        let result = file_ops.read_at(offset, writer, status_flags);
++        let return_span = crate::tla_trace::stamp(crate::tla_trace::begin_handle(self));
++        let observed_ofd = crate::tla_trace::observed_ofd_offset();
++        match result {
++            Ok(len) => {
++                crate::tla_trace::record_inode_return(
++                    return_span,
++                    crate::tla_trace::EVENT_INODE_READ_RETURN_OK,
++                    true,
++                    len,
++                    observed_ofd,
++                    true,
++                );
++                Ok(len)
++            }
++            Err(err) => {
++                crate::tla_trace::record_inode_return(
++                    return_span,
++                    crate::tla_trace::EVENT_INODE_READ_RETURN_ERROR,
++                    false,
++                    0,
++                    observed_ofd,
++                    true,
++                );
++                Err(err)
++            }
++        }
+     }
+ 
+     fn write_at(&self, mut offset: usize, reader: &mut VmReader) -> Result<usize> {
+-        let file_ops = self.file_ops_for_positional_io()?;
++        let normal_file_ops = self.file_ops_for_positional_io()?;
++        let file_ops =
++            crate::tla_trace::reference_file_ops_if_target(self).unwrap_or(normal_file_ops);
+         if self.status_flags().contains(StatusFlags::O_PATH) || !self.access_mode().is_writable() {
+             return_errno_with_message!(Errno::EBADF, "the file is not opened writable");
+         }
+@@ -350,7 +462,38 @@ impl FileLike for InodeHandle {
+             offset = self.path().size();
+         }
+ 
+-        file_ops.write_at(offset, reader, status_flags)
++        crate::tla_trace::record_positional_begin(
++            crate::tla_trace::begin_handle(self),
++            crate::tla_trace::EVENT_INODE_WRITE_AT_BEGIN,
++            offset,
++        );
++        let result = file_ops.write_at(offset, reader, status_flags);
++        let return_span = crate::tla_trace::stamp(crate::tla_trace::begin_handle(self));
++        let observed_ofd = crate::tla_trace::observed_ofd_offset();
++        match result {
++            Ok(len) => {
++                crate::tla_trace::record_inode_return(
++                    return_span,
++                    crate::tla_trace::EVENT_INODE_WRITE_RETURN_OK,
++                    true,
++                    len,
++                    observed_ofd,
++                    true,
++                );
++                Ok(len)
++            }
++            Err(err) => {
++                crate::tla_trace::record_inode_return(
++                    return_span,
++                    crate::tla_trace::EVENT_INODE_WRITE_RETURN_ERROR,
++                    false,
++                    0,
++                    observed_ofd,
++                    true,
++                );
++                Err(err)
++            }
++        }
+     }
+ 
+     fn ioctl(&self, raw_ioctl: RawIoctl) -> Result<i32> {
+diff --git a/kernel/core/src/fs/fs_impls/ext2/fs.rs b/kernel/core/src/fs/fs_impls/ext2/fs.rs
+index 1a1f899..cca411e 100644
+--- a/kernel/core/src/fs/fs_impls/ext2/fs.rs
++++ b/kernel/core/src/fs/fs_impls/ext2/fs.rs
+@@ -501,6 +501,24 @@ impl Ext2 {
+         Ok(())
+     }
+ 
++    /// Submits an asynchronous block write with Specula completion identity.
++    pub(super) fn write_blocks_async_traced(
++        &self,
++        bid: Ext2Bid,
++        bio_segment: BioSegment,
++        io_batch: &mut IoBatch,
++        identity: aster_block::tla_trace::TraceIdentity,
++    ) -> Result<aster_block::bio::TraceSubmitHandle> {
++        let handle = self.block_device.write_blocks_async_traced(
++            Bid::new(bid as u64),
++            bio_segment,
++            None,
++            io_batch,
++            identity,
++        )?;
++        Ok(handle)
++    }
++
+     /// Writes blocks synchronously starting at `bid`.
+     pub(super) fn write_blocks(&self, bid: Ext2Bid, bio_segment: BioSegment) -> Result<()> {
+         let bio_status = self
+diff --git a/kernel/core/src/fs/fs_impls/ext2/inode/file.rs b/kernel/core/src/fs/fs_impls/ext2/inode/file.rs
+index 8ae1f20..751d961 100644
+--- a/kernel/core/src/fs/fs_impls/ext2/inode/file.rs
++++ b/kernel/core/src/fs/fs_impls/ext2/inode/file.rs
+@@ -28,7 +28,14 @@ impl Inode {
+             return Ok(0);
+         }
+ 
+-        let read_len = self.inner.read().read_at(offset, writer)?;
++        let acquire_span = crate::tla_trace::begin_inode(self as *const Self as usize);
++        let inner = self.inner.read();
++        crate::tla_trace::record_acquire_data(acquire_span);
++        let result = inner.read_at(offset, writer);
++        let release_span = crate::tla_trace::stamp(crate::tla_trace::begin_backend());
++        drop(inner);
++        crate::tla_trace::record_release_data(release_span);
++        let read_len = result?;
+         if read_len > 0 {
+             self.inner.write().set_atime(utils::now());
+         }
+@@ -43,12 +50,23 @@ impl Inode {
+ 
+         let write_len = reader.remain();
+         if write_len == 0 {
++            crate::tla_trace::record(
++                crate::tla_trace::begin_inode(self as *const Self as usize),
++                crate::tla_trace::EVENT_EXT2_ZERO_WRITE_RETURN,
++                crate::tla_trace::event_fields(&[0, 0]),
++            );
+             return Ok(0);
+         }
+ 
+         let fs = self.fs()?;
++        let acquire_span = crate::tla_trace::begin_inode(self as *const Self as usize);
+         let mut inner = self.inner.write();
+-        inner.write_at(&fs, offset, reader)
++        crate::tla_trace::record_acquire_data(acquire_span);
++        let result = inner.write_at(&fs, offset, reader);
++        let release_span = crate::tla_trace::stamp(crate::tla_trace::begin_backend());
++        drop(inner);
++        crate::tla_trace::record_release_data(release_span);
++        result
+     }
+ 
+     /// Direct-I/O read path.
+@@ -67,7 +85,14 @@ impl Inode {
+         }
+ 
+         let fs = self.fs()?;
+-        let read_len = self.inner.read().read_direct_at(&fs, offset, writer)?;
++        let acquire_span = crate::tla_trace::begin_inode(self as *const Self as usize);
++        let inner = self.inner.read();
++        crate::tla_trace::record_acquire_data(acquire_span);
++        let result = inner.read_direct_at(&fs, offset, writer);
++        let release_span = crate::tla_trace::stamp(crate::tla_trace::begin_backend());
++        drop(inner);
++        crate::tla_trace::record_release_data(release_span);
++        let read_len = result?;
+         if read_len > 0 {
+             self.inner.write().set_atime(utils::now());
+         }
+@@ -82,6 +107,11 @@ impl Inode {
+ 
+         let write_len = reader.remain();
+         if write_len == 0 {
++            crate::tla_trace::record(
++                crate::tla_trace::begin_inode(self as *const Self as usize),
++                crate::tla_trace::EVENT_EXT2_ZERO_WRITE_RETURN,
++                crate::tla_trace::event_fields(&[0, 0]),
++            );
+             return Ok(0);
+         }
+ 
+@@ -91,8 +121,14 @@ impl Inode {
+         }
+ 
+         let fs = self.fs()?;
++        let acquire_span = crate::tla_trace::begin_inode(self as *const Self as usize);
+         let mut inner = self.inner.write();
+-        inner.write_direct_at(&fs, offset, reader)
++        crate::tla_trace::record_acquire_data(acquire_span);
++        let result = inner.write_direct_at(&fs, offset, reader);
++        let release_span = crate::tla_trace::stamp(crate::tla_trace::begin_backend());
++        drop(inner);
++        crate::tla_trace::record_release_data(release_span);
++        result
+     }
+ 
+     /// Truncates or extends the file to `new_size` bytes.
+@@ -227,19 +263,62 @@ impl InodeInner {
+ 
+     /// Reads file data at `offset` through the inode page cache.
+     fn read_at(&self, offset: usize, writer: &mut VmWriter) -> Result<usize> {
+-        if writer.avail() == 0 {
+-            return Ok(0);
+-        }
+-
++        let requested = writer.avail();
+         let file_size = self.file_size();
+-        if offset >= file_size {
++        if requested == 0 || offset >= file_size {
++            let epoch = crate::tla_trace::sample_data_epoch();
++            crate::tla_trace::record(
++                crate::tla_trace::begin_backend(),
++                crate::tla_trace::EVENT_FILE_READ_COPY_COMPLETE,
++                crate::tla_trace::event_fields(&[requested as u64, 0, 0, 0, epoch]),
++            );
++            crate::tla_trace::record(
++                crate::tla_trace::begin_backend(),
++                crate::tla_trace::EVENT_FILE_READ_FINISH,
++                crate::tla_trace::event_fields(&[1, 0, file_size as u64]),
++            );
+             return Ok(0);
+         }
+ 
+         let read_len = writer.avail().min(file_size - offset);
+         writer.limit(read_len);
+-        self.page_cache().read(offset, writer)?;
+-        Ok(read_len)
++        let before = writer.avail();
++        let copy_span = crate::tla_trace::begin_backend();
++        let result = self.page_cache().read(offset, writer);
++        let copied = before - writer.avail();
++        let epoch = crate::tla_trace::sample_data_epoch();
++        match result {
++            Ok(()) => {
++                crate::tla_trace::record(
++                    copy_span,
++                    crate::tla_trace::EVENT_FILE_READ_COPY_COMPLETE,
++                    crate::tla_trace::event_fields(&[requested as u64, copied as u64, 0, 0, epoch]),
++                );
++                crate::tla_trace::record(
++                    crate::tla_trace::begin_backend(),
++                    crate::tla_trace::EVENT_FILE_READ_FINISH,
++                    crate::tla_trace::event_fields(&[1, read_len as u64, file_size as u64]),
++                );
++                Ok(read_len)
++            }
++            Err(err) => {
++                crate::tla_trace::record(
++                    copy_span,
++                    if copied == 0 {
++                        crate::tla_trace::EVENT_FILE_READ_COPY_FAULT_ZERO
++                    } else {
++                        crate::tla_trace::EVENT_FILE_READ_COPY_FAULT_POSITIVE
++                    },
++                    crate::tla_trace::event_fields(&[requested as u64, copied as u64, 0, 0, epoch]),
++                );
++                crate::tla_trace::record(
++                    crate::tla_trace::begin_backend(),
++                    crate::tla_trace::EVENT_FILE_READ_FINISH,
++                    crate::tla_trace::event_fields(&[0, 0, file_size as u64]),
++                );
++                Err(err.into())
++            }
++        }
+     }
+ 
+     /// Writes file data at `offset` through the inode page cache.
+@@ -254,27 +333,104 @@ impl InodeInner {
+             .ok_or_else(|| Error::with_message(Errno::EINVAL, "write range overflow"))?;
+         let old_size = self.file_size();
+ 
++        let prepare_span = crate::tla_trace::begin_backend();
+         if let Err(err) = self.prepare_write(fs, offset, end) {
+             self.rollback_write(old_size, end);
+             return Err(err);
+         }
++        crate::tla_trace::record(
++            prepare_span,
++            crate::tla_trace::EVENT_INODE_INNER_PREPARE_WRITE,
++            crate::tla_trace::event_fields(&[old_size as u64, end as u64]),
++        );
+ 
+-        if let Err(err) = self.page_cache().write(offset, reader) {
++        crate::tla_trace::reset_copy_observation();
++        let before = reader.remain();
++        let copy_span = crate::tla_trace::begin_backend();
++        let copy_result = self.page_cache().write(offset, reader);
++        let copied = before - reader.remain();
++
++        if let Err(err) = copy_result {
++            let (fault_page, retained) = crate::tla_trace::copy_observation();
++            crate::tla_trace::record(
++                copy_span,
++                if copied == 0 {
++                    crate::tla_trace::EVENT_FILE_WRITE_COPY_FAULT_ZERO
++                } else {
++                    crate::tla_trace::EVENT_FILE_WRITE_COPY_FAULT_POSITIVE
++                },
++                crate::tla_trace::event_fields(&[
++                    write_len as u64,
++                    copied as u64,
++                    fault_page.into(),
++                    retained as u64,
++                    crate::tla_trace::sample_data_epoch(),
++                ]),
++            );
+             self.rollback_write(old_size, end);
++            let retains_old_data = retained > 0 && offset < old_size;
++            let epoch = if retains_old_data {
++                crate::tla_trace::publish_data_effect()
++            } else {
++                crate::tla_trace::sample_data_epoch()
++            };
++            crate::tla_trace::record(
++                crate::tla_trace::begin_backend(),
++                if retains_old_data {
++                    crate::tla_trace::EVENT_BUFFERED_WRITE_FAULT_RETAIN
++                } else {
++                    crate::tla_trace::EVENT_BUFFERED_WRITE_FAULT_DISCARD
++                },
++                crate::tla_trace::event_fields(&[self.file_size() as u64, epoch]),
++            );
+             return Err(err.into());
+         }
+ 
++        crate::tla_trace::record(
++            copy_span,
++            crate::tla_trace::EVENT_FILE_WRITE_COPY_COMPLETE,
++            crate::tla_trace::event_fields(&[
++                write_len as u64,
++                copied as u64,
++                crate::tla_trace::PAGE_UP_TO_DATE.into(),
++                copied as u64,
++                crate::tla_trace::sample_data_epoch(),
++            ]),
++        );
++
+         self.set_mtime_ctime(utils::now());
+         if end > old_size {
+             self.set_file_size(end);
+         }
++        let epoch = if copied > 0 {
++            crate::tla_trace::publish_data_effect()
++        } else {
++            crate::tla_trace::sample_data_epoch()
++        };
++        crate::tla_trace::record(
++            crate::tla_trace::begin_backend(),
++            crate::tla_trace::EVENT_BUFFERED_WRITE_SUCCESS,
++            crate::tla_trace::event_fields(&[write_len as u64, self.file_size() as u64, epoch]),
++        );
+         Ok(write_len)
+     }
+ 
+     /// Reads file data directly after flushing overlapping cached pages.
+     fn read_direct_at(&self, fs: &Ext2, offset: usize, writer: &mut VmWriter) -> Result<usize> {
++        let requested = writer.avail();
+         let file_size = self.file_size();
+-        if offset >= file_size || writer.avail() == 0 {
++        if offset >= file_size || requested == 0 {
++            let epoch = crate::tla_trace::sample_data_epoch();
++            crate::tla_trace::record(
++                crate::tla_trace::begin_backend(),
++                crate::tla_trace::EVENT_FILE_READ_COPY_COMPLETE,
++                crate::tla_trace::event_fields(&[requested as u64, 0, 0, 0, epoch]),
++            );
++            crate::tla_trace::record(
++                crate::tla_trace::begin_backend(),
++                crate::tla_trace::EVENT_DIRECT_READ_FINISH,
++                crate::tla_trace::event_fields(&[1, 0, file_size as u64]),
++            );
+             return Ok(0);
+         }
+ 
+@@ -283,8 +439,43 @@ impl InodeInner {
+         let end = offset + read_len;
+ 
+         self.page_cache().flush_range(offset..end)?;
+-        self.read_direct_blocks(fs, offset, end, writer)?;
+-        Ok(read_len)
++        let before = writer.avail();
++        let copy_span = crate::tla_trace::begin_backend();
++        let result = self.read_direct_blocks(fs, offset, end, writer);
++        let copied = before - writer.avail();
++        let epoch = crate::tla_trace::sample_data_epoch();
++        match result {
++            Ok(()) => {
++                crate::tla_trace::record(
++                    copy_span,
++                    crate::tla_trace::EVENT_FILE_READ_COPY_COMPLETE,
++                    crate::tla_trace::event_fields(&[requested as u64, copied as u64, 0, 0, epoch]),
++                );
++                crate::tla_trace::record(
++                    crate::tla_trace::begin_backend(),
++                    crate::tla_trace::EVENT_DIRECT_READ_FINISH,
++                    crate::tla_trace::event_fields(&[1, read_len as u64, file_size as u64]),
++                );
++                Ok(read_len)
++            }
++            Err(err) => {
++                crate::tla_trace::record(
++                    copy_span,
++                    if copied == 0 {
++                        crate::tla_trace::EVENT_FILE_READ_COPY_FAULT_ZERO
++                    } else {
++                        crate::tla_trace::EVENT_FILE_READ_COPY_FAULT_POSITIVE
++                    },
++                    crate::tla_trace::event_fields(&[requested as u64, copied as u64, 0, 0, epoch]),
++                );
++                crate::tla_trace::record(
++                    crate::tla_trace::begin_backend(),
++                    crate::tla_trace::EVENT_DIRECT_READ_FINISH,
++                    crate::tla_trace::event_fields(&[0, 0, file_size as u64]),
++                );
++                Err(err)
++            }
++        }
+     }
+ 
+     /// Writes file data directly after invalidating overlapping cached pages.
+@@ -304,10 +495,16 @@ impl InodeInner {
+             .ok_or_else(|| Error::with_message(Errno::EINVAL, "write range overflow"))?;
+         let old_size = self.file_size();
+ 
++        let prepare_span = crate::tla_trace::begin_backend();
+         if let Err(err) = self.prepare_write(fs, offset, end) {
+             self.rollback_write(old_size, end);
+             return Err(err);
+         }
++        crate::tla_trace::record(
++            prepare_span,
++            crate::tla_trace::EVENT_INODE_INNER_PREPARE_WRITE,
++            crate::tla_trace::event_fields(&[old_size as u64, end as u64]),
++        );
+ 
+         let discard_start_bytes = offset.min(old_size);
+         let discard_end_bytes = end.min(old_size);
+@@ -318,6 +515,11 @@ impl InodeInner {
+ 
+         if let Err(err) = self.write_direct_blocks(fs, offset, reader) {
+             self.rollback_write(old_size, end);
++            crate::tla_trace::record(
++                crate::tla_trace::begin_backend(),
++                crate::tla_trace::EVENT_DIRECT_WRITE_ROLLBACK,
++                crate::tla_trace::event_fields(&[self.file_size() as u64]),
++            );
+             return Err(err);
+         }
+ 
+@@ -325,6 +527,11 @@ impl InodeInner {
+         if end > self.file_size() {
+             self.set_file_size(end);
+         }
++        crate::tla_trace::record(
++            crate::tla_trace::begin_backend(),
++            crate::tla_trace::EVENT_DIRECT_WRITE_COMMIT,
++            crate::tla_trace::event_fields(&[write_len as u64, self.file_size() as u64]),
++        );
+         Ok(write_len)
+     }
+ 
+@@ -381,13 +588,68 @@ impl InodeInner {
+         let mut range_iter = self.block_manager()?.iter_io_ranges(iblock_range);
+ 
+         let mut io_batch = IoBatch::new();
++        let mut logical_offset = offset;
+         while let Some(range) = range_iter.next()? {
+             match range {
+                 IoRange::Mapped(device_range) => {
+                     let nblocks = device_range.len();
++                    let range_bytes = nblocks as usize * BLOCK_SIZE;
+                     let bio_segment = BioSegment::alloc(nblocks, BioDirection::ToDevice);
+-                    bio_segment.writer().unwrap().write_fallible(reader)?;
+-                    fs.write_blocks_async(device_range.start, bio_segment, None, &mut io_batch)?;
++                    let before = reader.remain();
++                    let copy_span = crate::tla_trace::begin_backend();
++                    let copy_result = bio_segment.writer().unwrap().write_fallible(reader);
++                    let copied = before - reader.remain();
++                    let part = crate::tla_trace::current_direct_part();
++                    match copy_result {
++                        Ok(_) => {
++                            crate::tla_trace::record(
++                                copy_span,
++                                crate::tla_trace::EVENT_BIO_SEGMENT_COPY_COMPLETE,
++                                crate::tla_trace::event_fields(&[
++                                    range_bytes as u64,
++                                    copied as u64,
++                                    logical_offset as u64,
++                                    part,
++                                ]),
++                            );
++                        }
++                        Err((err, _)) => {
++                            crate::tla_trace::record(
++                                copy_span,
++                                if copied == 0 {
++                                    crate::tla_trace::EVENT_BIO_SEGMENT_COPY_FAULT_ZERO
++                                } else {
++                                    crate::tla_trace::EVENT_BIO_SEGMENT_COPY_FAULT_POSITIVE
++                                },
++                                crate::tla_trace::event_fields(&[
++                                    range_bytes as u64,
++                                    copied as u64,
++                                    logical_offset as u64,
++                                    part,
++                                ]),
++                            );
++                            return Err(err.into());
++                        }
++                    }
++
++                    if let Some(identity) = crate::tla_trace::current_bio_identity(logical_offset) {
++                        let submit_span = crate::tla_trace::begin_backend();
++                        let handle = fs.write_blocks_async_traced(
++                            device_range.start,
++                            bio_segment,
++                            &mut io_batch,
++                            identity,
++                        )?;
++                        crate::tla_trace::record_bio_submit(submit_span, identity, handle);
++                    } else {
++                        fs.write_blocks_async(
++                            device_range.start,
++                            bio_segment,
++                            None,
++                            &mut io_batch,
++                        )?;
++                    }
++                    logical_offset += range_bytes;
+                 }
+                 IoRange::Hole(_) => {
+                     // TODO: Consider falling back to buffered write like Linux.
+@@ -403,6 +665,11 @@ impl InodeInner {
+         }
+ 
+         io_batch.wait_all()?;
++        crate::tla_trace::record(
++            crate::tla_trace::begin_backend(),
++            crate::tla_trace::EVENT_IO_BATCH_WAIT_ALL,
++            [0; 16],
++        );
+         Ok(())
+     }
+ 
+diff --git a/kernel/core/src/fs/fs_impls/ramfs/fs.rs b/kernel/core/src/fs/fs_impls/ramfs/fs.rs
+index 005b013..7773fc5 100644
+--- a/kernel/core/src/fs/fs_impls/ramfs/fs.rs
++++ b/kernel/core/src/fs/fs_impls/ramfs/fs.rs
+@@ -700,14 +700,74 @@ impl FileOps for RamInode {
+     ) -> Result<usize> {
+         let read_len = match &self.inner {
+             Inner::File(page_cache) => {
+-                let (offset, read_len) = {
++                let (offset, read_len, file_size) = {
+                     let file_size = self.size();
+                     let start = file_size.min(offset);
+                     let end = file_size.min(offset + writer.avail());
+-                    (start, end - start)
++                    (start, end - start, file_size)
+                 };
+-                page_cache.lock().read(offset, writer)?;
+-                read_len
++                crate::tla_trace::record(
++                    crate::tla_trace::begin_inode(self as *const Self as usize),
++                    crate::tla_trace::EVENT_RAM_READ_SNAPSHOT_SIZE,
++                    crate::tla_trace::event_fields(&[file_size as u64]),
++                );
++                let acquire_span = crate::tla_trace::begin_inode(self as *const Self as usize);
++                let page_cache = page_cache.lock();
++                crate::tla_trace::record_acquire_data(acquire_span);
++                let requested = writer.avail();
++                let before = writer.avail();
++                let copy_span = crate::tla_trace::begin_backend();
++                let result = page_cache.read(offset, writer);
++                let copied = before - writer.avail();
++                let epoch = crate::tla_trace::sample_data_epoch();
++                let read_result = match result {
++                    Ok(()) => {
++                        crate::tla_trace::record(
++                            copy_span,
++                            crate::tla_trace::EVENT_FILE_READ_COPY_COMPLETE,
++                            crate::tla_trace::event_fields(&[
++                                requested as u64,
++                                copied as u64,
++                                0,
++                                0,
++                                epoch,
++                            ]),
++                        );
++                        crate::tla_trace::record(
++                            crate::tla_trace::begin_backend(),
++                            crate::tla_trace::EVENT_FILE_READ_FINISH,
++                            crate::tla_trace::event_fields(&[1, read_len as u64, file_size as u64]),
++                        );
++                        Ok(read_len)
++                    }
++                    Err(err) => {
++                        crate::tla_trace::record(
++                            copy_span,
++                            if copied == 0 {
++                                crate::tla_trace::EVENT_FILE_READ_COPY_FAULT_ZERO
++                            } else {
++                                crate::tla_trace::EVENT_FILE_READ_COPY_FAULT_POSITIVE
++                            },
++                            crate::tla_trace::event_fields(&[
++                                requested as u64,
++                                copied as u64,
++                                0,
++                                0,
++                                epoch,
++                            ]),
++                        );
++                        crate::tla_trace::record(
++                            crate::tla_trace::begin_backend(),
++                            crate::tla_trace::EVENT_FILE_READ_FINISH,
++                            crate::tla_trace::event_fields(&[0, 0, file_size as u64]),
++                        );
++                        Err(err)
++                    }
++                };
++                let release_span = crate::tla_trace::stamp(crate::tla_trace::begin_backend());
++                drop(page_cache);
++                crate::tla_trace::record_release_data(release_span);
++                read_result?
+             }
+             _ => return_errno_with_message!(Errno::EISDIR, "read is not supported"),
+         };
+@@ -728,7 +788,9 @@ impl FileOps for RamInode {
+             InodeType::File => {
+                 let now = now();
+ 
++                let acquire_span = crate::tla_trace::begin_inode(self as *const Self as usize);
+                 let mut page_cache = self.inner.as_file().unwrap().lock();
++                crate::tla_trace::record_acquire_data(acquire_span);
+ 
+                 let mut inode_meta = self.metadata.lock();
+                 let file_size = inode_meta.size;
+@@ -743,12 +805,86 @@ impl FileOps for RamInode {
+                     inode_meta.blocks = new_size_aligned / BLOCK_SIZE;
+                 }
+                 drop(inode_meta);
++                crate::tla_trace::record(
++                    crate::tla_trace::begin_backend(),
++                    crate::tla_trace::EVENT_RAM_PUBLISH_METADATA,
++                    crate::tla_trace::event_fields(&[
++                        file_size as u64,
++                        new_size as u64,
++                        file_size.max(new_size) as u64,
++                    ]),
++                );
+ 
+                 if should_expand_size {
+                     page_cache.resize(new_size_aligned, file_size)?;
+                 }
+-                page_cache.write(offset, reader)?;
+-
++                crate::tla_trace::reset_copy_observation();
++                let before = reader.remain();
++                let copy_span = crate::tla_trace::begin_backend();
++                let result = page_cache.write(offset, reader);
++                let copied = before - reader.remain();
++                let copy_error = match result {
++                    Ok(()) => {
++                        crate::tla_trace::record(
++                            copy_span,
++                            crate::tla_trace::EVENT_FILE_WRITE_COPY_COMPLETE,
++                            crate::tla_trace::event_fields(&[
++                                write_len as u64,
++                                copied as u64,
++                                crate::tla_trace::PAGE_UP_TO_DATE.into(),
++                                copied as u64,
++                                crate::tla_trace::sample_data_epoch(),
++                            ]),
++                        );
++                        None
++                    }
++                    Err(err) => {
++                        crate::tla_trace::record(
++                            copy_span,
++                            if copied == 0 {
++                                crate::tla_trace::EVENT_FILE_WRITE_COPY_FAULT_ZERO
++                            } else {
++                                crate::tla_trace::EVENT_FILE_WRITE_COPY_FAULT_POSITIVE
++                            },
++                            crate::tla_trace::event_fields(&[
++                                write_len as u64,
++                                copied as u64,
++                                crate::tla_trace::PAGE_UP_TO_DATE.into(),
++                                copied as u64,
++                                crate::tla_trace::sample_data_epoch(),
++                            ]),
++                        );
++                        Some(err)
++                    }
++                };
++                let epoch = if copied > 0 {
++                    crate::tla_trace::publish_data_effect()
++                } else {
++                    crate::tla_trace::sample_data_epoch()
++                };
++                crate::tla_trace::record(
++                    crate::tla_trace::begin_backend(),
++                    if copy_error.is_none() {
++                        crate::tla_trace::EVENT_ANON_WRITE_SUCCESS
++                    } else {
++                        crate::tla_trace::EVENT_ANON_WRITE_FAULT
++                    },
++                    crate::tla_trace::event_fields(&[
++                        if copy_error.is_none() {
++                            write_len as u64
++                        } else {
++                            0
++                        },
++                        file_size.max(new_size) as u64,
++                        epoch,
++                    ]),
++                );
++                let release_span = crate::tla_trace::stamp(crate::tla_trace::begin_backend());
++                drop(page_cache);
++                crate::tla_trace::record_release_data(release_span);
++                if let Some(err) = copy_error {
++                    return Err(err.into());
++                }
+                 write_len
+             }
+             _ => return_errno_with_message!(Errno::EISDIR, "write is not supported"),
+diff --git a/kernel/core/src/lib.rs b/kernel/core/src/lib.rs
+index bfa6b7c..2de6a81 100644
+--- a/kernel/core/src/lib.rs
++++ b/kernel/core/src/lib.rs
+@@ -57,6 +57,7 @@ mod security;
+ mod syscall;
+ mod thread;
+ mod time;
++mod tla_trace;
+ mod util;
+ // TODO: Add vDSO support for other architectures.
+ #[cfg(any(target_arch = "x86_64", target_arch = "riscv64"))]
+diff --git a/kernel/core/src/process/posix_thread/thread_local.rs b/kernel/core/src/process/posix_thread/thread_local.rs
+index 0860345..93fddcb 100644
+--- a/kernel/core/src/process/posix_thread/thread_local.rs
++++ b/kernel/core/src/process/posix_thread/thread_local.rs
+@@ -53,6 +53,9 @@ pub(crate) struct ThreadLocal {
+     /// at the most recent kernel entry, or `None` for non-syscall entries.
+     orig_syscall_ret: Cell<Option<usize>>,
+ 
++    // Test-only fixed actor label for allocation-free Specula tracing.
++    specula_trace_actor: Cell<u8>,
++
+     // Namespaces.
+     user_ns: RefCell<Arc<UserNamespace>>,
+     ns_proxy: RefCell<Option<Arc<NsProxy>>>,
+@@ -82,6 +85,7 @@ impl ThreadLocal {
+             sig_stack: RefCell::new(SigStack::default()),
+             sig_mask_saved: Cell::new(None),
+             orig_syscall_ret: Cell::new(None),
++            specula_trace_actor: Cell::new(u8::MAX),
+             user_ns: RefCell::new(user_ns),
+             ns_proxy: RefCell::new(Some(ns_proxy)),
+         }
+@@ -188,6 +192,14 @@ impl ThreadLocal {
+         self.orig_syscall_ret.set(value);
+     }
+ 
++    pub(crate) fn specula_trace_actor(&self) -> u8 {
++        self.specula_trace_actor.get()
++    }
++
++    pub(crate) fn set_specula_trace_actor(&self, actor: u8) {
++        self.specula_trace_actor.set(actor);
++    }
++
+     pub(crate) fn borrow_user_ns(&self) -> Ref<'_, Arc<UserNamespace>> {
+         self.user_ns.borrow()
+     }
+diff --git a/kernel/core/src/process/signal/mod.rs b/kernel/core/src/process/signal/mod.rs
+index 3ef4e7c..394ed23 100644
+--- a/kernel/core/src/process/signal/mod.rs
++++ b/kernel/core/src/process/signal/mod.rs
+@@ -56,6 +56,11 @@ pub(crate) fn handle_pending_signal(user_ctx: &mut UserContext, ctx: &Context) {
+     {
+         // We should never return `ERESTARTSYS` to the userspace.
+         user_ctx.set_syscall_ret(-(Errno::EINTR as i32) as usize);
++        crate::tla_trace::record(
++            crate::tla_trace::begin_current(),
++            crate::tla_trace::EVENT_SIGNAL_CLASSIFY,
++            crate::tla_trace::event_fields(&[orig_syscall_ret as u64]),
++        );
+         Some(orig_syscall_ret)
+     } else {
+         None
+@@ -157,6 +162,19 @@ pub(crate) fn handle_pending_signal(user_ctx: &mut UserContext, ctx: &Context) {
+                     .set_instruction_pointer(user_ctx.instruction_pointer() - SYSCALL_INSTR_LEN);
+             }
+ 
++            if syscall_restart.is_some() {
++                let restart = flags.contains(SigActionFlags::SA_RESTART);
++                crate::tla_trace::record_signal_delivery(
++                    crate::tla_trace::begin_current(),
++                    if restart {
++                        crate::tla_trace::EVENT_SIGNAL_RESTART
++                    } else {
++                        crate::tla_trace::EVENT_SIGNAL_NO_RESTART
++                    },
++                    restart,
++                );
++            }
++
+             if let Err(e) = handle_user_signal(
+                 ctx,
+                 sig_num,
+diff --git a/kernel/core/src/syscall/prctl.rs b/kernel/core/src/syscall/prctl.rs
+index 6e141f4..af49caa 100644
+--- a/kernel/core/src/syscall/prctl.rs
++++ b/kernel/core/src/syscall/prctl.rs
+@@ -66,6 +66,7 @@ pub(super) fn sys_prctl(
+             let mut name_bytes = [0u8; ThreadName::MAX_BYTES];
+             ctx.user_space().read_bytes(read_addr, &mut name_bytes)?;
+             *ctx.posix_thread.thread_name().lock() = ThreadName::from_bytes_until_nul(&name_bytes);
++            crate::tla_trace::control_name(ctx, &name_bytes);
+         }
+         PrctlCmd::PR_GET_NAME(write_to_addr) => {
+             let thread_name = ctx.posix_thread.thread_name().lock();
+diff --git a/kernel/core/src/syscall/pread64.rs b/kernel/core/src/syscall/pread64.rs
+index a15dcdd..72d068d 100644
+--- a/kernel/core/src/syscall/pread64.rs
++++ b/kernel/core/src/syscall/pread64.rs
+@@ -30,15 +30,36 @@ pub(super) fn sys_pread64(
+         return_errno_with_message!(Errno::EINVAL, "offset + user_buf_len overflow");
+     }
+ 
+-    let read_len = {
+-        let user_space = ctx.user_space();
+-        let mut writer = user_space.writer(user_buf_ptr, user_buf_len)?;
+-        file.read_at(offset as usize, &mut writer)?
++    let user_space = ctx.user_space();
++    let mut writer = user_space.writer(user_buf_ptr, user_buf_len)?;
++    crate::tla_trace::record_start(
++        &file,
++        crate::tla_trace::EVENT_SYS_PREAD64_START,
++        user_buf_len,
++        offset as usize,
++        false,
++    );
++    let read_len = match file.read_at(offset as usize, &mut writer) {
++        Ok(read_len) => read_len,
++        Err(err) => {
++            crate::tla_trace::record(
++                crate::tla_trace::begin_current(),
++                crate::tla_trace::EVENT_SYS_PREAD64_RETURN,
++                crate::tla_trace::event_fields(&[0, 0, err.error() as u64]),
++            );
++            return Err(err);
++        }
+     };
+ 
+     if read_len > 0 {
+         fs::vfs::notify::on_access(&file);
+     }
+ 
++    crate::tla_trace::record(
++        crate::tla_trace::begin_current(),
++        crate::tla_trace::EVENT_SYS_PREAD64_RETURN,
++        crate::tla_trace::event_fields(&[1, read_len as u64, 0]),
++    );
++
+     Ok(SyscallReturn::Return(read_len as _))
+ }
+diff --git a/kernel/core/src/syscall/preadv.rs b/kernel/core/src/syscall/preadv.rs
+index d24dd13..27a4dc4 100644
+--- a/kernel/core/src/syscall/preadv.rs
++++ b/kernel/core/src/syscall/preadv.rs
+@@ -153,7 +153,20 @@ fn do_sys_readv(
+ 
+     let user_space = ctx.user_space();
+     let mut writer_array = VmWriterArray::from_user_io_vecs(&user_space, io_vec_ptr, io_vec_count)?;
+-    for writer in writer_array.writers_mut() {
++    let first_request = writer_array
++        .writers_mut()
++        .first()
++        .map(|writer| writer.avail())
++        .unwrap_or(0);
++    crate::tla_trace::record_start(
++        &file,
++        crate::tla_trace::EVENT_DO_SYS_READV_START,
++        first_request,
++        0,
++        false,
++    );
++    let writer_count = writer_array.writers_mut().len();
++    for (index, writer) in writer_array.writers_mut().iter_mut().enumerate() {
+         debug_assert!(writer.has_avail());
+ 
+         // TODO: According to the man page
+@@ -163,9 +176,41 @@ fn do_sys_readv(
+         // A suitable fix would be to add a `readv` method for the `FileLike` trait,
+         // allowing each subsystem to implement atomicity.
+         match file.read(writer) {
+-            Ok(read_len) => total_len += read_len,
+-            Err(_) if total_len > 0 => break,
+-            Err(err) => return Err(err),
++            Ok(read_len) => {
++                total_len += read_len;
++                let should_return = writer.has_avail() || index + 1 == writer_count;
++                crate::tla_trace::record_vector_event(
++                    crate::tla_trace::begin_current(),
++                    if should_return {
++                        crate::tla_trace::EVENT_READV_ENTRY_OK_RETURN
++                    } else {
++                        crate::tla_trace::EVENT_READV_ENTRY_OK_CONTINUE
++                    },
++                    index + 1,
++                    read_len,
++                    total_len,
++                    writer.avail(),
++                    true,
++                );
++                if should_return {
++                    break;
++                }
++            }
++            Err(err) => {
++                crate::tla_trace::record_vector_event(
++                    crate::tla_trace::begin_current(),
++                    crate::tla_trace::EVENT_READV_ENTRY_FAULT_RETURN,
++                    index + 1,
++                    0,
++                    total_len,
++                    writer.avail(),
++                    false,
++                );
++                if total_len == 0 {
++                    return Err(err);
++                }
++                break;
++            }
+         }
+         if writer.has_avail() {
+             // End of file reached or no more data to read
+diff --git a/kernel/core/src/syscall/pwrite64.rs b/kernel/core/src/syscall/pwrite64.rs
+index 37aa475..6606868 100644
+--- a/kernel/core/src/syscall/pwrite64.rs
++++ b/kernel/core/src/syscall/pwrite64.rs
+@@ -32,11 +32,34 @@ pub(super) fn sys_pwrite64(
+ 
+     let user_space = ctx.user_space();
+     let mut reader = user_space.reader(user_buf_ptr, user_buf_len)?;
+-    let write_len = file.write_at(offset as _, &mut reader)?;
++    crate::tla_trace::record_start(
++        &file,
++        crate::tla_trace::EVENT_SYS_PWRITE64_START,
++        user_buf_len,
++        offset as usize,
++        false,
++    );
++    let write_len = match file.write_at(offset as _, &mut reader) {
++        Ok(write_len) => write_len,
++        Err(err) => {
++            crate::tla_trace::record(
++                crate::tla_trace::begin_current(),
++                crate::tla_trace::EVENT_SYS_PWRITE64_RETURN,
++                crate::tla_trace::event_fields(&[0, 0, err.error() as u64]),
++            );
++            return Err(err);
++        }
++    };
+ 
+     if write_len > 0 {
+         fs::vfs::notify::on_modify(&file);
+     }
+ 
++    crate::tla_trace::record(
++        crate::tla_trace::begin_current(),
++        crate::tla_trace::EVENT_SYS_PWRITE64_RETURN,
++        crate::tla_trace::event_fields(&[1, write_len as u64, 0]),
++    );
++
+     Ok(SyscallReturn::Return(write_len as _))
+ }
+diff --git a/kernel/core/src/syscall/pwritev.rs b/kernel/core/src/syscall/pwritev.rs
+index 36fbc70..477cf3c 100644
+--- a/kernel/core/src/syscall/pwritev.rs
++++ b/kernel/core/src/syscall/pwritev.rs
+@@ -149,7 +149,20 @@ fn do_sys_writev(
+ 
+     let user_space = ctx.user_space();
+     let mut reader_array = VmReaderArray::from_user_io_vecs(&user_space, io_vec_ptr, io_vec_count)?;
+-    for reader in reader_array.readers_mut() {
++    let first_request = reader_array
++        .readers_mut()
++        .first()
++        .map(|reader| reader.remain())
++        .unwrap_or(0);
++    crate::tla_trace::record_start(
++        &file,
++        crate::tla_trace::EVENT_DO_SYS_WRITEV_START,
++        first_request,
++        0,
++        false,
++    );
++    let reader_count = reader_array.readers_mut().len();
++    for (index, reader) in reader_array.readers_mut().iter_mut().enumerate() {
+         debug_assert!(reader.has_remain());
+ 
+         // TODO: According to the man page
+@@ -159,9 +172,41 @@ fn do_sys_writev(
+         // A suitable fix would be to add a `writev` method for the `FileLike` trait,
+         // allowing each subsystem to implement atomicity.
+         match file.write(reader) {
+-            Ok(write_len) => total_len += write_len,
+-            Err(_) if total_len > 0 => break,
+-            Err(err) => return Err(err),
++            Ok(write_len) => {
++                total_len += write_len;
++                let should_return = reader.has_remain() || index + 1 == reader_count;
++                crate::tla_trace::record_vector_event(
++                    crate::tla_trace::begin_current(),
++                    if should_return {
++                        crate::tla_trace::EVENT_WRITEV_ENTRY_OK_RETURN
++                    } else {
++                        crate::tla_trace::EVENT_WRITEV_ENTRY_OK_CONTINUE
++                    },
++                    index + 1,
++                    write_len,
++                    total_len,
++                    reader.remain(),
++                    true,
++                );
++                if should_return {
++                    break;
++                }
++            }
++            Err(err) => {
++                crate::tla_trace::record_vector_event(
++                    crate::tla_trace::begin_current(),
++                    crate::tla_trace::EVENT_WRITEV_ENTRY_FAULT_RETURN,
++                    index + 1,
++                    0,
++                    total_len,
++                    reader.remain(),
++                    false,
++                );
++                if total_len == 0 {
++                    return Err(err);
++                }
++                break;
++            }
+         }
+         if reader.has_remain() {
+             // Partial write, maybe errors in the middle
+diff --git a/kernel/core/src/syscall/read.rs b/kernel/core/src/syscall/read.rs
+index 92ff33b..0e31fa7 100644
+--- a/kernel/core/src/syscall/read.rs
++++ b/kernel/core/src/syscall/read.rs
+@@ -24,22 +24,57 @@ pub(super) fn sys_read(
+     // According to <https://man7.org/linux/man-pages/man2/read.2.html>, if
+     // the user specified an empty buffer, we should detect errors by checking
+     // the file descriptor. If no errors detected, return 0 successfully.
+-    let read_len = {
++    let result = {
+         if buf_len != 0 {
+             let user_space = ctx.user_space();
+             let mut writer = user_space.writer(user_buf_addr, buf_len)?;
++            crate::tla_trace::record_start(
++                &file,
++                crate::tla_trace::EVENT_SYS_READ_START,
++                buf_len,
++                0,
++                false,
++            );
+             file.read(&mut writer)
+         } else {
++            crate::tla_trace::record_start(
++                &file,
++                crate::tla_trace::EVENT_SYS_READ_START,
++                0,
++                0,
++                false,
++            );
+             file.read_bytes(&mut [])
+         }
+-    }
+-    .map_err(|err| match err.error() {
+-        Errno::EINTR => Error::new(Errno::ERESTARTSYS),
+-        _ => err,
+-    })?;
++    };
++
++    let read_len = match result {
++        Ok(read_len) => read_len,
++        Err(err) if err.error() == Errno::EINTR => {
++            crate::tla_trace::record(
++                crate::tla_trace::begin_current(),
++                crate::tla_trace::EVENT_SYS_READ_TRANSLATE_EINTR,
++                crate::tla_trace::event_fields(&[Errno::EINTR as u64]),
++            );
++            return Err(Error::new(Errno::ERESTARTSYS));
++        }
++        Err(err) => {
++            crate::tla_trace::record(
++                crate::tla_trace::begin_current(),
++                crate::tla_trace::EVENT_SYS_READ_RETURN,
++                crate::tla_trace::event_fields(&[0, 0, err.error() as u64]),
++            );
++            return Err(err);
++        }
++    };
+ 
+     if read_len > 0 {
+         fs::vfs::notify::on_access(&file);
+     }
++    crate::tla_trace::record(
++        crate::tla_trace::begin_current(),
++        crate::tla_trace::EVENT_SYS_READ_RETURN,
++        crate::tla_trace::event_fields(&[1, read_len as u64, 0]),
++    );
+     Ok(SyscallReturn::Return(read_len as _))
+ }
+diff --git a/kernel/core/src/syscall/write.rs b/kernel/core/src/syscall/write.rs
+index 079dbb5..e59d91c 100644
+--- a/kernel/core/src/syscall/write.rs
++++ b/kernel/core/src/syscall/write.rs
+@@ -24,22 +24,59 @@ pub(super) fn sys_write(
+     // According to <https://man7.org/linux/man-pages/man2/write.2.html>, if
+     // the user specified an empty buffer, we should detect errors by checking
+     // the file descriptor. If no errors detected, return 0 successfully.
+-    let write_len = {
++    let result = {
+         if user_buf_len != 0 {
+             let user_space = ctx.user_space();
+             let mut reader = user_space.reader(user_buf_ptr, user_buf_len)?;
++            crate::tla_trace::record_start(
++                &file,
++                crate::tla_trace::EVENT_SYS_WRITE_START,
++                user_buf_len,
++                0,
++                file.status_flags()
++                    .contains(fs::file::StatusFlags::O_APPEND),
++            );
+             file.write(&mut reader)
+         } else {
++            crate::tla_trace::record_start(
++                &file,
++                crate::tla_trace::EVENT_SYS_WRITE_START,
++                0,
++                0,
++                file.status_flags()
++                    .contains(fs::file::StatusFlags::O_APPEND),
++            );
+             file.write_bytes(&[])
+         }
+-    }
+-    .map_err(|err| match err.error() {
+-        Errno::EINTR => Error::new(Errno::ERESTARTSYS),
+-        _ => err,
+-    })?;
++    };
++
++    let write_len = match result {
++        Ok(write_len) => write_len,
++        Err(err) if err.error() == Errno::EINTR => {
++            crate::tla_trace::record(
++                crate::tla_trace::begin_current(),
++                crate::tla_trace::EVENT_SYS_WRITE_TRANSLATE_EINTR,
++                crate::tla_trace::event_fields(&[Errno::EINTR as u64]),
++            );
++            return Err(Error::new(Errno::ERESTARTSYS));
++        }
++        Err(err) => {
++            crate::tla_trace::record(
++                crate::tla_trace::begin_current(),
++                crate::tla_trace::EVENT_SYS_WRITE_RETURN,
++                crate::tla_trace::event_fields(&[0, 0, err.error() as u64]),
++            );
++            return Err(err);
++        }
++    };
+ 
+     if write_len > 0 {
+         fs::vfs::notify::on_modify(&file);
+     }
++    crate::tla_trace::record(
++        crate::tla_trace::begin_current(),
++        crate::tla_trace::EVENT_SYS_WRITE_RETURN,
++        crate::tla_trace::event_fields(&[1, write_len as u64, 0]),
++    );
+     Ok(SyscallReturn::Return(write_len as _))
+ }
+diff --git a/kernel/core/src/thread/task.rs b/kernel/core/src/thread/task.rs
+index 8c18802..a3d711f 100644
+--- a/kernel/core/src/thread/task.rs
++++ b/kernel/core/src/thread/task.rs
+@@ -81,6 +81,7 @@ pub(crate) fn create_new_user_task(
+                     handle_exception(&ctx, user_ctx, exception)
+                 }
+                 ReturnReason::UserSyscall => {
++                    crate::tla_trace::record_task_restart(user_ctx.syscall_num());
+                     ctx.thread_local
+                         .set_orig_syscall_ret(Some(user_ctx.syscall_ret()));
+ 
+diff --git a/kernel/core/src/vm/page_cache/vmo/mod.rs b/kernel/core/src/vm/page_cache/vmo/mod.rs
+index 1380cc8..bc916ae 100644
+--- a/kernel/core/src/vm/page_cache/vmo/mod.rs
++++ b/kernel/core/src/vm/page_cache/vmo/mod.rs
+@@ -738,6 +738,11 @@ impl Vmo {
+                 {
+                     Ok(written_size) => written_size,
+                     Err((err, written_size)) => {
++                        crate::tla_trace::observe_backed_fault(
++                            self as *const Self as usize,
++                            state.is_up_to_date(),
++                            written_size,
++                        );
+                         // If the page is not initialized, keep it as it is on a partial write.
+                         if written_size > 0 && state.is_up_to_date() {
+                             locked_page.set_dirty();
+@@ -748,6 +753,10 @@ impl Vmo {
+ 
+                 if written_size > 0 {
+                     locked_page.set_dirty();
++                    crate::tla_trace::observe_retained_prefix(
++                        self as *const Self as usize,
++                        written_size,
++                    );
+                 }
+ 
+                 *page_offset = 0;
+diff --git a/test/initramfs/Makefile b/test/initramfs/Makefile
+index 0f31c0d..55ef060 100644
+--- a/test/initramfs/Makefile
++++ b/test/initramfs/Makefile
+@@ -7,6 +7,7 @@ ENABLE_CONFORMANCE_TEST ?= false
+ CONFORMANCE_TEST_SUITE ?= ltp
+ CONFORMANCE_TEST_WORKDIR ?= /tmp
+ ENABLE_REGRESSION_TEST ?= false
++ENABLE_SPECULA_TRACE ?= false
+ # Specify platform macros when building regression tests (supported: asterinas, linux).
+ # - asterinas: Define both `__asterinas__` and `__linux__`. Tests may fail in Linux.
+ # - linux: Define only `__linux__`. Tests may fail in Asterinas.
+@@ -56,6 +57,7 @@ BOOT_IMAGE_NIX_ARGS := \
+ 	--arg enableBenchmarkTest $(ENABLE_BENCHMARK_TEST) \
+ 	--arg enableConformanceTest $(ENABLE_CONFORMANCE_TEST) \
+ 	--arg enableRegressionTest $(ENABLE_REGRESSION_TEST) \
++	--arg enableSpeculaTrace $(ENABLE_SPECULA_TRACE) \
+ 	--argstr conformanceTestSuite $(CONFORMANCE_TEST_SUITE) \
+ 	--argstr conformanceTestWorkDir $(CONFORMANCE_TEST_WORKDIR) \
+ 	--argstr regressionTestPlatform $(REGRESSION_TEST_PLATFORM) \
+diff --git a/test/initramfs/nix/default.nix b/test/initramfs/nix/default.nix
+index c221c49..1aa037f 100644
+--- a/test/initramfs/nix/default.nix
++++ b/test/initramfs/nix/default.nix
+@@ -1,7 +1,8 @@
+ { target ? "x86_64", enableBenchmarkTest ? false, enableConformanceTest ? false
+-, enableRegressionTest ? false, conformanceTestSuite ? "ltp"
+-, conformanceTestWorkDir ? "/tmp", regressionTestPlatform ? "asterinas"
+-, dnsServer ? "none", smp ? 1, initramfsCompressed ? true, }:
++, enableRegressionTest ? false, enableSpeculaTrace ? false
++, conformanceTestSuite ? "ltp", conformanceTestWorkDir ? "/tmp"
++, regressionTestPlatform ? "asterinas", dnsServer ? "none", smp ? 1
++, initramfsCompressed ? true, }:
+ let
+   crossSystem.config = if target == "x86_64" then
+     "x86_64-unknown-linux-gnu"
+@@ -32,12 +33,14 @@ in rec {
+   };
+   regression =
+     pkgs.callPackage ./regression { testPlatform = regressionTestPlatform; };
++  specula = pkgs.callPackage ./specula { };
+ 
+   initramfs = pkgs.callPackage ./initramfs.nix {
+     inherit busybox;
+     benchmark = if enableBenchmarkTest then benchmark else null;
+     conformance = if enableConformanceTest then conformance else null;
+     regression = if enableRegressionTest then regression else null;
++    specula = if enableSpeculaTrace then specula else null;
+     dnsServer = dnsServer;
+   };
+   initramfs-image = pkgs.callPackage ./initramfs-image.nix {
+diff --git a/test/initramfs/nix/initramfs.nix b/test/initramfs/nix/initramfs.nix
+index 3bf35a8..7765236 100644
+--- a/test/initramfs/nix/initramfs.nix
++++ b/test/initramfs/nix/initramfs.nix
+@@ -1,5 +1,5 @@
+ { lib, pkgs, stdenvNoCC, fetchFromGitHub, hostPlatform, writeClosure, busybox
+-, benchmark, conformance, regression, dnsServer, }:
++, benchmark, conformance, regression, specula, dnsServer, }:
+ let
+   boot_hello = builtins.path { path = ./../src/boot_hello.sh; };
+   init = builtins.path { path = ./../src/init; };
+@@ -22,6 +22,7 @@ let
+     ++ lib.optionals (benchmark != null) [ benchmark.package ]
+     ++ lib.optionals (conformance != null) [ conformance.package ]
+     ++ lib.optionals (regression != null) [ regression.package ]
++    ++ lib.optionals (specula != null) [ specula ]
+     ++ lib.optionals is_evtest_included [ pkgs.evtest ];
+ in stdenvNoCC.mkDerivation {
+   name = "initramfs";
+@@ -49,6 +50,10 @@ in stdenvNoCC.mkDerivation {
+       cp -r ${regression.package}/* $out/test/
+     ''}
+ 
++    ${lib.optionalString (specula != null) ''
++      cp -r ${specula}/* $out/test/
++    ''}
++
+     ${lib.optionalString (benchmark != null) ''
+       cp -r "${benchmark.package}"/* $out/benchmark/
+     ''}
+

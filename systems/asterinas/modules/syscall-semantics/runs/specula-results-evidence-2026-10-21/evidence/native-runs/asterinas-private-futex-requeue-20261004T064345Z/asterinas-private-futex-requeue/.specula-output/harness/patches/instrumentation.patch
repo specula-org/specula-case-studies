@@ -1,0 +1,1281 @@
+diff --git a/OSDK.toml b/OSDK.toml
+index 064fd551a..1ed37a5da 100644
+--- a/OSDK.toml
++++ b/OSDK.toml
+@@ -9,7 +9,7 @@ method = "grub-rescue-iso"
+ boot_protocol = "multiboot2"
+ 
+ [qemu]
+-args = "$(./tools/qemu_args.sh normal)"
++args = "-machine q35,accel=kvm -cpu host -m 2G -smp 2 -no-reboot -display none -serial stdio -monitor none -device isa-debug-exit,iobase=0xf4,iosize=0x04"
+ log_file = "qemu-serial.log"
+ 
+ # Special options for running
+diff --git a/kernel/core/src/lib.rs b/kernel/core/src/lib.rs
+index 5e65ce6a5..4381d7f3e 100644
+--- a/kernel/core/src/lib.rs
++++ b/kernel/core/src/lib.rs
+@@ -55,6 +55,7 @@ pub mod prelude;
+ pub mod process;
+ mod sched;
+ pub mod security;
++pub(crate) mod specula_probes;
+ mod syscall;
+ mod thread;
+ mod time;
+diff --git a/kernel/core/src/process/posix_thread/futex.rs b/kernel/core/src/process/posix_thread/futex.rs
+index 96d453195..d0532ff36 100644
+--- a/kernel/core/src/process/posix_thread/futex.rs
++++ b/kernel/core/src/process/posix_thread/futex.rs
+@@ -3,6 +3,7 @@
+ use int_to_c_enum::TryFromInt;
+ use ostd::{
+     cpu::num_cpus,
++    specula_trace as tr,
+     sync::{PreemptDisabled, Waiter, Waker},
+ };
+ use spin::Once;
+@@ -11,6 +12,7 @@ use crate::{
+     context::current_userspace,
+     prelude::*,
+     process::VmarSnapshot,
++    specula_probes as probe,
+     time::wait::ManagedTimeout,
+     vm::{page_cache::Vmo, perms::VmPerms, vmar::PageFaultInfo},
+ };
+@@ -76,21 +78,54 @@ pub(crate) fn futex_wait_bitset(
+ 
+     let user_space = ctx.user_space();
+     let futex_key = FutexKey::new(futex_addr, bitset, &user_space, visibility)?;
+-    let (_, futex_bucket_ref) = get_futex_bucket(&futex_key);
++    let (trace_bucket, futex_bucket_ref) = get_futex_bucket(&futex_key);
++    let trace_start = tr::stamp();
++    let trace_key = trace_key(&futex_key);
+     let (futex_item, waiter) = FutexItem::create(futex_key);
++    let trace_g = probe::generation();
++    waiter
++        .waker()
++        .specula_generation
++        .store(trace_g, core::sync::atomic::Ordering::Relaxed);
++    probe::mark(
++        "SysFutexWait",
++        trace_start,
++        &[trace_g, trace_key, trace_bucket as u64, futex_val as u64],
++        &[],
++    );
+ 
+     let (mut futex_bucket, val) = loop {
+         // Lock the futex bucket first to avoid race conditions.
+-        let futex_bucket = futex_bucket_ref.lock();
++        let ts = tr::stamp();
++        let mut futex_bucket = futex_bucket_ref.lock();
++        futex_bucket.trace_epoch += 1;
++        probe::mark(
++            "FutexWaitLock",
++            ts,
++            &[trace_g, trace_bucket as u64, futex_bucket.trace_epoch],
++            &[],
++        );
++        let ts = tr::stamp();
+ 
+         let pf_result = ctx
+             .thread_local
+             .with_page_fault_disabled(|| user_space.atomic_load::<u32>(futex_addr));
+         if let Some(result) = pf_result {
+-            break (futex_bucket, result?);
++            let val = result?;
++            probe::mark("FutexWaitLoad", ts, &[trace_g, val as u64], &[]);
++            break (futex_bucket, val);
+         }
+ 
++        probe::mark("FutexWaitFault", ts, &[trace_g], &[]);
++        let ts = tr::stamp();
+         drop(futex_bucket);
++        probe::mark(
++            "FutexWaitFaultUnlock",
++            ts,
++            &[trace_g, trace_bucket as u64],
++            &[],
++        );
++        let ts = tr::stamp();
+ 
+         // The futex word is aligned on a 4-byte boundary, so it cannot cross the page boundary.
+         user_space
+@@ -102,27 +137,81 @@ pub(crate) fn futex_wait_bitset(
+                     "the page fault of the futex word cannot be resolved",
+                 )
+             })?;
++        probe::mark("HandlePageFault", ts, &[trace_g], &[]);
+     };
+ 
+-    if val != futex_val.cast_unsigned() {
++    let ts = tr::stamp();
++    let mismatch = val != futex_val.cast_unsigned();
++    probe::mark(
++        "FutexWaitCompare",
++        ts,
++        &[trace_g, val as u64, mismatch as u64],
++        &[],
++    );
++    if mismatch {
++        let ts = tr::stamp();
++        drop(futex_bucket);
++        drop(futex_item);
++        probe::mark(
++            "FutexWaitMismatchUnlock",
++            ts,
++            &[trace_g, trace_bucket as u64],
++            &[],
++        );
+         return_errno_with_message!(
+             Errno::EAGAIN,
+             "the futex word does not contain the expected value"
+         );
+     }
+ 
++    let ts = tr::stamp();
+     futex_bucket.add_item(futex_item);
++    probe::mark(
++        "FutexBucketAddItem",
++        ts,
++        &[trace_g, trace_bucket as u64],
++        &futex_bucket.trace_queue(),
++    );
++    if trace_g != 0 {
++        probe::enrolled(trace_g);
++    }
+ 
+-    // Release the lock.
++    let ts = tr::stamp();
+     drop(futex_bucket);
++    probe::mark("FutexWaitUnlock", ts, &[trace_g, trace_bucket as u64], &[]);
+ 
+     let result = waiter.pause_timeout(&timeout.into());
+ 
+     // If the futex wait operation was interrupted by a signal or timed out, the
+     // `FutexItem` must be dequeued and dropped. Otherwise, malicious user programs
+     // could repeatedly issue futex wait operations to exhaust kernel memory.
+-    let item = futex_bucket_ref.lock().remove_by_waker(&waiter.waker());
+-    if item.is_none() {
++    let ts = tr::stamp();
++    let mut guard = futex_bucket_ref.lock();
++    guard.trace_epoch += 1;
++    probe::mark(
++        "FutexCleanupLock",
++        ts,
++        &[trace_g, trace_bucket as u64, guard.trace_epoch],
++        &[],
++    );
++    let ts = tr::stamp();
++    let item = guard.remove_by_waker(&waiter.waker());
++    probe::mark(
++        "FutexRemoveByWaker",
++        ts,
++        &[trace_g, trace_bucket as u64, item.is_some() as u64],
++        &guard.trace_queue(),
++    );
++    let ts = tr::stamp();
++    drop(guard);
++    probe::mark(
++        "FutexCleanupUnlock",
++        ts,
++        &[trace_g, trace_bucket as u64],
++        &[],
++    );
++    let ts = tr::stamp();
++    let result = if item.is_none() {
+         // The futex item will be removed asynchronously if and only if it has been woken up. In
+         // that case, we should report success to the user.
+         // FIXME: `pause_timeout` should return `Ok(())` in this case, but it currently may return
+@@ -132,11 +221,11 @@ pub(crate) fn futex_wait_bitset(
+         Err(err)
+     } else {
+         // Spurious wakeups. Return `EINTR` anyway.
+-        return_errno_with_message!(
+-            Errno::EINTR,
+-            "the current thread is interrupted by a signal"
+-        );
+-    }
++        Err(Error::new(Errno::EINTR))
++    };
++    let code = probe::result_code(&result.clone().map(|_| 0));
++    probe::mark("FutexWaitDecide", ts, &[trace_g, code], &[]);
++    result
+ }
+ 
+ pub(crate) fn futex_wake(
+@@ -163,10 +252,31 @@ pub(crate) fn futex_wake_bitset(
+     }
+ 
+     let futex_key = FutexKey::new(futex_addr, bitset, &current_userspace!(), visibility)?;
+-    let (_, futex_bucket_ref) = get_futex_bucket(&futex_key);
++    let (trace_bucket, futex_bucket_ref) = get_futex_bucket(&futex_key);
++    let ts = tr::stamp();
+     let mut futex_bucket = futex_bucket_ref.lock();
++    futex_bucket.trace_epoch += 1;
++    probe::mark(
++        "LockBucketPairsFirst",
++        ts,
++        &[
++            trace_bucket as u64,
++            trace_bucket as u64,
++            futex_bucket.trace_epoch,
++        ],
++        &[],
++    );
+     let res = futex_bucket.remove_and_wake_items(&futex_key, max_count);
+-
++    probe::mark("FutexWakeEnd", tr::stamp(), &[0, res as u64], &[]);
++    probe::mark(
++        "FutexRequeueFinish",
++        tr::stamp(),
++        &[res as u64, 0, trace_bucket as u64, trace_bucket as u64],
++        &futex_bucket.trace_queue(),
++    );
++    let ts = tr::stamp();
++    drop(futex_bucket);
++    probe::mark("FutexReleaseSource", ts, &[trace_bucket as u64], &[]);
+     Ok(res)
+ }
+ 
+@@ -366,6 +476,14 @@ pub(crate) fn futex_requeue(
+     let (mut futex_bucket, futex_new_bucket) = lock_bucket_pairs(&futex_key, &futex_new_key);
+ 
+     let nwakes = futex_bucket.remove_and_wake_items(&futex_key, max_nwakes);
++    let sb = get_futex_bucket(&futex_key).0;
++    let db = get_futex_bucket(&futex_new_key).0;
++    probe::mark(
++        "FutexWakeEnd",
++        tr::stamp(),
++        &[if sb == db { 1 } else { 2 }, nwakes as u64],
++        &[],
++    );
+ 
+     if let Some(mut futex_new_bucket) = futex_new_bucket {
+         futex_bucket.requeue_items_to_another_bucket(
+@@ -374,10 +492,33 @@ pub(crate) fn futex_requeue(
+             &futex_new_key,
+             max_nrequeues,
+         );
++        probe::mark(
++            "FutexRequeueFinish",
++            tr::stamp(),
++            &[nwakes as u64, sb as u64, db as u64],
++            &futex_bucket.trace_queue(),
++        );
++        probe::mark(
++            "QueueView",
++            tr::stamp(),
++            &[db as u64],
++            &futex_new_bucket.trace_queue(),
++        );
++        let ts = tr::stamp();
++        drop(futex_new_bucket);
++        probe::mark("FutexReleaseDest", ts, &[db as u64], &[]);
+     } else {
+         futex_bucket.update_item_keys(&futex_key, &futex_new_key, max_nrequeues);
++        probe::mark(
++            "FutexRequeueFinish",
++            tr::stamp(),
++            &[nwakes as u64, sb as u64, db as u64],
++            &futex_bucket.trace_queue(),
++        );
+     }
+-
++    let ts = tr::stamp();
++    drop(futex_bucket);
++    probe::mark("FutexReleaseSource", ts, &[sb as u64], &[]);
+     Ok(nwakes)
+ }
+ 
+@@ -412,15 +553,58 @@ fn lock_bucket_pairs(
+     let (index_2, futex_bucket_ref_2) = get_futex_bucket(futex_key_2);
+ 
+     match index_1.cmp(&index_2) {
+-        core::cmp::Ordering::Equal => (futex_bucket_ref_1.lock(), None),
++        core::cmp::Ordering::Equal => {
++            let ts = tr::stamp();
++            let mut b = futex_bucket_ref_1.lock();
++            b.trace_epoch += 1;
++            probe::mark(
++                "LockBucketPairsFirst",
++                ts,
++                &[index_1 as u64, index_2 as u64, b.trace_epoch],
++                &[],
++            );
++            (b, None)
++        }
+         core::cmp::Ordering::Less => {
+-            let bucket_1 = futex_bucket_ref_1.lock();
+-            let bucket_2 = futex_bucket_ref_2.lock();
++            let ts = tr::stamp();
++            let mut bucket_1 = futex_bucket_ref_1.lock();
++            bucket_1.trace_epoch += 1;
++            probe::mark(
++                "LockBucketPairsFirst",
++                ts,
++                &[index_1 as u64, index_2 as u64, bucket_1.trace_epoch],
++                &[],
++            );
++            let ts = tr::stamp();
++            let mut bucket_2 = futex_bucket_ref_2.lock();
++            bucket_2.trace_epoch += 1;
++            probe::mark(
++                "LockBucketPairsSecond",
++                ts,
++                &[index_2 as u64, bucket_2.trace_epoch],
++                &[],
++            );
+             (bucket_1, Some(bucket_2))
+         }
+         core::cmp::Ordering::Greater => {
+-            let bucket_2 = futex_bucket_ref_2.lock();
+-            let bucket_1 = futex_bucket_ref_1.lock();
++            let ts = tr::stamp();
++            let mut bucket_2 = futex_bucket_ref_2.lock();
++            bucket_2.trace_epoch += 1;
++            probe::mark(
++                "LockBucketPairsFirst",
++                ts,
++                &[index_2 as u64, index_1 as u64, bucket_2.trace_epoch],
++                &[],
++            );
++            let ts = tr::stamp();
++            let mut bucket_1 = futex_bucket_ref_1.lock();
++            bucket_1.trace_epoch += 1;
++            probe::mark(
++                "LockBucketPairsSecond",
++                ts,
++                &[index_1 as u64, bucket_1.trace_epoch],
++                &[],
++            );
+             (bucket_1, Some(bucket_2))
+         }
+     }
+@@ -460,12 +644,25 @@ impl FutexBucketVec {
+ }
+ 
+ struct FutexBucket {
++    trace_epoch: u64,
+     items: Vec<FutexItem>,
+ }
+ 
+ impl FutexBucket {
++    fn trace_queue(&self) -> [u64; 16] {
++        let mut ids = [0; 16];
++        for (i, item) in self.items.iter().enumerate() {
++            if i < 16 {
++                ids[i] = item.trace_id();
++            } else {
++                probe::mark("QueueView", tr::stamp(), &[19999], &[]);
++            }
++        }
++        ids
++    }
+     pub(self) fn new() -> FutexBucket {
+         FutexBucket {
++            trace_epoch: 0,
+             items: Vec::with_capacity(1),
+         }
+     }
+@@ -484,30 +681,74 @@ impl FutexBucket {
+ 
+     pub(self) fn remove_and_wake_items(&mut self, key: &FutexKey, max_count: usize) -> usize {
+         let mut count = 0;
+-
++        let mut view = self.trace_queue();
++        let mut index = 0;
++        probe::mark("FutexWakeStart", tr::stamp(), &[], &view);
+         self.items.retain(|item| {
+-            if item.key.match_up(key) && count < max_count && item.wake() {
++            let ts = tr::stamp();
++            let g = item.trace_id();
++            let attempted = item.key.match_up(key) && count < max_count;
++            if !attempted {
++                index += 1;
++                probe::mark("FutexItemWake", ts, &[g, 0, index as u64], &[]);
++                return true;
++            }
++            let accepted = item.wake();
++            let ts = tr::stamp();
++            if accepted {
+                 count += 1;
+-                false
++                if index < 16 {
++                    view.copy_within(index + 1.., index);
++                    view[15] = 0;
++                } else {
++                    probe::mark("QueueView", ts, &[19999], &[]);
++                }
+             } else {
+-                true
++                index += 1;
+             }
++            probe::mark(
++                "FutexWakeRetain",
++                ts,
++                &[g, index as u64 + 1, count as u64, accepted as u64],
++                &view,
++            );
++            !accepted
+         });
+-
+         count
+     }
+ 
+     pub(self) fn update_item_keys(&mut self, key: &FutexKey, new_key: &FutexKey, max_count: usize) {
+         let mut count = 0;
++        let mut index = 0;
++        let mut stopped = false;
+         for item in self.items.iter_mut() {
++            let ts = tr::stamp();
++            index += 1;
+             if item.key.match_up(key) {
+                 item.key = new_key.clone();
+                 count += 1;
+             }
+-            if count >= max_count {
++            let stop = count >= max_count;
++            probe::mark(
++                "FutexUpdateItemKey",
++                ts,
++                &[
++                    item.trace_id(),
++                    index + 1,
++                    count as u64,
++                    trace_key(&item.key),
++                    stop as u64,
++                ],
++                &[],
++            );
++            if stop {
++                stopped = true;
+                 break;
+             }
+         }
++        if !stopped {
++            probe::mark("FutexMoveEnd", tr::stamp(), &[], &[]);
++        }
+     }
+ 
+     pub(self) fn requeue_items_to_another_bucket(
+@@ -518,19 +759,46 @@ impl FutexBucket {
+         max_nrequeues: usize,
+     ) {
+         let mut count = 0;
++        let mut view = self.trace_queue();
++        let mut index = 0;
+         self.items
+             .extract_if(.., |item| {
+-                if item.key.match_up(key) && count < max_nrequeues {
++                let ts = tr::stamp();
++                let hit = item.key.match_up(key) && count < max_nrequeues;
++                if hit {
+                     count += 1;
+-                    true
++                    if index < 16 {
++                        view.copy_within(index + 1.., index);
++                        view[15] = 0;
++                    } else {
++                        probe::mark("QueueView", ts, &[19999], &[]);
++                    }
+                 } else {
+-                    false
++                    index += 1;
+                 }
++                probe::mark(
++                    "FutexExtractItem",
++                    ts,
++                    &[item.trace_id(), index as u64 + 1, count as u64, hit as u64],
++                    &view,
++                );
++                hit
+             })
+             .for_each(|mut extracted| {
++                let ts = tr::stamp();
+                 extracted.key = new_key.clone();
++                let g = extracted.trace_id();
++                probe::mark(
++                    "FutexExtractedKey",
++                    ts,
++                    &[g, trace_key(&extracted.key)],
++                    &[],
++                );
++                let ts = tr::stamp();
+                 another.add_item(extracted);
++                probe::mark("FutexAppendExtracted", ts, &[g], &another.trace_queue());
+             });
++        probe::mark("FutexMoveEnd", tr::stamp(), &[], &[]);
+     }
+ }
+ 
+@@ -540,6 +808,11 @@ struct FutexItem {
+ }
+ 
+ impl FutexItem {
++    fn trace_id(&self) -> u64 {
++        self.waker
++            .specula_generation
++            .load(core::sync::atomic::Ordering::Relaxed)
++    }
+     pub(self) fn create(key: FutexKey) -> (Self, Waiter) {
+         let (waiter, waker) = Waiter::new_pair();
+         let futex_item = FutexItem { key, waker };
+@@ -730,3 +1003,23 @@ pub(crate) fn futex_op_and_flags_from_u32(bits: u32) -> Result<(FutexOp, FutexFl
+ 
+     Ok((op, flags))
+ }
++
++fn trace_key(key: &FutexKey) -> u64 {
++    match &key.identity {
++        FutexIdentity::Private { addr, .. } => probe::key(*addr),
++        _ => 0,
++    }
++}
++pub(crate) fn trace_identity(addr: usize, ctx: &Context) -> Result<usize> {
++    let k = FutexKey::new(
++        addr,
++        FUTEX_BITSET_MATCH_ANY,
++        &ctx.user_space(),
++        FutexVisibility::Private,
++    )?;
++    Ok(get_futex_bucket(&k).0)
++}
++
++pub(crate) fn trace_bucket_count() -> usize {
++    FUTEX_BUCKETS.get().unwrap().size()
++}
+diff --git a/kernel/core/src/process/signal/pause.rs b/kernel/core/src/process/signal/pause.rs
+index 9477c7e14..1a4a74b48 100644
+--- a/kernel/core/src/process/signal/pause.rs
++++ b/kernel/core/src/process/signal/pause.rs
+@@ -1,6 +1,9 @@
+ // SPDX-License-Identifier: MPL-2.0
+ 
+-use ostd::sync::{WaitQueue, Waiter};
++use ostd::{
++    specula_trace as tr,
++    sync::{WaitQueue, Waiter},
++};
+ 
+ use super::sig_mask::SigMask;
+ use crate::{
+@@ -9,6 +12,7 @@ use crate::{
+         posix_thread::{AsPosixThread, ContextPthreadAdminApi},
+         signal::HandlePendingSignal,
+     },
++    specula_probes as probe,
+     thread::AsThread,
+     time::{
+         timer::TimerGuard,
+@@ -169,7 +173,18 @@ impl Pause for Waiter {
+     }
+ 
+     fn pause_timeout(&self, timeout: &TimeoutExt<'_>) -> Result<()> {
+-        let timer = timeout.check_expired()?.map(|timeout| {
++        let ts = tr::stamp();
++        let checked = timeout.check_expired();
++        probe::mark(
++            "PauseTimeoutCheck",
++            ts,
++            &[
++                checked.is_err() as u64,
++                checked.as_ref().is_ok_and(|t| t.is_some()) as u64,
++            ],
++            &[],
++        );
++        let timer = checked?.map(|timeout| {
+             let waker = self.waker();
+             timeout.create_timer(move |_guard: TimerGuard| {
+                 waker.wake_up();
+@@ -200,12 +215,34 @@ impl Pause for Waiter {
+         }
+ 
+         if let Some(timer) = timer {
++            let ts = tr::stamp();
+             let timer_guard = timer.lock();
+-            if timer_guard.remain().is_zero() {
++            probe::mark(
++                "PauseTimeoutTimerLock",
++                ts,
++                &[timer_guard.trace_epoch()],
++                &[],
++            );
++            let remain = timer_guard.remain();
++            let ts = tr::stamp();
++            let expired = remain.is_zero();
++            probe::mark("PauseTimeoutRemain", ts, &[expired as u64], &[]);
++            if !expired {
++                let ts = tr::stamp();
++                timer_guard.cancel();
++                probe::mark("TimerCancel", ts, &[], &[]);
++            }
++            let ts = tr::stamp();
++            drop(timer_guard);
++            probe::mark("PauseTimeoutTimerUnlock", ts, &[], &[]);
++            let ts = tr::stamp();
++            drop(timer);
++            probe::mark("PauseTimeoutTimerDrop", ts, &[], &[]);
++            if expired {
+                 return_errno_with_message!(Errno::ETIME, "the time limit is reached");
+             }
+-            // If the timeout is not expired, cancel the timer manually.
+-            timer_guard.cancel();
++        } else {
++            probe::mark("PauseTimeoutNoTimer", tr::stamp(), &[], &[]);
+         }
+ 
+         if posix_thread_opt
+diff --git a/kernel/core/src/syscall/futex.rs b/kernel/core/src/syscall/futex.rs
+index a6b8181ba..9a5a3a1e6 100644
+--- a/kernel/core/src/syscall/futex.rs
++++ b/kernel/core/src/syscall/futex.rs
+@@ -2,7 +2,7 @@
+ 
+ use core::time::Duration;
+ 
+-use ostd::mm::VmIo;
++use ostd::{mm::VmIo, specula_trace as tr};
+ 
+ use crate::{
+     prelude::*,
+@@ -10,6 +10,7 @@ use crate::{
+         FutexFlags, FutexOp, FutexVisibility, futex_op_and_flags_from_u32, futex_requeue,
+         futex_wait, futex_wait_bitset, futex_wake, futex_wake_bitset, futex_wake_op,
+     },
++    specula_probes as probe,
+     syscall::SyscallReturn,
+     time::{
+         clocks::{MonotonicClock, RealTimeClock},
+@@ -28,6 +29,92 @@ pub(super) fn sys_futex(
+     bitset: u32,
+     ctx: &Context,
+ ) -> Result<SyscallReturn> {
++    if futex_op == 0x5350 {
++        use core::sync::atomic::Ordering;
++
++        use crate::process::posix_thread::futex::trace_identity;
++        let value = match futex_val {
++            1 => {
++                tr::register(utime_addr);
++                ostd::early_println!("SPECULA_THREAD {} {}", utime_addr, ctx.posix_thread.tid());
++                0
++            }
++            2 => {
++                probe::reset();
++                ostd::early_println!(
++                    "SPECULA_BEGIN {} {} {}",
++                    utime_addr,
++                    ostd::cpu::num_cpus(),
++                    crate::process::posix_thread::futex::trace_bucket_count()
++                );
++                ostd::early_println!("SPECULA_ID {}", probe::BUILD_ID);
++                0
++            }
++            3 => {
++                if utime_addr >= 3 {
++                    return Err(Error::new(Errno::EINVAL));
++                }
++                probe::KEYS[utime_addr].store(futex_addr as u64, Ordering::Relaxed);
++                let bucket = trace_identity(futex_addr, ctx)?;
++                let vmar = ctx.user_space().vmar_snapshot().as_ptr() as u64;
++                probe::VMAR.store(vmar, Ordering::Relaxed);
++                let word = ctx.user_space().read_val::<u32>(futex_addr)?;
++                ostd::early_println!(
++                    "SPECULA_KEY {} {} {} {} {}",
++                    utime_addr + 1,
++                    futex_addr,
++                    bucket,
++                    vmar,
++                    word
++                );
++                bucket
++            }
++            4 => trace_identity(futex_addr, ctx)?,
++            5 => probe::count_enrolled(),
++            6 => {
++                tr::set_active(0);
++                tr::dump();
++                ostd::early_println!("SPECULA_END {}", utime_addr);
++                0
++            }
++            7 => {
++                tr::emit(
++                    "UserStore",
++                    utime_addr as u64,
++                    &[probe::key(futex_addr), bitset as u64],
++                    &[],
++                );
++                0
++            }
++            8 => {
++                use crate::time::Clock;
++                let ts = tr::stamp();
++                let now = MonotonicClock::get().read_time();
++                tr::emit("ClockAdvance", ts, &[now.as_nanos() as u64], &[]);
++                0
++            }
++            9 => {
++                tr::emit("HarnessJoin", tr::stamp(), &[utime_addr as u64], &[]);
++                0
++            }
++            10 => {
++                tr::emit(
++                    "HarnessEnrolled",
++                    tr::stamp(),
++                    &probe::enrollment_snapshot(),
++                    &[],
++                );
++                0
++            }
++            _ => return Err(Error::new(Errno::EINVAL)),
++        };
++        return Ok(SyscallReturn::Return(value as _));
++    }
++    let traced =
++        tr::enabled() && probe::key(futex_addr) > 0 && tr::stream() > 0 && futex_op & 128 != 0;
++    if traced {
++        tr::next_id();
++    }
+     let (futex_op, futex_flags) = futex_op_and_flags_from_u32(futex_op as _)?;
+     debug!(
+         "futex_op = {:?}, futex_flags = {:?}, futex_addr = 0x{:x}, futex_val = 0x{:x}",
+@@ -36,12 +123,24 @@ pub(super) fn sys_futex(
+ 
+     let get_futex_timeout = |timeout_addr: Vaddr| -> Result<Option<ManagedTimeout<'static>>> {
+         if timeout_addr == 0 {
++            if traced {
++                tr::emit("WaitInput", tr::stamp(), &[0, 0], &[]);
++            }
+             return Ok(None);
+         }
+ 
+         let timeout = {
+             let time_spec: timespec_t = ctx.user_space().read_val(timeout_addr)?;
+-            Duration::try_from(time_spec)?
++            let duration = Duration::try_from(time_spec)?;
++            if traced {
++                tr::emit(
++                    "WaitInput",
++                    tr::stamp(),
++                    &[1, duration.as_nanos() as u64],
++                    &[],
++                );
++            }
++            duration
+         };
+ 
+         let is_real_time = futex_flags.contains(FutexFlags::FUTEX_CLOCK_REALTIME);
+@@ -77,6 +176,38 @@ pub(super) fn sys_futex(
+     };
+ 
+     let visibility = FutexVisibility::from(futex_flags);
++    if traced && matches!(futex_op, FutexOp::FUTEX_WAKE | FutexOp::FUTEX_REQUEUE) {
++        let dst = if futex_op == FutexOp::FUTEX_WAKE {
++            futex_addr
++        } else {
++            futex_new_addr
++        };
++        let sb = crate::process::posix_thread::futex::trace_identity(futex_addr, ctx)?;
++        let db = crate::process::posix_thread::futex::trace_identity(dst, ctx)?;
++        tr::emit(
++            "SysFutexControl",
++            tr::stamp(),
++            &[
++                if futex_op == FutexOp::FUTEX_WAKE {
++                    0
++                } else {
++                    1
++                },
++                probe::key(futex_addr),
++                probe::key(dst),
++                futex_val as u64,
++                if futex_op == FutexOp::FUTEX_WAKE {
++                    0
++                } else {
++                    utime_addr as u64
++                },
++                futex_val_to_max_count(futex_val) as u64,
++                sb as u64,
++                db as u64,
++            ],
++            &[],
++        );
++    }
+     let res = match futex_op {
+         FutexOp::FUTEX_WAIT => {
+             let timeout = get_futex_timeout(utime_addr)?;
+@@ -137,8 +268,21 @@ pub(super) fn sys_futex(
+         Errno::ETIME => Error::new(Errno::ETIMEDOUT),
+         Errno::EINTR => Error::new(Errno::ERESTARTSYS),
+         _ => err,
+-    })?;
+-
++    });
++    if traced {
++        tr::emit(
++            if futex_op == FutexOp::FUTEX_WAIT {
++                "SysFutexWaitReturn"
++            } else {
++                "SysFutexControlReturn"
++            },
++            tr::stamp(),
++            &[probe::result_code(&res)],
++            &[],
++        );
++        tr::set_active(0);
++    }
++    let res = res?;
+     debug!("futex returns, tid = {}", ctx.posix_thread.tid());
+     Ok(SyscallReturn::Return(res as _))
+ }
+diff --git a/kernel/core/src/time/core/timer.rs b/kernel/core/src/time/core/timer.rs
+index 817f9e258..43dd69fff 100644
+--- a/kernel/core/src/time/core/timer.rs
++++ b/kernel/core/src/time/core/timer.rs
+@@ -11,9 +11,13 @@ use core::{
+     time::Duration,
+ };
+ 
+-use ostd::sync::{LocalIrqDisabled, SpinLock, SpinLockGuard};
++use ostd::{
++    specula_trace as tr,
++    sync::{LocalIrqDisabled, SpinLock, SpinLockGuard},
++};
+ 
+ use super::Clock;
++use crate::specula_probes as probe;
+ 
+ /// A timeout, represented in one of the two ways.
+ #[derive(Clone, Debug)]
+@@ -31,6 +35,7 @@ pub(crate) enum Timeout {
+ /// its `interval` field with [`TimerGuard::set_interval`]. By doing this,
+ /// the timer will use the interval time to configure a new timing after expiration.
+ pub(crate) struct Timer {
++    trace_g: u64,
+     inner: SpinLock<TimerInner>,
+     timer_manager: Arc<TimerManager>,
+     registered_callback: Box<dyn Fn(TimerGuard) + Send + Sync>,
+@@ -38,6 +43,7 @@ pub(crate) struct Timer {
+ 
+ #[derive(Default)]
+ struct TimerInner {
++    trace_epoch: u64,
+     interval: Duration,
+     timer_callback: Weak<TimerCallback>,
+ }
+@@ -52,6 +58,9 @@ impl TimerGuard<'_> {
+     /// Sets the interval time for this timer.
+     ///
+     /// The timer will be reset with the interval time upon expiration.
++    pub(crate) fn trace_epoch(&self) -> u64 {
++        self.inner.trace_epoch
++    }
+     pub(crate) fn set_interval(&mut self, interval: Duration) {
+         self.inner.interval = interval;
+     }
+@@ -64,7 +73,16 @@ impl TimerGuard<'_> {
+     pub(crate) fn set_timeout(&mut self, timeout: Timeout) {
+         let expired_time = match timeout {
+             Timeout::After(timeout) => {
++                let ts = tr::stamp();
+                 let now = self.timer.timer_manager.clock.read_time();
++                if self.timer.trace_g != 0 {
++                    tr::emit(
++                        "TimerSetClock",
++                        ts,
++                        &[self.timer.trace_g, now.as_nanos() as u64],
++                        &[],
++                    );
++                }
+                 now + timeout
+             }
+             Timeout::When(timeout) => timeout,
+@@ -103,7 +121,16 @@ impl TimerGuard<'_> {
+     /// If the timer has not been set, this method
+     /// will return `Duration::ZERO`.
+     pub(crate) fn remain(&self) -> Duration {
++        let ts = tr::stamp();
+         let now = self.timer.timer_manager.clock.read_time();
++        if self.timer.trace_g != 0 {
++            tr::emit(
++                "PauseTimeoutClock",
++                ts,
++                &[self.timer.trace_g, now.as_nanos() as u64],
++                &[],
++            );
++        }
+         let expired_time = self.expired_time();
+         if expired_time > now {
+             expired_time - now
+@@ -129,6 +156,7 @@ impl Timer {
+         F: Fn(TimerGuard) + Send + Sync + 'static,
+     {
+         Arc::new(Self {
++            trace_g: probe::generation(),
+             inner: SpinLock::new(TimerInner::default()),
+             timer_manager,
+             registered_callback: Box::new(registered_callback),
+@@ -137,10 +165,9 @@ impl Timer {
+ 
+     /// Locks the timer and returns a [`TimerGuard`] for exclusive access.
+     pub(crate) fn lock(self: &Arc<Self>) -> TimerGuard<'_> {
+-        TimerGuard {
+-            inner: self.inner.disable_irq().lock(),
+-            timer: self,
+-        }
++        let mut inner = self.inner.disable_irq().lock();
++        inner.trace_epoch += 1;
++        TimerGuard { inner, timer: self }
+     }
+ 
+     /// Returns a reference to the [`TimerManager`] which manages
+@@ -156,6 +183,7 @@ impl Timer {
+ /// These created `Timer`s will hold an `Arc` pointer to this manager, hence this manager
+ /// will be actually dropped after all the created timers have been dropped.
+ pub(crate) struct TimerManager {
++    trace_epoch: core::sync::atomic::AtomicU64,
+     clock: Arc<dyn Clock>,
+     timer_callbacks: SpinLock<BinaryHeap<Arc<TimerCallback>>>,
+ }
+@@ -164,6 +192,7 @@ impl TimerManager {
+     /// Creates a `TimerManager` instance from a clock.
+     pub(crate) fn new(clock: Arc<dyn Clock>) -> Arc<Self> {
+         Arc::new(Self {
++            trace_epoch: core::sync::atomic::AtomicU64::new(0),
+             clock,
+             timer_callbacks: SpinLock::new(BinaryHeap::new()),
+         })
+@@ -186,39 +215,101 @@ impl TimerManager {
+     }
+ 
+     fn insert(&self, timer_callback: Arc<TimerCallback>) {
+-        self.timer_callbacks
+-            .disable_irq()
+-            .lock()
+-            .push(timer_callback);
++        let ts = tr::stamp();
++        let g = timer_callback.trace_g;
++        let deadline = timer_callback.expired_time.as_nanos() as u64;
++        let mut heap = self.timer_callbacks.disable_irq().lock();
++        let epoch = self.trace_epoch.fetch_add(1, Ordering::Relaxed) + 1;
++        heap.push(timer_callback);
++        if g != 0 {
++            tr::emit("TimerSetTimeout", ts, &[g, deadline, epoch], &[]);
++        }
++        drop(heap);
+     }
+ 
+     /// Checks and processes the managed timers.
+     ///
+     /// If any of the timers have timed out, call the corresponding callback functions.
+     pub(crate) fn process_expired_timers(&self) {
++        let mut traced = false;
++        let mut ready = [0; 16];
++        let mut nready = 0;
++        let mut batch = 0;
++        let mut sample = 0;
++        let end_start;
+         let callbacks = {
+             let mut timeout_list = self.timer_callbacks.disable_irq().lock();
+             if timeout_list.is_empty() {
+                 return;
+             }
+ 
++            let epoch = self.trace_epoch.fetch_add(1, Ordering::Relaxed) + 1;
++            traced = timeout_list.iter().any(|t| t.trace_g != 0);
+             let mut callbacks = Vec::new();
++            let ts = tr::stamp();
+             let current_time = self.clock.read_time();
++            sample = current_time.as_nanos() as u64;
++            if traced {
++                batch = tr::emit("TimerCollectClock", ts, &[sample, epoch], &[]);
++            }
++
+             while let Some(t) = timeout_list.peek() {
++                let ts = tr::stamp();
+                 if t.is_cancelled() {
+-                    // Just ignore the cancelled callback
+-                    timeout_list.pop();
++                    let removed = timeout_list.pop().unwrap();
++                    if removed.trace_g != 0 {
++                        tr::emit(
++                            "TimerCollect",
++                            ts,
++                            &[removed.trace_g, batch as u64, sample, 1],
++                            &ready,
++                        );
++                    }
+                 } else if t.expired_time <= current_time {
+-                    callbacks.push(timeout_list.pop().unwrap());
++                    let removed = timeout_list.pop().unwrap();
++                    if removed.trace_g != 0 {
++                        if nready < 16 {
++                            ready[nready] = removed.trace_g;
++                            nready += 1;
++                        } else {
++                            tr::emit("HeapView", ts, &[19999], &[]);
++                        }
++                        tr::emit(
++                            "TimerCollect",
++                            ts,
++                            &[removed.trace_g, batch as u64, sample, 0],
++                            &ready,
++                        );
++                    }
++                    callbacks.push(removed);
+                 } else {
+                     break;
+                 }
+             }
++            end_start = tr::stamp();
+             callbacks
+         };
+ 
++        if traced {
++            tr::emit(
++                "TimerCollectEnd",
++                end_start,
++                &[batch as u64, sample],
++                &ready,
++            );
++        }
+         for callback in callbacks {
++            let g = callback.trace_g;
++            if g != 0 {
++                tr::set_active(g);
++            }
+             callback.call();
++            if g != 0 {
++                ready.copy_within(1.., 0);
++                ready[15] = 0;
++                tr::emit("TimerContext", tr::stamp(), &[g, batch as u64], &ready);
++                tr::set_active(0);
++            }
+         }
+     }
+ 
+@@ -233,6 +324,7 @@ impl TimerManager {
+ 
+ /// A `TimerCallback` can be used to execute a timer callback function.
+ struct TimerCallback {
++    trace_g: u64,
+     expired_time: Duration,
+     timer: Weak<Timer>,
+     is_cancelled: AtomicBool,
+@@ -242,6 +334,7 @@ impl TimerCallback {
+     /// Creates an instance of `TimerCallback`.
+     fn new(timeout: Duration, timer: Weak<Timer>) -> Self {
+         Self {
++            trace_g: timer.upgrade().map_or(0, |t| t.trace_g),
+             expired_time: timeout,
+             timer,
+             is_cancelled: AtomicBool::new(false),
+@@ -260,14 +353,46 @@ impl TimerCallback {
+     }
+ 
+     fn call(&self) {
+-        let Some(timer) = self.timer.upgrade() else {
++        let ts = tr::stamp();
++        let upgraded = self.timer.upgrade();
++        if self.trace_g != 0 {
++            tr::emit(
++                "TimerCallbackUpgrade",
++                ts,
++                &[self.trace_g, upgraded.is_some() as u64],
++                &[],
++            );
++        }
++        let Some(timer) = upgraded else {
+             return;
+         };
+-
++        let ts = tr::stamp();
+         let mut timer_guard = timer.lock();
+-
+-        if self.is_cancelled() {
+-            // The callback is cancelled.
++        if self.trace_g != 0 {
++            tr::emit(
++                "TimerCallbackLock",
++                ts,
++                &[self.trace_g, timer_guard.trace_epoch()],
++                &[],
++            );
++        }
++        let ts = tr::stamp();
++        let cancelled = self.is_cancelled();
++        if self.trace_g != 0 {
++            tr::emit(
++                "TimerCallbackCheck",
++                ts,
++                &[self.trace_g, cancelled as u64],
++                &[],
++            );
++        }
++        if cancelled {
++            let ts = tr::stamp();
++            drop(timer_guard);
++            drop(timer);
++            if self.trace_g != 0 {
++                tr::emit("TimerCallbackFinish", ts, &[self.trace_g], &[]);
++            }
+             return;
+         }
+ 
+@@ -278,7 +403,12 @@ impl TimerCallback {
+ 
+         // Pass the `timer_guard` guard to the callback, allowing it to prevent race conditions.
+         // The callback may choose to use the guard or drop it if not needed.
++        let ts = tr::stamp();
+         (timer.registered_callback)(timer_guard);
++        drop(timer);
++        if self.trace_g != 0 {
++            tr::emit("TimerCallbackFinish", ts, &[self.trace_g], &[]);
++        }
+     }
+ }
+ 
+diff --git a/ostd/src/lib.rs b/ostd/src/lib.rs
+index 1dcc3d8ed..2a1be7c40 100644
+--- a/ostd/src/lib.rs
++++ b/ostd/src/lib.rs
+@@ -46,6 +46,7 @@ pub mod panic;
+ pub mod power;
+ pub mod prelude;
+ pub mod smp;
++pub mod specula_trace;
+ pub mod sync;
+ pub mod task;
+ pub mod timer;
+diff --git a/ostd/src/sync/wait.rs b/ostd/src/sync/wait.rs
+index c1b7b9e5a..8b949f803 100644
+--- a/ostd/src/sync/wait.rs
++++ b/ostd/src/sync/wait.rs
+@@ -172,6 +172,8 @@ impl !Sync for Waiter {}
+ /// A waker can be created by calling [`Waiter::new_pair`]. This method creates an `Arc<Waker>` that can
+ /// be used across different threads.
+ pub struct Waker {
++    pub specula_generation: core::sync::atomic::AtomicU64,
++    specula_unparks: core::sync::atomic::AtomicU64,
+     has_woken: AtomicBool,
+     task: Arc<Task>,
+ }
+@@ -180,6 +182,8 @@ impl Waiter {
+     /// Creates a waiter and its associated [`Waker`].
+     pub fn new_pair() -> (Self, Arc<Waker>) {
+         let waker = Arc::new(Waker {
++            specula_generation: core::sync::atomic::AtomicU64::new(0),
++            specula_unparks: core::sync::atomic::AtomicU64::new(0),
+             has_woken: AtomicBool::new(false),
+             task: Task::current().unwrap().cloned(),
+         });
+@@ -260,25 +264,85 @@ impl Waker {
+     /// delivered, _or_ that the waiter will be dropped after being woken. It's up to the caller to
+     /// handle the latter case properly to avoid missing the wake event.
+     pub fn wake_up(&self) -> bool {
+-        if self.has_woken.swap(true, Ordering::Release) {
++        let ts = crate::specula_trace::stamp();
++        let old = self.has_woken.swap(true, Ordering::Release);
++        let g = self.specula_generation.load(Ordering::Relaxed);
++        let timer = crate::specula_trace::stream() >= 8;
++        if g != 0 {
++            crate::specula_trace::emit(
++                if timer {
++                    "TimerCallbackWake"
++                } else {
++                    "FutexItemWake"
++                },
++                ts,
++                &[g, 1, (!old) as u64],
++                &[],
++            );
++        }
++        if old {
+             return false;
+         }
++        let ts = crate::specula_trace::stamp();
++        self.specula_unparks.fetch_add(1, Ordering::Relaxed);
+         scheduler::unpark_target(self.task.clone());
++        if g != 0 {
++            crate::specula_trace::emit(
++                if timer {
++                    "TimerCallbackUnpark"
++                } else {
++                    "FutexWakeUnpark"
++                },
++                ts,
++                &[g],
++                &[],
++            );
++        }
+ 
+         true
+     }
+ 
+     #[track_caller]
+     fn do_wait(&self) {
+-        while !self.has_woken.swap(false, Ordering::Acquire) {
+-            scheduler::park_current(|| self.has_woken.load(Ordering::Acquire));
++        loop {
++            let ts = crate::specula_trace::stamp();
++            let old = self.has_woken.swap(false, Ordering::Acquire);
++            let g = self.specula_generation.load(Ordering::Relaxed);
++            if g != 0 {
++                crate::specula_trace::emit("WakerDoWait", ts, &[g, old as u64], &[]);
++            }
++            if old {
++                break;
++            }
++            let before = self.specula_unparks.load(Ordering::Relaxed);
++            scheduler::park_current(|| {
++                let ts = crate::specula_trace::stamp();
++                let flag = self.has_woken.load(Ordering::Acquire);
++                if g != 0 {
++                    crate::specula_trace::emit("WaiterPark", ts, &[g, flag as u64], &[]);
++                }
++                flag
++            });
++            if g != 0 {
++                crate::specula_trace::emit(
++                    "ParkReturn",
++                    crate::specula_trace::stamp(),
++                    &[g, before, self.specula_unparks.load(Ordering::Relaxed)],
++                    &[],
++                );
++            }
+         }
+     }
+ 
+     fn close(&self) {
+         // This must use `Ordering::Acquire`, although we do not care about the return value. See
+         // the memory order explanation at the top of the file for details.
++        let ts = crate::specula_trace::stamp();
+         let _ = self.has_woken.swap(true, Ordering::Acquire);
++        let g = self.specula_generation.load(Ordering::Relaxed);
++        if g != 0 {
++            crate::specula_trace::emit("WaiterDrop", ts, &[g], &[]);
++        }
+     }
+ }
+ 
+diff --git a/ostd/src/task/mod.rs b/ostd/src/task/mod.rs
+index c3f6770d6..47b7f1175 100644
+--- a/ostd/src/task/mod.rs
++++ b/ostd/src/task/mod.rs
+@@ -54,6 +54,7 @@ pub fn inject_post_schedule_handler(handler: fn()) {
+ /// execute user code. Multiple tasks can share a single user space.
+ #[derive(Debug)]
+ pub struct Task {
++    pub(crate) specula_stream: core::sync::atomic::AtomicUsize,
+     #[expect(clippy::type_complexity)]
+     func: ForceSync<Cell<Option<Box<dyn FnOnce() + Send>>>>,
+ 
+@@ -228,6 +229,7 @@ impl TaskOptions {
+         ctx.set_stack_pointer(kstack.end_vaddr() - 16);
+ 
+         let new_task = Task {
++            specula_stream: core::sync::atomic::AtomicUsize::new(0),
+             func: ForceSync::new(Cell::new(self.func)),
+             data: self.data.unwrap_or_else(|| Box::new(())),
+             local_data: ForceSync::new(self.local_data.unwrap_or_else(|| Box::new(()))),

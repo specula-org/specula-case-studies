@@ -1,0 +1,34 @@
+# MC-1 Linux control run (host kernel, same test program)
+
+Command: `gcc -Wall -O2 -o mc1_repro_host test_bugMC-1_readv_prefix_fault.c && ./mc1_repro_host`
+Host: Linux 7.1.9 x86_64 (Specula eval host), /tmp on the host root fs.
+
+```
+MC1_SETUP page_size=4096 unit=2048 ext2=0
+MC1_CASE name=readv_later tag=ramfs ret=2064 errno=0 offset=2064 linux_ret=2064 linux_offset=2064 prefix_copied_beyond_ret=1 stopped_at_fault=1
+MC1_FOLLOWUP name=readv_later tag=ramfs next_read=4096 errno=0 redelivers_prefix_bytes=0
+MC1_CASE name=readv_first tag=ramfs ret=2048 errno=0 offset=2048 linux_ret=2048 linux_offset=2048 prefix_copied_despite_efault=1
+MC1_CASE name=writev_later tag=ramfs ret=2064 errno=0 offset=2064 linux_ret=2064 linux_offset=2064 committed_prefix_bytes=2048 w_iov0_ok=1
+MC1_SKIP tag=ext2 reason=/ext2 not usable
+MC1_REPRO_DONE
+host_exit=0
+```
+
+Interpretation (Linux contract):
+- readv with a later iovec that faults after a 2048-byte prefix: returns the short
+  read 2064 (= 16-byte iovec 0 + 2048-byte prefix) and advances the shared offset to
+  2064. The copied prefix is COVERED by the return value.
+- readv with a first iovec faulting after a 2048-byte prefix: returns 2048 (NOT
+  EFAULT), offset 2048.
+- writev with a later iovec faulting after a 2048-byte prefix: returns 2064, offset
+  2064, 2048 prefix bytes committed.
+- Follow-up read at the post-readv offset returns the NEXT bytes (no re-delivery of
+  the prefix; `redelivers_prefix_bytes=0`).
+
+Note: `prefix_copied_beyond_ret=1` here means "the prefix was copied" — on Linux the
+return value covers it (ret == linux_ret), so nothing is beyond the report. The
+field discriminates the bug when ret < linux_ret while the prefix check still passes.
+
+(An earlier host run with a period-256 byte pattern made `redelivers_prefix_bytes`
+meaninglessly 1 on Linux; the pattern was fixed to an aperiodic multiplicative hash
+and the control re-run — all fields above are from the fixed program.)

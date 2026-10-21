@@ -1,0 +1,142 @@
+{
+  "schema_version": "2",
+  "system": "asterinas-syscall-buffered-file-size-read-consistency",
+  "generated_by": "validation-workflow",
+  "findings": [
+    {
+      "id": "MC-1",
+      "title": "Ramfs reads report a saved count that differs from delivered bytes",
+      "source": "model-checking",
+      "scenario": "S1: saved EOF versus copy progress (brief MC1)",
+      "severity": "High",
+      "invariant": "SuccessfulTransferAccounting",
+      "config": "MC_hunt_s1_ramfs.cfg",
+      "counterexample": "spec/output/MC_hunt_s1_ramfs_bfs1.out",
+      "affected_code": [
+        "kernel/core/src/fs/fs_impls/ramfs/fs.rs:704",
+        "kernel/core/src/fs/fs_impls/ramfs/fs.rs:709",
+        "kernel/core/src/vm/page_cache/vmo/mod.rs:535",
+        "kernel/core/src/fs/file/inode_handle.rs:287"
+      ],
+      "summary": "Ramfs observes logical EOF before taking the cache mutex and later returns that saved count. A competing shrink can reduce cache capacity to zero before the read copies, producing a positive return with zero delivered bytes; growth can instead deliver more bytes than the saved return. Shared-offset read advances by the saved count, while pread64 preserves the shared offset but still misreports delivery. The existing ramfs-2-2 guest trace also records 8192 bytes delivered with a 4096-byte return."
+    },
+    {
+      "id": "MC-2",
+      "title": "ExFAT reads copy beyond their reported prefix during write preparation",
+      "source": "model-checking",
+      "scenario": "S1: extension overlapping read",
+      "severity": "Medium",
+      "invariant": "SuccessfulTransferAccounting",
+      "config": "MC_hunt_s1_growth_exfat.cfg",
+      "counterexample": "spec/output/MC_hunt_s1_growth_exfat_bfs1.out",
+      "affected_code": [
+        "kernel/core/src/fs/fs_impls/exfat/inode.rs:648",
+        "kernel/core/src/fs/fs_impls/exfat/inode.rs:654",
+        "kernel/core/src/fs/fs_impls/exfat/inode.rs:729",
+        "kernel/core/src/fs/fs_impls/exfat/inode.rs:154"
+      ],
+      "summary": "An exFAT writer grows allocation and page-cache capacity before releasing its preparation guard, leaving logical EOF unchanged. A reader can then hold the upgradeable guard, calculate a one-page result, and copy two pages through its unlimited destination writer. The extra page is zero-filled by the backend while it lies beyond logical EOF, but those stores are omitted from the returned count. This is a concurrent manifestation of the known missing read-limit concern, and the triggering schedule still needs guest confirmation."
+    },
+    {
+      "id": "MC-3",
+      "title": "ExFAT stale write preparation permits false success and inconsistent extents",
+      "source": "model-checking",
+      "scenario": "S2: two extenders or a prepared extender versus shrink (brief MC2)",
+      "severity": "High",
+      "invariant": "SettledReadableExtent",
+      "config": "MC_hunt_s2_exfat_extent.cfg",
+      "counterexample": "spec/output/MC_hunt_s2_exfat_extent_bfs1.out",
+      "affected_code": [
+        "kernel/core/src/fs/fs_impls/exfat/inode.rs:715",
+        "kernel/core/src/fs/fs_impls/exfat/inode.rs:734",
+        "kernel/core/src/fs/fs_impls/exfat/inode.rs:743",
+        "kernel/core/src/fs/fs_impls/exfat/inode.rs:755",
+        "kernel/core/src/vm/page_cache/mod.rs:271",
+        "kernel/core/src/vm/page_cache/vmo/mod.rs:571"
+      ],
+      "summary": "ExFAT releases its preparation write guard before reacquiring an upgradeable guard for the copy, without revalidating the prepared cache bound. A second extender can lower that bound, so the first copies zero bytes yet returns the requested count and publishes its saved logical size. One completion order leaves logical size beyond cache capacity; the other regresses the reported extent of an earlier completed write. A competing truncate and a pre-established inaccessible source also reach the same protocol defect; these model schedules remain pending guest confirmation."
+    },
+    {
+      "id": "MC-4",
+      "title": "ExFAT successful ftruncate can retain the old logical size",
+      "source": "model-checking",
+      "scenario": "S3: public resize (brief TV2)",
+      "severity": "Medium",
+      "invariant": "SuccessfulResizeContract",
+      "config": "MC_hunt_s3_extend_zero_exfat.cfg",
+      "counterexample": "spec/output/MC_hunt_s3_extend_zero_exfat_bfs1.out",
+      "affected_code": [
+        "kernel/core/src/fs/fs_impls/exfat/inode.rs:286",
+        "kernel/core/src/fs/fs_impls/exfat/inode.rs:307",
+        "kernel/core/src/fs/fs_impls/exfat/inode.rs:1452",
+        "kernel/core/src/fs/fs_impls/exfat/inode.rs:1455"
+      ],
+      "summary": "ExFAT public resize grows neither the page-cache bound nor logical size, and its allocation helper changes logical size only when cluster count decreases. Extending an empty file can return success while logical size stays zero; same-cluster shrink can likewise retain the old size. Existing exfat-0-10 guest receipts independently show both shrink and extension returning success with unchanged logical size. The invariant requires the requested length only for an isolated successful ftruncate and permits errors."
+    },
+    {
+      "id": "MC-5",
+      "title": "ExFAT regrown holes can read the subject's old backing bytes",
+      "source": "model-checking",
+      "scenario": "S3: truncate, cluster reuse, and extending write (brief TV3)",
+      "severity": "High",
+      "invariant": "HoleZeros",
+      "config": "MC_hunt_s3_holes_exfat.cfg",
+      "counterexample": "spec/output/MC_hunt_s3_holes_exfat_bfs1.out",
+      "affected_code": [
+        "kernel/core/src/fs/fs_impls/exfat/inode.rs:154",
+        "kernel/core/src/fs/fs_impls/exfat/inode.rs:743",
+        "kernel/core/src/fs/fs_impls/exfat/fat.rs:208",
+        "kernel/core/src/fs/fs_impls/exfat/fat.rs:364"
+      ],
+      "summary": "Truncating a seeded file to zero decommits its cache pages and frees its clusters without erasing backing data. A later extending write can reclaim the same clusters, overwrite only its final page, and publish logical EOF across an untouched hole. Subsequent page loading sees that hole below logical EOF and reads the old backing bytes instead of zeros. Allocation from an empty chain searches from the first cluster, making this reuse source-reachable; physical reuse receipts and guest confirmation are still required, and no unrelated-file disclosure is claimed."
+    },
+    {
+      "id": "MC-6",
+      "title": "Ramfs zero-count positional writes can enlarge the file",
+      "source": "model-checking",
+      "scenario": "S4: empty positional write (brief TV5)",
+      "severity": "Medium",
+      "invariant": "EmptyWriteNoEffect",
+      "config": "MC_hunt_s4_empty_ramfs.cfg",
+      "counterexample": "spec/output/MC_hunt_s4_empty_ramfs_bfs1.out",
+      "affected_code": [
+        "kernel/core/src/fs/fs_impls/ramfs/fs.rs:736",
+        "kernel/core/src/fs/fs_impls/ramfs/fs.rs:742"
+      ],
+      "summary": "Ramfs calculates the requested end from the positional offset even when the reader is empty. With offset beyond EOF, it publishes that end and grows the cache before the zero copy returns success. The shared offset is preserved, but logical size changes despite a zero-count successful regular-file write. This witness still needs guest confirmation at an offset beyond EOF."
+    },
+    {
+      "id": "MC-7",
+      "title": "ExFAT zero-count positional writes can enlarge the file",
+      "source": "model-checking",
+      "scenario": "S4: empty positional write (brief TV5)",
+      "severity": "Medium",
+      "invariant": "EmptyWriteNoEffect",
+      "config": "MC_hunt_s4_empty_exfat.cfg",
+      "counterexample": "spec/output/MC_hunt_s4_empty_exfat_bfs1.out",
+      "affected_code": [
+        "kernel/core/src/fs/fs_impls/exfat/inode.rs:712",
+        "kernel/core/src/fs/fs_impls/exfat/inode.rs:725",
+        "kernel/core/src/fs/fs_impls/exfat/inode.rs:743"
+      ],
+      "summary": "ExFAT has no empty-reader return before extension preparation. A zero-count positional write beyond EOF can allocate storage, enlarge the cache, and publish its saved offset as logical size after an empty copy. The call returns zero and preserves the shared offset while changing the file extent. This backend-specific witness still needs guest confirmation."
+    },
+    {
+      "id": "MC-8",
+      "title": "Ramfs zero-progress failed writes can publish the full requested extent",
+      "source": "model-checking",
+      "scenario": "S4: fixed inaccessible source at EOF (brief TV4)",
+      "severity": "Medium",
+      "invariant": "AcceptedExtent",
+      "config": "MC_hunt_s4_fault_ramfs.cfg",
+      "counterexample": "spec/output/MC_hunt_s4_fault_ramfs_bfs1.out",
+      "affected_code": [
+        "kernel/core/src/fs/fs_impls/ramfs/fs.rs:742",
+        "kernel/core/src/fs/fs_impls/ramfs/fs.rs:750",
+        "ostd/src/mm/vm_space.rs:160",
+        "ostd/src/mm/io/mod.rs:354"
+      ],
+      "summary": "Ramfs publishes the full requested end before attempting its fallible user copy. A source that is inaccessible from the first byte can therefore produce EFAULT and zero accepted bytes while leaving a larger logical file and cache. The oracle is restricted to a zero-progress write starting at old EOF, compared with Linux v6.12 ramfs, whose generic write path rejects that source before write_begin. It imposes no universal partial-write rollback rule, and the existing partial-progress guest fault trace does not confirm this zero-progress witness."
+    }
+  ]
+}

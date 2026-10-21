@@ -1,0 +1,996 @@
+--- candidate-v1/INSTRUMENTATION.md
++++ candidate-v2/INSTRUMENTATION.md
+@@ -0,0 +1,103 @@
++# Wait/reap trace instrumentation
++
++This guide is for the controller and Phase 3 worker adjusting the Phase 2.5 harness. The harness modifies the real Asterinas checkout at `0c60537098f4c2949ad2d382aaf499de72263d76`. It is **incomplete**: the clock review remains open, no Asterinas kernel was built or booted, and no implementation trace was collected or validated. Read [STATUS.md](STATUS.md) and [the independent review](evidence/review-v1.md) before attempting execution.
++
++## Apply and run
++
++The controller must retain the existing `heavy.lock` allocation. This worker must not reacquire it. The shared [resource policy](/home/chin39/Documents/play/specula-profile/reports/flock-wait-handoff-2026-10-05/resources.json) requires at least 10 GiB host `MemAvailable` immediately before a kernel build, two build jobs, container limits of two CPUs, 8 GiB and 512 PIDs, and a guest with two CPUs and 2 GiB.
++
++From `.specula-output`, the intended entry point is:
++
++```sh
++bash harness/run.sh
++```
++
++The current entry point exits 78 at the unresolved review gate. It records the live memory reading and the gate disposition in a new `harness/evidence/<UTC>-<PID>/` directory. It must not be interpreted as successful harness execution. After the controller arranges an admissible clock method and the exact version passes independent review, the reviewer/controller records the review artifact hash and all semantic-input hashes in `review-gate.json`. Both execution and collection check that receipt. The receipt records a review decision. It is not an automatic proof that the review was adequate.
++
++The remaining script path builds the fixture with the repository's regression Makefile, runs Linux controls inside the pinned project container, checks memory again, builds the checkout's own OSDK and kernel, boots each guest scenario, and decodes the serial transport into per-actor and grouped traces. These steps are prepared but have not been executed on the corrected candidate. The installed image is pinned by ID `sha256:52dd279635dba5eb00635469308c1e0b9930fc0bd5448124ebaf2284ec18c278`. Only guest runs expose `/dev/kvm`, individually. No host `/dev` bind mount is used.
++
++Builds and tests have outer `timeout` bounds of at most 30 minutes. A timeout stops that attempt without an automatic retry. Preserve the log and distinguish an execution limit from a demonstrated lost wakeup. QEMU is stopped through QMP only after the fixture emits its completion marker. That stop is recorded separately from a timeout or guest exit.
++
++`apply.sh` checks the source pin and refuses to replace preexisting edits to any touched file. Its receipt binds all 20 installed files. Reapplication verifies those hashes and is idempotent. `clean.sh` restores only those owned files, and refuses to proceed if their contents changed after apply. It does not reset unrelated tracked files or remove the preexisting `.codex/` directory.
++
++## Recording and decoding
++
++`src/wr_trace.rs` is copied into OSTD. Three preallocated streams have one writer each, selected by the registered current Task pointer. The hot path uses no shared logging mutex, allocation, output, or global sequence counter. It preserves the production mutexes, queue locks and atomic orderings. Interrupt-context calls are excluded. Each stream holds at most 1,024 records, and a queue snapshot holds at most 16 entries. An overflow, truncated queue or unregistered waker is a collection failure.
++
++The fixture uses private `prctl` control values only in this instrumented kernel: `0x53575000` resets before fixture construction, `0x53575001` registers one actor and optionally requests a bounded observer-output delay, and `0x53575002` dumps after both calls and the notifier finish. The parent main task is `w1`, its sole extra thread is `w2`, and the single-threaded child is `child`. Both parent tasks remain alive through notifier completion. Registration is outside the recorded protocol. Child exit stays gated until fork, parent-thread creation and the calibration handshake have completed.
++
++The kernel serial transport uses `WR_RAW` records with a numeric event ID, real TSC values, the actor/generation pair, and saved operands or branch outcomes. `collect.py` decodes those records into the exact names and records required by `Trace.tla`. Its dispatch table does not execute the model or fill missing operations. `WR_USER` records independently capture direct libc `syscall` results, errno and output bytes. The merged `SysWaitReturn` retains the kernel's result and extends its interval through the caller's separately measured completion.
++
++After an approved run, raw decoded events go to `traces/raw/<case>/w1.ndjson`, `w2.ndjson` and `child.ndjson`. Each line has `tag: trace`, `actor`, `event`, `start`, `end`, `args` and `post`. The raw TSC values remain there. The grouped `traces/<case>.ndjson` file contains one JSON object with per-actor arrays, as required by this TraceSpec. Timestamp compression preserves every equality and ordering. The collector never sorts an actor's events or fixes a timestamp inversion.
++
++The current clock is the existing unfenced `read_tsc()` in OSTD and `__rdtsc()` in the fixture. CPU affinity and 64 round-trip samples are diagnostic checks only. They do not establish that instruction execution brackets each memory operation, nor bound all cross-vCPU offsets and drift. The independent review therefore rejects this clock method for trace acceptance. `collect.py` refuses to produce grouped validation input while the review gate remains open. Do not close it by adding a fence across the investigated ordering bridge, removing time constraints, or inventing intervals from model order.
++
++## Scenarios and evidence
++
++`cases.tsv` contains four scenario families: no-event and consuming results, repeated observations followed by consumption, competing consumers, and observer/consumer overlap. It includes both same-interface consumer pairs and mixed pairs, already-waitable children, exit values 0/37/255, and both consuming interfaces. The `overlap` case delays observer output for 50 million TSC cycles after `do_wait` has returned its Arc and released protocol locks. It starts the consumer independently after a user-space delay. Those delays make a history possible. Only recorded selection, removal and output boundaries can establish that it occurred.
++
++The zero-delay competition cases may exercise WR-09, and the delayed-exit cases may exercise WR-10. User-space started flags and sleep durations do not establish either kernel scheduling window. Report them as uncovered unless the actual internal events demonstrate the requested sequence. `ParkCurrentSpurious` is not emitted because this harness cannot distinguish an independent spurious return from a delayed in-scope unpark. If that distinction becomes necessary, add a reviewed scheduler observation. Never infer it from a watchdog timeout.
++
++`wait_calibration.c` is separate from all primary traces. It records zeroed and poisoned WR-SQ output, plus WR-CF consuming and nonconsuming output faults and their subsequent waits. Neither calibration has been run on Linux or Asterinas. The prepared Linux control uses the host Linux kernel through a Docker process, not the archived Linux v6.16.5 source oracle. Its actual uname, libc, binary and header identities must be recorded at execution. No source comparison is runtime evidence.
++
++The collector reports event counts, uncovered types, cross-actor interval overlaps and overlap fraction. All runtime event coverage is currently `NOT_RUN`. The concurrent skill's overlap quality requirement must be assessed from real records. A nonzero overlap count alone does not establish its 20 percent pair threshold. No quality threshold or final-state check is relaxed here.
++
++`Trace.tla` has 41 exact `ExpectedPost` arms and `ValidatePostState(e) == e.post = ExpectedPost(e)`. Every field produced by the decoder has a corresponding check. This was inspected statically. No L2 runtime validation has occurred. Use `TraceSearch.cfg` for the eventual quick check through the installed `run_trace_validation` tool or resource-budgeted TLC wrapper. Acceptance requires the exact `TraceNoCompleteMatch` violation, all preceding invariants intact, and a retained complete witness with all cursors exhausted. Exhaustion without a witness rejects the supplied trace. A timeout, other invariant violation or evaluation error is inconclusive. The optional universal `Trace.cfg` check has the different semantics described in `spec/instrumentation-spec.md`.
++
++## Make a reviewed correction
++
++Preserve the current candidate, applied receipt, triggering evidence and hashes before editing. `evidence/candidate-v1` preserves the original version and `review-v1.md` records its independent findings. Edit the copies under `harness/src`, not only their installed counterparts. `instrument.py` owns the source edits and regenerates `patches/instrumentation.patch` when applying to the clean pin.
++
++To add a field, save its actual operand or result at the hook and extend that event's payload in `wr_trace.rs` or the source edit. Update the corresponding `collect.py` arm and its exact TraceSpec check together. Do not infer a shared value from a later read or add a modeled lock acquisition for tracing. Queue snapshots use the already-held queue lock. Publication and token hooks save their operands or actual atomic return values.
++
++To add an event, allocate its transport ID in `collect.py`, insert the real hook through `instrument.py`, and document the source boundary below. A new event or changed TraceSpec arm is a semantic correction. For a moved capture point, record the start before the operation and save the end immediately at its required completion boundary. Serialize only the saved values. The false park check ends directly after the saved load while its runqueue guard remains held. The true branch ends only after `reschedule` returns and releases that guard. Dequeue and resume stay separate.
++
++After edits, create a new immutable candidate, record the diff and reason, and obtain independent review of its exact hashes. The author does not approve the change. Only after material findings are closed may the controller allow the affected build, guest or trace/TLC rerun. Return unresolved review to the controller as incomplete and continue this same campaign when it is closed.
++
++## Installed hook locations
++
++The table below is generated from the applied source receipt. Numeric IDs refer to the transport decoder. They are not synthetic timestamps or sequence numbers.
++
++| Event | Applied source boundary |
++| --- | --- |
++| `SysWaitBegin` | `kernel/core/src/syscall/wr_syscall.rs:25` |
++| `TryWaitChildrenLock` | `kernel/core/src/process/wait.rs:299` |
++| `TryWaitChildrenMatch` | `kernel/core/src/process/wait.rs:312`, `kernel/core/src/process/wait.rs:353` |
++| `TryWaitChildrenZombie` | `kernel/core/src/process/wait.rs:322` |
++| `TryWaitChildrenRetain` | `kernel/core/src/process/wait.rs:326` |
++| `ReapZombieChildRemove` | `kernel/core/src/process/wait.rs:368` |
++| `ReapZombieChildPidRemove` | `kernel/core/src/process/pid_table.rs:164` |
++| `ReapZombieChildFinish` | `kernel/core/src/process/wait.rs:400` |
++| `TryWaitChildrenUnlock` | `kernel/core/src/process/wait.rs:336`, `kernel/core/src/process/wait.rs:356` |
++| `DoWaitFound` | `kernel/core/src/process/wait.rs:78` |
++| `DoWaitNoMatch` | `kernel/core/src/process/wait.rs:84` |
++| `DoWaitNoHang` | `kernel/core/src/process/wait.rs:92` |
++| `DoWaitPending` | `kernel/core/src/process/wait.rs:103` |
++| `WaiterNewPair` | `ostd/src/sync/wait.rs:206` |
++| `SetSignalledWaker` | `kernel/core/src/process/posix_thread/mod.rs:185` |
++| `WaitQueueEnqueue` | `ostd/src/sync/wait.rs:153` |
++| `PauseCheckCancellation` | `kernel/core/src/process/signal/pause.rs:164` |
++| `WakerConsumeToken` | `ostd/src/sync/wait.rs:305` |
++| `ParkCurrentCheck` | `ostd/src/task/scheduler/mod.rs:460`, `ostd/src/task/scheduler/mod.rs:494` |
++| `ParkCurrentDequeue` | `ostd/src/task/scheduler/mod.rs:590` |
++| `ParkCurrentResume` | `ostd/src/task/scheduler/mod.rs:493` |
++| `ParkCurrentSpurious` | Not emitted. Independent spurious scheduling cannot be identified by this harness. |
++| `ClearSignalledWaker` | `kernel/core/src/process/posix_thread/mod.rs:194` |
++| `WaiterClose` | `ostd/src/sync/wait.rs:318` |
++| `SysWait4ReadStatus` | `kernel/core/src/syscall/wait4.rs:56` |
++| `SysWaitidReadStatus` | `kernel/core/src/syscall/waitid.rs:69` |
++| `SysWaitCopyout` | `kernel/core/src/syscall/wr_syscall.rs:34` |
++| `WaitStatusDrop` | `kernel/core/src/syscall/wait4.rs:75`, `kernel/core/src/syscall/waitid.rs:85` |
++| `SysWaitReturn` | `kernel/core/src/syscall/wr_syscall.rs:45` |
++| `ProcessStoreExitCode` | `kernel/core/src/process/status.rs:85` |
++| `ProcessPublishZombie` | `kernel/core/src/process/status.rs:58` |
++| `ProcessEnqueueSignal` | `kernel/core/src/process/process/mod.rs:651` |
++| `WakeSignalledWakerNone` | `kernel/core/src/process/posix_thread/mod.rs:264` |
++| `WakeSignalledWakerGet` | `kernel/core/src/process/posix_thread/mod.rs:264` |
++| `ProcessSignalLoopDone` | `kernel/core/src/process/process/mod.rs:662` |
++| `WakerWakeUp` | `ostd/src/sync/wait.rs:289` |
++| `SchedulerUnparkTarget` | `ostd/src/sync/wait.rs:293` |
++| `WakerWakeFinish` | `ostd/src/sync/wait.rs:131`, `kernel/core/src/process/posix_thread/mod.rs:268` |
++| `WaitQueueWakeAllCheck` | `ostd/src/sync/wait.rs:116` |
++| `WaitQueueWakeAllPop` | `ostd/src/sync/wait.rs:129` |
++| `WaitQueueWakeAllDone` | `ostd/src/sync/wait.rs:123` |
+--- candidate-v1/STATUS.md
++++ candidate-v2/STATUS.md
+@@ -0,0 +1,29 @@
++# Phase 2.5 status
++
++The harness is incomplete. Real source instrumentation, the regression fixtures, apply/cleanup scripts, the guarded build/run/collection entry point and the Phase 3 guide are present. There are no collected implementation traces and no trace-validation result.
++
++The independent v1 review found four material issues. The proposed correction moves imports after inner documentation, captures the false park-check end directly after its load, and adds same-interface consumers and an observer/consumer fixture. Exact-version re-review is pending. The clock issue remains open: unfenced TSC reads and sample handshakes do not establish the operation intervals required by this TraceSpec. The gate blocks dependent execution and grouped trace production until the controller supplies an admissible method and obtains independent approval.
++
++The host's observed available memory has also remained below the resource policy's 10 GiB kernel-build threshold. Each `run.sh` attempt records a fresh reading. The controller owns admission and the held heavy-stage lock. This worker has not reacquired it or launched another pipeline phase.
++
++| Evidence | Disposition |
++| --- | --- |
++| Source pin and 23 contract-file hashes | Verified before instrumentation. |
++| Initial v1 C fixture, Linux and Asterinas compile variants | Compiled in the pinned project container. These are prior-version binaries, not proof of the corrected candidate. |
++| Corrected scripts | Python AST and Bash syntax checked. Apply idempotence and `git diff --check` passed. |
++| Post-state checks | All 41 decoder names match exact TraceSpec arms. This is static L2 inspection. |
++| Corrected Rust and C build | `NOT_RUN`. |
++| Linux runtime control, WR-SQ and WR-CF | `NOT_RUN`. |
++| Asterinas guest, actual guest SMP and schedule evidence | `NOT_RUN`. |
++| Event coverage, timebox overlap and trace validation | `NOT_RUN`. |
++| Confirmation, classification and repair | Not invoked. They are outside this worker's assigned phase. |
++
++Every priority question retains a separate disposition:
++
++1. Unique consumption and post-reap results have hooks and prepared same/mixed-interface fixtures. No runtime result exists.
++2. Repeated WNOWAIT and late retained observation have prepared fixtures and distinct selection/removal/output hooks. The late-return schedule is not demonstrated.
++3. Registration, recheck, both wake paths, token handling, park/dequeue/resume and second-consumer ECHILD have hooks. WR-09/10 windows and completion remain unobserved. A watchdog alone would not establish a lost wakeup.
++4. Exit-code store, zombie publication, Acquire observation, retained status reads and copyout have separate hooks. The clock ordering prerequisite remains unresolved, and no visibility claim is established.
++5. No-event and post-reap outputs are prepared, with separate poisoned-output and copyout-fault controls. WR-SQ remains a source lead, and WR-CF remains uncalibrated at runtime.
++
++Preserve `evidence/candidate-v1`, its review, the proposed candidate, exact diffs and execution receipts. Continue this campaign after the clock review and resource admission are closed. Do not report Phase 2.5 as passed or use the spec-generation synthetic fixtures as implementation traces.
+--- candidate-v1/apply.sh
++++ candidate-v2/apply.sh
+@@ -0,0 +1,4 @@
++#!/usr/bin/env bash
++set -euo pipefail
++harness_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
++exec python3 "$harness_dir/src/instrument.py"
+--- candidate-v1/cases.tsv
++++ candidate-v2/cases.tsv
+@@ -0,0 +1,16 @@
++# name scenario exit_value exit_delay_us api_pair readiness
++nohang-37 nohang 37 20000 4i blocked
++consume-0 nohang 0 20000 4i blocked
++consume-255 nohang 255 20000 4i blocked
++observe-consume4 observe4 37 20000 4i blocked
++observe-consumeid observeid 37 20000 4i blocked
++consumers44-park compete 37 20000 44 blocked
++consumers44-ready compete 37 0 44 ready
++consumersii-park compete 37 20000 ii blocked
++consumersii-ready compete 37 0 ii ready
++consumers4i-park compete 37 20000 4i blocked
++consumersi4-park compete 37 20000 i4 blocked
++consumers4i-race compete 37 0 4i blocked
++consumersii-race compete 37 0 ii blocked
++observer-consume4 overlap 37 0 i4 ready
++observer-consumeid overlap 37 0 ii ready
+--- candidate-v1/clean.sh
++++ candidate-v2/clean.sh
+@@ -0,0 +1,19 @@
++#!/usr/bin/env bash
++set -euo pipefail
++harness_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
++python3 - "$harness_dir" <<'PY'
++import hashlib,json,subprocess,sys
++from pathlib import Path
++h=Path(sys.argv[1]); source=h.parent.parent/'source'
++receipt=h/'evidence/applied.json'
++data=json.loads(receipt.read_text())
++for name,expected in data['files'].items():
++    p=source/name
++    if not p.exists() or hashlib.sha256(p.read_bytes()).hexdigest()!=expected:
++        raise SystemExit(f'Refusing cleanup because {name} changed since apply')
++for name in data['files']:
++    baseline=subprocess.run(['git','-C',str(source),'show',f"{data['pin']}:{name}"],capture_output=True)
++    if baseline.returncode==0: (source/name).write_bytes(baseline.stdout)
++    else: (source/name).unlink()
++receipt.rename(h/'evidence/last-cleaned.json')
++PY
+--- candidate-v1/evidence/applied.json
++++ candidate-v2/evidence/applied.json
+@@ -3,22 +3,23 @@
+   "files": {
+     "ostd/src/lib.rs": "acc93d827d3b3d3272da051161e88f435255425400e08fc3667199c755d6cbaa",
+     "kernel/core/src/syscall/mod.rs": "f92b828c3becdcdd3d5311481f7fde262fabdae72497edb9badc1d68665b6482",
+-    "kernel/core/src/syscall/prctl.rs": "1889faa968e8c7a991c973644dd6b8fa3a1e5b26af0627c7f9b302c8ec31ba3a",
++    "kernel/core/src/syscall/prctl.rs": "a59528cd446cbb07a9bbe0a8021b2bbf374a6e76bcce685a8506d8e027fb8fc8",
+     "kernel/core/src/syscall/wait4.rs": "1c91f491697c2b7ef2e7bbf77ec4b09f6d122a3957851d5f7b53534d7b788a50",
+-    "kernel/core/src/syscall/waitid.rs": "cfb93db7fe03c45998e31f1e8082d0886c3b8f0464fe4560d6d665cd0e882f19",
++    "kernel/core/src/syscall/waitid.rs": "75a1f5084999d72445603398ff837040c3324876bccde9f4da2e7f7e18e27038",
+     "kernel/core/src/process/wait.rs": "6591eb9912c2e0374b61f4c62dc09317e97a3d069897c5e883c8c1e4c471a14f",
+-    "kernel/core/src/process/pid_table.rs": "e3ae8ee517dfd21554050c185b771843da4c5ee217f5d3541b84b65bf6d9c815",
+-    "kernel/core/src/process/status.rs": "e4206cbc5171e0940437af38a7c2d31ea7afe8bfcc51f9c7016652bb582de373",
++    "kernel/core/src/process/pid_table.rs": "c07b2b498375a5be48d2114357aaca1036d2367dc8c876e42d1b1540f7cac28b",
++    "kernel/core/src/process/status.rs": "35930b477736595748f08c73e97d052c7841240385d5395789fd6c1cd8f54d6b",
+     "kernel/core/src/process/signal/pause.rs": "41f07bc9e62acadf6c7fac53467ab9926e5ccdb60c54d93f64e1762f088f582f",
+     "kernel/core/src/process/posix_thread/mod.rs": "3d6d588ef244fabc616ab94db45e0f2f7afa09f92cfb4a0ec588ede82f1e9dcc",
+     "kernel/core/src/process/process/mod.rs": "0bbae0b5c78dc3f0bf935956f6be545aa4756b079c20e3a71e4077916fa7c680",
+     "kernel/core/src/process/exit.rs": "9af4203cdde3f5943fc7ef9acae04de9dd215c0eb9c928537dc56a1c6a9716fd",
+     "ostd/src/sync/wait.rs": "9ca169153a14e7169de647d43f8d09c1b78e0edfd3428358bf899572b4ce511a",
+-    "ostd/src/task/scheduler/mod.rs": "a86748b190ca6a1132e1b0d92cbd07e0924d76a0e5896f38f634b9ac384ce21b",
++    "ostd/src/task/scheduler/mod.rs": "4a6602138bf8fb1074f60bcbb885fc120f17253fe65879fb895fb09cfe768df7",
+     "test/initramfs/src/regression/process/Makefile": "52e77399113a2ec9227425bc21d9445ea49715e0b1b8792e71796161568a0fbe",
+-    "ostd/src/wr_trace.rs": "e5d9d3b21ba6c33f3081e0bfc9011361e39216911429d2c78d35d41078988716",
+-    "kernel/core/src/syscall/wr_syscall.rs": "a8b77d01860ce6aa39f23c6d352a1f84e3574c6ce2b38088fe7a85b5a0b6f5af",
+-    "test/initramfs/src/regression/process/wait_reap_trace/wait_reap_trace.c": "ab86a3a7e03154df540f9663f13e0bf332ea2990351583108b139af1bb03fe82",
++    "ostd/src/wr_trace.rs": "7b883bb76828bc2039020cfe6e2e09e33cf3242f276ddf164aa6f7562978f13c",
++    "kernel/core/src/syscall/wr_syscall.rs": "aee0e9ad96b463d2524a5ad5498b665b8dc6e5be37cad99309b8e0576f21d38b",
++    "test/initramfs/src/regression/process/wait_reap_trace/wait_reap_trace.c": "b649c793598d2981f59a25309194ebfa3202ae656a8b5c1ef603ee0212723d3e",
++    "test/initramfs/src/regression/process/wait_reap_trace/wait_calibration.c": "e591d0b635f3854038d8323ba03565a359fc38768b0bfc3173d61d08e04671c3",
+     "test/initramfs/src/regression/process/wait_reap_trace/Makefile": "124457dd18d700a8a3080f87956e34f578da7ef982b3aa8cbfafe965be1c14bb"
+   }
+ }
+--- candidate-v1/patches/instrumentation.patch
++++ candidate-v2/patches/instrumentation.patch
+@@ -17,17 +17,18 @@
+ +    wr::exit_done();
+  }
+ diff --git a/kernel/core/src/process/pid_table.rs b/kernel/core/src/process/pid_table.rs
+-index de49d1d85..1ea060303 100644
++index de49d1d85..16d9e7414 100644
+ --- a/kernel/core/src/process/pid_table.rs
+ +++ b/kernel/core/src/process/pid_table.rs
+-@@ -1,5 +1,7 @@
+- // SPDX-License-Identifier: MPL-2.0
+- 
+-+use ostd::wr_trace as wr;
+-+
+- //! A unified PID table that maps numeric identifiers to threads, processes,
+- //! process groups, and sessions.
+- //!
++@@ -7,6 +7,8 @@
++ //! the kernel objects that share the same numeric identifier, which eliminates
++ //! the need for separate per-type lookup tables.
++ 
+++use ostd::wr_trace as wr;
+++
++ use alloc::collections::btree_map::Entry;
++ 
++ use super::{Pgid, Pid, Process, ProcessGroup, Session, Sid};
+ @@ -156,8 +158,10 @@ impl PidTable {
+              // `clear_process` will assert the process slot is not empty.
+              self.process_count -= 1;
+@@ -159,17 +160,18 @@
+          let cond = || {
+              self.enqueue(waiter.waker());
+ diff --git a/kernel/core/src/process/status.rs b/kernel/core/src/process/status.rs
+-index cfe77afc5..c153b507f 100644
++index cfe77afc5..d744b4c32 100644
+ --- a/kernel/core/src/process/status.rs
+ +++ b/kernel/core/src/process/status.rs
+-@@ -1,5 +1,7 @@
+- // SPDX-License-Identifier: MPL-2.0
+- 
+-+use ostd::wr_trace as wr;
+-+
++@@ -2,6 +2,8 @@
++ 
+  //! The process status.
+  
+++use ostd::wr_trace as wr;
+++
+  use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
++ 
++ use ostd::sync::SpinLock;
+ @@ -50,7 +52,10 @@ impl ProcessStatus {
+      /// after it.
+      pub(super) fn set_zombie(&self) {
+@@ -328,14 +330,14 @@
+  mod waitid;
+  mod write;
+ diff --git a/kernel/core/src/syscall/prctl.rs b/kernel/core/src/syscall/prctl.rs
+-index c26b3ef6a..134e6ef7e 100644
++index c26b3ef6a..c6c5bb8a0 100644
+ --- a/kernel/core/src/syscall/prctl.rs
+ +++ b/kernel/core/src/syscall/prctl.rs
+ @@ -20,6 +20,7 @@ pub(super) fn sys_prctl(
+      arg5: u64,
+      ctx: &Context,
+  ) -> Result<SyscallReturn> {
+-+    if let Some(result) = super::wr_syscall::control(option, arg2, arg3, ctx) { return result; }
+++    if let Some(result) = super::wr_syscall::control(option, arg2, arg3, arg4, ctx) { return result; }
+      let prctl_cmd = PrctlCmd::from_args(option, arg2, arg3, arg4, arg5)?;
+      debug!("prctl_cmd = {:x?}", prctl_cmd);
+  
+@@ -399,7 +401,7 @@
+  }
+  
+ diff --git a/kernel/core/src/syscall/waitid.rs b/kernel/core/src/syscall/waitid.rs
+-index fc175eaa8..3ecdde738 100644
++index fc175eaa8..e79b5f328 100644
+ --- a/kernel/core/src/syscall/waitid.rs
+ +++ b/kernel/core/src/syscall/waitid.rs
+ @@ -1,5 +1,7 @@
+@@ -433,10 +435,11 @@
+      let wait_status =
+          do_wait(process_filter, wait_options, ctx).map_err(|err| match err.error() {
+              Errno::EINTR => Error::new(Errno::ERESTARTSYS),
+-@@ -51,10 +60,12 @@ pub(super) fn sys_waitid(
++@@ -51,10 +60,13 @@ pub(super) fn sys_waitid(
+      };
+  
+      if infoq_addr != 0 {
+++        wr::delay_output();
+ +        let wr_start = wr::stamp();
+          let siginfo = {
+              let (si_code, si_status) = calculate_si_code_and_si_status(&wait_status);
+@@ -446,7 +449,7 @@
+  
+              let mut siginfo = siginfo_t::new(SIGCHLD, si_code);
+              siginfo.set_pid_uid(pid, uid);
+-@@ -63,9 +74,14 @@ pub(super) fn sys_waitid(
++@@ -63,9 +75,14 @@ pub(super) fn sys_waitid(
+              siginfo
+          };
+  
+@@ -461,7 +464,7 @@
+      Ok(SyscallReturn::Return(0))
+  }
+  
+-@@ -87,6 +103,7 @@ fn calculate_si_code_and_si_status(wait_status: &WaitStatus) -> (i32, i32) {
++@@ -87,6 +104,7 @@ fn calculate_si_code_and_si_status(wait_status: &WaitStatus) -> (i32, i32) {
+      match wait_status {
+          WaitStatus::Zombie(process) => {
+              let exit_code = process.status().exit_code();
+@@ -642,10 +645,10 @@
+  }
+  
+ diff --git a/ostd/src/task/scheduler/mod.rs b/ostd/src/task/scheduler/mod.rs
+-index 87ea90175..6e1dfc31a 100644
++index 87ea90175..827d12f89 100644
+ --- a/ostd/src/task/scheduler/mod.rs
+ +++ b/ostd/src/task/scheduler/mod.rs
+-@@ -449,12 +449,14 @@ where
++@@ -449,12 +449,15 @@ where
+  {
+      let mut current = None;
+      let mut is_first_try = true;
+@@ -658,12 +661,13 @@
+ -                return ReschedAction::DoNothing;
+ -            }
+ +            let observed = has_unparked();
+++            let wr_check_end = crate::wr_trace::stamp();
+ +            if observed { return ReschedAction::DoNothing; }
+-+            if crate::wr_trace::parking() { crate::wr_trace::waiter_event(19, wr_start, &[0]); }
+++            if crate::wr_trace::parking() { crate::wr_trace::emit(19, wr_start, wr_check_end, crate::wr_trace::call(), &[0]); }
+              is_first_try = false;
+  
+              // Note the race conditions: the current task may be woken after the above `has_unparked`
+-@@ -467,7 +469,10 @@ where
++@@ -467,7 +470,10 @@ where
+              // after more complex schedulers are introduced.
+  
+              let should_pick_next = local_rq.update_current(UpdateFlags::Wait);
+@@ -674,7 +678,7 @@
+              should_pick_next.then(|| local_rq.pick_next())
+          } else {
+              local_rq.try_pick_next()
+-@@ -483,6 +488,10 @@ where
++@@ -483,6 +489,10 @@ where
+  
+          ReschedAction::Retry
+      });
+@@ -685,7 +689,7 @@
+  }
+  
+  /// Unblocks a target task.
+-@@ -577,6 +586,7 @@ where
++@@ -577,6 +587,7 @@ where
+          scheduler_singleton().mut_local_rq_with(&mut |rq| {
+              action = f(rq);
+          });
+--- candidate-v1/review-gate.json
++++ candidate-v2/review-gate.json
+@@ -0,0 +1,8 @@
++{
++  "status": "INCOMPLETE",
++  "blocking_finding": "R2: unfenced TSC does not establish the required operation interval ordering",
++  "review": "evidence/review-v1.md",
++  "review_sha256": "84f96ba7d8d48e73f3a4d14b40ea0fe318dbbf7badcd93f86fad281eacbf085f",
++  "reviewed_inputs": {},
++  "controller_action": "Arrange an admissible clock method and independent exact-version review before affected build, guest collection, or trace verification. Preserve this campaign and its prior candidates."
++}
+--- candidate-v1/run.sh
++++ candidate-v2/run.sh
+@@ -0,0 +1,121 @@
++#!/usr/bin/env bash
++set -euo pipefail
++harness_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
++lane_dir="$(cd -- "$harness_dir/../.." && pwd)"
++source_dir="$lane_dir/source"
++attempt="$(date -u +%Y%m%dT%H%M%SZ)-$$"
++evidence="$harness_dir/evidence/$attempt"
++mkdir -p "$evidence" "$harness_dir/build" "$lane_dir/.specula-output/traces"
++image_id=sha256:52dd279635dba5eb00635469308c1e0b9930fc0bd5448124ebaf2284ec18c278
++docker_cmd=(sudo -n docker -H unix:///var/run/docker.sock)
++container_name="wait-reap-$attempt"
++trap '"${docker_cmd[@]}" rm -f "$container_name" >/dev/null 2>&1 || true' EXIT
++
++bash "$harness_dir/apply.sh" >"$evidence/apply.log" 2>&1
++python3 - "$evidence" <<'PY'
++from pathlib import Path
++import datetime,json,sys
++mem={k:int(v.split()[0]) for k,v in (line.split(':',1) for line in Path('/proc/meminfo').read_text().splitlines())}
++Path(sys.argv[1],'preflight-memory.json').write_text(json.dumps({
++  'utc':datetime.datetime.now(datetime.timezone.utc).isoformat(),
++  'MemAvailable_kB':mem['MemAvailable'], 'required_kernel_build_kB':10*1024*1024},indent=2)+'\n')
++PY
++if ! python3 "$harness_dir/src/review_gate.py" >"$evidence/review-gate.log" 2>&1; then
++    cp "$harness_dir/review-gate.json" "$evidence/review-gate.json"
++    printf '%s\n' '{"status":"INCOMPLETE_REVIEW_GATE","build":"NOT_RUN","linux_control":"NOT_RUN","asterinas_runtime":"NOT_RUN","trace_validation":"NOT_RUN"}' >"$evidence/status.json"
++    cat "$evidence/review-gate.log"
++    exit 78
++fi
++"${docker_cmd[@]}" image inspect "$image_id" >"$evidence/container-image.json"
++git -C "$source_dir" rev-parse HEAD 'HEAD^{tree}' >"$evidence/source.txt"
++sha256sum "$harness_dir"/src/*.{rs,c,py} "$harness_dir/patches/instrumentation.patch" \
++    "$lane_dir/.specula-output/spec/"{base.tla,Trace.tla,Trace.cfg,TraceSearch.cfg} >"$evidence/inputs.sha256"
++lslocks --json --output PID,COMMAND,MODE,PATH >"$evidence/locks.json"
++
++# The controller owns heavy.lock. This script records ownership and never
++# recursively acquires that lock inside the admitted phase.
++timeout 180 "${docker_cmd[@]}" run --rm --name "$container_name" \
++    --cpus=2 --memory=8g --memory-swap=8g --pids-limit=512 --network=none \
++    -v "$lane_dir:/work" -w /work/source "$image_id" bash -euc '
++    export CARGO_BUILD_JOBS=2
++    gcc --version
++    rustc --version
++    ldd --version
++    timeout 120 make -C test/initramfs/src/regression/process/wait_reap_trace \
++        TEST_PLATFORM=asterinas OUTPUT_DIR=/work/.specula-output/harness/build/guest \
++        BUILD_DIR=/work/.specula-output/harness/build/guest-deps
++    timeout 120 make -C test/initramfs/src/regression/process/wait_reap_trace \
++        TEST_PLATFORM=linux OUTPUT_DIR=/work/.specula-output/harness/build/linux \
++        BUILD_DIR=/work/.specula-output/harness/build/linux-deps
++    ' >"$evidence/fixture-build.log" 2>&1
++
++while read -r case_name scenario value delay pair readiness; do
++    [[ -z "$case_name" || "$case_name" == \#* ]] && continue
++    timeout 30 "${docker_cmd[@]}" run --rm --name "$container_name" \
++        --cpus=2 --memory=8g --memory-swap=8g --pids-limit=512 --network=none \
++        -v "$harness_dir/build/linux:/fixture:ro" "$image_id" \
++        timeout 25 /fixture/process/wait_reap_trace/wait_reap_trace "$scenario" "$value" "$delay" "$pair" "$readiness" \
++        >"$evidence/linux-$case_name.log" 2>&1
++done <"$harness_dir/cases.tsv"
++timeout 30 "${docker_cmd[@]}" run --rm --name "$container_name" \
++    --cpus=2 --memory=8g --memory-swap=8g --pids-limit=512 --network=none \
++    -v "$harness_dir/build/linux:/fixture:ro" "$image_id" \
++    timeout 25 /fixture/process/wait_reap_trace/wait_calibration >"$evidence/linux-calibration.log" 2>&1
++sha256sum "$harness_dir"/build/{guest,linux}/process/wait_reap_trace/* >"$evidence/binaries.sha256"
++
++python3 - "$evidence" <<'PY'
++from pathlib import Path
++import datetime,json,sys
++mem={k:int(v.split()[0]) for k,v in (line.split(':',1) for line in Path('/proc/meminfo').read_text().splitlines())}
++passed=mem['MemAvailable']>=10*1024*1024
++data={'utc':datetime.datetime.now(datetime.timezone.utc).isoformat(), 'MemAvailable_kB':mem['MemAvailable'],
++      'required_kB':10*1024*1024, 'kernel_build_admitted':passed}
++Path(sys.argv[1],'memory-admission.json').write_text(json.dumps(data,indent=2)+'\n')
++print(json.dumps(data))
++if not passed:
++    Path(sys.argv[1],'status.json').write_text(json.dumps({'status':'INCOMPLETE_RESOURCE_ADMISSION',
++      'linux_control':'EXECUTED_SEE_LOGS','asterinas_runtime':'NOT_RUN','trace_validation':'NOT_RUN'},indent=2)+'\n')
++    raise SystemExit(75)
++PY
++
++timeout 1800 "${docker_cmd[@]}" run --rm --name "$container_name" \
++    --cpus=2 --memory=8g --memory-swap=8g --pids-limit=512 --network=none \
++    -v "$lane_dir:/work" -w /work/source "$image_id" bash -euc '
++    export CARGO_BUILD_JOBS=2 CARGO_NET_OFFLINE=true OSDK_LOCAL_DEV=1
++    timeout 900 cargo build --manifest-path osdk/Cargo.toml --locked --target-dir /work/.specula-output/harness/build/osdk
++    cd kernel
++    timeout 1500 /work/.specula-output/harness/build/osdk/debug/cargo-osdk osdk build --release \
++        --target-arch x86_64 --boot-method vmm-direct --strip-elf
++    ' >"$evidence/kernel-build.log" 2>&1
++
++kernel_path="$source_dir/target/osdk/aster-kernel-osdk-bin.qemu_elf"
++test -s "$kernel_path"
++sha256sum "$kernel_path" >"$evidence/kernel.sha256"
++for binary in wait_reap_trace wait_calibration; do
++    python3 "$harness_dir/src/initramfs.py" \
++        "$harness_dir/build/guest/process/wait_reap_trace/$binary" "$harness_dir/build/$binary.cpio"
++done
++sha256sum "$harness_dir/build/"*.cpio >"$evidence/initramfs.sha256"
++
++while read -r case_name scenario value delay pair readiness; do
++    [[ -z "$case_name" || "$case_name" == \#* ]] && continue
++    timeout 125 "${docker_cmd[@]}" run --rm --name "$container_name" \
++        --cpus=2 --memory=8g --memory-swap=8g --pids-limit=512 --network=none --device=/dev/kvm \
++        -v "$lane_dir:/work" "$image_id" \
++        timeout 120 python3 /work/.specula-output/harness/src/boot.py \
++        --kernel /work/source/target/osdk/aster-kernel-osdk-bin.qemu_elf \
++        --initramfs /work/.specula-output/harness/build/wait_reap_trace.cpio \
++        --log "/work/.specula-output/harness/evidence/$attempt/guest-$case_name.log" "$scenario" "$value" "$delay" "$pair" "$readiness"
++    python3 "$harness_dir/src/collect.py" "$evidence/guest-$case_name.log" \
++        "$lane_dir/.specula-output/traces/$case_name-$attempt.ndjson" >"$evidence/collect-$case_name.json"
++done <"$harness_dir/cases.tsv"
++timeout 125 "${docker_cmd[@]}" run --rm --name "$container_name" \
++    --cpus=2 --memory=8g --memory-swap=8g --pids-limit=512 --network=none --device=/dev/kvm \
++    -v "$lane_dir:/work" "$image_id" \
++    timeout 120 python3 /work/.specula-output/harness/src/boot.py \
++    --kernel /work/source/target/osdk/aster-kernel-osdk-bin.qemu_elf \
++    --initramfs /work/.specula-output/harness/build/wait_calibration.cpio \
++    --log "/work/.specula-output/harness/evidence/$attempt/guest-calibration.log" --calibration calibration 37 0
++wc -l "$lane_dir/.specula-output/traces/"*"$attempt.ndjson"
++printf 'Collection evidence: %s\n' "$evidence"
++printf 'Grouped traces require TraceSearch.cfg validation and review of clock assumptions.\n'
+--- candidate-v1/src/boot.py
++++ candidate-v2/src/boot.py
+@@ -0,0 +1,74 @@
++#!/usr/bin/env python3
++"""Stop QEMU only after the fixture's completion marker, or fail on timeout."""
++import argparse
++import json
++from pathlib import Path
++import selectors
++import socket
++import subprocess
++import time
++
++p = argparse.ArgumentParser()
++p.add_argument("--kernel", required=True)
++p.add_argument("--initramfs", required=True)
++p.add_argument("--log", type=Path, required=True)
++p.add_argument("--calibration", action="store_true")
++p.add_argument("scenario")
++p.add_argument("value")
++p.add_argument("delay")
++p.add_argument("pair", nargs="?", default="4i")
++p.add_argument("readiness", nargs="?", default="blocked")
++a = p.parse_args()
++qmp_path = str(a.log.with_suffix(".qmp"))
++command = ["qemu-system-x86_64", "-enable-kvm", "-cpu", "host", "-machine", "q35",
++           "-smp", "2", "-m", "2G", "-display", "none", "-serial", "stdio",
++           "-monitor", "none", "-qmp", f"unix:{qmp_path},server=on,wait=off",
++           "-no-reboot", "-nic", "none", "-kernel", a.kernel, "-initrd", a.initramfs,
++           "-append", f"console=ttyS0 loglevel=error rdinit=/init -- {a.scenario} {a.value} {a.delay} {a.pair} {a.readiness}"]
++a.log.with_suffix(".command.json").write_text(json.dumps(command, indent=2) + "\n")
++marker = b"WR_CALIBRATION_COMPLETE" if a.calibration else b"WR_COMPLETE"
++started = time.monotonic()
++process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
++matched = False
++try:
++    selector = selectors.DefaultSelector()
++    selector.register(process.stdout, selectors.EVENT_READ)
++    tail = b""
++    with a.log.open("wb") as log:
++        while time.monotonic() - started < 110:
++            for key, _ in selector.select(timeout=1):
++                block = key.fileobj.read1(65536)
++                if not block:
++                    raise RuntimeError(f"QEMU exited before {marker.decode()}")
++                log.write(block)
++                log.flush()
++                tail = (tail + block)[-65536:]
++                if marker in tail:
++                    matched = True
++                    break
++            if matched:
++                break
++        if not matched:
++            raise TimeoutError("guest fixture did not complete within 110 seconds")
++    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as qmp:
++        qmp.settimeout(5)
++        qmp.connect(qmp_path)
++        qmp.recv(65536)
++        qmp.sendall(b'{"execute":"qmp_capabilities"}\r\n')
++        qmp.recv(65536)
++        qmp.sendall(b'{"execute":"quit"}\r\n')
++    process.wait(timeout=5)
++finally:
++    if process.poll() is None:
++        process.terminate()
++        try:
++            process.wait(timeout=5)
++        except subprocess.TimeoutExpired:
++            process.kill()
++            process.wait()
++    Path(qmp_path).unlink(missing_ok=True)
++    a.log.with_suffix(".outcome.json").write_text(json.dumps({
++        "fixture_complete": matched, "qemu_returncode": process.returncode,
++        "elapsed_seconds": time.monotonic() - started,
++        "termination": "QMP quit after fixture completion" if matched else "incomplete execution",
++    }, indent=2) + "\n")
+--- candidate-v1/src/collect.py
++++ candidate-v2/src/collect.py
+@@ -6,6 +6,7 @@
+ import json
+ from pathlib import Path
+ import re
++from review_gate import check as check_review
+ 
+ EVENTS = """SysWaitBegin TryWaitChildrenLock TryWaitChildrenMatch TryWaitChildrenZombie
+ TryWaitChildrenRetain ReapZombieChildRemove ReapZombieChildPidRemove ReapZombieChildFinish
+@@ -114,6 +115,7 @@
+ 
+ 
+ def collect(log, output):
++    check_review()
+     lines = log.read_text(errors="strict").replace("\r", "").splitlines()
+     assert lines.count("WR_COMPLETE") == 1, "missing or duplicate fixture completion"
+     metadata = [json.loads(s[8:]) for s in lines if s.startswith("WR_META ")]
+--- candidate-v1/src/initramfs.py
++++ candidate-v2/src/initramfs.py
+@@ -0,0 +1,19 @@
++#!/usr/bin/env python3
++"""Package the statically linked regression executable as /init."""
++from pathlib import Path
++import stat
++import sys
++
++binary, destination = map(Path, sys.argv[1:])
++with destination.open("wb") as stream:
++    for index, (name, payload, mode) in enumerate([
++        ("init", binary.read_bytes(), stat.S_IFREG | 0o755),
++        ("TRAILER!!!", b"", 0),
++    ], 1):
++        name = name.encode() + b"\0"
++        fields = [index, mode, 0, 0, 1, 0, len(payload), 0, 0, 0, 0, len(name), 0]
++        header = b"070701" + b"".join(f"{v:08x}".encode() for v in fields)
++        stream.write(header + name)
++        stream.write(b"\0" * (-(len(header) + len(name)) % 4))
++        stream.write(payload)
++        stream.write(b"\0" * (-len(payload) % 4))
+--- candidate-v1/src/instrument.py
++++ candidate-v2/src/instrument.py
+@@ -31,13 +31,15 @@
+ 
+ 
+ def use(path):
+-    edit(path, "// SPDX-License-Identifier: MPL-2.0\n", "// SPDX-License-Identifier: MPL-2.0\n\nuse ostd::wr_trace as wr;\n")
++    text = changes.get(path, (ROOT / path).read_text())
++    pos = text.index("\nuse ")
++    changes[path] = text[:pos] + "\nuse ostd::wr_trace as wr;\n" + text[pos:]
+ 
+ 
+ edit("ostd/src/lib.rs", "pub mod task;", "pub mod task;\npub mod wr_trace;")
+ edit("kernel/core/src/syscall/mod.rs", "mod wait4;", "mod wr_syscall;\nmod wait4;")
+ edit("kernel/core/src/syscall/prctl.rs", "    let prctl_cmd = PrctlCmd::from_args(option, arg2, arg3, arg4, arg5)?;",
+-     "    if let Some(result) = super::wr_syscall::control(option, arg2, arg3, ctx) { return result; }\n    let prctl_cmd = PrctlCmd::from_args(option, arg2, arg3, arg4, arg5)?;")
++     "    if let Some(result) = super::wr_syscall::control(option, arg2, arg3, arg4, ctx) { return result; }\n    let prctl_cmd = PrctlCmd::from_args(option, arg2, arg3, arg4, arg5)?;")
+ 
+ # Keep a wrapper outside the original body's local destructors so the recorded
+ # ABI result follows WaitStatus destruction, including the ECHILD path.
+@@ -61,7 +63,7 @@
+ edit(p, "        ctx.user_space().write_val(status_ptr as _, &status_code)?;",
+      "        let wr_start = wr::stamp();\n        ctx.user_space().write_val(status_ptr as _, &status_code)?;\n        super::wr_syscall::copyout(wr_start, 4, status_ptr, ctx)?;")
+ p = "kernel/core/src/syscall/waitid.rs"
+-edit(p, "        let siginfo = {", "        let wr_start = wr::stamp();\n        let siginfo = {")
++edit(p, "        let siginfo = {", "        wr::delay_output();\n        let wr_start = wr::stamp();\n        let siginfo = {")
+ edit(p, "            let uid = wait_status.uid();", "            let uid = wait_status.uid();\n            wr::waiter_event(26, wr_start, &[wr::read_code(), pid as u64, u32::from(uid) as u64]);")
+ edit(p, "        ctx.user_space().write_val(infoq_addr as usize, &siginfo)?;",
+      "        let wr_start = wr::stamp();\n        ctx.user_space().write_val(infoq_addr as usize, &siginfo)?;\n        super::wr_syscall::copyout(wr_start, 247, infoq_addr, ctx)?;")
+@@ -179,7 +181,7 @@
+ edit(p, "pub(crate) fn park_current<F>(has_unparked: F)", "pub(crate) fn park_current<F>(has_unparked: F)")
+ edit(p, "    let mut current = None;\n    let mut is_first_try = true;", "    let mut current = None;\n    let mut is_first_try = true;\n    let wr_start = crate::wr_trace::stamp();\n    let mut wr_dequeued = false;")
+ edit(p, "            if has_unparked() {\n                return ReschedAction::DoNothing;\n            }\n            is_first_try = false;",
+-     "            let observed = has_unparked();\n            if observed { return ReschedAction::DoNothing; }\n            if crate::wr_trace::parking() { crate::wr_trace::waiter_event(19, wr_start, &[0]); }\n            is_first_try = false;")
++     "            let observed = has_unparked();\n            let wr_check_end = crate::wr_trace::stamp();\n            if observed { return ReschedAction::DoNothing; }\n            if crate::wr_trace::parking() { crate::wr_trace::emit(19, wr_start, wr_check_end, crate::wr_trace::call(), &[0]); }\n            is_first_try = false;")
+ edit(p, "            current = local_rq.dequeue_current();",
+      "            let wr_dequeue_start = crate::wr_trace::stamp();\n            current = local_rq.dequeue_current();\n            wr_dequeued = true;\n            crate::wr_trace::dequeue_pending(wr_dequeue_start);")
+ edit(p, "        ReschedAction::Retry\n    });\n}\n\n/// Unblocks a target task.",
+@@ -199,6 +201,7 @@
+     (ROOT / path).write_text(text)
+ copies = {"wr_trace.rs": "ostd/src/wr_trace.rs", "wr_syscall.rs": "kernel/core/src/syscall/wr_syscall.rs",
+           "wait_reap_trace.c": "test/initramfs/src/regression/process/wait_reap_trace/wait_reap_trace.c",
++          "wait_calibration.c": "test/initramfs/src/regression/process/wait_reap_trace/wait_calibration.c",
+           "Makefile": "test/initramfs/src/regression/process/wait_reap_trace/Makefile"}
+ for src, dst in copies.items():
+     (ROOT / dst).parent.mkdir(parents=True, exist_ok=True)
+--- candidate-v1/src/review_gate.py
++++ candidate-v2/src/review_gate.py
+@@ -0,0 +1,29 @@
++#!/usr/bin/env python3
++"""Check the review receipt without interpreting absence as approval."""
++import hashlib
++import json
++from pathlib import Path
++
++
++def check():
++    harness = Path(__file__).resolve().parent.parent
++    gate = json.loads((harness / "review-gate.json").read_text())
++    if gate["status"] != "APPROVED":
++        raise RuntimeError(gate["blocking_finding"])
++    review = harness / gate["review"]
++    assert hashlib.sha256(review.read_bytes()).hexdigest() == gate["review_sha256"]
++    inputs = gate["reviewed_inputs"]
++    required = {str(p.relative_to(harness)) for p in (harness / "src").iterdir() if p.is_file()}
++    required.update({"run.sh", "apply.sh", "cases.tsv", "patches/instrumentation.patch", "evidence/applied.json"})
++    required.update("../spec/" + p for p in ("base.tla", "Trace.tla", "Trace.cfg", "TraceSearch.cfg", "instrumentation-spec.md"))
++    assert required <= set(inputs), "review receipt does not cover every semantic input"
++    for name, expected in inputs.items():
++        assert hashlib.sha256((harness / name).read_bytes()).hexdigest() == expected, f"changed reviewed input: {name}"
++
++
++if __name__ == "__main__":
++    try:
++        check()
++    except (RuntimeError, AssertionError, KeyError, OSError) as error:
++        print(f"INCOMPLETE_REVIEW_GATE: {error}")
++        raise SystemExit(78)
+--- candidate-v1/src/wait_calibration.c
++++ candidate-v2/src/wait_calibration.c
+@@ -0,0 +1,83 @@
++// SPDX-License-Identifier: MPL-2.0
++#define _GNU_SOURCE
++#include <assert.h>
++#include <errno.h>
++#include <gnu/libc-version.h>
++#include <signal.h>
++#include <stdint.h>
++#include <stdio.h>
++#include <string.h>
++#include <sys/mman.h>
++#include <sys/syscall.h>
++#include <sys/utsname.h>
++#include <sys/wait.h>
++#include <unistd.h>
++
++static void report(const char *name, long ret, int error, const siginfo_t *info)
++{
++    printf("{\"kind\":\"calibration\",\"case\":\"%s\",\"libcRet\":%ld,\"errno\":%d,"
++           "\"si_pid\":%d,\"si_uid\":%u,\"si_signo\":%d,\"si_code\":%d,\"si_status\":%d}\n",
++           name, ret, error, info->si_pid, info->si_uid, info->si_signo, info->si_code, info->si_status);
++}
++int main(void)
++{
++    alarm(20);
++    struct sigaction action = { .sa_handler = SIG_DFL };
++    sigset_t blocked;
++    sigemptyset(&action.sa_mask);
++    assert(sigaction(SIGCHLD, &action, NULL) == 0);
++    sigemptyset(&blocked);
++    sigaddset(&blocked, SIGCHLD);
++    assert(sigprocmask(SIG_BLOCK, &blocked, NULL) == 0);
++    struct utsname identity;
++    assert(uname(&identity) == 0);
++    printf("{\"kind\":\"identity\",\"kernel\":\"%s %s %s\",\"libc\":\"glibc %s\"}\n",
++           identity.sysname, identity.release, identity.machine, gnu_get_libc_version());
++    int gate[2];
++    assert(pipe(gate) == 0);
++    pid_t child = fork();
++    assert(child >= 0);
++    if (!child) { char byte; close(gate[1]); assert(read(gate[0], &byte, 1) == 1); _exit(37); }
++    close(gate[0]);
++    for (int poison = 0; poison < 2; ++poison) {
++        siginfo_t info;
++        memset(&info, poison ? 0x5a : 0, sizeof(info));
++        errno = 0;
++        long ret = syscall(SYS_waitid, P_PID, child, &info, WEXITED | WNOHANG, NULL);
++        int error = errno;
++        report(poison ? "WR-SQ-poison" : "WR-SQ-zero", ret, error, &info);
++        assert(ret == 0 && error == 0);
++    }
++    assert(write(gate[1], "x", 1) == 1);
++    close(gate[1]);
++    int status;
++    assert(syscall(SYS_wait4, child, &status, 0, NULL) == child);
++    assert(WIFEXITED(status) && WEXITSTATUS(status) == 37);
++    void *fault = mmap(NULL, 4096, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
++    assert(fault != MAP_FAILED);
++    for (int mode = 0; mode < 3; ++mode) {
++        child = fork();
++        assert(child >= 0);
++        if (!child) _exit(37);
++        siginfo_t info = {0};
++        assert(syscall(SYS_waitid, P_PID, child, &info, WEXITED | WNOWAIT, NULL) == 0);
++        assert(info.si_pid == child && info.si_status == 37);
++        errno = 0;
++        long ret = mode == 0 ? syscall(SYS_wait4, child, fault, 0, NULL) :
++            syscall(SYS_waitid, P_PID, child, fault, WEXITED | (mode == 2 ? WNOWAIT : 0), NULL);
++        int error = errno;
++        report(mode == 0 ? "WR-CF-wait4-fault" : mode == 1 ? "WR-CF-waitid-fault" : "WR-CF-nowait-fault", ret, error, &info);
++        assert(ret == -1 && error == EFAULT);
++        errno = 0;
++        ret = syscall(SYS_wait4, child, &status, WNOHANG, NULL);
++        error = errno;
++        report(mode == 0 ? "WR-CF-wait4-followup" : mode == 1 ? "WR-CF-waitid-followup" : "WR-CF-nowait-followup", ret, error, &info);
++        if (mode == 2) {
++            assert(ret == child && error == 0);
++            assert(WIFEXITED(status) && WEXITSTATUS(status) == 37);
++        } else assert(ret == -1 && error == ECHILD);
++    }
++    assert(munmap(fault, 4096) == 0);
++    puts("WR_CALIBRATION_COMPLETE");
++    return 0;
++}
+--- candidate-v1/src/wait_reap_trace.c
++++ candidate-v2/src/wait_reap_trace.c
+@@ -42,7 +42,7 @@
+ static struct waiter waiters[2];
+ static struct shared *shared;
+ static pid_t child;
+-static int competing, delay_us, exit_value = 37;
++static int competing, overlap, already_exited, main_api = 4, delay_us, exit_value = 37;
+ static uint64_t clock_samples[CALIBRATION_SAMPLES][4];
+ 
+ static uint64_t stamp(void) { return __rdtsc(); }
+@@ -71,7 +71,8 @@
+ static int control(int command, int actor)
+ {
+ #ifdef __asterinas__
+-    return syscall(SYS_prctl, 0x53575000 + command, actor, child, 0, 0);
++    return syscall(SYS_prctl, 0x53575000 + command, actor, child,
++                   overlap && actor == 1 ? 50000000UL : 0UL, 0);
+ #else
+     (void)command;
+     (void)actor;
+@@ -145,6 +146,10 @@
+         atomic_store_explicit(&shared->clock_seq, i * 2 + 2, memory_order_release);
+     }
+     until(&shared->command, 1);
++    if (overlap) {
++        until(&shared->started, 1);
++        usleep(1000);
++    }
+     if (competing)
+         atomic_fetch_or_explicit(&shared->started, 2, memory_order_release);
+     invoke(waiter, waiter->api, waiter->options);
+@@ -173,12 +178,18 @@
+ {
+     const char *scenario = argc > 1 ? argv[1] : "compete";
+     assert(!strcmp(scenario, "nohang") || !strcmp(scenario, "observe4") ||
+-           !strcmp(scenario, "observeid") || !strcmp(scenario, "compete"));
++           !strcmp(scenario, "observeid") || !strcmp(scenario, "compete") ||
++           !strcmp(scenario, "overlap"));
+     if (argc > 2) exit_value = atoi(argv[2]);
+     if (argc > 3) delay_us = atoi(argv[3]);
+     assert(exit_value >= 0 && exit_value <= 255 && delay_us >= 0 && delay_us <= 100000);
+     alarm(20);
+     competing = !strcmp(scenario, "compete");
++    overlap = !strcmp(scenario, "overlap");
++    already_exited = overlap || (argc > 5 && !strcmp(argv[5], "ready"));
++    const char *pair = argc > 4 ? argv[4] : "4i";
++    assert(!strcmp(pair, "44") || !strcmp(pair, "ii") || !strcmp(pair, "4i") || !strcmp(pair, "i4"));
++    main_api = pair[0] == '4' ? 4 : 247;
+     struct sigaction action = { .sa_handler = SIG_DFL };
+     sigemptyset(&action.sa_mask);
+     assert(sigaction(SIGCHLD, &action, NULL) == 0);
+@@ -197,8 +208,8 @@
+     waiters[0].cpu = cpus[0];
+     waiters[1].actor = 2;
+     waiters[1].cpu = cpus[1];
+-    waiters[1].api = competing ? 247 : 4;
+-    waiters[1].options = competing ? WEXITED : 0;
++    waiters[1].api = (competing || overlap) && pair[1] == 'i' ? 247 : 4;
++    waiters[1].options = waiters[1].api == 247 ? WEXITED : 0;
+     shared = mmap(NULL, sizeof(*shared), PROT_READ | PROT_WRITE,
+                   MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+     assert(shared != MAP_FAILED);
+@@ -210,7 +221,8 @@
+         pin(cpus[1]);
+         assert(control(1, 3) >= 2);
+         atomic_store_explicit(&shared->ready, 1, memory_order_release);
+-        until(competing ? &shared->started : &shared->allow_exit, competing ? 3 : 1);
++        until(competing && !already_exited ? &shared->started : &shared->allow_exit,
++              competing && !already_exited ? 3 : 1);
+         if (delay_us) usleep(delay_us);
+         syscall(SYS_exit, exit_value);
+         __builtin_unreachable();
+@@ -231,14 +243,26 @@
+         assert(clock_samples[i][2] <= clock_samples[i][3]);
+     }
+     struct waiter *main_waiter = &waiters[0];
++    if (already_exited) {
++        atomic_store_explicit(&shared->allow_exit, 1, memory_order_release);
++        expect_event(invoke(main_waiter, 247, WEXITED | WNOWAIT));
++    }
+     if (competing) {
+         atomic_store_explicit(&shared->command, 1, memory_order_release);
+         atomic_fetch_or_explicit(&shared->started, 1, memory_order_release);
+-        invoke(main_waiter, 4, 0);
++        struct result *a = invoke(main_waiter, main_api, main_api == 4 ? 0 : WEXITED);
+         until(&shared->done, 1);
+-        struct result *a = &main_waiter->calls[0], *b = &waiters[1].calls[0];
+-        if (a->ret == child) { expect_event(a); expect_echild(b); }
++        struct result *b = &waiters[1].calls[0];
++        if (a->ret >= 0) { expect_event(a); expect_echild(b); }
+         else { expect_echild(a); expect_event(b); }
++    } else if (overlap) {
++        atomic_store_explicit(&shared->command, 1, memory_order_release);
++        atomic_store_explicit(&shared->started, 1, memory_order_release);
++        struct result *observer = invoke(main_waiter, 247, WEXITED | WNOWAIT);
++        until(&shared->done, 1);
++        expect_event(&waiters[1].calls[0]);
++        if (observer->ret >= 0) expect_event(observer);
++        else expect_echild(observer);
+     } else {
+         if (!strcmp(scenario, "nohang")) {
+             struct result *r = invoke(main_waiter, 4, WNOHANG);
+@@ -251,8 +275,8 @@
+             expect_event(invoke(main_waiter, 247, WEXITED | WNOWAIT));
+             expect_event(invoke(main_waiter, 247, WEXITED | WNOWAIT | WNOHANG));
+         }
+-        if (!strcmp(scenario, "observeid")) expect_event(invoke(main_waiter, 247, WEXITED));
+-        else expect_event(invoke(main_waiter, 4, 0));
++        if (!strcmp(scenario, "observeid")) expect_event(invoke(main_waiter, 247, WEXITED | WNOHANG));
++        else expect_event(invoke(main_waiter, 4, !strcmp(scenario, "observe4") ? WNOHANG : 0));
+         atomic_store_explicit(&shared->command, 1, memory_order_release);
+         until(&shared->done, 1);
+         expect_echild(&waiters[1].calls[0]);
+@@ -266,11 +290,13 @@
+            "\"smp\":%d,\"concurrent\":%s,\"buffers\":{\"w1\":%" PRIuPTR ",\"w2\":%" PRIuPTR "},"
+            "\"sigchld\":\"SIG_DFL\",\"sa_nocldwait\":false,\"sigchld_blocked\":true,"
+            "\"valid_buffers\":true,\"rusage_null\":true,\"kernel\":\"%s %s %s\",\"libc\":\"glibc %s\","
+-           "\"clock\":\"unfenced-rdtsc\",\"clock_samples\":%d,\"cpu_affinity\":[%d,%d],\"exit_delay_us\":%d}\n",
+-           scenario, child, getuid(), exit_value, waiters[0].smp, competing ? "true" : "false",
++           "\"clock\":\"unfenced-rdtsc\",\"clock_samples\":%d,\"cpu_affinity\":[%d,%d],\"exit_delay_us\":%d,"
++           "\"pair\":\"%s\",\"already_exited\":%s,\"observer_delay_cycles\":%lu}\n",
++           scenario, child, getuid(), exit_value, waiters[0].smp, competing || overlap ? "true" : "false",
+            (uintptr_t)waiters[0].output, (uintptr_t)waiters[1].output,
+            identity.sysname, identity.release, identity.machine, gnu_get_libc_version(),
+-           CALIBRATION_SAMPLES, cpus[0], cpus[1], delay_us);
++           CALIBRATION_SAMPLES, cpus[0], cpus[1], delay_us, pair, already_exited ? "true" : "false",
++           overlap ? 50000000UL : 0UL);
+     for (int i = 0; i < CALIBRATION_SAMPLES; ++i)
+         printf("WR_CLOCK %" PRIu64 " %" PRIu64 " %" PRIu64 " %" PRIu64 "\n",
+                clock_samples[i][0], clock_samples[i][1], clock_samples[i][2], clock_samples[i][3]);
+--- candidate-v1/src/wr_syscall.rs
++++ candidate-v2/src/wr_syscall.rs
+@@ -45,7 +45,7 @@
+     wr::finish(ret);
+ }
+ 
+-pub(super) fn control(option: i32, actor: u64, child: u64, ctx: &Context)
++pub(super) fn control(option: i32, actor: u64, child: u64, delay: u64, ctx: &Context)
+     -> Option<Result<SyscallReturn>> {
+     match option {
+         0x53575000 => {
+@@ -55,7 +55,7 @@
+         0x53575001 => {
+             let queue = ctx.process.children_wait_queue() as *const _ as usize;
+             let ok = wr::register(actor as usize, ctx.posix_thread.tid() as u64,
+-                child, ctx.process.pid() as u64, queue);
++                child, ctx.process.pid() as u64, queue, delay);
+             Some(if ok { Ok(SyscallReturn::Return(ostd::cpu::num_cpus() as _)) }
+                 else { Err(Error::with_message(Errno::EINVAL, "trace actor already registered")) })
+         }
+--- candidate-v1/src/wr_trace.rs
++++ candidate-v2/src/wr_trace.rs
+@@ -31,6 +31,7 @@
+     channel: AtomicU64,
+     park: AtomicBool,
+     dequeue_start: AtomicU64,
++    output_delay: AtomicU64,
+     records: [Record; CAPACITY],
+ }
+ 
+@@ -44,6 +45,7 @@
+             arm_pair: AtomicBool::new(false), read_code: AtomicU64::new(0),
+             remaining: AtomicU64::new(0), channel: AtomicU64::new(0),
+             park: AtomicBool::new(false), dequeue_start: AtomicU64::new(0),
++            output_delay: AtomicU64::new(0),
+             records: [const { Record { words: [const { AtomicU64::new(0) }; WORDS] } }; CAPACITY],
+         }
+     }
+@@ -111,7 +113,7 @@
+     QUEUE.store(0, Ordering::Relaxed);
+ }
+ 
+-pub fn register(a: usize, tid: u64, pid: u64, parent: u64, queue: usize) -> bool {
++pub fn register(a: usize, tid: u64, pid: u64, parent: u64, queue: usize, delay: u64) -> bool {
+     if !(1..=3).contains(&a) { return false; }
+     let Some(task) = Task::current() else { return false; };
+     let s = &STREAMS[a - 1];
+@@ -120,12 +122,22 @@
+         return false;
+     }
+     s.tid.store(tid, Ordering::Relaxed);
++    s.output_delay.store(delay.min(100_000_000), Ordering::Relaxed);
+     if a == 1 {
+         CHILD_PID.store(pid, Ordering::Relaxed);
+         PARENT_PID.store(parent, Ordering::Relaxed);
+         QUEUE.store(queue, Ordering::Relaxed);
+     }
+     true
++}
++
++pub fn delay_output() {
++    if !waiting() { return; }
++    let delay = local().unwrap().output_delay.load(Ordering::Relaxed);
++    let start = stamp();
++    // Selection already returned its retained Arc and released the children
++    // mutex. This bounded scheduling delay cannot hold a protocol lock.
++    while stamp().wrapping_sub(start) < delay { core::hint::spin_loop(); }
+ }
+ 
+ pub fn emit(event: u64, start: u64, end: u64, key: Call, data: &[u64]) {

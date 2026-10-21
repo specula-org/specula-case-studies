@@ -1,0 +1,49 @@
+==============================================================
+STEP 1  Linux control (challenge payload, tmpfs, host 7.1.9)
+==============================================================
+MC-3 challenge: filesystem under test = /dev/shm/mc3c-control
+[C1 defaults survive a short record] ret=8 (expected 8) timeout_ms=5000 (expected 5000) retries=3 (expected 3) name="default-profile" (expected "default-profile") -> OK
+[C2 readv leaves a live object alone] ret=1 (expected 1) magic=0xabcd1234 (expected 0xabcd1234) payload_intact=60/60 -> OK
+[C3 past-EOF window after truncate] ret=10 (expected 10) untouched=4086 zeroed=0 stale_pre_truncate=0 other=0 -> OK
+[C4 control: page-aligned file, cap == EOF] ret=4096 (expected 4096) clobbered_past_eof=0 (expected 0) -> OK
+[C5 CE: pread(off=1,len=64,size=2)] ret=1 (expected 1) modified_past_return=0 (expected 0) -> OK
+MC3C_SUMMARY wrong_outcomes=0 control_failures=0
+MC3C_RESULT MATCHES_LINUX
+MC3C_SCENARIO_DONE
+
+==============================================================
+STEP 2  Asterinas (pristine kernel, both payloads in one boot)
+==============================================================
+--- kernel/ostd modifications in the tree under test (must be empty) ---
+--- end ---
+
+--- Asterinas guest output ---
+MC-3 repro: filesystem under test = /mc3
+[case1 pread(off=1,len=64,size=2)] ret=1 (expected 1) untouched_range=[1,64) clobbered=63 first_clobbered=1 -> VIOLATION
+[case2 pread(off=EOF=2,len=64)] ret=0 (expected 0) untouched_range=[0,64) clobbered=64 first_clobbered=0 -> VIOLATION
+[case3 read(off=1,len=64,size=2)] ret=1 (expected 1) untouched_range=[1,64) clobbered=63 first_clobbered=1 -> VIOLATION
+[case3 offset] after read the shared offset is 2 (expected 2) -> OK
+[case4 preadv(off=1, iov=[2,64], size=2)] ret=1 (expected 1)
+[case4 entry0 tail] ret=1 (expected 1) untouched_range=[1,2) clobbered=1 first_clobbered=1 -> VIOLATION
+[case4 entry1 (starts at EOF)] ret=1 (expected 1) untouched_range=[0,64) clobbered=64 first_clobbered=0 -> VIOLATION
+[case5 pread(off=4096,len=4096,size=4100)] ret=4 (expected 4) untouched_range=[4,4096) clobbered=4092 first_clobbered=4 -> VIOLATION
+MC3_SUMMARY wrong_return_values=0 buffers_modified_past_return=6
+MC3_RESULT DIVERGES_FROM_LINUX
+MC3_SCENARIO_DONE
+MC-3 challenge: filesystem under test = /mc3
+[C1 defaults survive a short record] ret=8 (expected 8) timeout_ms=0 (expected 5000) retries=0 (expected 3) name="" (expected "default-profile") -> WRONG_OUTCOME
+[C2 readv leaves a live object alone] ret=1 (expected 1) magic=0x00000000 (expected 0xabcd1234) payload_intact=0/60 -> WRONG_OUTCOME
+[C3 past-EOF window after truncate] ret=10 (expected 10) untouched=0 zeroed=4086 stale_pre_truncate=0 other=0 -> ZEROED_PAST_RETURN
+[C4 control: page-aligned file, cap == EOF] ret=4096 (expected 4096) clobbered_past_eof=0 (expected 0) -> OK
+[C5 CE: pread(off=1,len=64,size=2)] ret=1 (expected 1) modified_past_return=63 (expected 0) -> VIOLATION
+MC3C_SUMMARY wrong_outcomes=4 control_failures=0
+MC3C_RESULT DIVERGES_FROM_LINUX
+MC3C_SCENARIO_DONE
+
+==============================================================
+VERDICT
+==============================================================
+Linux host      : MC3C_RESULT MATCHES_LINUX
+Asterinas       : MC3C_RESULT DIVERGES_FROM_LINUX
+Asterinas ctrl  : control_failures=0 (must be control_failures=0)
+MC-3 CHALLENGE: consumer-level harm CONFIRMED (negative control held)

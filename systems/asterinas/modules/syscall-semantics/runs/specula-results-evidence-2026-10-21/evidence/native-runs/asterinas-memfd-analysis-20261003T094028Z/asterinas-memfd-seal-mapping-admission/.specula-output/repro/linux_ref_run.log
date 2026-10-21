@@ -1,0 +1,639 @@
+[7.2.8] CR-2 reproduction: ownership of write eligibility across split/merge/protect/unmap
+[7.2.8] --- SEQ1 partial-unmap split ---
+[7.2.8] ok   S1 mmap RW [0,4)
+[7.2.8] ok   S1.p1 EBUSY whole RW mapping: expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   S1.p2 EBUSY split survivors [0,1)+[3,4): expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   S1.p3 EBUSY last survivor [3,4): expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   S1.p4 seal succeeds after last piece unmapped: expect seal success, got r=0 errno=0 (0)
+[7.2.8] --- SEQ2 protect-split, re-split, merge-back ---
+[7.2.8] ok   S2 mmap RW [0,4)
+[7.2.8] ok   S2.p1 EBUSY whole RW mapping: expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   S2 mprotect [1,3) down to R
+[7.2.8] ok   S2.p2 EBUSY 3-way split [0,1)W [1,3)R [3,4)W: expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   S2 mprotect [1,2) back to RW (re-split middle)
+[7.2.8] ok   S2.p3 EBUSY 4 pieces after re-split: expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   S2 mprotect [1,3) RW (unify + merge)
+[7.2.8] ok   S2.p4 EBUSY merged mapping (upgrades keep count): expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   S2.p5 after unmapping page 0: expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   S2.p6 after unmapping page 1: expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   S2.p7 after unmapping page 2: expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   S2.p8 after unmapping page 3: expect seal success, got r=0 errno=0 (0)
+[7.2.8] --- SEQ3 two mmaps merged by protect ---
+[7.2.8] ok   S3 mmap RW [0,2)
+[7.2.8] ok   S3 mmap RW [2,4)
+[7.2.8] ok   S3.p1 EBUSY two eligible mappings: expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   S3 mprotect [0,4) down to R (merges pieces)
+[7.2.8] ok   S3.p2 EBUSY merged R mapping still eligible: expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   S3.p3 EBUSY survivor [2,4)R: expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   S3.p4 seal succeeds after merge traffic ends: expect seal success, got r=0 errno=0 (0)
+[7.2.8] --- SEQ4 mixed eligibility adjacency ---
+[7.2.8] ok   S4 mmap R via O_RDWR fd [0,2) (eligible)
+[7.2.8] ok   S4 mmap R via O_RDONLY fd [2,4) (ineligible)
+[7.2.8] ok   S4.p1 EBUSY eligible [0,2) dominates: expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   S4 mprotect [0,4) up RW rejected with EACCES (errno=13)
+[7.2.8] ok   S4.p2 EBUSY still after failed cross-upgrade: expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   S4.p3 seal must SUCCEED while ineligible [2,4) stays live: expect seal success, got r=0 errno=0 (0)
+[7.2.8] ok   S4 ineligible piece cannot be upgraded (errno=13)
+[7.2.8] --- SEQ5 downgrade retains eligibility ---
+[7.2.8] ok   S5 mmap RW [0,4)
+[7.2.8] ok   S5.p1 EBUSY RW mapping: expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   S5 downgrade to R
+[7.2.8] ok   S5.p2 EBUSY downgraded mapping still eligible: expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   S5 upgrade [0,1) back to RW
+[7.2.8] ok   S5.p3 EBUSY upgraded piece: expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   S5.p4 EBUSY half gone: expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   S5.p5 seal succeeds: expect seal success, got r=0 errno=0 (0)
+[7.2.8] --- SEQ6 MAP_FIXED interior replacement ---
+[7.2.8] ok   S6 mmap RW [0,4)
+[7.2.8] ok   S6.p1 EBUSY whole mapping: expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   S6 MAP_FIXED R replacement of page 1 (split + re-admission)
+[7.2.8] ok   S6.p2 EBUSY survivors + replacement: expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   S6.p3 EBUSY survivors [0,1)+[2,4): expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   S6.p4 seal succeeds: expect seal success, got r=0 errno=0 (0)
+[7.2.8] --- SEQ7 protect across hole ---
+[7.2.8] ok   S7 mmap RW [0,2)
+[7.2.8] ok   S7.p1 EBUSY: expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   S7 mprotect [0,4) hits hole with ENOMEM (errno=12)
+[7.2.8] ok   S7.p2 EBUSY after failed cross-hole protect: expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   S7 partial downgrade of survivor half
+[7.2.8] ok   S7.p3 EBUSY split halves of survivor: expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   S7.p4 seal succeeds after all pieces gone: expect seal success, got r=0 errno=0 (0)
+[7.2.8] --- STRESS deterministic op mix, 24 rounds ---
+[7.2.8] ok   R00.00 munmap [1,3): expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R00.01 munmap [1,2): expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R00.02 munmap [3,4): expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R00.03 mprotect [1,4) RW: expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R00.04 MAP_FIXED R [0,2) admitted
+[7.2.8] ok   R00.04 MAP_FIXED R [0,2): expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R00.05 mprotect [2,3) RW: expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R00.06 MAP_FIXED R [1,2) admitted
+[7.2.8] ok   R00.06 MAP_FIXED R [1,2): expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R00.07 MAP_FIXED R [0,4) admitted
+[7.2.8] ok   R00.07 MAP_FIXED R [0,4): expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R00.08 mprotect [3,4) R: expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R00.09 munmap [2,4): expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R00.10 MAP_FIXED R [2,3) admitted
+[7.2.8] ok   R00.10 MAP_FIXED R [2,3): expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R00.11 MAP_FIXED R [1,3) admitted
+[7.2.8] ok   R00.11 MAP_FIXED R [1,3): expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R00.12 MAP_FIXED R [3,4) admitted
+[7.2.8] ok   R00.12 MAP_FIXED R [3,4): expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R00.13 mprotect [3,4) R: expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R00.14 munmap [1,2): expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R00.15 munmap [0,1): expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R00.16 munmap [0,2): expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R00.17 munmap [3,4): expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R00.18 munmap [1,3): expect seal success, got r=0 errno=0 (0)
+[7.2.8] ok   R01.00 mprotect [1,2) RW: expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R01.01 munmap [2,3): expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R01.02 MAP_FIXED R [2,3) admitted
+[7.2.8] ok   R01.02 MAP_FIXED R [2,3): expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R01.03 mprotect [1,4) RW: expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R01.04 MAP_FIXED R [2,3) admitted
+[7.2.8] ok   R01.04 MAP_FIXED R [2,3): expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R01.05 munmap [2,3): expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R01.06 munmap [0,1): expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R01.07 mprotect [3,4) R: expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R01.08 mprotect [1,4) R: expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R01.09 munmap [1,2): expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R01.10 munmap [3,4): expect seal success, got r=0 errno=0 (0)
+[7.2.8] ok   R02.00 munmap [1,3): expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R02.01 mprotect [1,4) RW: expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R02.02 MAP_FIXED R [0,3) admitted
+[7.2.8] ok   R02.02 MAP_FIXED R [0,3): expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R02.03 MAP_FIXED R [2,3) admitted
+[7.2.8] ok   R02.03 MAP_FIXED R [2,3): expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R02.04 mprotect [2,3) R: expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R02.05 MAP_FIXED R [3,4) admitted
+[7.2.8] ok   R02.05 MAP_FIXED R [3,4): expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R02.06 mprotect [0,2) R: expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R02.07 munmap [0,2): expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R02.08 mprotect [2,3) RW: expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R02.09 munmap [0,1): expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R02.10 mprotect [3,4) R: expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R02.11 MAP_FIXED R [1,3) admitted
+[7.2.8] ok   R02.11 MAP_FIXED R [1,3): expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R02.12 MAP_FIXED R [1,4) admitted
+[7.2.8] ok   R02.12 MAP_FIXED R [1,4): expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R02.13 munmap [2,4): expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R02.14 mprotect [0,4) RW: expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R02.15 mprotect [0,2) RW: expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R02.16 mprotect [2,3) RW: expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R02.17 MAP_FIXED R [0,4) admitted
+[7.2.8] ok   R02.17 MAP_FIXED R [0,4): expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R02.18 munmap [1,3): expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R02.19 MAP_FIXED R [3,4) admitted
+[7.2.8] ok   R02.19 MAP_FIXED R [3,4): expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R02.20 munmap [0,1): expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R02.21 munmap [0,4): expect seal success, got r=0 errno=0 (0)
+[7.2.8] ok   R03.00 MAP_FIXED R [1,2) admitted
+[7.2.8] ok   R03.00 MAP_FIXED R [1,2): expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R03.01 munmap [3,4): expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R03.02 mprotect [3,4) RW: expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R03.03 MAP_FIXED R [3,4) admitted
+[7.2.8] ok   R03.03 MAP_FIXED R [3,4): expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R03.04 munmap [2,3): expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R03.05 munmap [1,3): expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R03.06 munmap [2,3): expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R03.07 mprotect [0,3) R: expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R03.08 mprotect [2,4) R: expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R03.09 munmap [0,4): expect seal success, got r=0 errno=0 (0)
+[7.2.8] ok   R04.00 munmap [1,4): expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R04.01 mprotect [2,3) RW: expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R04.02 mprotect [3,4) R: expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R04.03 MAP_FIXED R [3,4) admitted
+[7.2.8] ok   R04.03 MAP_FIXED R [3,4): expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R04.04 munmap [3,4): expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R04.05 munmap [3,4): expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R04.06 MAP_FIXED R [0,4) admitted
+[7.2.8] ok   R04.06 MAP_FIXED R [0,4): expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R04.07 munmap [1,3): expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R04.08 mprotect [3,4) RW: expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R04.09 munmap [2,4): expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R04.10 munmap [3,4): expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R04.11 mprotect [0,4) RW: expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R04.12 munmap [1,2): expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R04.13 munmap [0,3): expect seal success, got r=0 errno=0 (0)
+[7.2.8] ok   R05.00 MAP_FIXED R [1,3) admitted
+[7.2.8] ok   R05.00 MAP_FIXED R [1,3): expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R05.01 mprotect [0,2) R: expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R05.02 mprotect [1,3) R: expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R05.03 munmap [0,4): expect seal success, got r=0 errno=0 (0)
+[7.2.8] ok   R06.00 mprotect [1,4) R: expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R06.01 MAP_FIXED R [2,3) admitted
+[7.2.8] ok   R06.01 MAP_FIXED R [2,3): expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R06.02 mprotect [3,4) RW: expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R06.03 munmap [2,3): expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R06.04 mprotect [2,3) R: expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R06.05 munmap [3,4): expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R06.06 MAP_FIXED R [0,1) admitted
+[7.2.8] ok   R06.06 MAP_FIXED R [0,1): expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R06.07 MAP_FIXED R [3,4) admitted
+[7.2.8] ok   R06.07 MAP_FIXED R [3,4): expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R06.08 munmap [2,4): expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R06.09 munmap [2,4): expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R06.10 MAP_FIXED R [2,4) admitted
+[7.2.8] ok   R06.10 MAP_FIXED R [2,4): expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R06.11 mprotect [3,4) R: expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R06.12 munmap [3,4): expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R06.13 mprotect [3,4) R: expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R06.14 mprotect [3,4) R: expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R06.15 mprotect [0,3) RW: expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R06.16 munmap [1,4): expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R06.17 mprotect [2,4) RW: expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R06.18 munmap [2,4): expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R06.19 munmap [1,2): expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R06.20 mprotect [0,3) RW: expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R06.21 MAP_FIXED R [1,2) admitted
+[7.2.8] ok   R06.21 MAP_FIXED R [1,2): expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R06.22 MAP_FIXED R [2,4) admitted
+[7.2.8] ok   R06.22 MAP_FIXED R [2,4): expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R06.23 mprotect [0,3) R: expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R06 cleanup: expect seal success, got r=0 errno=0 (0)
+[7.2.8] ok   R07.00 MAP_FIXED R [1,3) admitted
+[7.2.8] ok   R07.00 MAP_FIXED R [1,3): expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R07.01 MAP_FIXED R [0,4) admitted
+[7.2.8] ok   R07.01 MAP_FIXED R [0,4): expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R07.02 MAP_FIXED R [3,4) admitted
+[7.2.8] ok   R07.02 MAP_FIXED R [3,4): expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R07.03 mprotect [2,3) R: expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R07.04 mprotect [1,3) RW: expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R07.05 mprotect [0,4) R: expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R07.06 mprotect [1,2) RW: expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R07.07 MAP_FIXED R [1,3) admitted
+[7.2.8] ok   R07.07 MAP_FIXED R [1,3): expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R07.08 MAP_FIXED R [0,4) admitted
+[7.2.8] ok   R07.08 MAP_FIXED R [0,4): expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R07.09 munmap [1,2): expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R07.10 munmap [1,2): expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R07.11 mprotect [0,3) RW: expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R07.12 munmap [3,4): expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R07.13 mprotect [3,4) R: expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R07.14 munmap [0,2): expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R07.15 mprotect [1,2) RW: expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R07.16 MAP_FIXED R [1,3) admitted
+[7.2.8] ok   R07.16 MAP_FIXED R [1,3): expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R07.17 MAP_FIXED R [0,4) admitted
+[7.2.8] ok   R07.17 MAP_FIXED R [0,4): expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R07.18 munmap [0,3): expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R07.19 munmap [1,2): expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R07.20 MAP_FIXED R [2,3) admitted
+[7.2.8] ok   R07.20 MAP_FIXED R [2,3): expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R07.21 mprotect [2,3) RW: expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R07.22 mprotect [3,4) R: expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R07.23 mprotect [0,1) RW: expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R07 cleanup: expect seal success, got r=0 errno=0 (0)
+[7.2.8] ok   R08.00 mprotect [1,4) R: expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R08.01 munmap [3,4): expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R08.02 munmap [3,4): expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R08.03 mprotect [1,4) R: expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R08.04 mprotect [1,2) RW: expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R08.05 mprotect [3,4) R: expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R08.06 munmap [2,3): expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R08.07 mprotect [1,4) RW: expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R08.08 mprotect [1,2) RW: expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R08.09 MAP_FIXED R [1,2) admitted
+[7.2.8] ok   R08.09 MAP_FIXED R [1,2): expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R08.10 MAP_FIXED R [2,3) admitted
+[7.2.8] ok   R08.10 MAP_FIXED R [2,3): expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R08.11 munmap [3,4): expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R08.12 munmap [1,2): expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R08.13 MAP_FIXED R [0,3) admitted
+[7.2.8] ok   R08.13 MAP_FIXED R [0,3): expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R08.14 mprotect [2,3) R: expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R08.15 MAP_FIXED R [3,4) admitted
+[7.2.8] ok   R08.15 MAP_FIXED R [3,4): expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R08.16 mprotect [1,3) R: expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R08.17 munmap [3,4): expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R08.18 mprotect [1,2) R: expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R08.19 MAP_FIXED R [2,4) admitted
+[7.2.8] ok   R08.19 MAP_FIXED R [2,4): expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R08.20 munmap [3,4): expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R08.21 MAP_FIXED R [3,4) admitted
+[7.2.8] ok   R08.21 MAP_FIXED R [3,4): expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R08.22 MAP_FIXED R [0,1) admitted
+[7.2.8] ok   R08.22 MAP_FIXED R [0,1): expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R08.23 mprotect [0,4) R: expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R08 cleanup: expect seal success, got r=0 errno=0 (0)
+[7.2.8] ok   R09.00 munmap [1,3): expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R09.01 MAP_FIXED R [0,1) admitted
+[7.2.8] ok   R09.01 MAP_FIXED R [0,1): expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R09.02 munmap [3,4): expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R09.03 mprotect [3,4) RW: expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R09.04 munmap [2,4): expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R09.05 MAP_FIXED R [0,1) admitted
+[7.2.8] ok   R09.05 MAP_FIXED R [0,1): expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R09.06 MAP_FIXED R [3,4) admitted
+[7.2.8] ok   R09.06 MAP_FIXED R [3,4): expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R09.07 MAP_FIXED R [3,4) admitted
+[7.2.8] ok   R09.07 MAP_FIXED R [3,4): expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R09.08 MAP_FIXED R [2,4) admitted
+[7.2.8] ok   R09.08 MAP_FIXED R [2,4): expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R09.09 MAP_FIXED R [1,2) admitted
+[7.2.8] ok   R09.09 MAP_FIXED R [1,2): expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R09.10 munmap [3,4): expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R09.11 mprotect [2,4) RW: expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R09.12 MAP_FIXED R [1,4) admitted
+[7.2.8] ok   R09.12 MAP_FIXED R [1,4): expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R09.13 MAP_FIXED R [0,3) admitted
+[7.2.8] ok   R09.13 MAP_FIXED R [0,3): expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R09.14 mprotect [2,3) R: expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R09.15 MAP_FIXED R [1,2) admitted
+[7.2.8] ok   R09.15 MAP_FIXED R [1,2): expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R09.16 MAP_FIXED R [3,4) admitted
+[7.2.8] ok   R09.16 MAP_FIXED R [3,4): expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R09.17 mprotect [0,2) R: expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R09.18 munmap [0,4): expect seal success, got r=0 errno=0 (0)
+[7.2.8] ok   R10.00 MAP_FIXED R [1,4) admitted
+[7.2.8] ok   R10.00 MAP_FIXED R [1,4): expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R10.01 munmap [2,4): expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R10.02 mprotect [3,4) RW: expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R10.03 munmap [3,4): expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R10.04 munmap [3,4): expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R10.05 mprotect [0,3) R: expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R10.06 MAP_FIXED R [2,4) admitted
+[7.2.8] ok   R10.06 MAP_FIXED R [2,4): expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R10.07 MAP_FIXED R [0,3) admitted
+[7.2.8] ok   R10.07 MAP_FIXED R [0,3): expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R10.08 mprotect [2,3) RW: expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R10.09 munmap [2,4): expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R10.10 mprotect [0,3) R: expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R10.11 munmap [2,4): expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R10.12 mprotect [3,4) R: expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R10.13 MAP_FIXED R [0,1) admitted
+[7.2.8] ok   R10.13 MAP_FIXED R [0,1): expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R10.14 MAP_FIXED R [2,3) admitted
+[7.2.8] ok   R10.14 MAP_FIXED R [2,3): expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R10.15 mprotect [0,1) R: expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R10.16 mprotect [0,2) RW: expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R10.17 munmap [2,3): expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R10.18 munmap [1,3): expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R10.19 MAP_FIXED R [2,3) admitted
+[7.2.8] ok   R10.19 MAP_FIXED R [2,3): expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R10.20 munmap [1,4): expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R10.21 munmap [0,2): expect seal success, got r=0 errno=0 (0)
+[7.2.8] ok   R11.00 mprotect [1,3) R: expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R11.01 munmap [2,4): expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R11.02 MAP_FIXED R [0,3) admitted
+[7.2.8] ok   R11.02 MAP_FIXED R [0,3): expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R11.03 munmap [0,2): expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R11.04 MAP_FIXED R [0,3) admitted
+[7.2.8] ok   R11.04 MAP_FIXED R [0,3): expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R11.05 MAP_FIXED R [0,1) admitted
+[7.2.8] ok   R11.05 MAP_FIXED R [0,1): expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R11.06 MAP_FIXED R [0,3) admitted
+[7.2.8] ok   R11.06 MAP_FIXED R [0,3): expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R11.07 MAP_FIXED R [1,3) admitted
+[7.2.8] ok   R11.07 MAP_FIXED R [1,3): expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R11.08 mprotect [3,4) R: expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R11.09 munmap [1,2): expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R11.10 MAP_FIXED R [1,4) admitted
+[7.2.8] ok   R11.10 MAP_FIXED R [1,4): expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R11.11 mprotect [3,4) R: expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R11.12 MAP_FIXED R [0,3) admitted
+[7.2.8] ok   R11.12 MAP_FIXED R [0,3): expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R11.13 munmap [3,4): expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R11.14 MAP_FIXED R [2,3) admitted
+[7.2.8] ok   R11.14 MAP_FIXED R [2,3): expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R11.15 MAP_FIXED R [2,3) admitted
+[7.2.8] ok   R11.15 MAP_FIXED R [2,3): expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R11.16 mprotect [1,3) RW: expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R11.17 munmap [1,3): expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R11.18 munmap [0,3): expect seal success, got r=0 errno=0 (0)
+[7.2.8] ok   R12.00 MAP_FIXED R [2,4) admitted
+[7.2.8] ok   R12.00 MAP_FIXED R [2,4): expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R12.01 munmap [3,4): expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R12.02 munmap [3,4): expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R12.03 mprotect [3,4) RW: expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R12.04 munmap [0,4): expect seal success, got r=0 errno=0 (0)
+[7.2.8] ok   R13.00 mprotect [2,3) R: expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R13.01 munmap [0,2): expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R13.02 MAP_FIXED R [0,4) admitted
+[7.2.8] ok   R13.02 MAP_FIXED R [0,4): expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R13.03 MAP_FIXED R [3,4) admitted
+[7.2.8] ok   R13.03 MAP_FIXED R [3,4): expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R13.04 mprotect [1,3) R: expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R13.05 MAP_FIXED R [3,4) admitted
+[7.2.8] ok   R13.05 MAP_FIXED R [3,4): expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R13.06 munmap [2,4): expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R13.07 MAP_FIXED R [1,3) admitted
+[7.2.8] ok   R13.07 MAP_FIXED R [1,3): expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R13.08 mprotect [1,2) RW: expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R13.09 munmap [0,2): expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R13.10 mprotect [2,4) RW: expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R13.11 munmap [3,4): expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R13.12 mprotect [3,4) R: expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R13.13 munmap [1,2): expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R13.14 munmap [2,4): expect seal success, got r=0 errno=0 (0)
+[7.2.8] ok   R14.00 MAP_FIXED R [2,3) admitted
+[7.2.8] ok   R14.00 MAP_FIXED R [2,3): expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R14.01 munmap [3,4): expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R14.02 MAP_FIXED R [3,4) admitted
+[7.2.8] ok   R14.02 MAP_FIXED R [3,4): expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R14.03 mprotect [0,1) R: expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R14.04 munmap [2,4): expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R14.05 mprotect [3,4) RW: expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R14.06 MAP_FIXED R [1,2) admitted
+[7.2.8] ok   R14.06 MAP_FIXED R [1,2): expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R14.07 mprotect [1,4) RW: expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R14.08 MAP_FIXED R [1,4) admitted
+[7.2.8] ok   R14.08 MAP_FIXED R [1,4): expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R14.09 mprotect [2,3) R: expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R14.10 mprotect [0,1) RW: expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R14.11 MAP_FIXED R [2,3) admitted
+[7.2.8] ok   R14.11 MAP_FIXED R [2,3): expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R14.12 munmap [2,3): expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R14.13 munmap [3,4): expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R14.14 mprotect [1,2) R: expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R14.15 MAP_FIXED R [0,2) admitted
+[7.2.8] ok   R14.15 MAP_FIXED R [0,2): expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R14.16 MAP_FIXED R [0,1) admitted
+[7.2.8] ok   R14.16 MAP_FIXED R [0,1): expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R14.17 mprotect [0,3) R: expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R14.18 MAP_FIXED R [3,4) admitted
+[7.2.8] ok   R14.18 MAP_FIXED R [3,4): expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R14.19 MAP_FIXED R [0,1) admitted
+[7.2.8] ok   R14.19 MAP_FIXED R [0,1): expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R14.20 munmap [0,2): expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R14.21 MAP_FIXED R [2,3) admitted
+[7.2.8] ok   R14.21 MAP_FIXED R [2,3): expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R14.22 munmap [2,3): expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R14.23 mprotect [2,3) RW: expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R14 cleanup: expect seal success, got r=0 errno=0 (0)
+[7.2.8] ok   R15.00 mprotect [2,4) RW: expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R15.01 mprotect [1,2) R: expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R15.02 mprotect [3,4) R: expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R15.03 munmap [2,3): expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R15.04 munmap [1,2): expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R15.05 MAP_FIXED R [2,4) admitted
+[7.2.8] ok   R15.05 MAP_FIXED R [2,4): expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R15.06 mprotect [3,4) RW: expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R15.07 munmap [2,3): expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R15.08 munmap [2,4): expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R15.09 munmap [3,4): expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R15.10 MAP_FIXED R [0,3) admitted
+[7.2.8] ok   R15.10 MAP_FIXED R [0,3): expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R15.11 MAP_FIXED R [2,3) admitted
+[7.2.8] ok   R15.11 MAP_FIXED R [2,3): expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R15.12 munmap [1,2): expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R15.13 mprotect [1,2) RW: expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R15.14 mprotect [0,2) RW: expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R15.15 MAP_FIXED R [1,4) admitted
+[7.2.8] ok   R15.15 MAP_FIXED R [1,4): expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R15.16 MAP_FIXED R [1,3) admitted
+[7.2.8] ok   R15.16 MAP_FIXED R [1,3): expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R15.17 munmap [1,4): expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R15.18 mprotect [3,4) R: expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R15.19 mprotect [2,4) RW: expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R15.20 MAP_FIXED R [3,4) admitted
+[7.2.8] ok   R15.20 MAP_FIXED R [3,4): expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R15.21 mprotect [1,3) R: expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R15.22 mprotect [1,4) RW: expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R15.23 mprotect [1,3) R: expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R15 cleanup: expect seal success, got r=0 errno=0 (0)
+[7.2.8] ok   R16.00 munmap [2,3): expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R16.01 mprotect [3,4) RW: expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R16.02 mprotect [2,4) R: expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R16.03 mprotect [3,4) R: expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R16.04 munmap [0,4): expect seal success, got r=0 errno=0 (0)
+[7.2.8] ok   R17.00 mprotect [2,3) RW: expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R17.01 munmap [3,4): expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R17.02 mprotect [0,4) R: expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R17.03 mprotect [1,4) RW: expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R17.04 MAP_FIXED R [0,4) admitted
+[7.2.8] ok   R17.04 MAP_FIXED R [0,4): expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R17.05 munmap [1,3): expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R17.06 MAP_FIXED R [0,1) admitted
+[7.2.8] ok   R17.06 MAP_FIXED R [0,1): expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R17.07 MAP_FIXED R [0,1) admitted
+[7.2.8] ok   R17.07 MAP_FIXED R [0,1): expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R17.08 munmap [0,4): expect seal success, got r=0 errno=0 (0)
+[7.2.8] ok   R18.00 munmap [2,4): expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R18.01 mprotect [3,4) RW: expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R18.02 munmap [1,3): expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R18.03 munmap [1,3): expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R18.04 mprotect [0,2) RW: expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R18.05 munmap [0,2): expect seal success, got r=0 errno=0 (0)
+[7.2.8] ok   R19.00 munmap [2,4): expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R19.01 MAP_FIXED R [2,4) admitted
+[7.2.8] ok   R19.01 MAP_FIXED R [2,4): expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R19.02 munmap [3,4): expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R19.03 mprotect [0,3) R: expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R19.04 mprotect [1,3) R: expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R19.05 MAP_FIXED R [2,4) admitted
+[7.2.8] ok   R19.05 MAP_FIXED R [2,4): expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R19.06 munmap [0,2): expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R19.07 munmap [0,2): expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R19.08 MAP_FIXED R [0,3) admitted
+[7.2.8] ok   R19.08 MAP_FIXED R [0,3): expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R19.09 munmap [1,2): expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R19.10 mprotect [1,2) RW: expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R19.11 mprotect [0,3) R: expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R19.12 mprotect [1,3) RW: expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R19.13 munmap [0,3): expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R19.14 munmap [3,4): expect seal success, got r=0 errno=0 (0)
+[7.2.8] ok   R20.00 mprotect [2,3) RW: expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R20.01 munmap [1,3): expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R20.02 munmap [1,3): expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R20.03 MAP_FIXED R [3,4) admitted
+[7.2.8] ok   R20.03 MAP_FIXED R [3,4): expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R20.04 munmap [2,3): expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R20.05 munmap [2,3): expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R20.06 munmap [2,3): expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R20.07 mprotect [3,4) RW: expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R20.08 mprotect [1,3) R: expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R20.09 munmap [2,3): expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R20.10 MAP_FIXED R [1,3) admitted
+[7.2.8] ok   R20.10 MAP_FIXED R [1,3): expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R20.11 munmap [2,3): expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R20.12 mprotect [1,2) R: expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R20.13 mprotect [2,3) RW: expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R20.14 munmap [2,3): expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R20.15 mprotect [0,3) R: expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R20.16 MAP_FIXED R [1,2) admitted
+[7.2.8] ok   R20.16 MAP_FIXED R [1,2): expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R20.17 MAP_FIXED R [2,4) admitted
+[7.2.8] ok   R20.17 MAP_FIXED R [2,4): expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R20.18 mprotect [0,3) RW: expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R20.19 mprotect [2,3) RW: expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R20.20 MAP_FIXED R [1,2) admitted
+[7.2.8] ok   R20.20 MAP_FIXED R [1,2): expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R20.21 MAP_FIXED R [1,4) admitted
+[7.2.8] ok   R20.21 MAP_FIXED R [1,4): expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R20.22 munmap [3,4): expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R20.23 munmap [1,4): expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R20 cleanup: expect seal success, got r=0 errno=0 (0)
+[7.2.8] ok   R21.00 munmap [2,3): expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R21.01 MAP_FIXED R [2,3) admitted
+[7.2.8] ok   R21.01 MAP_FIXED R [2,3): expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R21.02 MAP_FIXED R [3,4) admitted
+[7.2.8] ok   R21.02 MAP_FIXED R [3,4): expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R21.03 mprotect [1,4) RW: expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R21.04 mprotect [2,4) R: expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R21.05 mprotect [2,4) RW: expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R21.06 MAP_FIXED R [3,4) admitted
+[7.2.8] ok   R21.06 MAP_FIXED R [3,4): expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R21.07 MAP_FIXED R [3,4) admitted
+[7.2.8] ok   R21.07 MAP_FIXED R [3,4): expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R21.08 MAP_FIXED R [0,3) admitted
+[7.2.8] ok   R21.08 MAP_FIXED R [0,3): expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R21.09 munmap [0,4): expect seal success, got r=0 errno=0 (0)
+[7.2.8] ok   R22.00 mprotect [2,4) RW: expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R22.01 MAP_FIXED R [3,4) admitted
+[7.2.8] ok   R22.01 MAP_FIXED R [3,4): expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R22.02 MAP_FIXED R [1,3) admitted
+[7.2.8] ok   R22.02 MAP_FIXED R [1,3): expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R22.03 munmap [1,4): expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R22.04 MAP_FIXED R [3,4) admitted
+[7.2.8] ok   R22.04 MAP_FIXED R [3,4): expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R22.05 munmap [2,3): expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R22.06 mprotect [2,4) RW: expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R22.07 munmap [2,3): expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R22.08 MAP_FIXED R [0,2) admitted
+[7.2.8] ok   R22.08 MAP_FIXED R [0,2): expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R22.09 mprotect [1,2) RW: expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R22.10 munmap [0,4): expect seal success, got r=0 errno=0 (0)
+[7.2.8] ok   R23.00 munmap [2,4): expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R23.01 munmap [2,3): expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R23.02 mprotect [3,4) R: expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R23.03 mprotect [2,4) R: expect EBUSY, got r=-1 errno=16 (Device or resource busy)
+[7.2.8] ok   R23.04 munmap [0,3): expect seal success, got r=0 errno=0 (0)
+[7.2.8] --- L1 racing final unmap vs F_ADD_SEALS vs writer (48 rounds) ---
+[7.2.8] ok   L1 round 0: munmap r=0 (21 us), writer issued=558421 landed=558420, seal errno=0 late_retry_ok=-1
+[7.2.8] ok   L1 round 0: memfd ends WRITE-sealed
+[7.2.8] ok   L1 round 1: munmap r=0 (21 us), writer issued=607207 landed=607206, seal errno=0 late_retry_ok=-1
+[7.2.8] ok   L1 round 1: memfd ends WRITE-sealed
+[7.2.8] ok   L1 round 2: munmap r=0 (18 us), writer issued=534940 landed=534939, seal errno=0 late_retry_ok=-1
+[7.2.8] ok   L1 round 2: memfd ends WRITE-sealed
+[7.2.8] ok   L1 round 3: munmap r=0 (15 us), writer issued=520057 landed=520056, seal errno=0 late_retry_ok=-1
+[7.2.8] ok   L1 round 3: memfd ends WRITE-sealed
+[7.2.8] ok   L1 round 4: munmap r=0 (16 us), writer issued=493571 landed=493570, seal errno=0 late_retry_ok=-1
+[7.2.8] ok   L1 round 4: memfd ends WRITE-sealed
+[7.2.8] ok   L1 round 5: munmap r=0 (15 us), writer issued=536597 landed=536596, seal errno=0 late_retry_ok=-1
+[7.2.8] ok   L1 round 5: memfd ends WRITE-sealed
+[7.2.8] ok   L1 round 6: munmap r=0 (25 us), writer issued=536480 landed=536479, seal errno=0 late_retry_ok=-1
+[7.2.8] ok   L1 round 6: memfd ends WRITE-sealed
+[7.2.8] ok   L1 round 7: munmap r=0 (25 us), writer issued=520476 landed=520475, seal errno=0 late_retry_ok=-1
+[7.2.8] ok   L1 round 7: memfd ends WRITE-sealed
+[7.2.8] ok   L1 round 8: munmap r=0 (33 us), writer issued=506551 landed=506550, seal errno=0 late_retry_ok=-1
+[7.2.8] ok   L1 round 8: memfd ends WRITE-sealed
+[7.2.8] ok   L1 round 9: munmap r=0 (27 us), writer issued=572158 landed=572157, seal errno=0 late_retry_ok=-1
+[7.2.8] ok   L1 round 9: memfd ends WRITE-sealed
+[7.2.8] ok   L1 round 10: munmap r=0 (15 us), writer issued=565719 landed=565718, seal errno=0 late_retry_ok=-1
+[7.2.8] ok   L1 round 10: memfd ends WRITE-sealed
+[7.2.8] ok   L1 round 11: munmap r=0 (33 us), writer issued=550178 landed=550177, seal errno=0 late_retry_ok=-1
+[7.2.8] ok   L1 round 11: memfd ends WRITE-sealed
+[7.2.8] ok   L1 round 12: munmap r=0 (59 us), writer issued=567085 landed=567084, seal errno=0 late_retry_ok=-1
+[7.2.8] ok   L1 round 12: memfd ends WRITE-sealed
+[7.2.8] ok   L1 round 13: munmap r=0 (25 us), writer issued=397671 landed=397670, seal errno=0 late_retry_ok=-1
+[7.2.8] ok   L1 round 13: memfd ends WRITE-sealed
+[7.2.8] ok   L1 round 14: munmap r=0 (35 us), writer issued=422723 landed=422722, seal errno=0 late_retry_ok=-1
+[7.2.8] ok   L1 round 14: memfd ends WRITE-sealed
+[7.2.8] ok   L1 round 15: munmap r=0 (39 us), writer issued=232934 landed=232933, seal errno=0 late_retry_ok=-1
+[7.2.8] ok   L1 round 15: memfd ends WRITE-sealed
+[7.2.8] ok   L1 round 16: munmap r=0 (49 us), writer issued=429626 landed=429625, seal errno=0 late_retry_ok=-1
+[7.2.8] ok   L1 round 16: memfd ends WRITE-sealed
+[7.2.8] ok   L1 round 17: munmap r=0 (34 us), writer issued=513157 landed=513156, seal errno=0 late_retry_ok=-1
+[7.2.8] ok   L1 round 17: memfd ends WRITE-sealed
+[7.2.8] ok   L1 round 18: munmap r=0 (20 us), writer issued=532409 landed=532408, seal errno=0 late_retry_ok=-1
+[7.2.8] ok   L1 round 18: memfd ends WRITE-sealed
+[7.2.8] ok   L1 round 19: munmap r=0 (25 us), writer issued=624364 landed=624363, seal errno=0 late_retry_ok=-1
+[7.2.8] ok   L1 round 19: memfd ends WRITE-sealed
+[7.2.8] ok   L1 round 20: munmap r=0 (20 us), writer issued=534142 landed=534141, seal errno=0 late_retry_ok=-1
+[7.2.8] ok   L1 round 20: memfd ends WRITE-sealed
+[7.2.8] ok   L1 round 21: munmap r=0 (15 us), writer issued=516547 landed=516546, seal errno=0 late_retry_ok=-1
+[7.2.8] ok   L1 round 21: memfd ends WRITE-sealed
+[7.2.8] ok   L1 round 22: munmap r=0 (22 us), writer issued=532762 landed=532761, seal errno=0 late_retry_ok=-1
+[7.2.8] ok   L1 round 22: memfd ends WRITE-sealed
+[7.2.8] ok   L1 round 23: munmap r=0 (15 us), writer issued=537318 landed=537317, seal errno=0 late_retry_ok=-1
+[7.2.8] ok   L1 round 23: memfd ends WRITE-sealed
+[7.2.8] ok   L1 round 24: munmap r=0 (15 us), writer issued=593560 landed=593559, seal errno=0 late_retry_ok=-1
+[7.2.8] ok   L1 round 24: memfd ends WRITE-sealed
+[7.2.8] ok   L1 round 25: munmap r=0 (40 us), writer issued=521315 landed=521314, seal errno=0 late_retry_ok=-1
+[7.2.8] ok   L1 round 25: memfd ends WRITE-sealed
+[7.2.8] ok   L1 round 26: munmap r=0 (23 us), writer issued=633106 landed=633105, seal errno=0 late_retry_ok=-1
+[7.2.8] ok   L1 round 26: memfd ends WRITE-sealed
+[7.2.8] ok   L1 round 27: munmap r=0 (53 us), writer issued=596611 landed=596610, seal errno=0 late_retry_ok=-1
+[7.2.8] ok   L1 round 27: memfd ends WRITE-sealed
+[7.2.8] ok   L1 round 28: munmap r=0 (33 us), writer issued=539478 landed=539477, seal errno=0 late_retry_ok=-1
+[7.2.8] ok   L1 round 28: memfd ends WRITE-sealed
+[7.2.8] ok   L1 round 29: munmap r=0 (35 us), writer issued=554667 landed=554666, seal errno=0 late_retry_ok=-1
+[7.2.8] ok   L1 round 29: memfd ends WRITE-sealed
+[7.2.8] ok   L1 round 30: munmap r=0 (23 us), writer issued=577974 landed=577973, seal errno=0 late_retry_ok=-1
+[7.2.8] ok   L1 round 30: memfd ends WRITE-sealed
+[7.2.8] ok   L1 round 31: munmap r=0 (44 us), writer issued=530624 landed=530623, seal errno=0 late_retry_ok=-1
+[7.2.8] ok   L1 round 31: memfd ends WRITE-sealed
+[7.2.8] ok   L1 round 32: munmap r=0 (22 us), writer issued=512096 landed=512095, seal errno=0 late_retry_ok=-1
+[7.2.8] ok   L1 round 32: memfd ends WRITE-sealed
+[7.2.8] ok   L1 round 33: munmap r=0 (16 us), writer issued=569291 landed=569290, seal errno=0 late_retry_ok=-1
+[7.2.8] ok   L1 round 33: memfd ends WRITE-sealed
+[7.2.8] ok   L1 round 34: munmap r=0 (15 us), writer issued=551939 landed=551938, seal errno=0 late_retry_ok=-1
+[7.2.8] ok   L1 round 34: memfd ends WRITE-sealed
+[7.2.8] ok   L1 round 35: munmap r=0 (15 us), writer issued=563013 landed=563012, seal errno=0 late_retry_ok=-1
+[7.2.8] ok   L1 round 35: memfd ends WRITE-sealed
+[7.2.8] ok   L1 round 36: munmap r=0 (26 us), writer issued=567282 landed=567281, seal errno=0 late_retry_ok=-1
+[7.2.8] ok   L1 round 36: memfd ends WRITE-sealed
+[7.2.8] ok   L1 round 37: munmap r=0 (37 us), writer issued=554238 landed=554237, seal errno=0 late_retry_ok=-1
+[7.2.8] ok   L1 round 37: memfd ends WRITE-sealed
+[7.2.8] ok   L1 round 38: munmap r=0 (20 us), writer issued=491702 landed=491701, seal errno=0 late_retry_ok=-1
+[7.2.8] ok   L1 round 38: memfd ends WRITE-sealed
+[7.2.8] ok   L1 round 39: munmap r=0 (39 us), writer issued=676076 landed=676075, seal errno=0 late_retry_ok=-1
+[7.2.8] ok   L1 round 39: memfd ends WRITE-sealed
+[7.2.8] ok   L1 round 40: munmap r=0 (16 us), writer issued=528666 landed=528665, seal errno=0 late_retry_ok=-1
+[7.2.8] ok   L1 round 40: memfd ends WRITE-sealed
+[7.2.8] ok   L1 round 41: munmap r=0 (26 us), writer issued=481641 landed=481640, seal errno=0 late_retry_ok=-1
+[7.2.8] ok   L1 round 41: memfd ends WRITE-sealed
+[7.2.8] ok   L1 round 42: munmap r=0 (19 us), writer issued=414492 landed=414491, seal errno=0 late_retry_ok=-1
+[7.2.8] ok   L1 round 42: memfd ends WRITE-sealed
+[7.2.8] ok   L1 round 43: munmap r=0 (21 us), writer issued=373425 landed=373424, seal errno=0 late_retry_ok=-1
+[7.2.8] ok   L1 round 43: memfd ends WRITE-sealed
+[7.2.8] ok   L1 round 44: munmap r=0 (17 us), writer issued=281992 landed=281991, seal errno=0 late_retry_ok=-1
+[7.2.8] ok   L1 round 44: memfd ends WRITE-sealed
+[7.2.8] ok   L1 round 45: munmap r=0 (17 us), writer issued=428915 landed=428914, seal errno=0 late_retry_ok=-1
+[7.2.8] ok   L1 round 45: memfd ends WRITE-sealed
+[7.2.8] ok   L1 round 46: munmap r=0 (17 us), writer issued=442300 landed=442299, seal errno=0 late_retry_ok=-1
+[7.2.8] ok   L1 round 46: memfd ends WRITE-sealed
+[7.2.8] ok   L1 round 47: munmap r=0 (17 us), writer issued=423603 landed=423602, seal errno=0 late_retry_ok=-1
+[7.2.8] ok   L1 round 47: memfd ends WRITE-sealed
+[7.2.8] CR2_TOTAL_CHECKS=627 CR2_FAILURES=0
+CR2_RESULT: all expectations met on both protocol directions

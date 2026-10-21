@@ -1,0 +1,111 @@
+{
+  "schema_version": "2",
+  "system": "asterinas-local-flock-ownership",
+  "generated_by": "consolidate",
+  "findings": [
+    {
+      "id": "MC-1",
+      "title": "Conflicting conversions retain the old shared flock",
+      "source": "model-checking",
+      "scenario": "2 - Conversion retention (C05 and C06)",
+      "severity": "Medium",
+      "invariant": "ConversionOracle",
+      "config": "MC_hunt_2_conversion_oracle.cfg",
+      "counterexample": "spec/output/round1-20261005T202037Z/MC_hunt_2_conversion_oracle-bfs.log",
+      "affected_code": [
+        "kernel/core/src/fs/file/flock.rs:114",
+        "kernel/core/src/fs/file/flock.rs:147"
+      ],
+      "summary": "Asterinas checks a conflicting conversion before removing the caller's existing SH flock, so it can return EAGAIN or wait while retaining the old mode. The fixed generic local Linux v6.16.5 path removes that old mode before conflict handling, and the existing Linux 7.2.8 tmpfs control matches that source oracle. C05 violates ConversionOracle after 80 states, and C06 violates ConvertersDrain after 57 concrete states followed by stuttering. Both results share one source mechanism and are supported by freshly matched runtime histories. This is a source-mapped Case C candidate from bounded checking; separate confirmation and general exhaustive convergence remain incomplete.",
+      "dedup_note": "also covers code-review Scenario 2 (same conversion-retention mechanism at flock.rs:115-124) and its restatements FL-SQ-1/FL-MC-1 and FL-TV-1"
+    },
+    {
+      "id": "MC-2",
+      "title": "A final temporary reference can deadlock flock cleanup",
+      "source": "model-checking",
+      "scenario": "5 - Temporary owner reference and final release (C11)",
+      "severity": "High",
+      "invariant": "NoRecursiveListWait",
+      "config": "MC_hunt_5_temporary_last_reference.cfg",
+      "counterexample": "spec/output/round1-20261005T202037Z/MC_hunt_5_temporary_last_reference-bfs.log",
+      "affected_code": [
+        "kernel/core/src/fs/file/flock.rs:166",
+        "kernel/core/src/fs/file/inode_handle.rs:537",
+        "ostd/src/sync/mutex.rs:35"
+      ],
+      "summary": "An unlock scan upgrades another OFD's Weak owner while holding the inode's flock-list Mutex. If another thread removes that OFD's last descriptor and drops ClosedFile, releasing the scan's temporary Arc can synchronously enter InodeHandle::drop while the outer Mutex guard is still held. C11 violates NoRecursiveListWait after 34 states when that destructor attempts the same nonrecursive Mutex, and the matched SMP-2 runtime prefix captures the corresponding reference window and nested attempt. The extra-alias and close-before/close-after controls complete without violations, while FinalReleaseCompletes has no separate C11 verdict because the safety failure stops TLC. This is a source-mapped Case C candidate; separate confirmation and classification were not executed.",
+      "dedup_note": "also covers code-review Scenario 5 (same temporary-owner-reference deadlock mechanism at flock.rs:164-181) and its restatements FL-SQ-2/FL-MC-2 and FL-TV-2"
+    },
+    {
+      "id": "CR-1",
+      "title": "OFD identity and compatible ownership across independent opens and dup aliases",
+      "source": "code-review",
+      "scenario": "1 - OFD identity and compatible ownership",
+      "severity": "Medium",
+      "invariant": null,
+      "config": null,
+      "counterexample": null,
+      "affected_code": [
+        "kernel/core/src/fs/file/file_table.rs:137-205",
+        "kernel/core/src/fs/file/file_table.rs:341-361",
+        "kernel/core/src/fs/file/flock.rs:29-59",
+        "kernel/core/src/fs/file/flock.rs:122-127",
+        "kernel/core/src/syscall/open.rs:102-126"
+      ],
+      "summary": "Independent opens create distinct open-file descriptions (OFDs), while dup and get_file_fast! produce shared-Arc aliases of one OFD, and flock conflict checks exclude only the same file object, so descriptor lifetimes and file-object lifetimes must not be conflated. The mechanism hypothesis is whether FD removal, FD reuse, or descriptor-table mutation can change the owner of an already captured flock request, or let one OFD install two flock items, breaking the local Linux identity contract. The targeted hunts for compatible ownership (C01), FD reuse, and OFD aliases (C02) exhausted their reachable state graphs without violations, so no model-checking counterexample represents this scenario. This scenario is the foundation for the other four and is retained here as a candidate with no counterexample; separate confirmation decides whether any residual identity gap exists beyond the checked bounds."
+    },
+    {
+      "id": "CR-2",
+      "title": "Waiter registration, notification, and retry against a new blocker",
+      "source": "code-review",
+      "scenario": "3 - Registration, notification, and retry against a new blocker",
+      "severity": "High",
+      "invariant": null,
+      "config": null,
+      "counterexample": null,
+      "affected_code": [
+        "kernel/core/src/fs/file/flock.rs:69-82",
+        "kernel/core/src/fs/file/flock.rs:114-157",
+        "kernel/core/src/fs/file/flock.rs:164-181",
+        "ostd/src/sync/wait.rs:88-148",
+        "ostd/src/sync/wait.rs:209-282",
+        "ostd/src/task/scheduler/mod.rs:441-493"
+      ],
+      "summary": "A failed flock attempt registers its waker on one conflicting item's wait queue, and only that item's removal or replacement notifies the waiter; the notification is a retry trigger, not a grant, and the retry may then conflict with a different owner. The mechanism hypothesis is whether a release or replacement overlapping actual registration, migration between two SH blockers, or a wake race can leave a live blocked request without a notification or a reachable registration/retry path. Historical fixes (#1474, #1497, #1261) addressed related stale-condition and false-lost-wake compensation paths and are context only; no additional lost-wake defect is asserted by the brief. The targeted hunts for both C07 release orderings, C08 blocker migration, and C09 wake-race safety exhausted their bounded state graphs without violations, so this candidate carries no counterexample and confirmation must assess it."
+    },
+    {
+      "id": "CR-3",
+      "title": "Last descriptor removal is not final OFD release",
+      "source": "code-review",
+      "scenario": "4 - Last descriptor removal is not final OFD release",
+      "severity": "High",
+      "invariant": null,
+      "config": null,
+      "counterexample": null,
+      "affected_code": [
+        "kernel/core/src/fs/file/file_table.rs:196-205",
+        "kernel/core/src/fs/file/file_table.rs:274-298",
+        "kernel/core/src/fs/file/file_table.rs:341-361",
+        "kernel/core/src/syscall/close.rs:22-35",
+        "kernel/core/src/fs/file/inode_handle.rs:537-541"
+      ],
+      "summary": "Removing the last numeric descriptor does not by itself destroy the file object: a dup alias, an in-flight syscall reference captured by get_file_fast!, or a pending ClosedFile can keep the OFD alive, and final destruction begins only when the last strong reference drops. The mechanism hypothesis is whether this reference accounting preserves an alias's flock across the other descriptor's close, lets a previously captured blocking flock syscall complete after its own FD is removed instead of returning EBADF, and lets scheduled final cleanup finish and remove expired ownership once external references drain. The targeted hunts for alias preservation (C03) and in-flight reference after close (C10) exhausted their state graphs without violations, so no model-checking counterexample isolates this deferral mechanism itself. MC-2's counterexample exercises this same descriptor-to-destructor chain but attributes the defect to the separate Scenario 5 temporary-owner-reference mechanism, so Scenario 4's accounting questions remain for confirmation on their own."
+    },
+    {
+      "id": "CR-4",
+      "title": "Successful request's local Drop drains the waiter queue outside the list Mutex",
+      "source": "code-review",
+      "scenario": "3 - Registration, notification, and retry (FL-CR-1 code-review-only)",
+      "severity": "Medium",
+      "invariant": null,
+      "config": null,
+      "counterexample": null,
+      "affected_code": [
+        "kernel/core/src/fs/file/flock.rs:69-82",
+        "kernel/core/src/fs/file/flock.rs:124-157",
+        "ostd/src/sync/wait.rs:119-131"
+      ],
+      "summary": "When a local flock request succeeds and the request clone is dropped, the FlockItem Drop handler drains the item's wait queue after the list Mutex critical section has closed, so awakened contenders can retry while the granting item is still held and immediately re-enqueue against it. The review question is whether this repeated drain-and-re-enqueue work is an excessive scheduling impact, not whether it violates flock correctness: the C09 wake-race hunt deliberately does not assert fixture completion for this reason and exhausted without safety violations. Both the modeling brief and the bug report record FL-CR-1 as allowed behavior with no presumed latency violation and no additional model hunt justified. It is emitted here because deduplication is the only removal this step performs; confirmation decides whether any real scheduling concern remains."
+    }
+  ]
+}

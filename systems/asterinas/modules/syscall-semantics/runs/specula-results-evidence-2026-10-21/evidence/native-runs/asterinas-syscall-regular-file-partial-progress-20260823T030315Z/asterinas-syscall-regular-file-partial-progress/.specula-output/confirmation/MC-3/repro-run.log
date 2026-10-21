@@ -1,0 +1,52 @@
+==============================================================
+STEP 1  Linux control (same payload, tmpfs, host kernel 7.1.9)
+==============================================================
+MC-3 repro: filesystem under test = /dev/shm/mc3-control
+[case1 pread(off=1,len=64,size=2)] ret=1 (expected 1) untouched_range=[1,64) clobbered=0 first_clobbered=-1 -> OK
+[case2 pread(off=EOF=2,len=64)] ret=0 (expected 0) untouched_range=[0,64) clobbered=0 first_clobbered=-1 -> OK
+[case3 read(off=1,len=64,size=2)] ret=1 (expected 1) untouched_range=[1,64) clobbered=0 first_clobbered=-1 -> OK
+[case3 offset] after read the shared offset is 2 (expected 2) -> OK
+[case4 preadv(off=1, iov=[2,64], size=2)] ret=1 (expected 1)
+[case4 entry0 tail] ret=1 (expected 1) untouched_range=[1,2) clobbered=0 first_clobbered=-1 -> OK
+[case4 entry1 (starts at EOF)] ret=1 (expected 1) untouched_range=[0,64) clobbered=0 first_clobbered=-1 -> OK
+[case5 pread(off=4096,len=4096,size=4100)] ret=4 (expected 4) untouched_range=[4,4096) clobbered=0 first_clobbered=-1 -> OK
+MC3_SUMMARY wrong_return_values=0 buffers_modified_past_return=0
+MC3_RESULT MATCHES_LINUX
+MC3_SCENARIO_DONE
+
+==============================================================
+STEP 2  Asterinas (pristine kernel + same payload as init)
+==============================================================
+--- kernel/ostd modifications in the tree under test (must be empty) ---
+--- end ---
+info: syncing channel updates for nightly-2026-07-21-x86_64-unknown-linux-gnu
+info: latest update on 2026-07-21 for version 1.99.0-nightly (87e5904f5 2026-07-20)
+info: component llvm-tools is up to date
+info: component rust-src is up to date
+info: component rust-std for target x86_64-unknown-none is up to date
+info: component rustc-dev is up to date
+
+  nightly-2026-07-21-x86_64-unknown-linux-gnu unchanged - rustc 1.99.0-nightly (87e5904f5 2026-07-20)
+
+info: checking for self-update (current version: 1.29.0)
+
+--- Asterinas guest output ---
+MC-3 repro: filesystem under test = /mc3
+[case1 pread(off=1,len=64,size=2)] ret=1 (expected 1) untouched_range=[1,64) clobbered=63 first_clobbered=1 -> VIOLATION
+[case2 pread(off=EOF=2,len=64)] ret=0 (expected 0) untouched_range=[0,64) clobbered=64 first_clobbered=0 -> VIOLATION
+[case3 read(off=1,len=64,size=2)] ret=1 (expected 1) untouched_range=[1,64) clobbered=63 first_clobbered=1 -> VIOLATION
+[case3 offset] after read the shared offset is 2 (expected 2) -> OK
+[case4 preadv(off=1, iov=[2,64], size=2)] ret=1 (expected 1)
+[case4 entry0 tail] ret=1 (expected 1) untouched_range=[1,2) clobbered=1 first_clobbered=1 -> VIOLATION
+[case4 entry1 (starts at EOF)] ret=1 (expected 1) untouched_range=[0,64) clobbered=64 first_clobbered=0 -> VIOLATION
+[case5 pread(off=4096,len=4096,size=4100)] ret=4 (expected 4) untouched_range=[4,4096) clobbered=4092 first_clobbered=4 -> VIOLATION
+MC3_SUMMARY wrong_return_values=0 buffers_modified_past_return=6
+MC3_RESULT DIVERGES_FROM_LINUX
+MC3_SCENARIO_DONE
+
+==============================================================
+VERDICT
+==============================================================
+Linux host : MC3_RESULT MATCHES_LINUX
+Asterinas  : MC3_RESULT DIVERGES_FROM_LINUX
+MC-3 REPRODUCED

@@ -1,0 +1,74 @@
+{
+  "schema_version": "2",
+  "system": "asterinas-private-futex-requeue",
+  "generated_by": "validation-workflow",
+  "findings": [
+    {
+      "id": "MC-1",
+      "title": "A timed-out waiter moved to another bucket leaves its entry behind",
+      "source": "model-checking",
+      "scenario": "Scenarios 3 and 4, contract cases F07 and F09",
+      "severity": "High",
+      "invariant": "ResourceAccountingBalance",
+      "config": "MC_hunt_s3_owner.cfg",
+      "counterexample": "spec/output/hunt-round2/MC_hunt_s3_owner-bfs.out",
+      "affected_code": [
+        "kernel/core/src/process/posix_thread/futex.rs:79",
+        "kernel/core/src/process/posix_thread/futex.rs:121-130",
+        "kernel/core/src/process/posix_thread/futex.rs:513-534",
+        "kernel/core/src/process/posix_thread/futex.rs:485-498",
+        "kernel/core/src/process/posix_thread/futex.rs:500-511",
+        "ostd/src/sync/wait.rs:244-250",
+        "ostd/src/sync/wait.rs:262-265"
+      ],
+      "summary": "futex_wait_bitset saves its bucket reference from the original key (futex.rs:79), and after pause_timeout it removes its FutexItem only from that bucket (futex.rs:124). A cross-bucket REQUEUE moves the item into another bucket (futex.rs:513-534), so a waiter that times out after the move, or after observing expiry but before cleanup, misses the lookup and returns 0 instead of ETIMEDOUT (futex.rs:125-130). Dropping the Waiter closes the waker, and the closed item stays in the global destination bucket for good: WAKE retains it because wake_up returns false, and both migration paths still count it. The 56-state MC_hunt_s3_owner counterexample violates ResourceAccountingBalance. The 93-state MC_hunt_s4_live_migration counterexample (spec/output/hunt-round2/MC_hunt_s4_live_migration-bfs.out) shows the Linux-visible consequence, LiveMigrationExhaustion: a later REQUEUE(1,1) from that key moves the dead entry and leaves a live waiter behind. Implementation traces case-11 and case-13 show the same histories on SMP=2. Linux follows q->lock_ptr in futex_unqueue (core.c:921-964), so a completed waiter never stays queued. Each stranded item retains an Arc<Waker> and its Arc<Task>, including an exited thread's kernel stack. That growth is inferred from the code and was not measured."
+    },
+    {
+      "id": "MC-2",
+      "title": "Ordinary REQUEUE with a zero wake quota wakes a waiter",
+      "source": "model-checking",
+      "scenario": "Scenario 2, contract case F05 (TV-1)",
+      "severity": "Medium",
+      "invariant": "RequeueWakeQuota",
+      "config": "MC_hunt_s2_zero_wake.cfg",
+      "counterexample": "spec/output/hunt-round2/MC_hunt_s2_zero_wake-bfs.out",
+      "affected_code": [
+        "kernel/core/src/syscall/futex.rs:105-106",
+        "kernel/core/src/syscall/futex.rs:146-151",
+        "kernel/core/src/process/posix_thread/futex.rs:368"
+      ],
+      "summary": "sys_futex converts FUTEX_REQUEUE's wake count with futex_val_to_max_count, which raises 0 to 1 (syscall/futex.rs:106,146-151). That at-least-one rule belongs to Linux FUTEX_WAKE only (waitwake.c:192). Linux REQUEUE uses nr_wake unchanged and tests the quota before each waiter (requeue.c:585,607), so REQUEUE(0,0) wakes nothing. In the 20-state counterexample, REQUEUE(A to B, 0, 0) accepts and removes one of two enrolled waiters. MC_hunt_s2_quotas.cfg fails the same clause on the same-bucket path. Implementation trace case-16 woke one waiter and returned 1 for REQUEUE(0,0). The Linux 7.2.8 control returned 0 and left both waiters on the source key."
+    },
+    {
+      "id": "MC-3",
+      "title": "A same-bucket REQUEUE with a zero migration quota moves one waiter",
+      "source": "model-checking",
+      "scenario": "Scenario 2, contract case F04 (TV-2)",
+      "severity": "Medium",
+      "invariant": "RequeueMoveQuota",
+      "config": "MC_hunt_s2_zero_move_same_bucket.cfg",
+      "counterexample": "spec/output/hunt-round2/MC_hunt_s2_zero_move_same_bucket-bfs.out",
+      "affected_code": [
+        "kernel/core/src/process/posix_thread/futex.rs:500-511",
+        "kernel/core/src/process/posix_thread/futex.rs:378"
+      ],
+      "summary": "update_item_keys rekeys a matching entry and counts it before testing count >= max_count (futex.rs:500-511). With a migration quota of 0, the first remaining entry moves whenever it matches the source key. The cross-bucket path tests the quota first (futex.rs:522-523), and Linux tests task_count - nr_wake >= nr_requeue before each waiter (requeue.c:585). In the 22-state counterexample, REQUEUE(A to C, 1, 0), with A and C sharing a bucket, wakes one waiter and moves the other to C. A later WAKE on A then misses it. Implementation trace case-05 shows this, and cases 06 and 07 (different buckets, unrelated first entry) move nothing. The Linux 7.2.8 control moved no waiter for REQUEUE(1,0)."
+    },
+    {
+      "id": "MC-4",
+      "title": "REQUEUE returns only the number of woken waiters",
+      "source": "model-checking",
+      "scenario": "Scenario 2, contract cases F03 and F06 (TV-3)",
+      "severity": "Medium",
+      "invariant": "RequeueReturnCount",
+      "config": "MC_hunt_s2_return_count.cfg",
+      "counterexample": "spec/output/hunt-round2/MC_hunt_s2_return_count-bfs.out",
+      "affected_code": [
+        "kernel/core/src/process/posix_thread/futex.rs:381",
+        "kernel/core/src/process/posix_thread/futex.rs:353-355",
+        "kernel/core/src/process/posix_thread/futex.rs:500-534"
+      ],
+      "summary": "futex_requeue returns Ok(nwakes) (futex.rs:381), the requeue helpers report no count, and identical addresses take the futex_wake shortcut (futex.rs:353-355). Linux ordinary REQUEUE counts every woken or requeued waiter, including same-address requeues (requeue.c:607-610,691). In the 30-state counterexample, REQUEUE(A to B, 1, 1) wakes one waiter, moves the other and returns 1 instead of 2. MC_hunt_s2_same_address.cfg (24 states, spec/output/hunt-round2/MC_hunt_s2_same_address-bfs.out) fails the same invariant for identical addresses. Implementation traces case-03, case-04 and case-09 returned 1. The Linux 7.2.8 control returned 2 in both shapes. The FUTEX_REQUEUE manual page describes only woken waiters, which conflicts with the pinned source and the running kernel."
+    }
+  ]
+}

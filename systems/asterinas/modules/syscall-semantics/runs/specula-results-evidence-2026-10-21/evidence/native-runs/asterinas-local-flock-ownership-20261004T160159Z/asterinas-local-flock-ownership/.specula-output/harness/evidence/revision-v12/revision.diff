@@ -1,0 +1,172 @@
+--- v11/patches/instrumentation.patch
++++ v12/patches/instrumentation.patch
+@@ -372,7 +372,7 @@
+ +    result
+ +}
+ diff --git a/kernel/core/src/syscall/open.rs b/kernel/core/src/syscall/open.rs
+-index 830b98c4f..1b0a68e1a 100644
++index 830b98c4f..5e880ecd1 100644
+ --- a/kernel/core/src/syscall/open.rs
+ +++ b/kernel/core/src/syscall/open.rs
+ @@ -1,5 +1,7 @@
+@@ -401,8 +401,8 @@
+ +        let owner = trace::new_ofd(Arc::as_ptr(&file_handle) as *const () as usize);
+ +        trace::emit(trace::stamp(), "SysOpen", [owner, 0, 0], Packet { ofd: owner, strong: 1, life: "live", ..Packet::default() });
+ +    }
+++    if traced { trace::open_table_attempt(); }
+ +    let trace_start = trace::stamp();
+-+    if traced { trace::open_table_attempt(); }
+      let fd = {
+          let file_table = ctx.thread_local.borrow_file_table();
+          let mut file_table_locked = file_table.unwrap().write();
+@@ -678,10 +678,10 @@
+          } else {
+ diff --git a/ostd/src/flock_trace.rs b/ostd/src/flock_trace.rs
+ new file mode 100644
+-index 000000000..9acb50744
++index 000000000..7220a9dbd
+ --- /dev/null
+ +++ b/ostd/src/flock_trace.rs
+-@@ -0,0 +1,363 @@
++@@ -0,0 +1,366 @@
+ +// SPDX-License-Identifier: MPL-2.0
+ +
+ +//! Per-task trace storage for the bounded local-flock fixture.
+@@ -1032,6 +1032,9 @@
+ +pub fn open_table_attempt() {
+ +    if OPEN_WINDOW.load(Ordering::Acquire) && task_id(task_address()) == 3 {
+ +        OPEN_STAGE.store(2, Ordering::Release);
+++        // The controller shares this CPU. Wait before the measured insertion
+++        // and before taking its preemption-disabling table guard.
+++        while !OPEN_RELEASE_GUARD.load(Ordering::Acquire) { Task::yield_now(); }
+ +    }
+ +}
+ +pub fn open_guard_window() {
+@@ -1042,6 +1045,6 @@
+ +}
+ +pub fn pause_open_original() {
+ +    if OPEN_WINDOW.load(Ordering::Acquire) {
+-+        while !OPEN_RELEASE_ORIGINAL.load(Ordering::Acquire) { core::hint::spin_loop(); }
+-+    }
+-+}
+++        while !OPEN_RELEASE_ORIGINAL.load(Ordering::Acquire) { Task::yield_now(); }
+++    }
+++}
+--- v11/src/collect.py
++++ v12/src/collect.py
+@@ -17,6 +17,7 @@
+ identities = None
+ command_line = None
+ clock = None
++placement = None
+ for line in log.read_text(errors='replace').splitlines():
+     # QEMU may include carriage returns and a kernel prefix on serial lines.
+     if 'SPECULA_EVENT ' in line:
+@@ -35,13 +36,15 @@
+         command_line = line.split('SPECULA_CMDLINE ', 1)[1]
+     elif 'SPECULA_CLOCK ' in line:
+         clock = json.loads(line.split('SPECULA_CLOCK ', 1)[1])
++    elif 'SPECULA_PLACEMENT ' in line:
++        placement = json.loads(line.split('SPECULA_PLACEMENT ', 1)[1])
+     elif 'SPECULA_END ' in line:
+         end = json.loads(line.split('SPECULA_END ', 1)[1])
+ for tid in (1, 2, 3):
+     stream = streams.setdefault(tid, [])
+     (raw / f'thread-{tid}.ndjson').write_text(''.join(json.dumps(e,separators=(',',':'))+'\n' for e in stream))
+ manifest = {'case': name, 'config': config, 'completion': end, 'buffers': buffers,
+-            'observed_syscall_returns': returns, 'identities': identities, 'guest_command_line': command_line, 'clock': clock, 'serial_log': str(log.resolve()),
++            'observed_syscall_returns': returns, 'identities': identities, 'guest_command_line': command_line, 'clock': clock, 'cpu_placement': placement, 'serial_log': str(log.resolve()),
+             'source': '0c60537098f4c2949ad2d382aaf499de72263d76',
+             'attempt_inputs': str((attempt/'inputs.json').resolve()),
+             'log_sha256': hashlib.sha256(log.read_bytes()).hexdigest()}
+--- v11/src/flock_trace.rs
++++ v12/src/flock_trace.rs
+@@ -348,6 +348,9 @@
+ pub fn open_table_attempt() {
+     if OPEN_WINDOW.load(Ordering::Acquire) && task_id(task_address()) == 3 {
+         OPEN_STAGE.store(2, Ordering::Release);
++        // The controller shares this CPU. Wait before the measured insertion
++        // and before taking its preemption-disabling table guard.
++        while !OPEN_RELEASE_GUARD.load(Ordering::Acquire) { Task::yield_now(); }
+     }
+ }
+ pub fn open_guard_window() {
+@@ -358,6 +361,6 @@
+ }
+ pub fn pause_open_original() {
+     if OPEN_WINDOW.load(Ordering::Acquire) {
+-        while !OPEN_RELEASE_ORIGINAL.load(Ordering::Acquire) { core::hint::spin_loop(); }
+-    }
+-}
++        while !OPEN_RELEASE_ORIGINAL.load(Ordering::Acquire) { Task::yield_now(); }
++    }
++}
+--- v11/src/scenarios.c
++++ v12/src/scenarios.c
+@@ -46,8 +46,11 @@
+ #define close observed_close
+ #define dup observed_dup
+ 
+-struct worker { pthread_t thread; atomic_int ready, command, done; int tid, fd, op, unlock, result, error; };
++struct worker { pthread_t thread; atomic_int ready, command, done; int tid, cpu, fd, op, unlock, result, error; };
+ static struct worker workers[2];
++static struct worker *roles[2];
++static int controller_cpu;
++static int current_cpu(void) { unsigned cpu; CHECK(syscall(SYS_getcpu,&cpu,NULL,NULL)); return cpu; }
+ static long control(long op, long a, long b, long c)
+ {
+     return syscall(SYS_prctl, 0x53504543, op, a, b, c);
+@@ -81,9 +84,12 @@
+ static void *worker_main(void *argument)
+ {
+     struct worker *w = argument;
++    w->cpu = current_cpu();
++    atomic_store_explicit(&w->ready, 1, memory_order_release);
++    wait_atomic(&w->ready,2);
+     acting_tid = w->tid;
+     if (instrumented) CHECK(control(1, w->tid, 0, 0));
+-    atomic_store_explicit(&w->ready, 1, memory_order_release);
++    atomic_store_explicit(&w->ready, 3, memory_order_release);
+     for (;;) {
+         wait_atomic(&w->command, 1);
+         atomic_store(&w->command, 0);
+@@ -97,14 +103,14 @@
+ }
+ static void start_worker(int index, int fd, int op, int unlock)
+ {
+-    struct worker *w = &workers[index];
++    struct worker *w = roles[index];
+     w->fd = fd; w->op = op; w->unlock = unlock;
+     atomic_store(&w->done, 0);
+     atomic_store_explicit(&w->command, 1, memory_order_release);
+ }
+ static void finish_worker(int index)
+ {
+-    struct worker *w = &workers[index];
++    struct worker *w = roles[index];
+     wait_atomic(&w->done, 1);
+     printf("SPECULA_RETURN {\"tid\":%d,\"result\":%d,\"errno\":%d}\n",w->tid,w->result,w->error);
+     CHECK_WITH(w->result, (w->op == 0 ? _ret >= 3 : _ret == 0) && w->error == 0);
+@@ -165,11 +171,22 @@
+     unsigned eax,ebx,ecx,edx;
+     int invariant_tsc=__get_cpuid(0x80000007,&eax,&ebx,&ecx,&edx) && (edx & (1U<<8));
+     printf("SPECULA_CLOCK {\"source\":\"LFENCE RDTSC LFENCE\",\"invariant_tsc\":%s}\n",invariant_tsc?"true":"false");
++    controller_cpu=current_cpu();
+     for (int i = 0; i < 2; ++i) {
+         workers[i].tid = i + 2;
+         CHECK(pthread_create(&workers[i].thread, NULL, worker_main, &workers[i]));
+         wait_atomic(&workers[i].ready, 1);
+     }
++    roles[0]=&workers[0]; roles[1]=&workers[1];
++    if (!strcmp(scenario,"C00-open-overlap") || !strcmp(scenario,"C13-open-close")) {
++        CHECK_WITH(current_cpu(),_ret==controller_cpu);
++        if (workers[0].cpu==controller_cpu) { roles[0]=&workers[1]; roles[1]=&workers[0]; }
++        CHECK_WITH(roles[0]->cpu,_ret!=controller_cpu);
++        CHECK_WITH(roles[1]->cpu,_ret==controller_cpu);
++        roles[0]->tid=2; roles[1]->tid=3;
++    }
++    printf("SPECULA_PLACEMENT {\"controller\":%d,\"tid2\":%d,\"tid3\":%d}\n",controller_cpu,roles[0]->cpu,roles[1]->cpu);
++    for (int i=0;i<2;++i) { atomic_store_explicit(&workers[i].ready,2,memory_order_release); wait_atomic(&workers[i].ready,3); }
+     if (instrumented) CHECK(control(1, 1, 0, 0));
+     atomic_store_explicit(&capture_returns,1,memory_order_release);
+ END_SETUP()

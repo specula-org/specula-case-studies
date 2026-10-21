@@ -1,0 +1,18 @@
+note: mount /proc failed (Operation not permitted); the O_RDONLY control needs it
+MC-1 reproduction: post-seal read-only mappings retain writable accounting
+target: reference kernel (expect zero deviations)
+Case A: F_SEAL_WRITE then read-only shared mmap via the O_RDWR memfd handle (the MC-1 trace)
+  memfd_create(O_RDWR)               -> fd=3
+  F_ADD_SEALS(F_SEAL_WRITE)          -> ret=0           errno=0    (ok)  expected: success
+  mmap(PROT_READ, MAP_SHARED)        -> ret=123874971750400 errno=0    (ok)  expected: success
+  mmap(PROT_READ, O_RDONLY fd) [control] -> ret=123874971750400 errno=0    (ok)  expected: success
+Case B: F_SEAL_FUTURE_WRITE, read-only shared mmap, then F_ADD_SEALS(F_SEAL_WRITE)
+  memfd_create(O_RDWR)               -> fd=3
+  F_ADD_SEALS(F_SEAL_FUTURE_WRITE)   -> ret=0           errno=0    (ok)  expected: success
+  mmap(PROT_READ, MAP_SHARED)        -> ret=123874971750400 errno=0    (ok)  expected: success
+  mprotect(PROT_READ|PROT_WRITE)     -> ret=-1          errno=13   (Permission denied)  expected: failure
+  F_ADD_SEALS(F_SEAL_WRITE)          -> ret=0           errno=0    (ok)  expected: success
+  F_GET_SEALS                        -> seals=0x18
+  munmap                             -> ret=0           errno=0    (ok)  expected: success
+  F_ADD_SEALS(F_SEAL_WRITE) retry    -> ret=0           errno=0    (ok)  expected: success
+MC-1: NOT REPRODUCED (all operations Linux-compatible)

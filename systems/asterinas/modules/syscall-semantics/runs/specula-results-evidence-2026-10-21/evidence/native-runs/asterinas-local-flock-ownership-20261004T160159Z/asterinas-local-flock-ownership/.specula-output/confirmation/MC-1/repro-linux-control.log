@@ -1,0 +1,23 @@
+MC1_ENV kernel=Linux 7.2.8 smp=24
+P1 opens a=3 b=4 c=5 (independent opens, one OFD each)
+P1 flock(a, SH|NB)   = 0 errno=0
+P1 flock(b, SH|NB)   = 0 errno=0
+P1 flock(a, EX|NB)   = -1 errno=EAGAIN   <- A converts SH->EX, conflicts with B's SH
+P1 flock(b, UN)      = 0 errno=0   <- B releases its SH
+P1 flock(c, EX|NB)   = 0 errno=0   <- DISCRIMINATOR: Linux oracle =0 (A's failed conversion removed A's SH); Asterinas bug =EAGAIN (A's old SH retained)
+P1 flock(a, UN)      = 0 errno=0   <- A drops its retained old SH
+P1 flock(c, EX|NB)   = 0 errno=0   <- after A's UN, C must succeed on both kernels
+P2 opens a2=3 b2=4
+P2 flock(a2, SH|NB)  = 0 errno=0
+P2 flock(b2, SH|NB)  = 0 errno=0
+P2 both converters entered blocking flock(a2/b2, EX)
+P2 window(5s)        : t1_done=0 t2_done=1   <- Asterinas bug: 0 0 (both parked, each holding the SH the other waits for); Linux oracle: exactly one completed
+P2 drain: flock(a2, UN) = 0 errno=0
+P2 drain: t2_done=1 (blocking conversion returned)
+P2 drain: flock(b2, UN) = 0 errno=0
+P2 drain: t1_done=1 (blocking conversion returned)
+P2 results: t1 flock=0 errno=0, t2 flock=0 errno=0
+MC1_P1_OBSERVED C_EX_NB_after_B_unlock=SUCCESS(old lock gone)
+MC1_P2_OBSERVED completed_during_window=1
+MC1_ASSESSMENT LINUX_CONTROL_MATCHED: failed conversion left no lock (C granted), and exactly one blocking converter completed spontaneously
+MC1_GUEST_DONE status=LINUX_CONTROL

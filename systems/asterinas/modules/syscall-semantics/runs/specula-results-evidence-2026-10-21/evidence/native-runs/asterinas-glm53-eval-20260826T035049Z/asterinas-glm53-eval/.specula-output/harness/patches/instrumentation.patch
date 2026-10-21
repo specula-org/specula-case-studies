@@ -1,0 +1,2546 @@
+diff --git baseline/Makefile instrumented/Makefile
+index 0ee7af9..2e30afe 100644
+--- baseline/Makefile
++++ instrumented/Makefile
+@@ -131,6 +131,12 @@ CARGO_OSDK_BUILD_ARGS += --kcmd-args="INTEL_TDX=$(INTEL_TDX)"
+ CARGO_OSDK_BUILD_ARGS += --init-args="/test/run_regression_test.sh"
+ else ifeq ($(AUTO_TEST), boot)
+ CARGO_OSDK_BUILD_ARGS += --init-args="/test/boot_hello.sh"
++else ifeq ($(AUTO_TEST), specula)
++ENABLE_REGRESSION_TEST := true
++ifeq ($(strip $(SPECULA_SCENARIO)),)
++$(error SPECULA_SCENARIO must name a trace scenario)
++endif
++CARGO_OSDK_BUILD_ARGS += --init-args="/test/io/file_io/specula_trace.sh $(SPECULA_SCENARIO)"
+ else ifeq ($(AUTO_TEST), vsock)
+ ENABLE_REGRESSION_TEST := true
+ export VSOCK=on
+@@ -312,6 +318,9 @@ else ifeq ($(AUTO_TEST), regression)
+ else ifeq ($(AUTO_TEST), boot)
+ 	@tail --lines 100 qemu.log | grep -q "^Successfully booted." \
+ 		|| (echo "Boot test failed" && exit 1)
++else ifeq ($(AUTO_TEST), specula)
++	@grep -q "^SPECULA_SCENARIO_DONE $(SPECULA_SCENARIO)" qemu.log \
++		|| (echo "Specula trace scenario failed" && exit 1)
+ else ifeq ($(AUTO_TEST), vsock)
+ 	@tail --lines 100 qemu.log | grep -q "^Vsock test passed." \
+ 		|| (echo "Vsock test failed" && exit 1)
+diff --git baseline/kernel/core/src/fs/file/inode_handle.rs instrumented/kernel/core/src/fs/file/inode_handle.rs
+index 99e0cd9..a122ffe 100644
+--- baseline/kernel/core/src/fs/file/inode_handle.rs
++++ instrumented/kernel/core/src/fs/file/inode_handle.rs
+@@ -32,6 +32,7 @@ pub(crate) struct InodeHandle {
+     /// and `ioctl` will be provided by the per-open file object instead of `path`.
+     open_file: Option<Box<dyn PerOpenFileOps>>,
+     offset: Mutex<usize>,
++    tla_trace_file: Option<Arc<crate::tla_trace::TraceFileState>>,
+ }
+ 
+ impl InodeHandle {
+@@ -68,10 +69,12 @@ impl InodeHandle {
+             inode.open(access_mode, status_flags).transpose()?
+         };
+ 
++        let tla_trace_file = crate::tla_trace::trace_file_for_path(&path);
+         Ok(Self {
+             common: FileCommon::new(path, access_mode, status_flags),
+             open_file,
+             offset: Mutex::new(0),
++            tla_trace_file,
+         })
+     }
+ 
+@@ -92,6 +95,10 @@ impl InodeHandle {
+         *offset
+     }
+ 
++    pub(crate) fn tla_trace_file(&self) -> Option<&Arc<crate::tla_trace::TraceFileState>> {
++        self.tla_trace_file.as_ref()
++    }
++
+     fn file_ops_and_is_offset_aware(&self) -> (&dyn FileOps, bool) {
+         if let Some(ref open_file) = self.open_file {
+             let is_offset_aware = open_file.is_offset_aware();
+@@ -283,11 +290,39 @@ impl FileLike for InodeHandle {
+         }
+ 
+         let mut offset = self.offset.lock();
+-
+-        let len = file_ops.read_at(*offset, writer, status_flags)?;
+-        *offset += len;
+-
+-        Ok(len)
++        if let Some(trace_file) = &self.tla_trace_file {
++            let start = crate::tla_trace::timestamp();
++            crate::tla_trace::read_acquire_offset(trace_file, *offset, start);
++        }
++
++        let result = file_ops.read_at(*offset, writer, status_flags);
++        match result {
++            Ok(len) => {
++                let start = crate::tla_trace::timestamp();
++                *offset += len;
++                if let Some(trace_file) = &self.tla_trace_file {
++                    crate::tla_trace::commit_offset(trace_file, *offset, len, start);
++                }
++                if let Some(trace_file) = &self.tla_trace_file {
++                    let start = crate::tla_trace::timestamp();
++                    crate::tla_trace::release_offset(trace_file, start);
++                }
++                drop(offset);
++                Ok(len)
++            }
++            Err(err) => {
++                let start = crate::tla_trace::timestamp();
++                if let Some(trace_file) = &self.tla_trace_file {
++                    crate::tla_trace::propagate_error(trace_file, err.error(), start);
++                }
++                if let Some(trace_file) = &self.tla_trace_file {
++                    let start = crate::tla_trace::timestamp();
++                    crate::tla_trace::release_offset(trace_file, start);
++                }
++                drop(offset);
++                Err(err)
++            }
++        }
+     }
+ 
+     fn write(&self, reader: &mut VmReader) -> Result<usize> {
+@@ -305,7 +340,14 @@ impl FileLike for InodeHandle {
+             return file_ops.write_at(0, reader, status_flags);
+         }
+ 
++        if let Some(trace_file) = &self.tla_trace_file {
++            crate::tla_trace::wait_for_vector_boundary(trace_file);
++        }
+         let mut offset = self.offset.lock();
++        if let Some(trace_file) = &self.tla_trace_file {
++            let start = crate::tla_trace::timestamp();
++            crate::tla_trace::write_acquire_offset(trace_file, *offset, start);
++        }
+ 
+         // FIXME: How can we deal with the `O_APPEND` flag if `open_file` is set?
+         if status_flags.contains(StatusFlags::O_APPEND) && self.open_file.is_none() {
+@@ -314,10 +356,34 @@ impl FileLike for InodeHandle {
+             *offset = self.path().size();
+         }
+ 
+-        let len = file_ops.write_at(*offset, reader, status_flags)?;
+-        *offset += len;
+-
+-        Ok(len)
++        let result = file_ops.write_at(*offset, reader, status_flags);
++        match result {
++            Ok(len) => {
++                let start = crate::tla_trace::timestamp();
++                *offset += len;
++                if let Some(trace_file) = &self.tla_trace_file {
++                    crate::tla_trace::commit_offset(trace_file, *offset, len, start);
++                }
++                if let Some(trace_file) = &self.tla_trace_file {
++                    let start = crate::tla_trace::timestamp();
++                    crate::tla_trace::release_offset(trace_file, start);
++                }
++                drop(offset);
++                Ok(len)
++            }
++            Err(err) => {
++                let start = crate::tla_trace::timestamp();
++                if let Some(trace_file) = &self.tla_trace_file {
++                    crate::tla_trace::propagate_error(trace_file, err.error(), start);
++                }
++                if let Some(trace_file) = &self.tla_trace_file {
++                    let start = crate::tla_trace::timestamp();
++                    crate::tla_trace::release_offset(trace_file, start);
++                }
++                drop(offset);
++                Err(err)
++            }
++        }
+     }
+ 
+     fn read_at(&self, offset: usize, writer: &mut VmWriter) -> Result<usize> {
+@@ -328,7 +394,19 @@ impl FileLike for InodeHandle {
+ 
+         let status_flags = self.status_flags();
+ 
+-        file_ops.read_at(offset, writer, status_flags)
++        if let Some(trace_file) = &self.tla_trace_file {
++            crate::tla_trace::read_at_start(trace_file, offset);
++        }
++        let result = file_ops.read_at(offset, writer, status_flags);
++        let start = crate::tla_trace::timestamp();
++        if let Some(trace_file) = &self.tla_trace_file {
++            crate::tla_trace::positional_return(
++                trace_file,
++                result.as_ref().err().map(|err| err.error()),
++                start,
++            );
++        }
++        result
+     }
+ 
+     fn write_at(&self, mut offset: usize, reader: &mut VmReader) -> Result<usize> {
+@@ -350,7 +428,19 @@ impl FileLike for InodeHandle {
+             offset = self.path().size();
+         }
+ 
+-        file_ops.write_at(offset, reader, status_flags)
++        if let Some(trace_file) = &self.tla_trace_file {
++            crate::tla_trace::write_at_start(trace_file, offset);
++        }
++        let result = file_ops.write_at(offset, reader, status_flags);
++        let start = crate::tla_trace::timestamp();
++        if let Some(trace_file) = &self.tla_trace_file {
++            crate::tla_trace::positional_return(
++                trace_file,
++                result.as_ref().err().map(|err| err.error()),
++                start,
++            );
++        }
++        result
+     }
+ 
+     fn ioctl(&self, raw_ioctl: RawIoctl) -> Result<i32> {
+@@ -422,7 +512,11 @@ impl FileLike for InodeHandle {
+         if let Some(ref open_file) = self.open_file {
+             open_file.check_seekable()?;
+             if open_file.is_offset_aware() {
+-                return do_seek_util(&self.offset, pos, open_file.seek_end()?);
++                let offset = do_seek_util(&self.offset, pos, open_file.seek_end()?)?;
++                if let Some(trace_file) = &self.tla_trace_file {
++                    trace_file.sync_seek(offset);
++                }
++                return Ok(offset);
+             } else {
+                 return Ok(0);
+             }
+@@ -432,7 +526,11 @@ impl FileLike for InodeHandle {
+         if !inode.type_().is_seekable() {
+             return_errno_with_message!(Errno::ESPIPE, "seek is not supported");
+         }
+-        do_seek_util(&self.offset, pos, inode.seek_end())
++        let offset = do_seek_util(&self.offset, pos, inode.seek_end())?;
++        if let Some(trace_file) = &self.tla_trace_file {
++            trace_file.sync_seek(offset);
++        }
++        Ok(offset)
+     }
+ 
+     fn fallocate(&self, mode: FallocMode, offset: usize, len: usize) -> Result<()> {
+diff --git baseline/kernel/core/src/fs/fs_impls/exfat/inode.rs instrumented/kernel/core/src/fs/fs_impls/exfat/inode.rs
+index 68be618..ef1c435 100644
+--- baseline/kernel/core/src/fs/fs_impls/exfat/inode.rs
++++ instrumented/kernel/core/src/fs/fs_impls/exfat/inode.rs
+@@ -645,14 +645,28 @@ impl ExfatInode {
+         if inner.inode_type.is_directory() {
+             return_errno!(Errno::EISDIR)
+         }
+-        let (read_off, read_len) = {
++        let trace_start = crate::tla_trace::timestamp();
++        let (read_off, read_len, file_size) = {
+             let file_size = inner.size;
+             let start = file_size.min(offset);
+             let end = file_size.min(offset + writer.avail());
+-            (start, end - start)
++            (start, end - start, file_size)
+         };
++        crate::tla_trace::ramfs_exfat_read_compute_limit(
++            file_size,
++            inner.page_cache.size(),
++            trace_start,
++        );
+         inner.page_cache.read(read_off, writer)?;
+ 
++        let trace_start = crate::tla_trace::timestamp();
++        crate::tla_trace::file_ops_read_return(
++            read_len,
++            file_size,
++            inner.page_cache.size(),
++            trace_start,
++        );
++
+         inner.upgrade().update_atime()?;
+         Ok(read_len)
+     }
+@@ -711,7 +725,7 @@ impl ExfatInode {
+     fn write_at(&self, offset: usize, reader: &mut VmReader) -> Result<usize> {
+         let write_len = reader.remain();
+         // We need to obtain the fs lock to resize the file.
+-        let new_size = {
++        let (old_size, new_size) = {
+             let mut inner = self.inner.write();
+             if inner.inode_type.is_directory() {
+                 return_errno!(Errno::EISDIR)
+@@ -728,11 +742,13 @@ impl ExfatInode {
+                 }
+                 inner.page_cache.resize(new_size, file_size)?;
+             }
+-            new_size.max(file_size)
++            (file_size, new_size.max(file_size))
+         };
+ 
+         // Locks released here, so that file write can be parallelized.
+         let inner = self.inner.upread();
++        let trace_start = crate::tla_trace::timestamp();
++        crate::tla_trace::deferred_write_prepare(old_size, inner.page_cache.size(), trace_start);
+         inner.page_cache.write(offset, reader)?;
+ 
+         // Update timestamps and size.
+@@ -752,6 +768,14 @@ impl ExfatInode {
+             inner.sync_all(&fs_guard)?;
+         }
+ 
++        let trace_start = crate::tla_trace::timestamp();
++        crate::tla_trace::file_ops_write_return(
++            write_len,
++            inner.size,
++            inner.page_cache.size(),
++            trace_start,
++        );
++
+         Ok(write_len)
+     }
+ 
+diff --git baseline/kernel/core/src/fs/fs_impls/ext2/inode/file.rs instrumented/kernel/core/src/fs/fs_impls/ext2/inode/file.rs
+index 8ae1f20..f5dd686 100644
+--- baseline/kernel/core/src/fs/fs_impls/ext2/inode/file.rs
++++ instrumented/kernel/core/src/fs/fs_impls/ext2/inode/file.rs
+@@ -231,14 +231,23 @@ impl InodeInner {
+             return Ok(0);
+         }
+ 
++        let trace_start = crate::tla_trace::timestamp();
+         let file_size = self.file_size();
+-        if offset >= file_size {
+-            return Ok(0);
+-        }
+-
+-        let read_len = writer.avail().min(file_size - offset);
++        let read_len = writer.avail().min(file_size.saturating_sub(offset));
+         writer.limit(read_len);
++        crate::tla_trace::correct_read_compute_limit(
++            file_size,
++            self.page_cache().size(),
++            trace_start,
++        );
+         self.page_cache().read(offset, writer)?;
++        let trace_start = crate::tla_trace::timestamp();
++        crate::tla_trace::file_ops_read_return(
++            read_len,
++            self.file_size(),
++            self.page_cache().size(),
++            trace_start,
++        );
+         Ok(read_len)
+     }
+ 
+@@ -259,6 +268,8 @@ impl InodeInner {
+             return Err(err);
+         }
+ 
++        let trace_start = crate::tla_trace::timestamp();
++        crate::tla_trace::deferred_write_prepare(old_size, self.page_cache().size(), trace_start);
+         if let Err(err) = self.page_cache().write(offset, reader) {
+             self.rollback_write(old_size, end);
+             return Err(err.into());
+@@ -268,6 +279,13 @@ impl InodeInner {
+         if end > old_size {
+             self.set_file_size(end);
+         }
++        let trace_start = crate::tla_trace::timestamp();
++        crate::tla_trace::file_ops_write_return(
++            write_len,
++            self.file_size(),
++            self.page_cache().size(),
++            trace_start,
++        );
+         Ok(write_len)
+     }
+ 
+diff --git baseline/kernel/core/src/fs/fs_impls/ramfs/fs.rs instrumented/kernel/core/src/fs/fs_impls/ramfs/fs.rs
+index 005b013..40894f2 100644
+--- baseline/kernel/core/src/fs/fs_impls/ramfs/fs.rs
++++ instrumented/kernel/core/src/fs/fs_impls/ramfs/fs.rs
+@@ -700,13 +700,27 @@ impl FileOps for RamInode {
+     ) -> Result<usize> {
+         let read_len = match &self.inner {
+             Inner::File(page_cache) => {
+-                let (offset, read_len) = {
++                let trace_start = crate::tla_trace::timestamp();
++                let (offset, read_len, file_size) = {
+                     let file_size = self.size();
+                     let start = file_size.min(offset);
+                     let end = file_size.min(offset + writer.avail());
+-                    (start, end - start)
++                    (start, end - start, file_size)
+                 };
+-                page_cache.lock().read(offset, writer)?;
++                let page_cache = page_cache.lock();
++                crate::tla_trace::ramfs_exfat_read_compute_limit(
++                    file_size,
++                    page_cache.size(),
++                    trace_start,
++                );
++                page_cache.read(offset, writer)?;
++                let trace_start = crate::tla_trace::timestamp();
++                crate::tla_trace::file_ops_read_return(
++                    read_len,
++                    self.size(),
++                    page_cache.size(),
++                    trace_start,
++                );
+                 read_len
+             }
+             _ => return_errno_with_message!(Errno::EISDIR, "read is not supported"),
+@@ -747,8 +761,27 @@ impl FileOps for RamInode {
+                 if should_expand_size {
+                     page_cache.resize(new_size_aligned, file_size)?;
+                 }
++                let trace_start = crate::tla_trace::timestamp();
++                crate::tla_trace::ramfs_write_publish_requested_end(
++                    file_size,
++                    if should_expand_size {
++                        new_size
++                    } else {
++                        file_size
++                    },
++                    page_cache.size(),
++                    trace_start,
++                );
+                 page_cache.write(offset, reader)?;
+ 
++                let trace_start = crate::tla_trace::timestamp();
++                crate::tla_trace::file_ops_write_return(
++                    write_len,
++                    self.size(),
++                    page_cache.size(),
++                    trace_start,
++                );
++
+                 write_len
+             }
+             _ => return_errno_with_message!(Errno::EISDIR, "write is not supported"),
+diff --git baseline/kernel/core/src/fs/fs_impls/virtiofs/inode/ops.rs instrumented/kernel/core/src/fs/fs_impls/virtiofs/inode/ops.rs
+index a3031d4..f110ece 100644
+--- baseline/kernel/core/src/fs/fs_impls/virtiofs/inode/ops.rs
++++ instrumented/kernel/core/src/fs/fs_impls/virtiofs/inode/ops.rs
+@@ -62,21 +62,27 @@ impl VirtioFsInode {
+         // to use still-valid cached attributes.
+         self.revalidate_attr(Some(fh))?;
+ 
++        let trace_start = crate::tla_trace::timestamp();
+         let inner = self.inner.read();
+         let file_size = self.size();
+         let start = file_size.min(offset);
+         let end = file_size.min(offset.saturating_add(writer.avail()));
+         let read_len = end - start;
+-        if read_len == 0 {
+-            return Ok(0);
+-        }
+-
+         let mut limited_writer = writer.clone_exclusive();
+         limited_writer.limit(read_len);
+         let page_cache = inner.page_cache().unwrap();
++        crate::tla_trace::correct_read_compute_limit(file_size, page_cache.size(), trace_start);
+         page_cache.read(start, &mut limited_writer)?;
+         writer.skip(read_len);
+ 
++        let trace_start = crate::tla_trace::timestamp();
++        crate::tla_trace::file_ops_read_return(
++            read_len,
++            self.size(),
++            page_cache.size(),
++            trace_start,
++        );
++
+         Ok(read_len)
+     }
+ 
+diff --git baseline/kernel/core/src/lib.rs instrumented/kernel/core/src/lib.rs
+index bfa6b7c..2de6a81 100644
+--- baseline/kernel/core/src/lib.rs
++++ instrumented/kernel/core/src/lib.rs
+@@ -57,6 +57,7 @@ mod security;
+ mod syscall;
+ mod thread;
+ mod time;
++mod tla_trace;
+ mod util;
+ // TODO: Add vDSO support for other architectures.
+ #[cfg(any(target_arch = "x86_64", target_arch = "riscv64"))]
+diff --git baseline/kernel/core/src/process/posix_thread/exit.rs instrumented/kernel/core/src/process/posix_thread/exit.rs
+index 474c346..f79891b 100644
+--- baseline/kernel/core/src/process/posix_thread/exit.rs
++++ instrumented/kernel/core/src/process/posix_thread/exit.rs
+@@ -60,6 +60,10 @@ fn exit_internal(
+     let thread_local = current_task.as_thread_local().unwrap();
+     let posix_process = posix_thread.process();
+ 
++    // pthread_join observes clear_child_tid after this path. Flush first so a
++    // joined worker cannot race the parent's userspace output on the console.
++    crate::tla_trace::flush_thread(thread_local);
++
+     let is_last_thread = {
+         let mut tasks = posix_process.tasks().lock();
+         let has_exited_group = tasks.has_exited_group();
+diff --git baseline/kernel/core/src/process/posix_thread/thread_local.rs instrumented/kernel/core/src/process/posix_thread/thread_local.rs
+index 0860345..d6a2a26 100644
+--- baseline/kernel/core/src/process/posix_thread/thread_local.rs
++++ instrumented/kernel/core/src/process/posix_thread/thread_local.rs
+@@ -56,6 +56,9 @@ pub(crate) struct ThreadLocal {
+     // Namespaces.
+     user_ns: RefCell<Arc<UserNamespace>>,
+     ns_proxy: RefCell<Option<Arc<NsProxy>>>,
++
++    // Specula events are buffered per POSIX thread and flushed at task exit.
++    tla_trace: RefCell<crate::tla_trace::ThreadTrace>,
+ }
+ 
+ impl ThreadLocal {
+@@ -84,6 +87,7 @@ impl ThreadLocal {
+             orig_syscall_ret: Cell::new(None),
+             user_ns: RefCell::new(user_ns),
+             ns_proxy: RefCell::new(Some(ns_proxy)),
++            tla_trace: RefCell::new(crate::tla_trace::ThreadTrace::new()),
+         }
+     }
+ 
+@@ -199,6 +203,10 @@ impl ThreadLocal {
+     pub(in crate::process) fn borrow_ns_proxy_mut(&self) -> NsProxyRefMut<'_> {
+         ThreadLocalOptionRefMut(self.ns_proxy.borrow_mut())
+     }
++
++    pub(crate) fn tla_trace(&self) -> &RefCell<crate::tla_trace::ThreadTrace> {
++        &self.tla_trace
++    }
+ }
+ 
+ /// Supplementary userspace CPU context.
+diff --git baseline/kernel/core/src/process/signal/mod.rs instrumented/kernel/core/src/process/signal/mod.rs
+index 3ef4e7c..907f816 100644
+--- baseline/kernel/core/src/process/signal/mod.rs
++++ instrumented/kernel/core/src/process/signal/mod.rs
+@@ -45,8 +45,19 @@ pub(crate) trait SignalContext {
+     fn set_arguments(&mut self, sig_num: SigNum, siginfo_addr: usize, ucontext_addr: usize);
+ }
+ 
++struct TraceSignalDecision {
++    restartable: bool,
++}
++
++impl Drop for TraceSignalDecision {
++    fn drop(&mut self) {
++        crate::tla_trace::handle_pending_signal(self.restartable);
++    }
++}
++
+ /// Handles a pending signal for the current process.
+ pub(crate) fn handle_pending_signal(user_ctx: &mut UserContext, ctx: &Context) {
++    let mut trace_signal_decision = TraceSignalDecision { restartable: false };
+     // FIXME: This function may handle or suppress only one signal per trap, delaying
+     // other pending unmasked signals until the next trap. Consider a looped scan.
+     //
+@@ -155,6 +166,7 @@ pub(crate) fn handle_pending_signal(user_ctx: &mut UserContext, ctx: &Context) {
+                 user_ctx.set_syscall_ret(orig_syscall_ret);
+                 user_ctx
+                     .set_instruction_pointer(user_ctx.instruction_pointer() - SYSCALL_INSTR_LEN);
++                trace_signal_decision.restartable = true;
+             }
+ 
+             if let Err(e) = handle_user_signal(
+diff --git baseline/kernel/core/src/syscall/mod.rs instrumented/kernel/core/src/syscall/mod.rs
+index 8ffe4cd..83cc20b 100644
+--- baseline/kernel/core/src/syscall/mod.rs
++++ instrumented/kernel/core/src/syscall/mod.rs
+@@ -378,6 +378,16 @@ impl SyscallArgument {
+ 
+ pub(crate) fn handle_syscall(ctx: &Context, user_ctx: &mut UserContext) {
+     let syscall_frame = SyscallArgument::new_from_context(user_ctx);
++    let restart_kind = match syscall_frame.syscall_number {
++        arch::SYS_READ => Some(crate::tla_trace::READ_KIND),
++        arch::SYS_WRITE => Some(crate::tla_trace::WRITE_KIND),
++        arch::SYS_PREAD64 => Some(crate::tla_trace::PREAD_KIND),
++        arch::SYS_PWRITE64 => Some(crate::tla_trace::PWRITE_KIND),
++        arch::SYS_READV => Some(crate::tla_trace::READV_KIND),
++        arch::SYS_WRITEV => Some(crate::tla_trace::WRITEV_KIND),
++        _ => None,
++    };
++    crate::tla_trace::restart_syscall_if_pending(restart_kind);
+     let syscall_return = arch::syscall_dispatch(
+         syscall_frame.syscall_number,
+         syscall_frame.args,
+diff --git baseline/kernel/core/src/syscall/pread64.rs instrumented/kernel/core/src/syscall/pread64.rs
+index a15dcdd..9585460 100644
+--- baseline/kernel/core/src/syscall/pread64.rs
++++ instrumented/kernel/core/src/syscall/pread64.rs
+@@ -30,11 +30,14 @@ pub(super) fn sys_pread64(
+         return_errno_with_message!(Errno::EINVAL, "offset + user_buf_len overflow");
+     }
+ 
+-    let read_len = {
++    crate::tla_trace::sys_pread64_begin(file.as_ref().as_ref(), offset as usize);
++    let result = (|| -> Result<usize> {
+         let user_space = ctx.user_space();
+         let mut writer = user_space.writer(user_buf_ptr, user_buf_len)?;
+-        file.read_at(offset as usize, &mut writer)?
+-    };
++        file.read_at(offset as usize, &mut writer)
++    })();
++    crate::tla_trace::sys_pread64_finish(&result);
++    let read_len = result?;
+ 
+     if read_len > 0 {
+         fs::vfs::notify::on_access(&file);
+diff --git baseline/kernel/core/src/syscall/preadv.rs instrumented/kernel/core/src/syscall/preadv.rs
+index d24dd13..bce19fe 100644
+--- baseline/kernel/core/src/syscall/preadv.rs
++++ instrumented/kernel/core/src/syscall/preadv.rs
+@@ -153,7 +153,10 @@ fn do_sys_readv(
+ 
+     let user_space = ctx.user_space();
+     let mut writer_array = VmWriterArray::from_user_io_vecs(&user_space, io_vec_ptr, io_vec_count)?;
+-    for writer in writer_array.writers_mut() {
++    crate::tla_trace::sys_readv_begin(file.as_ref().as_ref());
++    let writer_count = writer_array.writers_mut().len();
++    let mut final_error = None;
++    for (index, writer) in writer_array.writers_mut().iter_mut().enumerate() {
+         debug_assert!(writer.has_avail());
+ 
+         // TODO: According to the man page
+@@ -162,22 +165,36 @@ fn do_sys_readv(
+         // but the current implementation does not ensure atomicity.
+         // A suitable fix would be to add a `readv` method for the `FileLike` trait,
+         // allowing each subsystem to implement atomicity.
+-        match file.read(writer) {
+-            Ok(read_len) => total_len += read_len,
+-            Err(_) if total_len > 0 => break,
+-            Err(err) => return Err(err),
+-        }
+-        if writer.has_avail() {
+-            // End of file reached or no more data to read
++        let continue_to_next = match file.read(writer) {
++            Ok(read_len) => {
++                total_len += read_len;
++                !writer.has_avail() && index + 1 < writer_count
++            }
++            Err(_) if total_len > 0 => false,
++            Err(err) => {
++                final_error = Some(err);
++                false
++            }
++        };
++        let trace_start = crate::tla_trace::timestamp();
++        crate::tla_trace::vector_handle_entry(continue_to_next, trace_start);
++        if !continue_to_next {
+             break;
+         }
+     }
+ 
+-    if total_len > 0 {
++    let result = if let Some(err) = final_error {
++        Err(err)
++    } else {
++        Ok(total_len)
++    };
++    crate::tla_trace::sys_readv_finish(&result);
++
++    if result.as_ref().is_ok_and(|len| *len > 0) {
+         fs::vfs::notify::on_access(&file);
+     }
+ 
+-    Ok(total_len)
++    result
+ }
+ 
+ bitflags! {
+diff --git baseline/kernel/core/src/syscall/pwrite64.rs instrumented/kernel/core/src/syscall/pwrite64.rs
+index 37aa475..8d638aa 100644
+--- baseline/kernel/core/src/syscall/pwrite64.rs
++++ instrumented/kernel/core/src/syscall/pwrite64.rs
+@@ -30,9 +30,14 @@ pub(super) fn sys_pwrite64(
+         return_errno_with_message!(Errno::EINVAL, "offset + user_buf_len overflow");
+     }
+ 
+-    let user_space = ctx.user_space();
+-    let mut reader = user_space.reader(user_buf_ptr, user_buf_len)?;
+-    let write_len = file.write_at(offset as _, &mut reader)?;
++    crate::tla_trace::sys_pwrite64_begin(file.as_ref().as_ref(), offset as usize);
++    let result = (|| -> Result<usize> {
++        let user_space = ctx.user_space();
++        let mut reader = user_space.reader(user_buf_ptr, user_buf_len)?;
++        file.write_at(offset as _, &mut reader)
++    })();
++    crate::tla_trace::sys_pwrite64_finish(&result);
++    let write_len = result?;
+ 
+     if write_len > 0 {
+         fs::vfs::notify::on_modify(&file);
+diff --git baseline/kernel/core/src/syscall/pwritev.rs instrumented/kernel/core/src/syscall/pwritev.rs
+index 36fbc70..7c18969 100644
+--- baseline/kernel/core/src/syscall/pwritev.rs
++++ instrumented/kernel/core/src/syscall/pwritev.rs
+@@ -149,7 +149,10 @@ fn do_sys_writev(
+ 
+     let user_space = ctx.user_space();
+     let mut reader_array = VmReaderArray::from_user_io_vecs(&user_space, io_vec_ptr, io_vec_count)?;
+-    for reader in reader_array.readers_mut() {
++    crate::tla_trace::sys_writev_begin(file.as_ref().as_ref());
++    let reader_count = reader_array.readers_mut().len();
++    let mut final_error = None;
++    for (index, reader) in reader_array.readers_mut().iter_mut().enumerate() {
+         debug_assert!(reader.has_remain());
+ 
+         // TODO: According to the man page
+@@ -158,21 +161,36 @@ fn do_sys_writev(
+         // but the current implementation does not ensure atomicity.
+         // A suitable fix would be to add a `writev` method for the `FileLike` trait,
+         // allowing each subsystem to implement atomicity.
+-        match file.write(reader) {
+-            Ok(write_len) => total_len += write_len,
+-            Err(_) if total_len > 0 => break,
+-            Err(err) => return Err(err),
+-        }
+-        if reader.has_remain() {
+-            // Partial write, maybe errors in the middle
++        let continue_to_next = match file.write(reader) {
++            Ok(write_len) => {
++                total_len += write_len;
++                !reader.has_remain() && index + 1 < reader_count
++            }
++            Err(_) if total_len > 0 => false,
++            Err(err) => {
++                final_error = Some(err);
++                false
++            }
++        };
++        let trace_start = crate::tla_trace::timestamp();
++        crate::tla_trace::vector_handle_entry(continue_to_next, trace_start);
++        if !continue_to_next {
+             break;
+         }
+     }
+-    if total_len > 0 {
++
++    let result = if let Some(err) = final_error {
++        Err(err)
++    } else {
++        Ok(total_len)
++    };
++    crate::tla_trace::sys_writev_finish(&result);
++
++    if result.as_ref().is_ok_and(|len| *len > 0) {
+         fs::vfs::notify::on_modify(&file);
+     }
+ 
+-    Ok(total_len)
++    result
+ }
+ 
+ bitflags! {
+diff --git baseline/kernel/core/src/syscall/read.rs instrumented/kernel/core/src/syscall/read.rs
+index 92ff33b..5d01304 100644
+--- baseline/kernel/core/src/syscall/read.rs
++++ instrumented/kernel/core/src/syscall/read.rs
+@@ -20,11 +20,12 @@ pub(super) fn sys_read(
+ 
+     let mut file_table = ctx.thread_local.borrow_file_table_mut();
+     let file = get_file_fast!(&mut file_table, raw_fd.try_into()?);
++    crate::tla_trace::sys_read_begin(file.as_ref().as_ref());
+ 
+     // According to <https://man7.org/linux/man-pages/man2/read.2.html>, if
+     // the user specified an empty buffer, we should detect errors by checking
+     // the file descriptor. If no errors detected, return 0 successfully.
+-    let read_len = {
++    let result = {
+         if buf_len != 0 {
+             let user_space = ctx.user_space();
+             let mut writer = user_space.writer(user_buf_addr, buf_len)?;
+@@ -36,7 +37,9 @@ pub(super) fn sys_read(
+     .map_err(|err| match err.error() {
+         Errno::EINTR => Error::new(Errno::ERESTARTSYS),
+         _ => err,
+-    })?;
++    });
++    crate::tla_trace::sys_read_finish(&result);
++    let read_len = result?;
+ 
+     if read_len > 0 {
+         fs::vfs::notify::on_access(&file);
+diff --git baseline/kernel/core/src/syscall/write.rs instrumented/kernel/core/src/syscall/write.rs
+index 079dbb5..cbf81b9 100644
+--- baseline/kernel/core/src/syscall/write.rs
++++ instrumented/kernel/core/src/syscall/write.rs
+@@ -20,11 +20,12 @@ pub(super) fn sys_write(
+ 
+     let mut file_table = ctx.thread_local.borrow_file_table_mut();
+     let file = get_file_fast!(&mut file_table, raw_fd.try_into()?);
++    crate::tla_trace::sys_write_begin(file.as_ref().as_ref());
+ 
+     // According to <https://man7.org/linux/man-pages/man2/write.2.html>, if
+     // the user specified an empty buffer, we should detect errors by checking
+     // the file descriptor. If no errors detected, return 0 successfully.
+-    let write_len = {
++    let result = {
+         if user_buf_len != 0 {
+             let user_space = ctx.user_space();
+             let mut reader = user_space.reader(user_buf_ptr, user_buf_len)?;
+@@ -36,7 +37,9 @@ pub(super) fn sys_write(
+     .map_err(|err| match err.error() {
+         Errno::EINTR => Error::new(Errno::ERESTARTSYS),
+         _ => err,
+-    })?;
++    });
++    crate::tla_trace::sys_write_finish(&result);
++    let write_len = result?;
+ 
+     if write_len > 0 {
+         fs::vfs::notify::on_modify(&file);
+diff --git instrumented/kernel/core/src/tla_trace.rs instrumented/kernel/core/src/tla_trace.rs
+new file mode 100644
+index 0000000..ccae518
+--- /dev/null
++++ instrumented/kernel/core/src/tla_trace.rs
+@@ -0,0 +1,1131 @@
++// SPDX-License-Identifier: MPL-2.0
++
++//! Specula timebox tracing for regular-file I/O.
++//!
++//! The hot path records fixed-size events in the current POSIX thread. Events
++//! are printed only when the thread exits, so console serialization cannot
++//! become a linearization point for the operations under test.
++
++use core::{
++    fmt,
++    sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering, fence},
++};
++
++use ostd::task::Task;
++
++use crate::{
++    fs::{
++        file::{FileLike, InodeHandle},
++        vfs::path::Path,
++    },
++    prelude::*,
++    process::posix_thread::{AsPosixThread, ThreadLocal},
++    thread::AsThread,
++};
++
++const TRACE_UNIT_BYTES: usize = PAGE_SIZE / 2;
++const TRACE_REQUEST_BYTES: usize = PAGE_SIZE;
++const MAX_EVENTS: usize = 128;
++
++const IDLE: &str = "Idle";
++const NEED_OFFSET_START: &str = "NeedOffsetStart";
++const NEED_POSITIONAL_START: &str = "NeedPositionalStart";
++const NEED_ADAPTER: &str = "NeedAdapter";
++const NEED_COPY: &str = "NeedCopy";
++const NEED_TUPLE_CONVERSION: &str = "NeedTupleConversion";
++const NEED_FILE_OPS_RETURN: &str = "NeedFileOpsReturn";
++const NEED_HANDLE_RETURN: &str = "NeedHandleReturn";
++const NEED_OFFSET_RELEASE: &str = "NeedOffsetRelease";
++const NEED_VECTOR_DISPATCH: &str = "NeedVectorDispatch";
++const NEED_SYSCALL_FINISH: &str = "NeedSyscallFinish";
++const NEED_SIGNAL: &str = "NeedSignal";
++const NEED_RESTART: &str = "NeedRestart";
++const DONE: &str = "Done";
++
++const NONE: &str = "None";
++const OK: &str = "Ok";
++const EFAULT: &str = "EFAULT";
++const EINTR: &str = "EINTR";
++const ERESTARTSYS: &str = "ERESTARTSYS";
++const PENDING: &str = "Pending";
++
++pub(crate) const READ_KIND: &str = "Read";
++pub(crate) const WRITE_KIND: &str = "Write";
++pub(crate) const PREAD_KIND: &str = "Pread64";
++pub(crate) const PWRITE_KIND: &str = "Pwrite64";
++pub(crate) const READV_KIND: &str = "Readv";
++pub(crate) const WRITEV_KIND: &str = "Writev";
++
++#[derive(Clone, Copy, Debug, Eq, PartialEq)]
++enum Progress {
++    None,
++    Zero,
++    Prefix,
++    Complete,
++}
++
++impl Progress {
++    const fn as_str(self) -> &'static str {
++        match self {
++            Self::None => "None",
++            Self::Zero => "Zero",
++            Self::Prefix => "Prefix",
++            Self::Complete => "Complete",
++        }
++    }
++
++    const fn units(self) -> usize {
++        match self {
++            Self::None | Self::Zero => 0,
++            Self::Prefix => 1,
++            Self::Complete => 2,
++        }
++    }
++}
++
++fn units(bytes: usize) -> usize {
++    bytes.div_ceil(TRACE_UNIT_BYTES)
++}
++
++fn progress(bytes: usize) -> Progress {
++    if bytes == 0 {
++        Progress::Zero
++    } else if bytes < TRACE_REQUEST_BYTES {
++        Progress::Prefix
++    } else {
++        Progress::Complete
++    }
++}
++
++fn available(start: usize, bound: usize) -> Progress {
++    if bound <= start {
++        Progress::Zero
++    } else if bound - start < 2 {
++        Progress::Prefix
++    } else {
++        Progress::Complete
++    }
++}
++
++fn is_read(kind: &str) -> bool {
++    matches!(kind, READ_KIND | PREAD_KIND | READV_KIND)
++}
++
++fn is_write(kind: &str) -> bool {
++    matches!(kind, WRITE_KIND | PWRITE_KIND | WRITEV_KIND)
++}
++
++fn is_vector(kind: &str) -> bool {
++    matches!(kind, READV_KIND | WRITEV_KIND)
++}
++
++fn uses_shared_offset(kind: &str) -> bool {
++    matches!(kind, READ_KIND | WRITE_KIND | READV_KIND | WRITEV_KIND)
++}
++
++fn start_phase(kind: &str) -> &'static str {
++    if uses_shared_offset(kind) {
++        NEED_OFFSET_START
++    } else {
++        NEED_POSITIONAL_START
++    }
++}
++
++#[derive(Clone, Copy)]
++struct OpState {
++    phase: &'static str,
++    kind: &'static str,
++    uses_shared_offset: bool,
++    explicit_offset: usize,
++    entry_start: usize,
++    logical_avail: Progress,
++    copy_limit: Progress,
++    iov_index: usize,
++    requested: usize,
++    entry_copied: usize,
++    entry_returned: usize,
++    copied: usize,
++    committed: usize,
++    reported: usize,
++    offset_advanced: usize,
++    entry_status: &'static str,
++    result: &'static str,
++    last_fault_progress: Progress,
++    published_eof: Progress,
++    read_past_eof: bool,
++    size_at_entry: usize,
++    syscall_id: usize,
++    attempt_id: usize,
++    restart_pending: bool,
++    signal_pending: bool,
++    sa_restart: bool,
++}
++
++impl OpState {
++    const fn idle() -> Self {
++        Self {
++            phase: IDLE,
++            kind: NONE,
++            uses_shared_offset: false,
++            explicit_offset: 0,
++            entry_start: 0,
++            logical_avail: Progress::Zero,
++            copy_limit: Progress::Zero,
++            iov_index: 1,
++            requested: 0,
++            entry_copied: 0,
++            entry_returned: 0,
++            copied: 0,
++            committed: 0,
++            reported: 0,
++            offset_advanced: 0,
++            entry_status: NONE,
++            result: PENDING,
++            last_fault_progress: Progress::None,
++            published_eof: Progress::Zero,
++            read_past_eof: false,
++            size_at_entry: 0,
++            syscall_id: 0,
++            attempt_id: 0,
++            restart_pending: false,
++            signal_pending: false,
++            sa_restart: false,
++        }
++    }
++
++    fn begin(&mut self, kind: &'static str, explicit_offset: usize) {
++        let syscall_id = self.syscall_id + 1;
++        *self = Self {
++            phase: start_phase(kind),
++            kind,
++            uses_shared_offset: uses_shared_offset(kind),
++            explicit_offset,
++            iov_index: 1,
++            requested: if is_vector(kind) { 4 } else { 2 },
++            syscall_id,
++            attempt_id: 1,
++            ..Self::idle()
++        };
++    }
++}
++
++/// Per-open-description state shared only by trace hooks.
++pub(crate) struct TraceFileState {
++    profile: &'static str,
++    force_vector_boundary: bool,
++    vector_boundary_ready: AtomicBool,
++    started: AtomicBool,
++    initial_shared_offset: AtomicUsize,
++    initial_file_size: usize,
++    initial_cache_capacity: usize,
++    shared_offset: AtomicUsize,
++    offset_owner: AtomicU32,
++    file_size: AtomicUsize,
++    cache_capacity: AtomicUsize,
++    effect_log_len: AtomicUsize,
++    commit_log_len: AtomicUsize,
++}
++
++impl TraceFileState {
++    fn new(
++        profile: &'static str,
++        force_vector_boundary: bool,
++        file_size: usize,
++        cache_capacity: usize,
++    ) -> Self {
++        Self {
++            profile,
++            force_vector_boundary,
++            vector_boundary_ready: AtomicBool::new(false),
++            started: AtomicBool::new(false),
++            initial_shared_offset: AtomicUsize::new(0),
++            initial_file_size: file_size,
++            initial_cache_capacity: cache_capacity,
++            shared_offset: AtomicUsize::new(0),
++            offset_owner: AtomicU32::new(0),
++            file_size: AtomicUsize::new(file_size),
++            cache_capacity: AtomicUsize::new(cache_capacity),
++            effect_log_len: AtomicUsize::new(0),
++            commit_log_len: AtomicUsize::new(0),
++        }
++    }
++
++    pub(crate) fn sync_seek(&self, byte_offset: usize) {
++        let offset = units(byte_offset);
++        self.shared_offset.store(offset, Ordering::Relaxed);
++        if !self.started.load(Ordering::Relaxed) {
++            self.initial_shared_offset.store(offset, Ordering::Relaxed);
++        }
++    }
++
++    fn set_sizes(&self, file_size: usize, cache_capacity: usize) {
++        self.file_size.store(units(file_size), Ordering::Relaxed);
++        self.cache_capacity
++            .store(units(cache_capacity), Ordering::Relaxed);
++    }
++}
++
++pub(crate) fn trace_file_for_path(path: &Path) -> Option<Arc<TraceFileState>> {
++    let name = path.name();
++    let force_vector_boundary = name.starts_with(".specula_ramfs_fault_vector");
++    let profile = if name.starts_with(".specula_correct_") {
++        "Correct"
++    } else if name.starts_with(".specula_ramfs_") {
++        "RamFs"
++    } else if name.starts_with(".specula_exfat_") {
++        "Exfat"
++    } else {
++        return None;
++    };
++
++    let file_size = path.size();
++    let cache_capacity = path
++        .inode()
++        .page_cache()
++        .map(|vmo| vmo.size())
++        .unwrap_or(file_size);
++    Some(Arc::new(TraceFileState::new(
++        profile,
++        force_vector_boundary,
++        units(file_size),
++        units(cache_capacity),
++    )))
++}
++
++#[derive(Clone, Copy)]
++enum EventArgs {
++    Empty,
++    Begin {
++        signal_pending: bool,
++        sa_restart: bool,
++    },
++    PositionalBegin {
++        explicit_offset: usize,
++        signal_pending: bool,
++        sa_restart: bool,
++    },
++    Copy {
++        progress: Progress,
++    },
++}
++
++#[derive(Clone, Copy)]
++struct StateSnapshot {
++    shared_offset: usize,
++    offset_owner: u32,
++    file_size: usize,
++    cache_capacity: usize,
++    adapter_profile: &'static str,
++    op: OpState,
++    effect_log_len: usize,
++    commit_log_len: usize,
++}
++
++#[derive(Clone, Copy)]
++struct TraceEvent {
++    name: &'static str,
++    raw_tid: u32,
++    start: u64,
++    end: u64,
++    args: EventArgs,
++    state: StateSnapshot,
++}
++
++pub(crate) struct ThreadTrace {
++    raw_tid: u32,
++    file: Option<Arc<TraceFileState>>,
++    op: OpState,
++    events: Vec<TraceEvent>,
++    dropped: usize,
++    suppress_next_begin: bool,
++}
++
++impl ThreadTrace {
++    pub(crate) fn new() -> Self {
++        Self {
++            raw_tid: 0,
++            file: None,
++            op: OpState::idle(),
++            events: Vec::with_capacity(MAX_EVENTS),
++            dropped: 0,
++            suppress_next_begin: false,
++        }
++    }
++
++    fn append(&mut self, name: &'static str, start: u64, end: u64, args: EventArgs) {
++        let Some(file) = self.file.as_ref() else {
++            return;
++        };
++        let state = StateSnapshot {
++            shared_offset: file.shared_offset.load(Ordering::Relaxed),
++            offset_owner: file.offset_owner.load(Ordering::Relaxed),
++            file_size: file.file_size.load(Ordering::Relaxed),
++            cache_capacity: file.cache_capacity.load(Ordering::Relaxed),
++            adapter_profile: file.profile,
++            op: self.op,
++            effect_log_len: file.effect_log_len.load(Ordering::Relaxed),
++            commit_log_len: file.commit_log_len.load(Ordering::Relaxed),
++        };
++        if self.events.len() == MAX_EVENTS {
++            self.dropped += 1;
++            return;
++        }
++        self.events.push(TraceEvent {
++            name,
++            raw_tid: self.raw_tid,
++            start,
++            end,
++            args,
++            state,
++        });
++    }
++
++    fn is_active_file(&self, file: &TraceFileState) -> bool {
++        self.file
++            .as_ref()
++            .is_some_and(|active| core::ptr::eq(active.as_ref(), file))
++    }
++
++    fn flush(&mut self) {
++        let Some(file) = self.file.as_ref() else {
++            return;
++        };
++        println!(
++            "SPECULA_CONFIG {{\"tag\":\"config\",\"raw_tid\":\"k{}\",\"initial_state\":{{\"shared_offset\":{},\"file_size\":{},\"cache_capacity\":{},\"adapter_profile\":\"{}\"}},\"dropped\":{}}}",
++            self.raw_tid,
++            file.initial_shared_offset.load(Ordering::Relaxed),
++            file.initial_file_size,
++            file.initial_cache_capacity,
++            file.profile,
++            self.dropped,
++        );
++        for event in &self.events {
++            println!("SPECULA_TRACE {}", EventDisplay(event));
++        }
++        self.events.clear();
++    }
++}
++
++struct EventDisplay<'a>(&'a TraceEvent);
++
++impl fmt::Display for EventDisplay<'_> {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        let event = self.0;
++        write!(
++            f,
++            "{{\"tag\":\"trace\",\"event\":\"{}\",\"tid\":\"k{}\",\"start\":{},\"end\":{},\"args\":",
++            event.name, event.raw_tid, event.start, event.end,
++        )?;
++        match event.args {
++            EventArgs::Empty => write!(f, "{{}}")?,
++            EventArgs::Begin {
++                signal_pending,
++                sa_restart,
++            } => write!(
++                f,
++                "{{\"signal_pending\":{},\"sa_restart\":{}}}",
++                signal_pending, sa_restart,
++            )?,
++            EventArgs::PositionalBegin {
++                explicit_offset,
++                signal_pending,
++                sa_restart,
++            } => write!(
++                f,
++                "{{\"explicit_offset\":{},\"signal_pending\":{},\"sa_restart\":{}}}",
++                explicit_offset, signal_pending, sa_restart,
++            )?,
++            EventArgs::Copy { progress } => {
++                write!(f, "{{\"progress\":\"{}\"}}", progress.as_str())?
++            }
++        }
++
++        let state = event.state;
++        write!(
++            f,
++            ",\"state\":{{\"shared_offset\":{},\"offset_owner\":",
++            state.shared_offset
++        )?;
++        if state.offset_owner == 0 {
++            write!(f, "\"none\"")?;
++        } else {
++            write!(f, "\"k{}\"", state.offset_owner)?;
++        }
++        write!(
++            f,
++            ",\"file_size\":{},\"cache_capacity\":{},\"adapter_profile\":\"{}\",\"phase\":\"{}\",\"kind\":\"{}\",\"uses_shared_offset\":{},\"explicit_offset\":{},\"entry_start\":{},\"logical_avail\":\"{}\",\"copy_limit\":\"{}\",\"iov_index\":{},\"requested\":{},\"entry_copied\":{},\"entry_returned\":{},\"copied\":{},\"committed\":{},\"reported\":{},\"offset_advanced\":{},\"entry_status\":\"{}\",\"result\":\"{}\",\"last_fault_progress\":\"{}\",\"published_eof\":\"{}\",\"read_past_eof\":{},\"size_at_entry\":{},\"syscall_id\":{},\"attempt_id\":{},\"restart_pending\":{},\"signal_pending\":{},\"sa_restart\":{},\"effect_log_len\":{},\"commit_log_len\":{}}}}}",
++            state.file_size,
++            state.cache_capacity,
++            state.adapter_profile,
++            state.op.phase,
++            state.op.kind,
++            state.op.uses_shared_offset,
++            state.op.explicit_offset,
++            state.op.entry_start,
++            state.op.logical_avail.as_str(),
++            state.op.copy_limit.as_str(),
++            state.op.iov_index,
++            state.op.requested,
++            state.op.entry_copied,
++            state.op.entry_returned,
++            state.op.copied,
++            state.op.committed,
++            state.op.reported,
++            state.op.offset_advanced,
++            state.op.entry_status,
++            state.op.result,
++            state.op.last_fault_progress.as_str(),
++            state.op.published_eof.as_str(),
++            state.op.read_past_eof,
++            state.op.size_at_entry,
++            state.op.syscall_id,
++            state.op.attempt_id,
++            state.op.restart_pending,
++            state.op.signal_pending,
++            state.op.sa_restart,
++            state.effect_log_len,
++            state.commit_log_len,
++        )
++    }
++}
++
++fn current_tid() -> Option<u32> {
++    let task = Task::current()?;
++    let thread = task.as_thread()?;
++    Some(thread.as_posix_thread()?.tid())
++}
++
++fn with_trace_mut<R>(f: impl FnOnce(&mut ThreadTrace) -> R) -> Option<R> {
++    let task = Task::current()?;
++    let thread_local = task.as_thread_local()?;
++    Some(f(&mut thread_local.tla_trace().borrow_mut()))
++}
++
++/// Returns a fenced real TSC timestamp. The harness runs only on x86-64.
++pub(crate) fn timestamp() -> u64 {
++    fence(Ordering::SeqCst);
++    let value = ostd::arch::read_tsc();
++    fence(Ordering::SeqCst);
++    value
++}
++
++pub(crate) fn wait_for_vector_boundary(file: &TraceFileState) {
++    let should_wait = file.force_vector_boundary
++        && with_trace_mut(|trace| trace.is_active_file(file) && trace.op.kind == WRITE_KIND)
++            .unwrap_or(false);
++    while should_wait && !file.vector_boundary_ready.load(Ordering::Acquire) {
++        Task::yield_now();
++    }
++}
++
++pub(crate) fn flush_thread(thread_local: &ThreadLocal) {
++    thread_local.tla_trace().borrow_mut().flush();
++}
++
++fn begin_operation(
++    file: &dyn FileLike,
++    kind: &'static str,
++    explicit_offset_bytes: usize,
++    event: &'static str,
++) {
++    let Some(handle) = file.downcast_ref::<InodeHandle>() else {
++        return;
++    };
++    let Some(trace_file) = handle.tla_trace_file() else {
++        return;
++    };
++    let Some(raw_tid) = current_tid() else {
++        return;
++    };
++    let trace_file = trace_file.clone();
++    let _ = with_trace_mut(|trace| {
++        trace.raw_tid = raw_tid;
++        trace.file = Some(trace_file.clone());
++        if trace.suppress_next_begin {
++            trace.suppress_next_begin = false;
++            return;
++        }
++        trace_file.started.store(true, Ordering::Relaxed);
++        let start = timestamp();
++        trace.op.begin(kind, units(explicit_offset_bytes));
++        let end = timestamp();
++        let args = if uses_shared_offset(kind) {
++            EventArgs::Begin {
++                signal_pending: false,
++                sa_restart: false,
++            }
++        } else {
++            EventArgs::PositionalBegin {
++                explicit_offset: units(explicit_offset_bytes),
++                signal_pending: false,
++                sa_restart: false,
++            }
++        };
++        trace.append(event, start, end, args);
++    });
++}
++
++pub(crate) fn sys_read_begin(file: &dyn FileLike) {
++    begin_operation(file, READ_KIND, 0, "SysReadBegin");
++}
++
++pub(crate) fn sys_write_begin(file: &dyn FileLike) {
++    begin_operation(file, WRITE_KIND, 0, "SysWriteBegin");
++}
++
++pub(crate) fn sys_pread64_begin(file: &dyn FileLike, offset: usize) {
++    begin_operation(file, PREAD_KIND, offset, "SysPread64Begin");
++}
++
++pub(crate) fn sys_pwrite64_begin(file: &dyn FileLike, offset: usize) {
++    begin_operation(file, PWRITE_KIND, offset, "SysPwrite64Begin");
++}
++
++pub(crate) fn sys_readv_begin(file: &dyn FileLike) {
++    begin_operation(file, READV_KIND, 0, "DoSysReadvBegin");
++}
++
++pub(crate) fn sys_writev_begin(file: &dyn FileLike) {
++    begin_operation(file, WRITEV_KIND, 0, "DoSysWritevBegin");
++}
++
++pub(crate) fn restart_syscall_if_pending(kind: Option<&'static str>) {
++    let Some(kind) = kind else {
++        return;
++    };
++    let _ = with_trace_mut(|trace| {
++        if trace.op.phase != NEED_RESTART || !trace.op.restart_pending || trace.op.kind != kind {
++            return;
++        }
++        let start = timestamp();
++        trace.op.phase = start_phase(trace.op.kind);
++        trace.op.entry_start = 0;
++        trace.op.logical_avail = Progress::Zero;
++        trace.op.copy_limit = Progress::Zero;
++        trace.op.iov_index = 1;
++        trace.op.entry_copied = 0;
++        trace.op.entry_returned = 0;
++        trace.op.reported = 0;
++        trace.op.entry_status = NONE;
++        trace.op.result = PENDING;
++        trace.op.last_fault_progress = Progress::None;
++        trace.op.published_eof = Progress::Zero;
++        trace.op.size_at_entry = 0;
++        trace.op.attempt_id += 1;
++        trace.op.restart_pending = false;
++        trace.suppress_next_begin = true;
++        let end = timestamp();
++        trace.append("RestartSyscall", start, end, EventArgs::Empty);
++    });
++}
++
++fn acquire_offset(file: &TraceFileState, byte_offset: usize, start: u64, event: &'static str) {
++    let _ = with_trace_mut(|trace| {
++        if !trace.is_active_file(file) || trace.op.phase != NEED_OFFSET_START {
++            return;
++        }
++        file.shared_offset
++            .store(units(byte_offset), Ordering::Relaxed);
++        file.offset_owner.store(trace.raw_tid, Ordering::Relaxed);
++        trace.op.entry_start = units(byte_offset);
++        trace.op.phase = NEED_ADAPTER;
++        let end = timestamp();
++        trace.append(event, start, end, EventArgs::Empty);
++    });
++}
++
++pub(crate) fn read_acquire_offset(file: &TraceFileState, byte_offset: usize, start: u64) {
++    acquire_offset(file, byte_offset, start, "InodeHandleReadAcquireOffset");
++}
++
++pub(crate) fn write_acquire_offset(file: &TraceFileState, byte_offset: usize, start: u64) {
++    acquire_offset(file, byte_offset, start, "InodeHandleWriteAcquireOffset");
++}
++
++fn positional_start(file: &TraceFileState, byte_offset: usize, event: &'static str) {
++    let _ = with_trace_mut(|trace| {
++        if !trace.is_active_file(file) || trace.op.phase != NEED_POSITIONAL_START {
++            return;
++        }
++        let start = timestamp();
++        trace.op.entry_start = units(byte_offset);
++        trace.op.phase = NEED_ADAPTER;
++        let end = timestamp();
++        trace.append(event, start, end, EventArgs::Empty);
++    });
++}
++
++pub(crate) fn read_at_start(file: &TraceFileState, byte_offset: usize) {
++    positional_start(file, byte_offset, "InodeHandleReadAtStart");
++}
++
++pub(crate) fn write_at_start(file: &TraceFileState, byte_offset: usize) {
++    positional_start(file, byte_offset, "InodeHandleWriteAtStart");
++}
++
++fn read_compute_limit(
++    event: &'static str,
++    expected_profile: &'static str,
++    file_size_bytes: usize,
++    cache_capacity_bytes: usize,
++    bounded_to_eof: bool,
++    start: u64,
++) {
++    let _ = with_trace_mut(|trace| {
++        let Some(file) = trace.file.as_ref() else {
++            return;
++        };
++        if trace.op.phase != NEED_ADAPTER || !is_read(trace.op.kind) {
++            return;
++        }
++        if expected_profile == "Correct" {
++            if file.profile != "Correct" {
++                return;
++            }
++        } else if !matches!(file.profile, "RamFs" | "Exfat") {
++            return;
++        }
++        file.set_sizes(file_size_bytes, cache_capacity_bytes);
++        let file_size = units(file_size_bytes);
++        let cache_capacity = units(cache_capacity_bytes);
++        trace.op.logical_avail = available(trace.op.entry_start, file_size);
++        trace.op.copy_limit = if bounded_to_eof {
++            trace.op.logical_avail
++        } else {
++            available(trace.op.entry_start, cache_capacity)
++        };
++        trace.op.size_at_entry = file_size;
++        trace.op.phase = NEED_COPY;
++        let end = timestamp();
++        trace.append(event, start, end, EventArgs::Empty);
++    });
++}
++
++pub(crate) fn correct_read_compute_limit(file_size: usize, cache_capacity: usize, start: u64) {
++    read_compute_limit(
++        "Ext2VirtioFsReadComputeLimit",
++        "Correct",
++        file_size,
++        cache_capacity,
++        true,
++        start,
++    );
++}
++
++pub(crate) fn ramfs_exfat_read_compute_limit(file_size: usize, cache_capacity: usize, start: u64) {
++    read_compute_limit(
++        "RamFsExfatReadComputeLimit",
++        "RamFsOrExfat",
++        file_size,
++        cache_capacity,
++        false,
++        start,
++    );
++}
++
++pub(crate) fn ramfs_write_publish_requested_end(
++    old_size: usize,
++    new_size: usize,
++    cache_capacity: usize,
++    start: u64,
++) {
++    let _ = with_trace_mut(|trace| {
++        let Some(file) = trace.file.as_ref() else {
++            return;
++        };
++        if file.profile != "RamFs" || trace.op.phase != NEED_ADAPTER || !is_write(trace.op.kind) {
++            return;
++        }
++        file.set_sizes(new_size, cache_capacity);
++        trace.op.logical_avail = Progress::Complete;
++        trace.op.copy_limit = Progress::Complete;
++        trace.op.size_at_entry = units(old_size);
++        trace.op.published_eof = if new_size > old_size {
++            Progress::Complete
++        } else {
++            Progress::Zero
++        };
++        trace.op.phase = NEED_COPY;
++        let end = timestamp();
++        trace.append(
++            "RamFsWritePublishRequestedEnd",
++            start,
++            end,
++            EventArgs::Empty,
++        );
++    });
++}
++
++pub(crate) fn deferred_write_prepare(old_size: usize, cache_capacity: usize, start: u64) {
++    let _ = with_trace_mut(|trace| {
++        let Some(file) = trace.file.as_ref() else {
++            return;
++        };
++        if !matches!(file.profile, "Correct" | "Exfat")
++            || trace.op.phase != NEED_ADAPTER
++            || !is_write(trace.op.kind)
++        {
++            return;
++        }
++        file.set_sizes(old_size, cache_capacity);
++        trace.op.logical_avail = Progress::Complete;
++        trace.op.copy_limit = Progress::Complete;
++        trace.op.size_at_entry = units(old_size);
++        trace.op.published_eof = Progress::Zero;
++        trace.op.phase = NEED_COPY;
++        let end = timestamp();
++        trace.append("DeferredWritePrepare", start, end, EventArgs::Empty);
++    });
++}
++
++#[derive(Clone, Copy)]
++pub(crate) struct VmoProbe {
++    start: u64,
++    before: usize,
++    read: bool,
++}
++
++fn vmo_start(before: usize, read: bool) -> Option<VmoProbe> {
++    with_trace_mut(|trace| {
++        if trace.op.phase != NEED_COPY
++            || (read && !is_read(trace.op.kind))
++            || (!read && !is_write(trace.op.kind))
++        {
++            return None;
++        }
++        Some(VmoProbe {
++            start: timestamp(),
++            before,
++            read,
++        })
++    })?
++}
++
++pub(crate) fn vmo_read_start(before_avail: usize) -> Option<VmoProbe> {
++    vmo_start(before_avail, true)
++}
++
++pub(crate) fn vmo_write_start(before_remain: usize) -> Option<VmoProbe> {
++    vmo_start(before_remain, false)
++}
++
++fn vmo_finish(probe: Option<VmoProbe>, after: usize, faulted: bool) {
++    let Some(probe) = probe else {
++        return;
++    };
++    let moved = probe.before.saturating_sub(after);
++    let progress = progress(moved);
++    let amount = progress.units();
++    let _ = with_trace_mut(|trace| {
++        if trace.op.phase != NEED_COPY {
++            return;
++        }
++        trace.op.entry_copied = amount;
++        trace.op.copied += amount;
++        trace.op.committed += amount;
++        trace.op.last_fault_progress = if faulted { progress } else { Progress::None };
++        if probe.read {
++            trace.op.read_past_eof |= amount > trace.op.logical_avail.units();
++        }
++        trace.op.phase = if faulted {
++            NEED_TUPLE_CONVERSION
++        } else {
++            NEED_FILE_OPS_RETURN
++        };
++        if amount > 0 {
++            trace
++                .file
++                .as_ref()
++                .unwrap()
++                .effect_log_len
++                .fetch_add(1, Ordering::Relaxed);
++        }
++        let end = timestamp();
++        trace.append(
++            if probe.read { "VmoRead" } else { "VmoWrite" },
++            probe.start,
++            end,
++            EventArgs::Copy { progress },
++        );
++    });
++}
++
++pub(crate) fn vmo_read_finish(probe: Option<VmoProbe>, after_avail: usize, faulted: bool) {
++    vmo_finish(probe, after_avail, faulted);
++}
++
++pub(crate) fn vmo_write_finish(probe: Option<VmoProbe>, after_remain: usize, faulted: bool) {
++    vmo_finish(probe, after_remain, faulted);
++}
++
++pub(crate) fn error_from_tuple(start: u64) {
++    let _ = with_trace_mut(|trace| {
++        if trace.op.phase != NEED_TUPLE_CONVERSION {
++            return;
++        }
++        trace.op.entry_status = EFAULT;
++        trace.op.phase = NEED_HANDLE_RETURN;
++        let end = timestamp();
++        trace.append("ErrorFromTuple", start, end, EventArgs::Empty);
++    });
++}
++
++pub(crate) fn file_ops_read_return(
++    returned_bytes: usize,
++    file_size: usize,
++    cache_capacity: usize,
++    start: u64,
++) {
++    let _ = with_trace_mut(|trace| {
++        if trace.op.phase != NEED_FILE_OPS_RETURN || !is_read(trace.op.kind) {
++            return;
++        }
++        trace
++            .file
++            .as_ref()
++            .unwrap()
++            .set_sizes(file_size, cache_capacity);
++        trace.op.entry_returned = progress(returned_bytes).units();
++        trace.op.entry_status = OK;
++        trace.op.phase = NEED_HANDLE_RETURN;
++        let end = timestamp();
++        trace.append("FileOpsReadReturn", start, end, EventArgs::Empty);
++    });
++}
++
++pub(crate) fn file_ops_write_return(
++    returned_bytes: usize,
++    file_size: usize,
++    cache_capacity: usize,
++    start: u64,
++) {
++    let _ = with_trace_mut(|trace| {
++        if trace.op.phase != NEED_FILE_OPS_RETURN || !is_write(trace.op.kind) {
++            return;
++        }
++        trace
++            .file
++            .as_ref()
++            .unwrap()
++            .set_sizes(file_size, cache_capacity);
++        trace.op.entry_returned = progress(returned_bytes).units();
++        trace.op.entry_status = OK;
++        trace.op.published_eof = if units(file_size) > trace.op.size_at_entry {
++            Progress::Complete
++        } else {
++            Progress::Zero
++        };
++        trace.op.phase = NEED_HANDLE_RETURN;
++        let end = timestamp();
++        trace.append("FileOpsWriteReturn", start, end, EventArgs::Empty);
++    });
++}
++
++pub(crate) fn commit_offset(
++    file: &TraceFileState,
++    new_byte_offset: usize,
++    returned_bytes: usize,
++    start: u64,
++) {
++    let _ = with_trace_mut(|trace| {
++        if !trace.is_active_file(file)
++            || trace.op.phase != NEED_HANDLE_RETURN
++            || trace.op.entry_status != OK
++        {
++            return;
++        }
++        let amount = progress(returned_bytes).units();
++        file.shared_offset
++            .store(units(new_byte_offset), Ordering::Relaxed);
++        trace.op.offset_advanced += amount;
++        trace.op.phase = NEED_OFFSET_RELEASE;
++        if amount > 0 {
++            file.commit_log_len.fetch_add(1, Ordering::Relaxed);
++        }
++        let end = timestamp();
++        trace.append("InodeHandleCommitOffset", start, end, EventArgs::Empty);
++    });
++}
++
++pub(crate) fn propagate_error(file: &TraceFileState, errno: Errno, start: u64) {
++    let _ = with_trace_mut(|trace| {
++        if !trace.is_active_file(file) || trace.op.phase != NEED_HANDLE_RETURN {
++            return;
++        }
++        trace.op.entry_status = if errno == Errno::EINTR { EINTR } else { EFAULT };
++        trace.op.phase = NEED_OFFSET_RELEASE;
++        let end = timestamp();
++        trace.append("InodeHandlePropagateError", start, end, EventArgs::Empty);
++    });
++}
++
++pub(crate) fn positional_return(file: &TraceFileState, errno: Option<Errno>, start: u64) {
++    let _ = with_trace_mut(|trace| {
++        if !trace.is_active_file(file) || trace.op.phase != NEED_HANDLE_RETURN {
++            return;
++        }
++        if let Some(errno) = errno {
++            trace.op.entry_status = if errno == Errno::EINTR { EINTR } else { EFAULT };
++        }
++        trace.op.phase = NEED_SYSCALL_FINISH;
++        let end = timestamp();
++        trace.append("InodeHandlePositionalReturn", start, end, EventArgs::Empty);
++    });
++}
++
++pub(crate) fn release_offset(file: &TraceFileState, start: u64) {
++    let _ = with_trace_mut(|trace| {
++        if !trace.is_active_file(file) || trace.op.phase != NEED_OFFSET_RELEASE {
++            return;
++        }
++        file.offset_owner.store(0, Ordering::Relaxed);
++        trace.op.phase = if is_vector(trace.op.kind) {
++            NEED_VECTOR_DISPATCH
++        } else {
++            NEED_SYSCALL_FINISH
++        };
++        let end = timestamp();
++        trace.append("InodeHandleReleaseOffset", start, end, EventArgs::Empty);
++    });
++}
++
++pub(crate) fn vector_handle_entry(continue_to_next: bool, start: u64) {
++    let competitor = with_trace_mut(|trace| {
++        if trace.op.phase != NEED_VECTOR_DISPATCH {
++            return None;
++        }
++        let event = if trace.op.kind == READV_KIND {
++            "DoSysReadvHandleEntry"
++        } else if trace.op.kind == WRITEV_KIND {
++            "DoSysWritevHandleEntry"
++        } else {
++            return None;
++        };
++        if trace.op.entry_status == OK {
++            trace.op.reported += trace.op.entry_returned;
++        }
++        if continue_to_next {
++            trace.op.iov_index += 1;
++            trace.op.entry_start = 0;
++            trace.op.logical_avail = Progress::Zero;
++            trace.op.copy_limit = Progress::Zero;
++            trace.op.entry_copied = 0;
++            trace.op.entry_returned = 0;
++            trace.op.entry_status = NONE;
++            trace.op.last_fault_progress = Progress::None;
++            trace.op.published_eof = Progress::Zero;
++            trace.op.size_at_entry = 0;
++            trace.op.phase = NEED_OFFSET_START;
++        } else {
++            trace.op.phase = NEED_SYSCALL_FINISH;
++        }
++        let end = timestamp();
++        trace.append(event, start, end, EventArgs::Empty);
++        let file = trace.file.as_ref()?;
++        if continue_to_next && file.force_vector_boundary {
++            file.vector_boundary_ready.store(true, Ordering::Release);
++            Some((file.clone(), trace.raw_tid))
++        } else {
++            None
++        }
++    })
++    .flatten();
++
++    if let Some((file, own_tid)) = competitor {
++        loop {
++            let owner = file.offset_owner.load(Ordering::Acquire);
++            if owner != 0 && owner != own_tid {
++                break;
++            }
++            Task::yield_now();
++        }
++    }
++}
++
++fn scalar_finish(event: &'static str, kind: &'static str, result: &Result<usize>) {
++    let _ = with_trace_mut(|trace| {
++        if trace.op.phase != NEED_SYSCALL_FINISH || trace.op.kind != kind {
++            return;
++        }
++        let start = timestamp();
++        match result {
++            Ok(returned) => {
++                trace.op.reported = progress(*returned).units();
++                trace.op.result = OK;
++            }
++            Err(err) => {
++                trace.op.reported = 0;
++                trace.op.result = if matches!(kind, READ_KIND | WRITE_KIND)
++                    && err.error() == Errno::ERESTARTSYS
++                {
++                    ERESTARTSYS
++                } else if err.error() == Errno::EINTR {
++                    EINTR
++                } else {
++                    EFAULT
++                };
++            }
++        }
++        trace.op.phase = NEED_SIGNAL;
++        let end = timestamp();
++        trace.append(event, start, end, EventArgs::Empty);
++    });
++}
++
++pub(crate) fn sys_read_finish(result: &Result<usize>) {
++    scalar_finish("SysReadFinish", READ_KIND, result);
++}
++
++pub(crate) fn sys_write_finish(result: &Result<usize>) {
++    scalar_finish("SysWriteFinish", WRITE_KIND, result);
++}
++
++pub(crate) fn sys_pread64_finish(result: &Result<usize>) {
++    scalar_finish("SysPread64Finish", PREAD_KIND, result);
++}
++
++pub(crate) fn sys_pwrite64_finish(result: &Result<usize>) {
++    scalar_finish("SysPwrite64Finish", PWRITE_KIND, result);
++}
++
++fn vector_finish(event: &'static str, kind: &'static str, result: &Result<usize>) {
++    let _ = with_trace_mut(|trace| {
++        if trace.op.phase != NEED_SYSCALL_FINISH || trace.op.kind != kind {
++            return;
++        }
++        let start = timestamp();
++        trace.op.result = if result.is_ok() {
++            OK
++        } else {
++            trace.op.entry_status
++        };
++        trace.op.phase = NEED_SIGNAL;
++        let end = timestamp();
++        trace.append(event, start, end, EventArgs::Empty);
++    });
++}
++
++pub(crate) fn sys_readv_finish(result: &Result<usize>) {
++    vector_finish("SysReadvFinish", READV_KIND, result);
++}
++
++pub(crate) fn sys_writev_finish(result: &Result<usize>) {
++    vector_finish("SysWritevFinish", WRITEV_KIND, result);
++}
++
++pub(crate) fn handle_pending_signal(restartable: bool) {
++    let _ = with_trace_mut(|trace| {
++        if trace.op.phase != NEED_SIGNAL {
++            return;
++        }
++        let start = timestamp();
++        if trace.op.result == ERESTARTSYS {
++            trace.op.result = EINTR;
++        }
++        trace.op.restart_pending = restartable;
++        trace.op.signal_pending = false;
++        trace.op.phase = if restartable { NEED_RESTART } else { DONE };
++        let end = timestamp();
++        trace.append("HandlePendingSignal", start, end, EventArgs::Empty);
++    });
++}
+diff --git baseline/kernel/core/src/vm/page_cache/vmo/mod.rs instrumented/kernel/core/src/vm/page_cache/vmo/mod.rs
+index 1380cc8..9aa55d5 100644
+--- baseline/kernel/core/src/vm/page_cache/vmo/mod.rs
++++ instrumented/kernel/core/src/vm/page_cache/vmo/mod.rs
+@@ -532,8 +532,10 @@ impl Vmo {
+ 
+     /// Reads data from the VMO at `offset` into `writer`.
+     pub(crate) fn read(&self, offset: usize, writer: &mut VmWriter) -> Result<()> {
++        let trace_probe = crate::tla_trace::vmo_read_start(writer.avail());
+         let read_len = writer.avail().min(self.size().saturating_sub(offset));
+         if read_len == 0 {
++            crate::tla_trace::vmo_read_finish(trace_probe, writer.avail(), false);
+             return Ok(());
+         }
+         let read_end = offset + read_len;
+@@ -554,7 +556,13 @@ impl Vmo {
+             )?;
+ 
+             for (_, page) in page_batch.iter() {
+-                page.reader().skip(page_offset).read_fallible(writer)?;
++                if let Err(tuple) = page.reader().skip(page_offset).read_fallible(writer) {
++                    crate::tla_trace::vmo_read_finish(trace_probe, writer.avail(), true);
++                    let trace_start = crate::tla_trace::timestamp();
++                    let err = Error::from(tuple);
++                    crate::tla_trace::error_from_tuple(trace_start);
++                    return Err(err);
++                }
+                 page_offset = 0;
+             }
+ 
+@@ -563,13 +571,16 @@ impl Vmo {
+             current_idx = page_batch.last().unwrap().0 + 1;
+         }
+ 
++        crate::tla_trace::vmo_read_finish(trace_probe, writer.avail(), false);
+         Ok(())
+     }
+ 
+     /// Writes data from `reader` into the VMO at `offset`.
+     pub(crate) fn write(&self, offset: usize, reader: &mut VmReader) -> Result<()> {
++        let trace_probe = crate::tla_trace::vmo_write_start(reader.remain());
+         let write_len = reader.remain().min(self.size().saturating_sub(offset));
+         if write_len == 0 {
++            crate::tla_trace::vmo_write_finish(trace_probe, reader.remain(), false);
+             return Ok(());
+         }
+         let write_end = offset + write_len;
+@@ -582,24 +593,34 @@ impl Vmo {
+         ));
+ 
+         if !self.has_backend() {
+-            return self.write_anonymous_pages(
++            let result = self.write_anonymous_pages(
+                 &write_range,
+                 &mut page_offset,
+                 reader,
+                 &mut page_batch,
++                trace_probe,
+             );
++            if result.is_ok() {
++                crate::tla_trace::vmo_write_finish(trace_probe, reader.remain(), false);
++            }
++            return result;
+         }
+ 
+         // VMOs with a backend require dirty tracking and may skip backend reads
+         // for page-aligned ranges that will be entirely overwritten.
+         if write_range.len() < PAGE_SIZE {
+-            return self.write_pages_with_backend(
++            let result = self.write_pages_with_backend(
+                 &write_range,
+                 &mut page_offset,
+                 reader,
+                 CommitMode::Read,
+                 &mut page_batch,
++                trace_probe,
+             );
++            if result.is_ok() {
++                crate::tla_trace::vmo_write_finish(trace_probe, reader.remain(), false);
++            }
++            return result;
+         }
+ 
+         // Split into head (unaligned), middle (aligned), and tail (unaligned).
+@@ -614,6 +635,7 @@ impl Vmo {
+                 reader,
+                 CommitMode::Read,
+                 &mut page_batch,
++                trace_probe,
+             )?;
+         }
+         if up_align_start != down_align_end {
+@@ -624,6 +646,7 @@ impl Vmo {
+                 reader,
+                 CommitMode::Overwrite,
+                 &mut page_batch,
++                trace_probe,
+             )?;
+         }
+         if down_align_end != write_range.end {
+@@ -634,9 +657,11 @@ impl Vmo {
+                 reader,
+                 CommitMode::Read,
+                 &mut page_batch,
++                trace_probe,
+             )?;
+         }
+ 
++        crate::tla_trace::vmo_write_finish(trace_probe, reader.remain(), false);
+         Ok(())
+     }
+ 
+@@ -674,6 +699,7 @@ impl Vmo {
+         page_offset: &mut usize,
+         reader: &mut VmReader,
+         page_batch: &mut Vec<(usize, CachePage)>,
++        trace_probe: Option<crate::tla_trace::VmoProbe>,
+     ) -> Result<()> {
+         let page_idx_range = get_page_idx_range(range);
+         let mut current_idx = page_idx_range.start;
+@@ -687,7 +713,13 @@ impl Vmo {
+             )?;
+ 
+             for (_, page) in page_batch.iter() {
+-                page.writer().skip(*page_offset).write_fallible(reader)?;
++                if let Err(tuple) = page.writer().skip(*page_offset).write_fallible(reader) {
++                    crate::tla_trace::vmo_write_finish(trace_probe, reader.remain(), true);
++                    let trace_start = crate::tla_trace::timestamp();
++                    let err = Error::from(tuple);
++                    crate::tla_trace::error_from_tuple(trace_start);
++                    return Err(err);
++                }
+                 *page_offset = 0;
+             }
+ 
+@@ -710,6 +742,7 @@ impl Vmo {
+         reader: &mut VmReader,
+         commit_mode: CommitMode,
+         page_batch: &mut Vec<(usize, CachePage)>,
++        trace_probe: Option<crate::tla_trace::VmoProbe>,
+     ) -> Result<()> {
+         let page_idx_range = get_page_idx_range(range);
+         let mut current_idx = page_idx_range.start;
+@@ -742,7 +775,11 @@ impl Vmo {
+                         if written_size > 0 && state.is_up_to_date() {
+                             locked_page.set_dirty();
+                         }
+-                        return Err(Error::from(err));
++                        crate::tla_trace::vmo_write_finish(trace_probe, reader.remain(), true);
++                        let trace_start = crate::tla_trace::timestamp();
++                        let err = Error::from((err, written_size));
++                        crate::tla_trace::error_from_tuple(trace_start);
++                        return Err(err);
+                     }
+                 };
+ 
+diff --git instrumented/test/initramfs/src/regression/io/file_io/specula_trace.c instrumented/test/initramfs/src/regression/io/file_io/specula_trace.c
+new file mode 100644
+index 0000000..fbcb873
+--- /dev/null
++++ instrumented/test/initramfs/src/regression/io/file_io/specula_trace.c
+@@ -0,0 +1,401 @@
++// SPDX-License-Identifier: MPL-2.0
++
++#define _GNU_SOURCE
++
++#include <errno.h>
++#include <fcntl.h>
++#include <pthread.h>
++#include <stdatomic.h>
++#include <stdint.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <sys/mman.h>
++#include <sys/stat.h>
++#include <sys/uio.h>
++#include <unistd.h>
++
++enum operation {
++	OP_WRITE,
++	OP_PREAD,
++	OP_PWRITE,
++};
++
++struct fault_buffer {
++	void *mapping;
++	char *cursor;
++	size_t mapping_len;
++};
++
++struct worker_args {
++	pthread_barrier_t *barrier;
++	atomic_int *ready;
++	enum operation operation;
++	int fd;
++	char *buffer;
++	size_t length;
++	off_t offset;
++	ssize_t result;
++	int error;
++};
++
++static void fail(const char *what)
++{
++	fprintf(stderr, "SPECULA_SETUP_ERROR %s: %s\n", what, strerror(errno));
++	exit(EXIT_FAILURE);
++}
++
++static void wait_at_barrier(pthread_barrier_t *barrier)
++{
++	int error = pthread_barrier_wait(barrier);
++
++	if (error != 0 && error != PTHREAD_BARRIER_SERIAL_THREAD) {
++		errno = error;
++		fail("pthread_barrier_wait");
++	}
++}
++
++static void start_simultaneously(pthread_barrier_t *barrier, atomic_int *ready)
++{
++	wait_at_barrier(barrier);
++	atomic_fetch_add_explicit(ready, 1, memory_order_seq_cst);
++	while (atomic_load_explicit(ready, memory_order_seq_cst) != 2)
++		;
++}
++
++static char *allocate_buffer(size_t length, int fill)
++{
++	char *buffer = mmap(NULL, length, PROT_READ | PROT_WRITE,
++			    MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
++
++	if (buffer == MAP_FAILED)
++		fail("mmap buffer");
++	memset(buffer, fill, length);
++	return buffer;
++}
++
++static struct fault_buffer allocate_prefix_fault(size_t page_size, int fill)
++{
++	struct fault_buffer buffer = {
++		.mapping_len = 2 * page_size,
++	};
++
++	buffer.mapping = mmap(NULL, buffer.mapping_len, PROT_READ | PROT_WRITE,
++			      MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
++	if (buffer.mapping == MAP_FAILED)
++		fail("mmap fault buffer");
++	memset(buffer.mapping, fill, page_size);
++	if (mprotect((char *)buffer.mapping + page_size, page_size, PROT_NONE) <
++	    0)
++		fail("mprotect fault page");
++	buffer.cursor = (char *)buffer.mapping + page_size / 2;
++	return buffer;
++}
++
++static void prepare_file(const char *temporary, const char *target,
++			 size_t file_size)
++{
++	char *contents = allocate_buffer(file_size, 0x5a);
++	int fd;
++	ssize_t written;
++
++	unlink(temporary);
++	unlink(target);
++	fd = open(temporary, O_CREAT | O_EXCL | O_RDWR, 0600);
++	if (fd < 0)
++		fail("open staging file");
++	written = pwrite(fd, contents, file_size, 0);
++	if (written != (ssize_t)file_size)
++		fail("populate staging file");
++	if (fsync(fd) < 0)
++		fail("fsync staging file");
++	if (close(fd) < 0)
++		fail("close staging file");
++	if (rename(temporary, target) < 0)
++		fail("rename staging file");
++	munmap(contents, file_size);
++}
++
++static int open_shared_file(const char *target, off_t initial_offset)
++{
++	int fd = open(target, O_RDWR);
++
++	if (fd < 0)
++		fail("open trace target");
++	if (lseek(fd, initial_offset, SEEK_SET) != initial_offset)
++		fail("set shared offset");
++	return fd;
++}
++
++static void *run_worker(void *opaque)
++{
++	struct worker_args *args = opaque;
++
++	start_simultaneously(args->barrier, args->ready);
++	errno = 0;
++	switch (args->operation) {
++	case OP_WRITE:
++		args->result = write(args->fd, args->buffer, args->length);
++		break;
++	case OP_PREAD:
++		args->result = pread(args->fd, args->buffer, args->length,
++				     args->offset);
++		break;
++	case OP_PWRITE:
++		args->result = pwrite(args->fd, args->buffer, args->length,
++				      args->offset);
++		break;
++	}
++	args->error = errno;
++	return NULL;
++}
++
++static void finish_threads(pthread_t worker, pthread_barrier_t *barrier)
++{
++	int error = pthread_join(worker, NULL);
++
++	if (error != 0) {
++		errno = error;
++		fail("pthread_join");
++	}
++	error = pthread_barrier_destroy(barrier);
++	if (error != 0) {
++		errno = error;
++		fail("pthread_barrier_destroy");
++	}
++}
++
++static void run_ramfs_fault_vector(size_t page_size, size_t unit)
++{
++	const char *temporary = "/tmp/specula_stage_ramfs_fault";
++	const char *target = "/tmp/.specula_ramfs_fault_vector";
++	struct fault_buffer fault = allocate_prefix_fault(page_size, 0x41);
++	char *complete = allocate_buffer(page_size, 0x42);
++	pthread_barrier_t barrier;
++	atomic_int ready = ATOMIC_VAR_INIT(0);
++	pthread_t worker;
++	struct worker_args worker_args;
++	struct iovec iov[2];
++	ssize_t vector_result;
++	int vector_error;
++	int fd;
++	int fd2;
++
++	prepare_file(temporary, target, 7 * unit);
++	fd = open_shared_file(target, 0);
++	fd2 = dup(fd);
++	if (fd2 < 0)
++		fail("dup trace target");
++	if (pthread_barrier_init(&barrier, NULL, 2) != 0)
++		fail("pthread_barrier_init");
++	worker_args = (struct worker_args){
++		.barrier = &barrier,
++		.ready = &ready,
++		.operation = OP_WRITE,
++		.fd = fd2,
++		.buffer = complete,
++		.length = page_size,
++	};
++	if (pthread_create(&worker, NULL, run_worker, &worker_args) != 0)
++		fail("pthread_create");
++	iov[0] = (struct iovec){ .iov_base = complete, .iov_len = page_size };
++	iov[1] = (struct iovec){ .iov_base = fault.cursor,
++				 .iov_len = page_size };
++	start_simultaneously(&barrier, &ready);
++	errno = 0;
++	vector_result = writev(fd, iov, 2);
++	vector_error = errno;
++	finish_threads(worker, &barrier);
++	printf("SPECULA_RESULT ramfs_fault_vector writev=%zd errno=%d write=%zd errno=%d\n",
++	       vector_result, vector_error, worker_args.result,
++	       worker_args.error);
++	close(fd2);
++	close(fd);
++	munmap(fault.mapping, fault.mapping_len);
++	munmap(complete, page_size);
++}
++
++static void run_ramfs_eof_positional(size_t page_size, size_t unit)
++{
++	const char *temporary = "/tmp/specula_stage_ramfs_eof";
++	const char *target = "/tmp/.specula_ramfs_eof_positional";
++	char *shared_buffer = allocate_buffer(page_size, 0);
++	char *positional_buffer = allocate_buffer(page_size, 0);
++	pthread_barrier_t barrier;
++	atomic_int ready = ATOMIC_VAR_INIT(0);
++	pthread_t worker;
++	struct worker_args worker_args;
++	ssize_t shared_result;
++	int shared_error;
++	int fd;
++	int fd2;
++
++	prepare_file(temporary, target, 7 * unit);
++	fd = open_shared_file(target, 6 * unit);
++	fd2 = dup(fd);
++	if (fd2 < 0)
++		fail("dup trace target");
++	if (pthread_barrier_init(&barrier, NULL, 2) != 0)
++		fail("pthread_barrier_init");
++	worker_args = (struct worker_args){
++		.barrier = &barrier,
++		.ready = &ready,
++		.operation = OP_PREAD,
++		.fd = fd2,
++		.buffer = positional_buffer,
++		.length = page_size,
++		.offset = 6 * unit,
++	};
++	if (pthread_create(&worker, NULL, run_worker, &worker_args) != 0)
++		fail("pthread_create");
++	start_simultaneously(&barrier, &ready);
++	errno = 0;
++	shared_result = read(fd, shared_buffer, page_size);
++	shared_error = errno;
++	finish_threads(worker, &barrier);
++	printf("SPECULA_RESULT ramfs_eof_positional read=%zd errno=%d pread=%zd errno=%d\n",
++	       shared_result, shared_error, worker_args.result,
++	       worker_args.error);
++	close(fd2);
++	close(fd);
++	munmap(shared_buffer, page_size);
++	munmap(positional_buffer, page_size);
++}
++
++static void run_correct_vector_positional(size_t page_size, size_t unit)
++{
++	const char *temporary = "/ext2/specula_stage_correct";
++	const char *target = "/ext2/.specula_correct_vector_positional";
++	char *read_buffer1 = allocate_buffer(page_size, 0);
++	char *read_buffer2 = allocate_buffer(page_size, 0);
++	char *write_buffer = allocate_buffer(page_size, 0x43);
++	pthread_barrier_t barrier;
++	atomic_int ready = ATOMIC_VAR_INIT(0);
++	pthread_t worker;
++	struct worker_args worker_args;
++	struct iovec iov[2];
++	ssize_t vector_result;
++	int vector_error;
++	int fd;
++	int fd2;
++
++	prepare_file(temporary, target, 7 * unit);
++	fd = open_shared_file(target, 0);
++	fd2 = dup(fd);
++	if (fd2 < 0)
++		fail("dup trace target");
++	if (pthread_barrier_init(&barrier, NULL, 2) != 0)
++		fail("pthread_barrier_init");
++	worker_args = (struct worker_args){
++		.barrier = &barrier,
++		.ready = &ready,
++		.operation = OP_PWRITE,
++		.fd = fd2,
++		.buffer = write_buffer,
++		.length = page_size,
++		.offset = 6 * unit,
++	};
++	if (pthread_create(&worker, NULL, run_worker, &worker_args) != 0)
++		fail("pthread_create");
++	iov[0] = (struct iovec){ .iov_base = read_buffer1,
++				 .iov_len = page_size };
++	iov[1] = (struct iovec){ .iov_base = read_buffer2,
++				 .iov_len = page_size };
++	start_simultaneously(&barrier, &ready);
++	errno = 0;
++	vector_result = readv(fd, iov, 2);
++	vector_error = errno;
++	finish_threads(worker, &barrier);
++	printf("SPECULA_RESULT correct_vector_positional readv=%zd errno=%d pwrite=%zd errno=%d\n",
++	       vector_result, vector_error, worker_args.result,
++	       worker_args.error);
++	close(fd2);
++	close(fd);
++	munmap(read_buffer1, page_size);
++	munmap(read_buffer2, page_size);
++	munmap(write_buffer, page_size);
++}
++
++static void run_exfat_fault_vector(size_t page_size, size_t unit)
++{
++	const char *temporary = "/exfat/specula_stage_exfat";
++	const char *target = "/exfat/.specula_exfat_fault_vector";
++	struct fault_buffer fault = allocate_prefix_fault(page_size, 0x44);
++	char *read_buffer1 = allocate_buffer(page_size, 0);
++	char *read_buffer2 = allocate_buffer(page_size, 0);
++	pthread_barrier_t barrier;
++	atomic_int ready = ATOMIC_VAR_INIT(0);
++	pthread_t worker;
++	struct worker_args worker_args;
++	struct iovec iov[2];
++	ssize_t vector_result;
++	int vector_error;
++	int fd;
++	int fd2;
++
++	prepare_file(temporary, target, 7 * unit);
++	fd = open_shared_file(target, 6 * unit);
++	fd2 = dup(fd);
++	if (fd2 < 0)
++		fail("dup trace target");
++	if (pthread_barrier_init(&barrier, NULL, 2) != 0)
++		fail("pthread_barrier_init");
++	worker_args = (struct worker_args){
++		.barrier = &barrier,
++		.ready = &ready,
++		.operation = OP_PWRITE,
++		.fd = fd2,
++		.buffer = fault.cursor,
++		.length = page_size,
++		.offset = 6 * unit,
++	};
++	if (pthread_create(&worker, NULL, run_worker, &worker_args) != 0)
++		fail("pthread_create");
++	iov[0] = (struct iovec){ .iov_base = read_buffer1,
++				 .iov_len = page_size };
++	iov[1] = (struct iovec){ .iov_base = read_buffer2,
++				 .iov_len = page_size };
++	start_simultaneously(&barrier, &ready);
++	errno = 0;
++	vector_result = readv(fd, iov, 2);
++	vector_error = errno;
++	finish_threads(worker, &barrier);
++	printf("SPECULA_RESULT exfat_fault_vector readv=%zd errno=%d pwrite=%zd errno=%d\n",
++	       vector_result, vector_error, worker_args.result,
++	       worker_args.error);
++	close(fd2);
++	close(fd);
++	munmap(fault.mapping, fault.mapping_len);
++	munmap(read_buffer1, page_size);
++	munmap(read_buffer2, page_size);
++}
++
++int main(int argc, char **argv)
++{
++	long page_size = sysconf(_SC_PAGESIZE);
++	size_t unit;
++
++	if (argc != 2) {
++		fprintf(stderr, "usage: %s SCENARIO\n", argv[0]);
++		return EXIT_FAILURE;
++	}
++	if (page_size <= 0 || page_size % 2 != 0)
++		fail("sysconf page size");
++	unit = (size_t)page_size / 2;
++
++	if (strcmp(argv[1], "ramfs_fault_vector") == 0)
++		run_ramfs_fault_vector((size_t)page_size, unit);
++	else if (strcmp(argv[1], "ramfs_eof_positional") == 0)
++		run_ramfs_eof_positional((size_t)page_size, unit);
++	else if (strcmp(argv[1], "correct_vector_positional") == 0)
++		run_correct_vector_positional((size_t)page_size, unit);
++	else if (strcmp(argv[1], "exfat_fault_vector") == 0)
++		run_exfat_fault_vector((size_t)page_size, unit);
++	else {
++		fprintf(stderr, "unknown scenario: %s\n", argv[1]);
++		return EXIT_FAILURE;
++	}
++
++	printf("SPECULA_SCENARIO_DONE %s\n", argv[1]);
++	return EXIT_SUCCESS;
++}
+diff --git instrumented/test/initramfs/src/regression/io/file_io/specula_trace.sh instrumented/test/initramfs/src/regression/io/file_io/specula_trace.sh
+new file mode 100755
+index 0000000..b0407a5
+--- /dev/null
++++ instrumented/test/initramfs/src/regression/io/file_io/specula_trace.sh
+@@ -0,0 +1,5 @@
++#!/bin/sh
++
++# SPDX-License-Identifier: MPL-2.0
++
++exec /test/io/file_io/specula_trace "$@"
+diff --git baseline/tools/qemu_args.sh instrumented/tools/qemu_args.sh
+old mode 100644
+new mode 100755
+index 15f04f2..b389ac6
+--- baseline/tools/qemu_args.sh
++++ instrumented/tools/qemu_args.sh
+@@ -10,6 +10,7 @@
+ #  - BOOT_METHOD: "qemu-direct", "grub-rescue-iso" or "grub-qcow2";
+ #  - BOOT_PROTOCOL: "multiboot", "multiboot2", "linux-legacy32", "linux-efi-pe64" or "linux-efi-handover64";
+ #  - NETDEV: "user" or "tap";
++#  - QEMU_HOSTFWD: "on" or "off"; disable user-network host forwards;
+ #  - VHOST: "off" or "on";
+ #  - VSOCK: "off" or "on";
+ #  - VIRTIOFS: "off" or "on";
+@@ -28,6 +29,7 @@ VHOST=${VHOST:-"off"}
+ VSOCK=${VSOCK:-"off"}
+ VIRTIOFS=${VIRTIOFS:-"off"}
+ NETDEV=${NETDEV:-"user"}
++QEMU_HOSTFWD=${QEMU_HOSTFWD:-"on"}
+ CONSOLE=${CONSOLE:-"hvc0"}
+ XFSTESTS_NEEDS_BLOCK_DEVICES=${XFSTESTS_NEEDS_BLOCK_DEVICES:-false}
+ 
+@@ -54,8 +56,12 @@ MEMCACHED_RAND_PORT=${MEMCACHED_PORT:-${RAND_PORTS[6]}}
+ # QEMU_OPT_ARG_DUMP_PACKETS="-object filter-dump,id=filter0,netdev=net01,file=virtio-net.pcap"
+ 
+ if [ "$NETDEV" = "user" ]; then
+-    echo "[$1] Forwarded QEMU guest port: $SSH_RAND_PORT->22; $NGINX_RAND_PORT->8080 $REDIS_RAND_PORT->6379 $IPERF_RAND_PORT->5201 $LMBENCH_TCP_LAT_RAND_PORT->31234 $LMBENCH_TCP_BW_RAND_PORT->31236 $MEMCACHED_RAND_PORT->11211" 1>&2
+-    NETDEV_ARGS="-netdev user,id=net01,hostfwd=tcp::$SSH_RAND_PORT-:22,hostfwd=tcp::$NGINX_RAND_PORT-:8080,hostfwd=tcp::$REDIS_RAND_PORT-:6379,hostfwd=tcp::$IPERF_RAND_PORT-:5201,hostfwd=tcp::$LMBENCH_TCP_LAT_RAND_PORT-:31234,hostfwd=tcp::$LMBENCH_TCP_BW_RAND_PORT-:31236,hostfwd=tcp::$MEMCACHED_RAND_PORT-:11211"
++    if [ "$QEMU_HOSTFWD" = "off" ]; then
++        NETDEV_ARGS="-netdev user,id=net01"
++    else
++        echo "[$1] Forwarded QEMU guest port: $SSH_RAND_PORT->22; $NGINX_RAND_PORT->8080 $REDIS_RAND_PORT->6379 $IPERF_RAND_PORT->5201 $LMBENCH_TCP_LAT_RAND_PORT->31234 $LMBENCH_TCP_BW_RAND_PORT->31236 $MEMCACHED_RAND_PORT->11211" 1>&2
++        NETDEV_ARGS="-netdev user,id=net01,hostfwd=tcp::$SSH_RAND_PORT-:22,hostfwd=tcp::$NGINX_RAND_PORT-:8080,hostfwd=tcp::$REDIS_RAND_PORT-:6379,hostfwd=tcp::$IPERF_RAND_PORT-:5201,hostfwd=tcp::$LMBENCH_TCP_LAT_RAND_PORT-:31234,hostfwd=tcp::$LMBENCH_TCP_BW_RAND_PORT-:31236,hostfwd=tcp::$MEMCACHED_RAND_PORT-:11211"
++    fi
+ elif [ "$NETDEV" = "tap" ]; then
+     THIS_SCRIPT_DIR=$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )
+     QEMU_IFUP_SCRIPT_PATH=$THIS_SCRIPT_DIR/net/qemu-ifup.sh

@@ -1,0 +1,1591 @@
+diff --git a/harness/INSTRUMENTATION.md b/harness/INSTRUMENTATION.md
+index 8362b39..5df0fc4 100644
+--- a/harness/INSTRUMENTATION.md
++++ b/harness/INSTRUMENTATION.md
+@@ -1,78 +1,60 @@
+-# Wait/reap trace instrumentation
++# Wait/reap harness instrumentation
+ 
+-This guide is for the controller and Phase 3 worker adjusting the Phase 2.5 harness. The harness modifies the real Asterinas checkout at `0c60537098f4c2949ad2d382aaf499de72263d76`. Candidate v5 adds an opt-in consistency mode and remains **incomplete pending independent review**. No v5 source installation, build, guest, Linux control, collector execution or trace validation has run. Read [STATUS.md](STATUS.md), [the v4 clock analysis](evidence/clock-method-v4.md) and [the v5 encoding and claim](evidence/clock-method-v5.md) before review or execution. V4 remains preserved as diagnostic only. V5 does not close R2 for real global order or store visibility.
++This page is for the controller reviewing or changing the harness. Candidate v6 collects syscall outcomes on Linux and Asterinas at two eligible CPUs through `run.sh --outcome`, also available as `--diagnostic`. Execution requires independent approval of the exact candidate and installation in the lane layout. Read [STATUS.md](STATUS.md) and [the v6 design](evidence/outcome-mode-v6.md) for the static evidence and remaining limits.
+ 
+-## Apply and run
++## Review, installation and execution
+ 
+-The controller must retain the existing `heavy.lock` allocation. This worker must not reacquire it. The shared [resource policy](/home/chin39/Documents/play/specula-profile/reports/flock-wait-handoff-2026-10-05/resources.json) requires at least 10 GiB host `MemAvailable` immediately before a kernel build, two build jobs, container limits of two CPUs, 8 GiB and 512 PIDs, and a guest with two CPUs and 2 GiB.
++The live receipt is `INCOMPLETE` for candidate `v6`. The runner checks it before source application or execution, and both collectors check it again. An outcome receipt must name v6, state `APPROVED` and authorize `OUTCOME_ONLY`. Clock diagnostics and grouped collection require `CONSISTENCY_UNDER_SAMPLED_CLOCK_BOUND`. The checker binds live semantic inputs, the historical clock notes, the v6 design and reference identities, the installed receipt and `candidate-v6/hashes.json`. It also verifies every frozen snapshot hash. Python optimization remains refused.
+ 
+-From `.specula-output`, the intended entry point is:
++The controller must preserve the installed receipt, clean only the files it owns, install the reviewed candidate and bind the new installed receipt after review. The workspace's historical `evidence/applied.json` is preserved and does not describe a v6 installation. `apply.sh`, `clean.sh` and the pin-checked source edit generator retain their existing behavior. Do not run this workspace as if it were the controller's installed `.specula-output` tree.
++
++After independent outcome approval, the installed entry point is:
+ 
+ ```sh
+-bash harness/run.sh --diagnostic
+-# After independent approval explicitly covering the consistency scope:
+-bash harness/run.sh --consistency
++bash harness/run.sh --outcome
+ ```
+ 
+-Use this entry point only in the controller's installed lane layout. The current entry point exits 78 at the unresolved review gate, before applying source changes or invoking Docker. It records the live memory reading and gate disposition under a new `harness/evidence/<UTC>-<PID>-<UUID>/` directory. The reviewer/controller must bind the exact candidate, clock-method note and installed receipt before allowing dependent execution. Both execution and collection require an `APPROVED` receipt naming v5 and hashing the live semantic inputs, both clock notes and `candidate-v5/hashes.json`. The checker verifies the frozen snapshot too. A receipt with `approval_scope: DIAGNOSTIC_ONLY` admits diagnostics. Grouped output additionally requires `approval_scope: CONSISTENCY_UNDER_SAMPLED_CLOCK_BOUND` and the explicit `--consistency` flag. The author leaves the receipt `INCOMPLETE`. Python optimization is refused because it disables existing assertion-based checks.
+-
+-After the review gate, memory admission precedes source application and all execution. The remaining script path builds the fixture with the repository's regression Makefile, runs Linux controls inside the pinned project container, checks memory again, builds the checkout's own OSDK and kernel, boots each guest scenario, and decodes the serial transport into diagnostic per-actor JSON and a calibration report. In consistency mode it also writes grouped input and a collection sidecar when every refusal check and the interval encoding succeed. These steps are prepared but have not been executed on the corrected candidate. The selected image is the lane's `asterinas/dev:0.18.1-20260926`, pinned by ID `sha256:897cb1b354b3d7d28184d7a417c27565390fc3fa6886b328d2588e6de93c1dab`. This static task did not inspect its local installation or tools. The runner inspects that exact ID and uses `--pull=never`. Missing images or tools must stop the controller attempt. Each container name starts with `specula-wait-reap-20261005` and includes an attempt UUID and a distinct stage/case suffix. Only guest runs expose `/dev/kvm`, individually. No host `/dev` bind mount is used.
+-
+-Tests have outer `timeout` bounds of at most 30 minutes. The fixture build allows 15 minutes and the kernel build 85 minutes. Both containers use the network so that rustup can install the toolchain targets that `rust-toolchain.toml` requires. Only the kernel container also fetches Cargo dependencies, with `--locked` from the checked-in lockfiles, before building offline. It logs the hash and contents of the OSDK-generated kernel `Cargo.lock` under the `--output` directory. Guest and Linux-control containers have no network. A timeout stops that attempt without an automatic retry. Preserve the log and distinguish an execution limit from a demonstrated lost wakeup. QEMU is stopped through QMP only after the fixture emits its completion marker. That stop is recorded separately from a timeout or guest exit.
+-
+-`apply.sh` checks the source pin and refuses to replace preexisting edits to any touched file. Its receipt binds all 20 installed files. Reapplication verifies those hashes and checks that all copied candidate files match the installed files. It refuses a stale v3 installation when the candidate recorder or fixture differs. The preserved `evidence/applied.json` still describes v3. After approval, the controller must preserve that receipt, use `clean.sh` with it, apply the reviewed v5 candidate and bind the new receipt before execution. This task did not apply or clean anything. `clean.sh` restores only those owned files, and refuses to proceed if their contents changed after apply. It does not reset unrelated tracked files or remove the preexisting `.codex/` directory.
+-
+-## Recording and decoding
+-
+-`src/wr_trace.rs` is copied into OSTD. Three preallocated streams have one writer each, selected by the registered current Task pointer. The hot path uses no shared logging mutex, allocation, output, or global sequence counter. It preserves the production mutexes, queue locks and atomic orderings. Interrupt-context calls are excluded. Each stream holds at most 1,024 records, and a queue snapshot holds at most 16 entries. An overflow, truncated queue or unregistered waker is a collection failure.
+-
+-The fixture uses private `prctl` control values only in this instrumented kernel: `0x53575000` resets before fixture construction, `0x53575001` registers one actor and optionally requests a bounded observer-output delay, and `0x53575002` dumps after both calls and the notifier finish. The parent main task is `w1`, its sole extra thread is `w2`, and the single-threaded child is `child`. Both parent tasks remain alive through notifier completion. Registration is outside the recorded protocol. Child exit stays gated until fork, parent-thread creation and the calibration handshake have completed.
+-
+-The kernel serial transport uses `WR_RAW` records with a numeric event ID, real TSC values, the actor/generation pair, and saved operands or branch outcomes. `collect.py` decodes those records into the exact names and records required by `Trace.tla`. Its dispatch table does not execute the model or fill missing operations. `WR_USER` records independently capture direct libc `syscall` results, errno and output bytes. The merged `SysWaitReturn` retains the kernel's result and extends its interval through the caller's separately measured completion.
+-
+-After independent approval, `run.sh` writes under `.specula-output/traces/`. Diagnostic mode, also the runner default, writes `<attempt>-guest-<case>.diagnostic.json` and `<attempt>-linux-<case>.diagnostic.json`. Each successful report contains CPU identity, CPUID bits, all pre/post calibration samples, conditional offset ranges, the measured bound, user outputs and evidence hashes. Adjacent `<report-stem>-events/<actor>.json` files wrap the local event arrays with the evidence class and claim. Their event tag is `diagnostic`, their timestamps are `local_start_tsc` and `local_end_tsc`, and they retain observed per-actor order. Diagnostics remain `INELIGIBLE` and `LOCAL_STREAM_ORDER_ONLY`.
+-
+-Consistency mode produces that same guest diagnostic bundle, plus `<attempt>-guest-<case>.ndjson` and `<attempt>-guest-<case>.collection.json`. The grouped file is one JSON object with the unchanged TraceData schema and exact event envelopes. Its top-level fields carry the label, fixed claim, sampled bound, encoding identifier, CPU evidence and raw-log/review-receipt hashes. The sidecar binds the grouped and diagnostic files by SHA-256 and retains the full calibration. A collection refusal writes the diagnostic and, in consistency mode, the sidecar with `grouped_trace: REFUSED` and the reason, exits 65, and emits no grouped file. Raw serial logs remain in `harness/evidence/<attempt>/`. Existing output paths are never overwritten. Linux controls remain diagnostic only.
++Omitting the flag or using `--diagnostic` selects the same outcome path. `--consistency` keeps the v5 grouped path and clock admission. It still refuses the reported AMD KVM environment because the approved method requires GenuineIntel and invariant TSC. No mode is admitted by the current receipt.
+ 
+-Each guest initramfs contains the pinned image's static BusyBox. Before actor registration or any measured interval, `/init` runs `/bin/busybox nproc`, prints `WR_GUEST_NPROC`, then executes the unchanged fixture with its original arguments. The image build path checks the `sh` and `nproc` applets and absence of an ELF interpreter, and records the binary hash and program headers. Missing tools stop the attempt. `boot.py` saves the actual command, including `-smp 2`, and its outcome records the guest count. The collector requires guest `nproc == -smp == WR_META.smp` and affinity CPUs within that count. Linux logs separately record `WR_CONTROL_NPROC`. Container CPU quotas are not guest CPU counts. BusyBox availability and guest execution are still unverified at runtime.
++The controller retains `heavy.lock` ownership. The memory gate is unchanged from the separately approved 2026-10-09 correction: `MemFree + Inactive(file)` must reach 10 GiB before execution and again before kernel build. `MemAvailable` is retained as diagnostic data. Build jobs remain two, container limits remain two CPUs, 8 GiB and 512 PIDs, and the guest remains `-smp 2 -m 2G`.
+ 
+-## Clock method and acceptance limit
++The image remains `asterinas/dev:0.18.1-20260926`, ID `sha256:897cb1b354b3d7d28184d7a417c27565390fc3fa6886b328d2588e6de93c1dab`, with `--pull=never` and the existing rootless daemon. Build containers keep their bridge network, rustup volume and locked dependency-fetch handling. Guest and control containers remain offline. Only guests expose `/dev/kvm`, individually. Static BusyBox verification, the CPU probe and initramfs handling are unchanged.
+ 
+-Both stamps use `lfence; rdtsc; lfence` in a single assembly block with compiler memory barriers. Intel LFENCE orders execution but does not drain the store buffer. In particular, the plain Relaxed exit-code store and Release zombie store can become globally visible after their end stamps. Locked RMWs and Acquire reads require different reasoning, and mutex release must be distinguished from plain spinlock release. The [separately preserved method note](evidence/clock-method-v4.md#per-operation-soundness-analysis) contains the exact per-operation table, source references, acceptance/rejection analysis and reviewer obligations.
++## Outcome fixture and records
+ 
+-The C fixture checks invariant TSC, `CPUID.80000007H:EDX[8]`, TSC/SSE2 support and the admitted Intel vendor on the actual pinned CPUs in both guest and Linux control. It runs 64 fenced ping-pong samples before the first modeled operation and 64 after completion, without holding a modeled lock. For each row `a0,b0,b1,a1`, a constant B-minus-A offset lies in `[b1-a1, b0-a0]`. The collector intersects the intervals within each phase and records the largest absolute phase endpoint as `sampled_abs_bound_cycles`. It refuses missing or contradictory calibration, unexpected CPUs, unsupported CPUID, clock regressions, events outside their local calibration window or a bound above 100,000 ticks. It does not require mixed-CPU raw numbers to be numerically sorted.
++`run.sh` passes `--outcome` explicitly to the fixture, including through the guest boot arguments. The fixture branches before the old clock path. Its separate outcome helpers never call `check_clock_cpu`, either calibration exchange, `stamp`, or the private recorder controls. CPUID is read only to identify the current CPU, without clock admission or sampling. The metadata records the mode, actual CPUID fields, libc, uname, child PID/UID, exit value, CPU counts and inactive recorder/delay controls.
+ 
+-This is a conditional sampled bound. Invariant TSC and matching pre/post samples cannot exclude an offset excursion or drift during the scenario, especially under virtualization. `run_wide_bound_cycles` remains `null`. There is no v4 runtime value yet. No interval is widened using model expectations, and a small sampled offset is not treated as zero.
++The recorder is not registered, reset or dumped. Each guest starts fresh. With no registered actor, the syscall observer does not pre-read output buffers, which is necessary for WR-CF to reach the real copyout fault rather than an instrumentation fault. The unchanged kernel patch still has unconditional stamps and hook checks. This is an instrumented kernel with recording inactive, not proof of zero instrumentation overhead. The existing TSC-based observer-delay control is inactive in outcome mode.
+ 
+-Every v5 collector report, diagnostic event-file envelope, grouped TraceData object and collection sidecar carries `evidence_class: "CONSISTENCY_UNDER_SAMPLED_CLOCK_BOUND"` and this fixed `claim` text:
++Each invocation creates a fresh child. A shared readiness handshake holds it alive for no-event checks. A valid blocking WEXITED|WNOWAIT result establishes the zombie before CF, LX and ready-child competition. Each waiter has a separate output area. The fixture resets errno before each direct syscall, saves errno immediately afterward and records the return, flags, PID selector, null rusage, buffer kind, relevant fields and bytes before and after. A PROT_NONE page is never read for diagnostics and has null before/after fields and bytes. Expected-result mismatches are retained for comparison rather than asserted away. A failed zombie-establishment check stops dependent calls and makes that invocation inconclusive.
+ 
+-> An accepted TraceSearch.cfg witness shows that the observed per-event arguments and post-states are consistent with some model interleaving that respects each actor's local order and the recorded cross-actor interval constraints after widening by the sampled calibration bound. It does not establish the real global order, store-visibility timing, or a run-wide clock bound. A rejection is a candidate mismatch that must be re-examined against the clock limits before any model or kernel conclusion.
++Outcome results live in `harness/evidence/<attempt>/outcomes/{linux,guest}-<case>.outcome.json`. These reports carry `OUTCOME_ONLY_NO_IMPLEMENTATION_TRACE`, `implementation_trace: NONE` and `trace_validation: BLOCKED_ENVIRONMENT`, with the reported AMD KVM rejection fields and the separately observed current CPU identity. There are no timestamps, event intervals, event streams or TraceData envelopes in this format. Do not pass it to `Trace.tla`.
+ 
+-For each different-CPU actor pair, the same invocation's sampled bound `B` changes the comparison to `end + B < start - B`, equivalently `end + 2B < start`. Both endpoints are widened. Same-CPU cross-actor comparisons retain their local clock relation. Actor arrays retain their observed order. The encoder uses only timestamps, actor CPUs and `B`. It solves endpoint inequalities that preserve every widened cross-actor comparison, including every absent edge, together with `start <= end` and `previous.end <= next.start`. Equal endpoint ranks are permitted. A constraint cycle containing a strict edge makes exact scalar encoding impossible, so collection records `UNREPRESENTABLE_LOCAL_ORDER` and refuses instead of clipping uncertainty or selecting an offset from a model witness. See the [proof and encoding](evidence/clock-method-v5.md).
++The collector uses an explicit metadata/call schema and rejects clock or recorder transports. It never copies raw kernel event lines into outcome reports. Raw guest and control logs are labelled `NON_TRACE_DIAGNOSTIC_MATERIAL` and bound by path and SHA-256. The boot supervisor's existing adjacent `.outcome.json` describes process completion only. The syscall reports use the separate `outcomes/` directory so these files cannot overwrite each other.
+ 
+-V4's one-sided argument about premature ends still applies under its stated assumptions: shortening ends adds precedence constraints, so it can cause rejection without establishing actual visibility order on acceptance. Widening removes uncertain cross-CPU edges. Unseen offset excursions, unsound environment assumptions and the loss of correlations between endpoint errors can still allow interleavings absent from the real execution. These risks weaken the evidence without reversing the fixed claim. Only consistency with the supplied constraints is asserted. No runtime bound has been measured, and `run_wide_bound_cycles` remains `null` in diagnostic and sidecar calibration records.
++Linux outcome controls add a two-CPU cpuset because the retained Docker CPU quota alone does not constrain affinity. The report distinguishes the two eligible control CPUs from the host's online count. The guest uses SMP=2. Collection cross-checks nproc, the fixture's pre-pin affinity count and guest boot evidence. The pinned Asterinas uname reports Linux for glibc compatibility, so guest attribution uses the runner and boot artifacts. The existing CPU probe's fallback-count limitation from review-v5f remains unchanged.
+ 
+-## Scenarios and evidence
++Timeouts and abnormal fixture exits still produce an outcome report with partial completed calls and an inconclusive comparison. The runner removes the failed case container and continues the remaining outcome cases. A failure before per-case execution, such as review, image or build admission, still stops the attempt. Both full loops must complete to produce 42 syscall reports for the 21-case matrix. The status summary counts comparison results and does not interpret them as bug verdicts.
+ 
+-`cases.tsv` contains four scenario families: no-event and consuming results, repeated observations followed by consumption, competing consumers, and observer/consumer overlap. It includes both same-interface consumer pairs and mixed pairs, already-waitable children, exit values 0/37/255, and both consuming interfaces. The `overlap` case delays observer output for 50 million TSC cycles after `do_wait` has returned its Arc and released protocol locks. It starts the consumer independently after a user-space delay. Those delays make a history possible. Only recorded selection, removal and output boundaries can establish that it occurred.
++## Cases and Linux-source comparisons
+ 
+-The zero-delay competition cases may exercise WR-09, and the delayed-exit cases may exercise WR-10. User-space started flags and sleep durations do not establish either kernel scheduling window. Report them as uncovered unless the actual internal events demonstrate the requested sequence. `ParkCurrentSpurious` is not emitted because this harness cannot distinguish an independent spurious return from a delayed in-scope unpark. If that distinction becomes necessary, add a reviewed scheduler observation. Never infer it from a watchdog timeout.
++[cases.tsv](cases.tsv) maps each row to its WR IDs. Outcome mode runs all rows on both systems. Consistency mode retains the original 15 cases and separate legacy calibration binary, skipping the six new outcome-only rows. The normal-exit controls retain exit values 0, 37 and 255 where WR-02 requires them.
+ 
+-`wait_calibration.c` is separate from all primary traces. It records zeroed and poisoned WR-SQ output, plus WR-CF consuming and nonconsuming output faults and their subsequent waits. Neither calibration has been run on Linux or Asterinas. The prepared Linux control uses the host Linux kernel through a Docker process, not the archived Linux v6.16.5 source oracle. Its actual uname, libc, binary and header identities must be recorded at execution. No source comparison is runtime evidence.
++WR-SQ has separate fresh-child zeroed and poisoned siginfo runs. Linux's six selected fields must become zero. WR-CF separately tests consuming wait4, consuming waitid WEXITED and waitid WEXITED|WNOWAIT against PROT_NONE after a verified zombie. The next valid consuming wait expects ECHILD for the first two and the child's exit for WNOWAIT. WR-LX first calls waitid WSTOPPED|WNOHANG without WEXITED, then WEXITED|WNOHANG. Its Linux-source expectation is -1/ECHILD followed by a successful exit result. Although the zombie helper returns zero internally, its caller leaves `notask_error` at -ECHILD for this single-threaded zombie. [The v6 design](evidence/outcome-mode-v6.md) gives the full source chain. Any different observation is recorded without a bug label.
+ 
+-The diagnostic collector reports event counts and observed coverage. All runtime coverage is `NOT_RUN`. Overlap introduced by uncertainty is not observed physical overlap and is not a concurrency-quality result. Neither output mode establishes WR-08/09/10 physical timing. All model final-state and post-state checks remain unchanged.
++`collect_outcome.py` constructs the expected call plan from the reviewed case before reading observations. It checks each API, flags, selector and buffer initialization, then emits explicit Linux-source return/errno/field expectations and `match`, `mismatch` or `inconclusive`. Raw bytes are provenance. Padding and unrelated siginfo bytes are not equality oracles. Fields on syscall errors are recorded but not interpreted as delivered status. Competing consumers additionally require exactly one API-specific success and one ECHILD. Incomplete evidence cannot produce an overall match.
+ 
+-`Trace.tla` has 41 exact `ExpectedPost` arms and `ValidatePostState(e) == e.post = ExpectedPost(e)`. Every field produced by the decoder has a corresponding check. This was inspected statically. No L2 runtime validation has occurred. Only after independent v5 approval and successful consistency collection, use `TraceSearch.cfg` for the quick check through the installed `run_trace_validation` tool or resource-budgeted TLC wrapper. Acceptance requires the exact `TraceNoCompleteMatch` violation, all preceding invariants intact, and a retained complete witness with all cursors exhausted. Exhaustion without a witness is a candidate mismatch under the fixed claim and requires clock-limit re-examination. A timeout, other invariant violation or evaluation error is inconclusive. The optional universal `Trace.cfg` check has the different semantics described in `spec/instrumentation-spec.md`.
++WR-08 allows an observer that selected earlier to return saved status after consumption, but outcome records cannot prove that ordering. With the delay control inactive, this schedule is opportunistic. WR-09 and WR-10 internal scan, registration, notification, recheck and park windows are also unestablished and opportunistic. Their externally visible one-success/one-ECHILD/no-hang requirement remains checked. A timeout is an execution limit and cannot establish a lost wakeup.
+ 
+-## Make a reviewed correction
++## Preserved consistency path
+ 
+-Preserve the current candidate, applied receipt, triggering evidence and hashes before editing. `evidence/candidate-v1` preserves the original version and `review-v1.md` records its independent findings. Edit the copies under `harness/src`, not only their installed counterparts. `instrument.py` owns the source edits and regenerates `patches/instrumentation.patch` when applying to the clean pin.
++The v5 clock method, all existing collector functions, the original fixture body, kernel hooks and patch remain unchanged. The explicit `--consistency` path still records local intervals, requires supported clock identity and pre/post calibration, and applies the exact cross-actor interval encoding. Its Linux controls use the renamed `--clock-diagnostic` collector option under the same consistency approval. An `OUTCOME_ONLY` receipt cannot authorize that option or grouped output.
+ 
+-To add a field, save its actual operand or result at the hook and extend that event's payload in `wr_trace.rs` or the source edit. Update the corresponding `collect.py` arm and its exact TraceSpec check together. Do not infer a shared value from a later read or add a modeled lock acquisition for tracing. Queue snapshots use the already-held queue lock. Publication and token hooks save their operands or actual atomic return values.
++Read [clock-method-v4.md](evidence/clock-method-v4.md) and [clock-method-v5.md](evidence/clock-method-v5.md) for the assumptions, refusals and fixed `CONSISTENCY_UNDER_SAMPLED_CLOCK_BOUND` claim. R2 remains open for real global order, store visibility and a run-wide clock bound. The reported host cannot supply the required clock evidence. No v6 TLC or trace validation has run.
+ 
+-To add an event, allocate its transport ID in `collect.py`, insert the real hook through `instrument.py`, and document the source boundary below. A new event or changed TraceSpec arm is a semantic correction. For a moved capture point, record the start before the operation and save the end immediately at its required completion boundary. Serialize only the saved values. The false park check ends directly after the saved load while its runqueue guard remains held. The true branch ends only after `reschedule` returns and releases that guard. Dequeue and resume stay separate.
++## Preparing another correction
+ 
+-After edits, create a new immutable candidate, record the diff and reason, and obtain independent review of its exact hashes. Candidate v4 remains preserved in `evidence/candidate-v4`. Candidate v5 is frozen in `evidence/candidate-v5`, with `hashes.json` and the separate `evidence/correction-v4-v5.diff`. The author does not approve the change. Only after material findings are closed may the controller allow the affected build, guest or trace/TLC rerun. Return unresolved review to the controller as incomplete and continue this same campaign when it is closed.
++Preserve the installed receipt, triggering evidence and current candidate before editing. Change the harness copies, retain a diff, freeze their hashes and obtain independent review before execution or receipt rebinding. [candidate-v6/hashes.json](evidence/candidate-v6/hashes.json) and [correction-v5-v6.diff](evidence/correction-v5-v6.diff) identify this correction. Earlier candidates and approval records remain unchanged. The author does not approve its own correction.
+ 
+ ## Installed hook locations
+ 
+diff --git a/harness/STATUS.md b/harness/STATUS.md
+index 421e54d..044b299 100644
+--- a/harness/STATUS.md
++++ b/harness/STATUS.md
+@@ -1,43 +1,29 @@
+ # Phase 2.5 status
+ 
+-Candidate v5 implements an explicit `--consistency` collector/runner mode alongside diagnostics. The review gate remains `INCOMPLETE`, naming v5 as awaiting independent review. R2's real-global-order, store-visibility and run-wide-clock obligations remain open. The [v5 method](evidence/clock-method-v5.md) builds on the preserved v4 analysis and defines a weaker claim that the controller can review separately.
++Candidate v6 adds syscall-outcome collection through `run.sh --outcome`. `--diagnostic` is an alias and remains the default. The candidate is ready for independent review, with `review-gate.json` set to `INCOMPLETE`, candidate `v6` and scope `NONE`. The author has neither approved nor committed it.
+ 
+-Every grouped trace, collection sidecar and diagnostic envelope carries `evidence_class: "CONSISTENCY_UNDER_SAMPLED_CLOCK_BOUND"` and this fixed `claim` text:
++The first admitted v5 Linux control stopped with exit 78 and the reported diagnostic `WR_CLOCK_UNSUPPORTED actor=3 cpu=1 vendor=AuthenticAMD max=80000022 features=178bfbff invariant=0`. The supplied environment is an AMD Ryzen 9 9950X KVM guest using kvm-clock without invariant TSC. The grouped path still requires GenuineIntel and invariant TSC. Its clock method has not changed, and implementation trace validation is **BLOCKED_ENVIRONMENT**.
+ 
+-> An accepted TraceSearch.cfg witness shows that the observed per-event arguments and post-states are consistent with some model interleaving that respects each actor's local order and the recorded cross-actor interval constraints after widening by the sampled calibration bound. It does not establish the real global order, store-visibility timing, or a run-wide clock bound. A rejection is a candidate mismatch that must be re-examined against the clock limits before any model or kernel conclusion.
+-
+-No v5 source application, build, Docker invocation, Linux control, guest, calibration measurement, collector/encoder execution or TLC run occurred. No implementation trace or measured B was generated. The author has not approved or committed the change.
++Outcome records carry `evidence_class: "OUTCOME_ONLY_NO_IMPLEMENTATION_TRACE"`, `implementation_trace: "NONE"` and `trace_validation: "BLOCKED_ENVIRONMENT"`. They compare each observed call and the permitted history with the pinned Linux v6.16.5 source oracle. A comparison is `match`, `mismatch` or `inconclusive`. None of these values classifies a kernel bug. The Linux control runs the host kernel, whose uname is recorded separately from the source oracle version.
+ 
+ ## Required criteria
+ 
+-PASS here means static implementation and artifact checks only. It does not certify an executed collector, a compiled binary, a guest CPU count or a TraceSearch result. Independent review remains pending.
++PASS means static implementation or artifact verification. No v6 fixture, collector, Linux control or guest has executed. Both systems' runtime coverage and the comparison logic's runtime behavior remain **NOT RUN**. Static evidence is in [v6-static-checks.json](evidence/v6-static-checks.json).
+ 
+-| Criterion | Status | Evidence and limit |
++| Criterion | Status | Evidence and limits |
+ | --- | --- | --- |
+-| V1-label | PASS | `src/collect.py` defines one fixed class and claim used by every output envelope. The text also appears verbatim here, in `INSTRUMENTATION.md` and in `evidence/clock-method-v5.md`. Labels are top-level because TraceShapeOK forbids extra event fields. Output execution is NOT RUN. |
+-| V2-widening | PASS | `src/collect.py::encode_intervals` uses `end + 2B < start` across CPUs, with the same invocation's B, and unchanged comparisons on the same CPU. It preserves all cross-actor comparisons and local shape through endpoint constraints, with a recorded impossibility refusal for strict cycles. `evidence/clock-method-v5.md` gives the equivalence and one-sided acceptance/rejection argument. No model order is used. Encoder execution is NOT RUN. |
+-| V3-refusals | PASS | The shared read path retains every v4 calibration, decoding and completeness refusal. `src/review_gate.py` requires APPROVED, candidate v5, current/frozen hashes and an explicit consistency scope for grouped mode. `review-gate.json` remains INCOMPLETE. Static comparisons are recorded in `evidence/v5-static-checks.json`. |
+-| V4-runner | PASS | `run.sh` admits review and memory before execution and prepares diagnostics, grouped NDJSON and sidecars in `.specula-output/traces/`. `src/initramfs.py` runs guest BusyBox nproc before the fixture, `src/boot.py` records the boot command/outcome, and collection cross-checks nproc, -smp and fixture count. The v4 container naming and image pin are unchanged. Docker, tools, builds, CPU measurements and output production are NOT RUN. |
+-| V5-records | PASS | `evidence/candidate-v5/hashes.json`, `evidence/correction-v4-v5.diff`, `evidence/v5-inputs.json`, `evidence/v5-static-checks.json` and `evidence/v5-files.txt` preserve the candidate, static checks and changed-file inventory. V4 and older artifacts remain unchanged. The current gate awaits independent review. |
+-
+-## Encoding and remaining risk
+-
+-Both endpoints of every cross-CPU comparison receive B ticks of uncertainty. Actor-local intervals are not independently widened or clipped. An endpoint graph represents exactly the retained cross-actor relation and the original actor non-overlap rule. Zero-weight cycles become equal ranks. A cycle with a strict edge proves the relation cannot be encoded by the unchanged scalar interface and produces `UNREPRESENTABLE_LOCAL_ORDER`, diagnostics and a refusal sidecar without grouped output. The implementation audits all pairwise comparisons before serialization.
+-
+-Under the v4 assumptions, a premature store end can add false precedence edges and cause rejection. It does not identify the actual visibility order on acceptance. Conversely, unsampled offset excursions, environment or compiler failures, and discarded correlations between endpoint uncertainties can remove actual constraints and make the search more permissive than the real execution. These limits weaken the evidence without reversing the fixed consistency claim. Full samples and `run_wide_bound_cycles: null` remain in the diagnostic and sidecar. Raw ticks never become claimed global timestamps.
+-
+-## Static checks and preserved inputs
+-
+-[evidence/v5-static-checks.json](evidence/v5-static-checks.json) records Python compilation for syntax without executing harness code, Bash syntax checks including embedded shell programs, JSON parsing, document claim equality, source AST comparisons, preserved-input hashes and `git diff --check`. No C or Rust source changed, and no native compilation or disassembly was run. The collector and encoder have not been exercised, even with synthetic data.
+-
+-The 41-event list, full decoder, calibration routine, hook generator/patch, stamps, fixture, cases and expected outcomes remain identical to v4. All protected `spec/` files and `modeling-brief.md` remain identical. The read-only source is still the installed v3 candidate on Asterinas `0c60537098f4c2949ad2d382aaf499de72263d76`, and its recorded file hashes remain unchanged. The historical `evidence/applied.json` is not a v5 installation receipt. [v5-inputs.json](evidence/v5-inputs.json) records those distinctions.
++| O1-mode | PASS | [wait_reap_trace.c](src/wait_reap_trace.c) dispatches to a separate outcome entry that never calls the fixture clock, calibration or recorder controls. [collect_outcome.py](src/collect_outcome.py) writes only allowlisted syscall records. [run.sh](run.sh) sends outcome results to the attempt's `outcomes/` directory and skips calibration execution. The original grouped fixture body and collector functions are preserved. The unchanged kernel patch still executes some unrecorded stamps. |
++| O2-coverage | PASS | [cases.tsv](cases.tsv) maps all 21 cases to WR IDs, covering WR-01 through WR-10, WR-SQ, WR-CF and WR-LX. Both runner loops include every row in outcome mode. WR-08/09/10 internal windows remain opportunistic and unestablished. Execution on both systems is NOT RUN. |
++| O3-controls | PASS | [wait_reap_trace.c](src/wait_reap_trace.c) implements separate fresh-child SQ zero/poison cases, three CF cases with an established zombie and a valid follow-up, and the sequential LX calls. It records all six siginfo fields and relevant bytes before and after valid-buffer calls. Exit values 0, 37 and 255 remain covered by WR-02. Runtime checks are NOT RUN. |
++| O4-expected | PASS | [collect_outcome.py](src/collect_outcome.py) fixes the call plan before reading results, checks arguments and initial sentinels, emits the Linux-source expectations per call and checks one-success/one-ECHILD histories. Incomplete execution or missing evidence produces `inconclusive`. No mismatch is labelled a bug. Collector execution is NOT RUN. |
++| O5-records | PASS | [candidate-v6/hashes.json](evidence/candidate-v6/hashes.json), [correction-v5-v6.diff](evidence/correction-v5-v6.diff), [v6-inputs.json](evidence/v6-inputs.json), [outcome-mode-v6.md](evidence/outcome-mode-v6.md), the updated documents and the incomplete gate preserve the review candidate. The full changed-file list is [v6-files.txt](evidence/v6-files.txt). |
+ 
+-V4 remains frozen at workspace commit `9a09d42` and in `evidence/candidate-v4/`, including its diagnostic-only conclusion. [correction-v4-v5.diff](evidence/correction-v4-v5.diff) covers changed/new live candidate files, excluding the duplicated snapshot and the diff itself. The snapshot manifest hashes all files within candidate-v5 except itself. The changed-file list separately includes the complete snapshot and outer records.
++## Evidence limits and continuation
+ 
+-## Controller continuation
++The kernel recorder is not armed in outcome mode. The observer-delay control is inactive. Every guest uses a fresh boot, so no actor registration survives from an earlier case. The existing kernel instrumentation remains installed and contains unconditional stamp instructions and hook checks. Outcome mode therefore removes recording and output-buffer observer reads, but does not establish the behavior of an uninstrumented kernel.
+ 
+-Obtain independent review of the exact v5 snapshot, live semantic inputs and clock note. For later grouped collection, the receipt must name v5, state APPROVED, bind the required hashes and authorize `CONSISTENCY_UNDER_SAMPLED_CLOCK_BOUND`. A diagnostic-only receipt uses `DIAGNOSTIC_ONLY`. No such approval exists now. The controller owns installation, installed-receipt rebinding, resource admission and the existing heavy-stage lock. No lock was acquired here.
++WR-08 checks allowed observer/consumer results without proving selection-before-removal or late output. WR-09 and WR-10 may encounter their intended internal windows through zero-delay and delayed exits, but neither user-space started flags nor sleeps prove registration, recheck or park timing. Completed competing cases must still have one successful consumer, one ECHILD and no hang. A watchdog expiry is an execution limit, not evidence of a lost wakeup. R2's global order, store visibility and run-wide clock obligations remain open.
+ 
+-Before execution, preserve and clean the installed v3 files under controller ownership, install the reviewed candidate, and bind its installed receipt. Invoke `bash harness/run.sh --diagnostic` for local diagnostic records or explicitly choose `--consistency` for both diagnostics and eligible grouped inputs. The runner defaults to diagnostics. It preserves the v4 image `asterinas/dev:0.18.1-20260926`, ID `sha256:897cb1b354b3d7d28184d7a417c27565390fc3fa6886b328d2588e6de93c1dab`, and `specula-wait-reap-20261005-<attempt>-<stage/case>` names. BusyBox static linkage and required applets are checked during that future attempt, before guest packaging.
++The reviewer must approve the exact v6 snapshot and live inputs with `OUTCOME_ONLY` before outcome execution. Clock diagnostics and grouped collection require `CONSISTENCY_UNDER_SAMPLED_CLOCK_BOUND` and a compatible environment. The current receipt approves neither scope. The controller retains installation, receipt rebinding and heavy-stage lock ownership. The workspace's historical `evidence/applied.json` was not replaced and is not a v6 installation receipt.
+ 
+-Retain diagnostics and collection sidecars even when encoding refuses. When collection succeeds, use only the full-witness `TraceSearch.cfg` criterion described in the method note and retain the witness. Uncertainty-induced overlap is not observed physical overlap. WR-08/09/10 timing, weak-memory correctness and optional spurious scheduling remain unproved. WR-SQ/WR-CF remain separate controls. This static candidate does not complete Phase 2.5.
++No Docker, build, QEMU, TLC, source installation, runtime control or collector execution occurred during v6 preparation. Only source inspection, Python/Bash/C syntax checks, static comparisons and artifact verification were performed. `spec/`, `modeling-brief.md`, the kernel patch and hooks, clock method, memory admission, network policy, image pin and BusyBox/probe handling remain unchanged.
+diff --git a/harness/cases.tsv b/harness/cases.tsv
+index 8acfec3..b45c764 100644
+--- a/harness/cases.tsv
++++ b/harness/cases.tsv
+@@ -1,16 +1,24 @@
+-# name scenario exit_value exit_delay_us api_pair readiness
+-nohang-37 nohang 37 20000 4i blocked
+-consume-0 nohang 0 20000 4i blocked
+-consume-255 nohang 255 20000 4i blocked
+-observe-consume4 observe4 37 20000 4i blocked
+-observe-consumeid observeid 37 20000 4i blocked
+-consumers44-park compete 37 20000 44 blocked
+-consumers44-ready compete 37 0 44 ready
+-consumersii-park compete 37 20000 ii blocked
+-consumersii-ready compete 37 0 ii ready
+-consumers4i-park compete 37 20000 4i blocked
+-consumersi4-park compete 37 20000 i4 blocked
+-consumers4i-race compete 37 0 4i blocked
+-consumersii-race compete 37 0 ii blocked
+-observer-consume4 overlap 37 0 i4 ready
+-observer-consumeid overlap 37 0 ii ready
++# name scenario exit_value exit_delay_us api_pair readiness wr_ids modes
++# Both systems run every row in outcome mode. WR-08/09/10 internal windows are
++# opportunistic only in that mode. User-space delays do not prove those windows.
++nohang-37 nohang 37 20000 4i blocked WR-01,WR-02 both
++consume-0 nohang 0 20000 4i blocked WR-01,WR-02 both
++consume-255 nohang 255 20000 4i blocked WR-01,WR-02 both
++observe-consume4 observe4 37 20000 4i blocked WR-04 both
++observe-consumeid observeid 37 20000 4i blocked WR-03,WR-05 both
++consumers44-park compete 37 20000 44 blocked WR-06,WR-10 both
++consumers44-ready compete 37 0 44 ready WR-06 both
++consumersii-park compete 37 20000 ii blocked WR-07,WR-10 both
++consumersii-ready compete 37 0 ii ready WR-07 both
++consumers4i-park compete 37 20000 4i blocked WR-07,WR-10 both
++consumersi4-park compete 37 20000 i4 blocked WR-07,WR-10 both
++consumers4i-race compete 37 0 4i blocked WR-07,WR-09 both
++consumersii-race compete 37 0 ii blocked WR-07,WR-09 both
++observer-consume4 overlap 37 0 i4 ready WR-08 both
++observer-consumeid overlap 37 0 ii ready WR-08 both
++siginfo-zero sq-zero 37 0 4i blocked WR-SQ outcome
++siginfo-poison sq-poison 37 0 4i blocked WR-SQ outcome
++copyout-wait4 cf4 37 0 4i ready WR-CF outcome
++copyout-waitid cfid 37 0 4i ready WR-CF outcome
++copyout-nowait cfnowait 37 0 4i ready WR-CF outcome
++zombie-without-wexited lx 37 0 4i ready WR-LX outcome
+diff --git a/harness/review-gate.json b/harness/review-gate.json
+index 6a60763..244ba71 100644
+--- a/harness/review-gate.json
++++ b/harness/review-gate.json
+@@ -1,10 +1,10 @@
+ {
+   "status": "INCOMPLETE",
+-  "blocking_finding": "Candidate v5 awaits independent review of labelled sampled-bound consistency, exact cross-actor interval encoding, all v4 refusals and CPU-count evidence. R2 global-order and store-visibility obligations remain open. No v5 execution is approved.",
++  "candidate": "v6",
++  "approval_scope": "NONE",
++  "blocking_finding": "Candidate v6 awaits independent review of outcome-only collection, case coverage and Linux-source expectations. No v6 execution is approved. Implementation trace validation is BLOCKED_ENVIRONMENT on the reported AMD KVM host without invariant TSC.",
+   "review": null,
+   "review_sha256": null,
+   "reviewed_inputs": {},
+-  "controller_action": "Independently review candidate-v5/hashes.json, live semantic inputs and clock-method-v5.md. An APPROVED receipt must bind v5 and explicitly authorize CONSISTENCY_UNDER_SAMPLED_CLOCK_BOUND for grouped mode, or DIAGNOSTIC_ONLY. Preserve and clean the existing v3 installation under controller ownership, apply the approved candidate and bind its installed receipt. No v5 apply, build, Docker, Linux control, guest, collector execution or TLC has run. The author does not approve this change.",
+-  "candidate": "v5",
+-  "approval_scope": "NONE"
++  "controller_action": "Review candidate-v6/hashes.json, the live semantic inputs, v6-inputs.json and outcome-mode-v6.md before binding a receipt. OUTCOME_ONLY authorizes --outcome and its --diagnostic alias. Clock diagnostics and grouped output require a separate CONSISTENCY_UNDER_SAMPLED_CLOCK_BOUND scope and the unchanged clock preconditions. Preserve the installed receipt and install the reviewed fixture under controller ownership before rebinding. The author does not approve this change."
+ }
+diff --git a/harness/run.sh b/harness/run.sh
+index 1d5261c..337a943 100755
+--- a/harness/run.sh
++++ b/harness/run.sh
+@@ -1,12 +1,15 @@
+ #!/usr/bin/env bash
+ set -euo pipefail
+ mode="${1:---diagnostic}"
+-if (( $# > 1 )) || [[ "$mode" != --diagnostic && "$mode" != --consistency ]]; then
+-    printf 'Usage: %s [--diagnostic|--consistency]\n' "$0" >&2
++if (( $# > 1 )) || [[ "$mode" != --diagnostic && "$mode" != --outcome && "$mode" != --consistency ]]; then
++    printf 'Usage: %s [--outcome|--diagnostic|--consistency]\n' "$0" >&2
+     exit 64
+ fi
+-gate_args=()
+-[[ "$mode" != --consistency ]] || gate_args+=(--consistency)
++[[ "$mode" != --diagnostic ]] || mode=--outcome
++gate_args=("$mode")
++fixture_args=()
++boot_args=()
++[[ "$mode" != --outcome ]] || { fixture_args+=(--outcome); boot_args+=(--outcome); }
+ harness_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+ lane_dir="$(cd -- "$harness_dir/../.." && pwd)"
+ source_dir="$lane_dir/source"
+@@ -60,7 +63,12 @@ if not passed:
+ PY
+ }
+ admit_memory pre-execution
+-mkdir -p "$traces"
++if [[ "$mode" == --outcome ]]; then
++    results="$evidence/outcomes"
++else
++    results="$traces"
++fi
++mkdir -p "$results"
+ bash "$harness_dir/apply.sh" >"$evidence/apply.log" 2>&1
+ printf '%s %s\n' "$image_ref" "$image_id" >"$evidence/image-pin.txt"
+ "${docker_cmd[@]}" image inspect "$image_id" >"$evidence/container-image.json"
+@@ -118,24 +126,52 @@ timeout 1800 "${docker_cmd[@]}" run --rm --pull=never --name "$container_name" \
+ sha256sum "$harness_dir/build/guest/busybox" "$harness_dir/build/guest/nproc_probe" >"$evidence/guest-busybox.sha256"
+ cp "$harness_dir/build/busybox-program-headers.txt" "$harness_dir/build/nproc-probe-program-headers.txt" "$evidence/"
+ 
+-while read -r case_name scenario value delay pair readiness; do
++linux_cpu_args=()
++if [[ "$mode" == --outcome ]]; then
++    # A CPU quota alone does not restrict placement. Pin the control to two
++    # eligible host CPUs, while retaining the approved quota and memory limits.
++    linux_cpus=$(python3 - <<'PY'
++import os
++cpus = sorted(os.sched_getaffinity(0))
++assert len(cpus) >= 2
++print(','.join(map(str, cpus[:2])))
++PY
++)
++    linux_cpu_args+=(--cpuset-cpus="$linux_cpus")
++    printf '%s\n' "$linux_cpus" >"$evidence/linux-control-cpus.txt"
++fi
++while read -r case_name scenario value delay pair readiness wr_ids modes; do
+     [[ -z "$case_name" || "$case_name" == \#* ]] && continue
++    [[ "$mode" != --consistency || "$modes" == both ]] || continue
+     container_name="$container_base-linux-$case_name"
++    run_rc=0
+     timeout 30 "${docker_cmd[@]}" run --rm --pull=never --name "$container_name" \
+         --cpus=2 --memory=8g --memory-swap=8g --pids-limit=512 --network=none \
++        "${linux_cpu_args[@]}" \
+         -v "$harness_dir/build/linux:/fixture:ro" "$image_id" \
+         bash -euc 'count=$(nproc); printf "WR_CONTROL_NPROC %s\n" "$count"; exec timeout 25 /fixture/process/wait_reap_trace/wait_reap_trace "$@"' \
+-        fixture "$scenario" "$value" "$delay" "$pair" "$readiness" \
+-        >"$evidence/linux-$case_name.log" 2>&1
+-    python3 "$harness_dir/src/collect.py" --diagnostic --linux-control \
+-        "$evidence/linux-$case_name.log" "$traces/$attempt-linux-$case_name.diagnostic.json"
++        fixture "$scenario" "$value" "$delay" "$pair" "$readiness" "${fixture_args[@]}" \
++        >"$evidence/linux-$case_name.log" 2>&1 || run_rc=$?
++    if [[ "$mode" == --outcome ]]; then
++        if (( run_rc != 0 )); then
++            "${docker_cmd[@]}" rm -f "$container_name" >>"$evidence/linux-$case_name.log" 2>&1 || true
++        fi
++        python3 "$harness_dir/src/collect.py" --outcome --linux-control --case "$case_name" --run-exit-code "$run_rc" \
++            "$evidence/linux-$case_name.log" "$results/linux-$case_name.outcome.json"
++    else
++        (( run_rc == 0 )) || exit "$run_rc"
++        python3 "$harness_dir/src/collect.py" --clock-diagnostic --linux-control \
++            "$evidence/linux-$case_name.log" "$traces/$attempt-linux-$case_name.diagnostic.json"
++    fi
+ done <"$harness_dir/cases.tsv"
+-container_name="$container_base-linux-calibration"
+-timeout 30 "${docker_cmd[@]}" run --rm --pull=never --name "$container_name" \
+-    --cpus=2 --memory=8g --memory-swap=8g --pids-limit=512 --network=none \
+-    -v "$harness_dir/build/linux:/fixture:ro" "$image_id" \
+-    bash -euc 'count=$(nproc); printf "WR_CONTROL_NPROC %s\n" "$count"; exec timeout 25 /fixture/process/wait_reap_trace/wait_calibration' \
+-    >"$evidence/linux-calibration.log" 2>&1
++if [[ "$mode" == --consistency ]]; then
++    container_name="$container_base-linux-calibration"
++    timeout 30 "${docker_cmd[@]}" run --rm --pull=never --name "$container_name" \
++        --cpus=2 --memory=8g --memory-swap=8g --pids-limit=512 --network=none \
++        -v "$harness_dir/build/linux:/fixture:ro" "$image_id" \
++        bash -euc 'count=$(nproc); printf "WR_CONTROL_NPROC %s\n" "$count"; exec timeout 25 /fixture/process/wait_reap_trace/wait_calibration' \
++        >"$evidence/linux-calibration.log" 2>&1
++fi
+ sha256sum "$harness_dir"/build/{guest,linux}/process/wait_reap_trace/* >"$evidence/binaries.sha256"
+ 
+ admit_memory kernel-build
+@@ -170,35 +206,63 @@ timeout 5100 "${docker_cmd[@]}" run --rm --pull=never --name "$container_name" \
+ kernel_path="$harness_dir/build/kernel/asterinas-osdk-bin.elf"
+ test -s "$kernel_path"
+ sha256sum "$kernel_path" >"$evidence/kernel.sha256"
+-for binary in wait_reap_trace wait_calibration; do
++binaries=(wait_reap_trace)
++[[ "$mode" != --consistency ]] || binaries+=(wait_calibration)
++for binary in "${binaries[@]}"; do
+     python3 "$harness_dir/src/initramfs.py" \
+         "$harness_dir/build/guest/process/wait_reap_trace/$binary" "$harness_dir/build/guest/busybox" \
+         "$harness_dir/build/guest/nproc_probe" "$harness_dir/build/$binary.cpio"
+ done
+ sha256sum "$harness_dir/build/"*.cpio >"$evidence/initramfs.sha256"
+ 
+-while read -r case_name scenario value delay pair readiness; do
++while read -r case_name scenario value delay pair readiness wr_ids modes; do
+     [[ -z "$case_name" || "$case_name" == \#* ]] && continue
++    [[ "$mode" != --consistency || "$modes" == both ]] || continue
+     container_name="$container_base-guest-$case_name"
++    run_rc=0
+     timeout 125 "${docker_cmd[@]}" run --rm --pull=never --name "$container_name" \
+         --cpus=2 --memory=8g --memory-swap=8g --pids-limit=512 --network=none --device=/dev/kvm \
+         -v "$lane_dir:/work" "$image_id" \
+-        timeout 120 python3 /work/.specula-output/harness/src/boot.py \
++        timeout 120 python3 /work/.specula-output/harness/src/boot.py "${boot_args[@]}" \
+         --kernel /work/.specula-output/harness/build/kernel/asterinas-osdk-bin.elf \
+         --initramfs /work/.specula-output/harness/build/wait_reap_trace.cpio \
+-        --log "/work/.specula-output/harness/evidence/$attempt/guest-$case_name.log" "$scenario" "$value" "$delay" "$pair" "$readiness"
+-    output="$traces/$attempt-guest-$case_name.diagnostic.json"
+-    [[ "$mode" != --consistency ]] || output="$traces/$attempt-guest-$case_name.ndjson"
+-    python3 "$harness_dir/src/collect.py" "$mode" "$evidence/guest-$case_name.log" "$output"
++        --log "/work/.specula-output/harness/evidence/$attempt/guest-$case_name.log" "$scenario" "$value" "$delay" "$pair" "$readiness" || run_rc=$?
++    if [[ "$mode" == --outcome ]]; then
++        if (( run_rc != 0 )); then
++            "${docker_cmd[@]}" rm -f "$container_name" >>"$evidence/guest-$case_name.log" 2>&1 || true
++        fi
++        python3 "$harness_dir/src/collect.py" --outcome --case "$case_name" --run-exit-code "$run_rc" \
++            "$evidence/guest-$case_name.log" "$results/guest-$case_name.outcome.json"
++    else
++        (( run_rc == 0 )) || exit "$run_rc"
++        python3 "$harness_dir/src/collect.py" --consistency "$evidence/guest-$case_name.log" "$traces/$attempt-guest-$case_name.ndjson"
++    fi
+ done <"$harness_dir/cases.tsv"
+-container_name="$container_base-guest-calibration"
+-timeout 125 "${docker_cmd[@]}" run --rm --pull=never --name "$container_name" \
+-    --cpus=2 --memory=8g --memory-swap=8g --pids-limit=512 --network=none --device=/dev/kvm \
+-    -v "$lane_dir:/work" "$image_id" \
+-    timeout 120 python3 /work/.specula-output/harness/src/boot.py \
+-    --kernel /work/.specula-output/harness/build/kernel/asterinas-osdk-bin.elf \
+-    --initramfs /work/.specula-output/harness/build/wait_calibration.cpio \
+-    --log "/work/.specula-output/harness/evidence/$attempt/guest-calibration.log" --calibration calibration 37 0
++if [[ "$mode" == --consistency ]]; then
++    container_name="$container_base-guest-calibration"
++    timeout 125 "${docker_cmd[@]}" run --rm --pull=never --name "$container_name" \
++        --cpus=2 --memory=8g --memory-swap=8g --pids-limit=512 --network=none --device=/dev/kvm \
++        -v "$lane_dir:/work" "$image_id" \
++        timeout 120 python3 /work/.specula-output/harness/src/boot.py \
++        --kernel /work/.specula-output/harness/build/kernel/asterinas-osdk-bin.elf \
++        --initramfs /work/.specula-output/harness/build/wait_calibration.cpio \
++        --log "/work/.specula-output/harness/evidence/$attempt/guest-calibration.log" --calibration calibration 37 0
++fi
+ printf 'Collection evidence: %s\n' "$evidence"
+-printf 'Collection mode: %s. Output directory: %s\n' "$mode" "$traces"
+-printf 'Diagnostics are INELIGIBLE. Any grouped output carries the sampled-bound consistency claim. Trace validation was NOT_RUN.\n'
++printf 'Collection mode: %s. Output directory: %s\n' "$mode" "$results"
++if [[ "$mode" == --outcome ]]; then
++    python3 - "$results" "$evidence/status.json" <<'PY'
++from collections import Counter
++import json
++from pathlib import Path
++import sys
++reports = [json.loads(p.read_text()) for p in sorted(Path(sys.argv[1]).glob('*.outcome.json'))]
++Path(sys.argv[2]).write_text(json.dumps(dict(status='OUTCOMES_RECORDED', mode='outcome',
++    evidence_class='OUTCOME_ONLY_NO_IMPLEMENTATION_TRACE', implementation_trace='NONE',
++    trace_validation='BLOCKED_ENVIRONMENT', comparisons=dict(Counter(r['comparison'] for r in reports)),
++    runs=len(reports)), indent=2) + '\n')
++PY
++    printf 'Syscall outcomes recorded. Implementation trace: NONE. Trace validation: BLOCKED_ENVIRONMENT.\n'
++else
++    printf 'Diagnostics are INELIGIBLE. Any grouped output carries the sampled-bound consistency claim. Trace validation was NOT_RUN.\n'
++fi
+diff --git a/harness/src/boot.py b/harness/src/boot.py
+index f56995f..9927332 100644
+--- a/harness/src/boot.py
++++ b/harness/src/boot.py
+@@ -14,12 +14,15 @@ p.add_argument("--kernel", required=True)
+ p.add_argument("--initramfs", required=True)
+ p.add_argument("--log", type=Path, required=True)
+ p.add_argument("--calibration", action="store_true")
++p.add_argument("--outcome", action="store_true")
+ p.add_argument("scenario")
+ p.add_argument("value")
+ p.add_argument("delay")
+ p.add_argument("pair", nargs="?", default="4i")
+ p.add_argument("readiness", nargs="?", default="blocked")
+ a = p.parse_args()
++if a.outcome and a.calibration:
++    p.error("outcome mode cannot run calibration")
+ # sockaddr_un.sun_path holds 108 bytes, and the evidence log path is longer, so the
+ # QMP socket lives in the container-local /tmp under a unique name.
+ qmp_path = f"/tmp/wr-{uuid.uuid4().hex}.qmp"
+@@ -27,9 +30,9 @@ command = ["qemu-system-x86_64", "-enable-kvm", "-cpu", "host", "-machine", "q35
+            "-smp", "2", "-m", "2G", "-display", "none", "-serial", "stdio",
+            "-monitor", "none", "-qmp", f"unix:{qmp_path},server=on,wait=off",
+            "-no-reboot", "-nic", "none", "-kernel", a.kernel, "-initrd", a.initramfs,
+-           "-append", f"console=ttyS0 loglevel=error rdinit=/init -- {a.scenario} {a.value} {a.delay} {a.pair} {a.readiness}"]
++           "-append", f"console=ttyS0 loglevel=error rdinit=/init -- {a.scenario} {a.value} {a.delay} {a.pair} {a.readiness}" + (" --outcome" if a.outcome else "")]
+ a.log.with_suffix(".command.json").write_text(json.dumps(command, indent=2) + "\n")
+-marker = b"WR_CALIBRATION_COMPLETE" if a.calibration else b"WR_COMPLETE"
++marker = b"WR_OUTCOME_COMPLETE" if a.outcome else (b"WR_CALIBRATION_COMPLETE" if a.calibration else b"WR_COMPLETE")
+ started = time.monotonic()
+ process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+ matched = False
+diff --git a/harness/src/collect.py b/harness/src/collect.py
+index 19d7ed0..142f711 100644
+--- a/harness/src/collect.py
++++ b/harness/src/collect.py
+@@ -431,10 +431,21 @@ def collect(log, output, consistency=False, linux_control=False):
+ if __name__ == "__main__":
+     p = argparse.ArgumentParser()
+     mode = p.add_mutually_exclusive_group(required=True)
+-    mode.add_argument("--diagnostic", action="store_true", help="write ineligible local records only")
++    mode.add_argument("--outcome", "--diagnostic", dest="outcome", action="store_true", help="write syscall outcomes without implementation records")
++    mode.add_argument("--clock-diagnostic", action="store_true", help="write legacy clock diagnostics under consistency approval")
+     mode.add_argument("--consistency", action="store_true", help="also emit labelled sampled-bound TraceData")
+     p.add_argument("--linux-control", action="store_true", help="expect user calls without kernel records")
++    p.add_argument("--case", help="cases.tsv name, required for outcome mode")
++    p.add_argument("--run-exit-code", type=int, default=0, help="fixture or boot command exit code")
+     p.add_argument("log", type=Path)
+     p.add_argument("output", type=Path)
+     args = p.parse_args()
+-    collect(args.log, args.output, args.consistency, args.linux_control)
++    if args.outcome:
++        if not args.case:
++            p.error("outcome mode requires --case")
++        from collect_outcome import collect as collect_outcome
++        collect_outcome(args.log, args.output, args.case, args.linux_control, args.run_exit_code)
++    else:
++        if args.case or args.run_exit_code:
++            p.error("case and run-exit-code belong to outcome mode")
++        collect(args.log, args.output, args.consistency, args.linux_control)
+diff --git a/harness/src/review_gate.py b/harness/src/review_gate.py
+index 60f89c9..2287894 100644
+--- a/harness/src/review_gate.py
++++ b/harness/src/review_gate.py
+@@ -5,41 +5,47 @@ import json
+ from pathlib import Path
+ 
+ 
+-def check(consistency=False):
++def check(consistency=False, outcome=False):
+     if not __debug__:
+         raise RuntimeError("Python optimization disables required refusal checks")
+     harness = Path(__file__).resolve().parent.parent
+     gate = json.loads((harness / "review-gate.json").read_text())
+     if gate["status"] != "APPROVED":
+         raise RuntimeError(gate["blocking_finding"])
+-    assert gate["candidate"] == "v5", "review receipt is not for candidate v5"
+-    scopes = {"DIAGNOSTIC_ONLY", "CONSISTENCY_UNDER_SAMPLED_CLOCK_BOUND"}
++    assert not (consistency and outcome), "choose one collection scope"
++    assert gate["candidate"] == "v6", "review receipt is not for candidate v6"
++    scopes = {"OUTCOME_ONLY", "CONSISTENCY_UNDER_SAMPLED_CLOCK_BOUND"}
+     assert gate["approval_scope"] in scopes, "review receipt has no collection scope"
+-    if consistency:
+-        assert gate["approval_scope"] == "CONSISTENCY_UNDER_SAMPLED_CLOCK_BOUND", "grouped consistency mode is not approved"
++    if not outcome:
++        assert gate["approval_scope"] == "CONSISTENCY_UNDER_SAMPLED_CLOCK_BOUND", "clock diagnostics and grouped consistency mode are not approved"
++    else:
++        assert gate["approval_scope"] == "OUTCOME_ONLY", "outcome-only mode is not approved"
+     review = harness / gate["review"]
+     assert hashlib.sha256(review.read_bytes()).hexdigest() == gate["review_sha256"]
+     inputs = gate["reviewed_inputs"]
+     required = {str(p.relative_to(harness)) for p in (harness / "src").iterdir() if p.is_file()}
+     required.update({"run.sh", "apply.sh", "cases.tsv", "patches/instrumentation.patch", "evidence/applied.json"})
+     required.update({"INSTRUMENTATION.md", "STATUS.md", "evidence/clock-method-v4.md",
+-                     "evidence/clock-method-v5.md", "evidence/v5-inputs.json", "evidence/candidate-v5/hashes.json"})
++                     "evidence/clock-method-v5.md", "evidence/v5-inputs.json", "evidence/candidate-v5/hashes.json",
++                     "evidence/outcome-mode-v6.md", "evidence/v6-inputs.json", "evidence/candidate-v6/hashes.json"})
+     required.update("../spec/" + p for p in ("base.tla", "Trace.tla", "Trace.cfg", "TraceSearch.cfg", "instrumentation-spec.md"))
+     assert required <= set(inputs), "review receipt does not cover every semantic input"
+     for name, expected in inputs.items():
+         assert hashlib.sha256((harness / name).read_bytes()).hexdigest() == expected, f"changed reviewed input: {name}"
+-    snapshot = harness / "evidence/candidate-v5"
++    snapshot = harness / "evidence/candidate-v6"
+     for name, expected in json.loads((snapshot / "hashes.json").read_text()).items():
+-        assert hashlib.sha256((snapshot / name).read_bytes()).hexdigest() == expected, f"changed frozen v5 input: {name}"
++        assert hashlib.sha256((snapshot / name).read_bytes()).hexdigest() == expected, f"changed frozen v6 input: {name}"
+ 
+ 
+ if __name__ == "__main__":
+     import argparse
+     parser = argparse.ArgumentParser()
+-    parser.add_argument("--consistency", action="store_true")
++    modes = parser.add_mutually_exclusive_group()
++    modes.add_argument("--consistency", action="store_true")
++    modes.add_argument("--outcome", "--diagnostic", dest="outcome", action="store_true")
+     args = parser.parse_args()
+     try:
+-        check(consistency=args.consistency)
++        check(consistency=args.consistency, outcome=args.outcome)
+     except (RuntimeError, AssertionError, KeyError, OSError) as error:
+         print(f"INCOMPLETE_REVIEW_GATE: {error}")
+         raise SystemExit(78)
+diff --git a/harness/src/wait_reap_trace.c b/harness/src/wait_reap_trace.c
+index 3f1d6d5..811128a 100644
+--- a/harness/src/wait_reap_trace.c
++++ b/harness/src/wait_reap_trace.c
+@@ -255,8 +255,269 @@ static void print_calls(struct waiter *waiter)
+     }
+ }
+ 
++static void outcome_fields(const unsigned char *bytes, int api)
++{
++    if (api == 4) {
++        int status;
++        memcpy(&status, bytes, sizeof(status));
++        printf("{\"status\":%d}", status);
++    } else {
++        siginfo_t info;
++        memcpy(&info, bytes, sizeof(info));
++        printf("{\"si_signo\":%d,\"si_errno\":%d,\"si_code\":%d,"
++               "\"si_pid\":%d,\"si_uid\":%u,\"si_status\":%d}",
++               info.si_signo, info.si_errno, info.si_code,
++               info.si_pid, info.si_uid, info.si_status);
++    }
++}
++
++static void outcome_buffer(const unsigned char *bytes, int api, int inaccessible)
++{
++    if (inaccessible) {
++        printf("{\"accessible\":false,\"fields\":null,\"bytes\":null}");
++        return;
++    }
++    printf("{\"accessible\":true,\"fields\":");
++    outcome_fields(bytes, api);
++    printf(",\"bytes\":\"");
++    for (int i = 0; i < (api == 4 ? 4 : 128); ++i) printf("%02x", bytes[i]);
++    printf("\"}");
++}
++
++static struct result outcome_invoke(struct waiter *waiter, const char *purpose,
++                                  int api, int options, const char *buffer)
++{
++    struct result r = { .api = api, .options = options };
++    int inaccessible = !strcmp(buffer, "PROT_NONE");
++    size_t page_size = 0;
++    void *output = waiter->output;
++    check_cpu(waiter->cpu);
++    if (inaccessible) {
++        long size = sysconf(_SC_PAGESIZE);
++        assert(size > 0);
++        page_size = (size_t)size;
++        output = mmap(NULL, page_size, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
++        assert(output != MAP_FAILED);
++    } else {
++        memset(output, !strcmp(buffer, "siginfo-poison") ? 0xa5 : 0, 128);
++        if (api == 4) {
++            int status = -999;
++            memcpy(output, &status, sizeof(status));
++        }
++        memcpy(r.before, output, 128);
++    }
++    errno = 0;
++    if (api == 4)
++        r.ret = syscall(SYS_wait4, child, output, options, NULL);
++    else
++        r.ret = syscall(SYS_waitid, P_PID, child, output, options, NULL);
++    r.error = errno;
++    if (!inaccessible) memcpy(r.after, output, 128);
++    check_cpu(waiter->cpu);
++    // Serialize only completed syscall results, outside the wait operation.
++    // No cross-thread order or duration is inferred from the output order.
++    flockfile(stdout);
++    printf("WR_OUTCOME_CALL {\"actor\":\"w%d\",\"call_index\":%d,\"purpose\":\"%s\","
++           "\"api\":\"%s\",\"syscall_number\":%d,\"options\":%d,\"pid\":%d,"
++           "\"idtype\":%s,\"rusage\":null,\"buffer\":\"%s\",\"return\":%ld,\"errno\":%d,\"before\":",
++           waiter->actor, ++waiter->count, purpose, api == 4 ? "wait4" : "waitid",
++           api == 4 ? SYS_wait4 : SYS_waitid, options, child,
++           api == 4 ? "null" : "\"P_PID\"", buffer, r.ret, r.error);
++    outcome_buffer(r.before, api, inaccessible);
++    printf(",\"after\":");
++    outcome_buffer(r.after, api, inaccessible);
++    puts("}");
++    fflush(stdout);
++    funlockfile(stdout);
++    if (inaccessible) assert(munmap(output, page_size) == 0);
++    return r;
++}
++
++static struct result outcome_wait(struct waiter *waiter, const char *purpose,
++                                int api, int options)
++{
++    return outcome_invoke(waiter, purpose, api, options,
++                          api == 4 ? "status-sentinel" : "siginfo-zero");
++}
++
++static int outcome_event(const struct result *r)
++{
++    siginfo_t info;
++    memcpy(&info, r->after, sizeof(info));
++    return r->ret == 0 && r->error == 0 && info.si_pid == child &&
++           info.si_uid == getuid() && info.si_signo == SIGCHLD &&
++           info.si_code == CLD_EXITED && info.si_status == exit_value;
++}
++
++static void outcome_identity(const char *scenario, const char *pair, int affinity_count,
++                             long online_cpus, const int cpus[2])
++{
++    unsigned a, b, c, d, features, invariant = 0;
++    char vendor[13] = {0}, hypervisor[13] = {0};
++    __cpuid(0, a, b, c, d);
++    memcpy(vendor, &b, 4);
++    memcpy(vendor + 4, &d, 4);
++    memcpy(vendor + 8, &c, 4);
++    __cpuid(1, a, b, c, d);
++    features = d;
++    int virtualized = !!(c & (1U << 31));
++    if (virtualized) {
++        __cpuid(0x40000000, a, b, c, d);
++        memcpy(hypervisor, &b, 4);
++        memcpy(hypervisor + 4, &c, 4);
++        memcpy(hypervisor + 8, &d, 4);
++    }
++    unsigned maximum = __get_cpuid_max(0x80000000, NULL);
++    if (maximum >= 0x80000007) {
++        __cpuid(0x80000007, a, b, c, d);
++        invariant = d;
++    }
++    struct utsname identity;
++    assert(uname(&identity) == 0);
++    printf("WR_OUTCOME_META {\"mode\":\"outcome\",\"scenario\":\"%s\",\"pair\":\"%s\","
++           "\"child_pid\":%d,\"child_uid\":%u,\"exit_value\":%d,\"exit_delay_us\":%d,"
++           "\"already_exited\":%s,\"online_cpus\":%ld,\"affinity_count\":%d,\"selected_cpus\":[%d,%d],"
++           "\"sigchld\":\"SIG_DFL\",\"sa_nocldwait\":false,\"sigchld_blocked\":true,"
++           "\"kernel_recorder\":\"NOT_ARMED\",\"observer_delay_control\":\"INACTIVE\","
++           "\"kernel\":\"%s %s %s\",\"libc\":\"glibc %s\","
++           "\"cpu_identity\":{\"cpu\":%d,\"vendor\":\"%s\",\"max_extended\":%u,"
++           "\"features_edx\":%u,\"invariant_edx\":%u,\"hypervisor_present\":%s,\"hypervisor_vendor\":\"%s\"}}\n",
++           scenario, pair, child, getuid(), exit_value, delay_us,
++           already_exited ? "true" : "false", online_cpus,
++           affinity_count, cpus[0], cpus[1], identity.sysname, identity.release, identity.machine,
++           gnu_get_libc_version(), cpus[0], vendor, maximum, features, invariant,
++           virtualized ? "true" : "false", hypervisor);
++    fflush(stdout);
++}
++
++static void *outcome_worker(void *arg)
++{
++    struct waiter *waiter = arg;
++    pin(waiter->cpu);
++    check_signals();
++    until(&shared->command, 1);
++    if (overlap) {
++        until(&shared->started, 1);
++        usleep(1000);
++    }
++    if (competing) atomic_fetch_or_explicit(&shared->started, 2, memory_order_release);
++    outcome_wait(waiter, "consume", waiter->api, waiter->options);
++    atomic_store_explicit(&shared->done, 1, memory_order_release);
++    return NULL;
++}
++
++static int outcome_main(int argc, char **argv)
++{
++    assert(argc == 7);
++    const char *scenario = argv[1], *pair = argv[4];
++    int sq = !strcmp(scenario, "sq-zero") || !strcmp(scenario, "sq-poison");
++    int cf = !strcmp(scenario, "cf4") || !strcmp(scenario, "cfid") || !strcmp(scenario, "cfnowait");
++    int lx = !strcmp(scenario, "lx");
++    competing = !strcmp(scenario, "compete");
++    overlap = !strcmp(scenario, "overlap");
++    assert(sq || cf || lx || competing || overlap || !strcmp(scenario, "nohang") ||
++           !strcmp(scenario, "observe4") || !strcmp(scenario, "observeid"));
++    assert(!strcmp(pair, "44") || !strcmp(pair, "ii") || !strcmp(pair, "4i") || !strcmp(pair, "i4"));
++    assert(!strcmp(argv[5], "ready") || !strcmp(argv[5], "blocked"));
++    exit_value = atoi(argv[2]);
++    delay_us = atoi(argv[3]);
++    assert(exit_value >= 0 && exit_value <= 255 && delay_us >= 0 && delay_us <= 100000);
++    already_exited = cf || lx || overlap || !strcmp(argv[5], "ready");
++    alarm(20);
++    struct sigaction action = { .sa_handler = SIG_DFL };
++    sigemptyset(&action.sa_mask);
++    assert(sigaction(SIGCHLD, &action, NULL) == 0);
++    sigset_t mask;
++    sigemptyset(&mask);
++    sigaddset(&mask, SIGCHLD);
++    assert(pthread_sigmask(SIG_BLOCK, &mask, NULL) == 0);
++    check_signals();
++    cpu_set_t available;
++    assert(sched_getaffinity(0, sizeof(available), &available) == 0);
++    int cpus[2], count = 0, affinity_count = CPU_COUNT(&available);
++    long online_cpus = sysconf(_SC_NPROCESSORS_ONLN);
++    assert(affinity_count == 2);
++    for (int i = 0; i < CPU_SETSIZE && count < 2; ++i)
++        if (CPU_ISSET(i, &available)) cpus[count++] = i;
++    for (int i = 0; i < 2; ++i) {
++        waiters[i].actor = i + 1;
++        waiters[i].cpu = cpus[i];
++        waiters[i].api = pair[i] == '4' ? 4 : 247;
++        waiters[i].options = waiters[i].api == 4 ? 0 : WEXITED;
++    }
++    shared = mmap(NULL, sizeof(*shared), PROT_READ | PROT_WRITE,
++                  MAP_SHARED | MAP_ANONYMOUS, -1, 0);
++    assert(shared != MAP_FAILED);
++    memset(shared, 0, sizeof(*shared));
++    // Each guest boots afresh. Leaving all actors unregistered also prevents the
++    // syscall observer from reading PROT_NONE before the real copyout-fault call.
++    child = fork();
++    assert(child >= 0);
++    if (!child) {
++        pin(cpus[1]);
++        atomic_store_explicit(&shared->ready, 1, memory_order_release);
++        until(competing && !already_exited ? &shared->started : &shared->allow_exit,
++              competing && !already_exited ? 3 : 1);
++        if (delay_us) usleep(delay_us);
++        syscall(SYS_exit, exit_value);
++        __builtin_unreachable();
++    }
++    until(&shared->ready, 1);
++    pin(cpus[0]);
++    outcome_identity(scenario, pair, affinity_count, online_cpus, cpus);
++    struct waiter *w = &waiters[0];
++    if (already_exited) {
++        atomic_store_explicit(&shared->allow_exit, 1, memory_order_release);
++        struct result established = outcome_wait(w, "establish-zombie", 247, WEXITED | WNOWAIT);
++        if (!outcome_event(&established)) {
++            puts("WR_OUTCOME_SETUP_FAILED");
++            return 65;
++        }
++    }
++    if (competing || overlap) {
++        pthread_t thread;
++        assert(pthread_create(&thread, NULL, outcome_worker, &waiters[1]) == 0);
++        atomic_store_explicit(&shared->command, 1, memory_order_release);
++        atomic_fetch_or_explicit(&shared->started, 1, memory_order_release);
++        outcome_wait(w, overlap ? "observer" : "consume", overlap ? 247 : w->api,
++                     overlap ? WEXITED | WNOWAIT : w->options);
++        until(&shared->done, 1);
++        assert(pthread_join(thread, NULL) == 0);
++    } else if (cf) {
++        int api = !strcmp(scenario, "cf4") ? 4 : 247;
++        int options = api == 4 ? 0 : WEXITED;
++        if (!strcmp(scenario, "cfnowait")) options |= WNOWAIT;
++        outcome_invoke(w, "fault", api, options, "PROT_NONE");
++        outcome_wait(w, "after-fault", api, api == 4 ? WNOHANG : WEXITED | WNOHANG);
++    } else if (lx) {
++        outcome_wait(w, "without-wexited", 247, WSTOPPED | WNOHANG);
++        outcome_wait(w, "with-wexited", 247, WEXITED | WNOHANG);
++    } else {
++        if (sq) {
++            outcome_invoke(w, "live-siginfo", 247, WEXITED | WNOHANG,
++                           !strcmp(scenario, "sq-zero") ? "siginfo-zero" : "siginfo-poison");
++        } else if (!strcmp(scenario, "nohang")) {
++            outcome_wait(w, "live-wait4", 4, WNOHANG);
++            outcome_wait(w, "live-waitid", 247, WEXITED | WNOHANG);
++        }
++        atomic_store_explicit(&shared->allow_exit, 1, memory_order_release);
++        if (!strncmp(scenario, "observe", 7)) {
++            outcome_wait(w, "observe-1", 247, WEXITED | WNOWAIT);
++            outcome_wait(w, "observe-2", 247, WEXITED | WNOWAIT | WNOHANG);
++        }
++        int api = !strcmp(scenario, "observeid") ? 247 : 4;
++        outcome_wait(w, "consume", api, api == 4 ? 0 : WEXITED);
++    }
++    outcome_wait(w, "post-waitid", 247, WEXITED | WNOWAIT);
++    outcome_wait(w, "post-wait4", 4, WNOHANG);
++    puts("WR_OUTCOME_COMPLETE");
++    return 0;
++}
++
+ int main(int argc, char **argv)
+ {
++    if (argc == 7 && !strcmp(argv[6], "--outcome")) return outcome_main(argc, argv);
++    assert(argc <= 6);
+     const char *scenario = argc > 1 ? argv[1] : "compete";
+     assert(!strcmp(scenario, "nohang") || !strcmp(scenario, "observe4") ||
+            !strcmp(scenario, "observeid") || !strcmp(scenario, "compete") ||
+diff --git a/harness/evidence/outcome-mode-v6.md b/harness/evidence/outcome-mode-v6.md
+new file mode 100644
+index 0000000..cc4cd75
+--- /dev/null
++++ b/harness/evidence/outcome-mode-v6.md
+@@ -0,0 +1,68 @@
++# Candidate v6 outcome-only review
++
++Candidate v6 prepares the user's 2026-10-10 decision to collect syscall outcomes on Linux and Asterinas at two eligible CPUs without an implementation trace. Review is pending. `review-gate.json` remains `INCOMPLETE` for v6 with scope `NONE`. This document describes the change for an independent reviewer and grants no execution approval.
++
++The baseline is workspace HEAD `e9893140ebd3403ee99ccbb79ef98dc923da3fdf`, including the live memory-gate amendment. The approval chain ends with [review-v5f.md](/home/chin39/Documents/play/specula-profile/reports/flock-wait-handoff-2026-10-05/wait-reap/harness-fix-2026-10-06/review-v5f.md) and the separate [memory-gate review](/home/chin39/Documents/play/specula-profile/reports/flock-wait-handoff-2026-10-05/wait-reap/harness-fix-2026-10-06/review-v5-memgate-coordinator.md). Reference and protected-file hashes are in [v6-inputs.json](v6-inputs.json). Earlier candidate directories have not been rewritten.
++
++## Mode and recorder decision
++
++`run.sh --diagnostic` is now an alias for `--outcome`, which remains the default path. The runner, boot arguments and fixture metadata carry the mode explicitly. `main()` dispatches before the old fixture body to separate outcome helpers. Those helpers use direct `syscall()` calls without `check_clock_cpu`, calibration exchanges or TSC stamps. CPUID is read for provenance only.
++
++The kernel recorder is not armed, and no reset, actor registration or dump control is issued. The observer-delay control is inactive. A fresh guest boot per case ensures there is no previous registration. This also bypasses the instrumentation's output-buffer pre-read, allowing WR-CF to reach the actual copyout fault after selection and possible reap. The unchanged kernel patch contains unconditional stamp instructions and hook checks, so residual instrumentation overhead remains. No claim is made about an uninstrumented guest or about eliminating every kernel RDTSC instruction.
++
++The existing grouped fixture body and every existing function in `collect.py` retain their behavior. `--consistency` still uses the original 15-case set, old calibration program and approved clock requirements. Its Linux clock diagnostics use the renamed `--clock-diagnostic` collector option. Both that option and grouped output require `CONSISTENCY_UNDER_SAMPLED_CLOCK_BOUND`. `OUTCOME_ONLY` does not authorize either.
++
++The supplied first admitted v5 Linux control ended with exit 78 and:
++
++```text
++WR_CLOCK_UNSUPPORTED actor=3 cpu=1 vendor=AuthenticAMD max=80000022 features=178bfbff invariant=0
++```
++
++That admission observation and the supplied AMD Ryzen 9 9950X KVM/kvm-clock environment are retained as the reason for `BLOCKED_ENVIRONMENT`. Current per-run CPUID observations are recorded separately. The grouped clock admission is not weakened to accept this host. R2 remains open for global order, store visibility and a run-wide clock bound.
++
++## Outcome format and comparison
++
++Each executed case produces `harness/evidence/<attempt>/outcomes/{linux,guest}-<case>.outcome.json`. Its fixed fields are `evidence_class: OUTCOME_ONLY_NO_IMPLEMENTATION_TRACE`, `implementation_trace: NONE` and `trace_validation: BLOCKED_ENVIRONMENT`. It records the case's WR IDs, system attribution, actual CPU evidence, raw-log hash and path, metadata, planned calls, observations, explicit Linux-source expectations and comparison results. `bug_classification` is always `NOT_ASSESSED`.
++
++The raw guest log is `NON_TRACE_DIAGNOSTIC_MATERIAL`. The collector accepts only the outcome metadata and syscall schemas, rejects clock/recorder transport, and never embeds raw kernel lines. The format has no TSC values, event intervals, event streams, `traces` field or TraceData envelopes. Boot supervision remains in its existing adjacent `.outcome.json`, outside the syscall report directory.
++
++Each syscall record contains the API, syscall number, flags, positive PID, waitid selector when applicable, null rusage, buffer kind, return and errno. Valid output areas retain their relevant fields and bytes before and after. Siginfo includes `si_signo`, `si_errno`, `si_code`, `si_pid`, `si_uid` and `si_status`. PROT_NONE outputs have `accessible: false` and null fields/bytes because reading them would fault. Padding and unrelated union bytes are not equality oracles. Error outputs are retained without interpreting them as delivered status.
++
++The collector constructs a call plan from the reviewed case, independently of observed results. It checks the observed API/options/buffer/selector and initial sentinel, and compares return, errno and relevant successful output fields. Each call and the complete history receive `match`, `mismatch` or `inconclusive`. A missing record, malformed transport, failed CPU proof, failed setup or incomplete invocation cannot yield an overall match. Completed mismatches are recorded without aborting the remaining case matrix. Completed calls from a timed-out invocation remain visible, but its overall result is inconclusive. No end-to-end timeout is classified as a lost wakeup.
++
++## Case coverage and controls
++
++[cases.tsv](../cases.tsv) is the complete case-to-WR map. Both outcome runner loops read all 21 rows, for 42 planned reports. `both` identifies the 15 original cases, and `outcome` identifies the six new sequential rows. No case was executed during preparation.
++
++| WR IDs | Cases or control | Linux-source outcome |
++| --- | --- | --- |
++| WR-01, WR-02 | `nohang-37`, `consume-0`, `consume-255` | A live-child wait4 WNOHANG returns zero and preserves the sentinel. A later consuming wait4 returns the child's PID and `(exit_value & 255) << 8`. Both follow-up APIs return ECHILD. |
++| WR-03, WR-05 | `observe-consumeid` | Two WNOWAIT observations preserve the event. Consuming waitid returns zero with SIGCHLD, CLD_EXITED, PID, UID and the unshifted exit value. Later calls return ECHILD. |
++| WR-04 | `observe-consume4` | Both observations agree and wait4 can still consume the event once. |
++| WR-06, WR-07 | `consumers*` | Exactly one blocking consumer returns its API-specific exit result, the other gets ECHILD, and both finish. This includes ready and initially live children and same/mixed API pairs. |
++| WR-08 | `observer-consume4`, `observer-consumeid` | The consumer succeeds. The concurrent observer may obtain the retained status or ECHILD. An observer invoked after consumption gets ECHILD. |
++| WR-09 | `consumers4i-race`, `consumersii-race` | Zero-delay exits opportunistically exercise the failed-scan/registration window. The one-consumer/ECHILD/no-hang outcome is checked. |
++| WR-10 | `consumers44-park`, `consumersii-park`, `consumers4i-park`, `consumersi4-park` | Delayed exits opportunistically exercise registration/parking schedules. The same consumer outcome is checked. |
++| WR-SQ | `siginfo-zero`, `siginfo-poison` | On a held-live child, waitid P_PID WEXITED\|WNOHANG returns zero, errno zero, and all six selected siginfo fields zero. Each row starts a fresh child, then releases and consumes it. |
++| WR-CF | `copyout-wait4`, `copyout-waitid`, `copyout-nowait` | Each row establishes its own zombie with valid WEXITED\|WNOWAIT, then calls through PROT_NONE. The fault returns -1/EFAULT. A subsequent valid consuming wait returns ECHILD for the two consuming faults and the exit result for the WNOWAIT fault. |
++| WR-LX | `zombie-without-wexited` | After establishing a zombie, WSTOPPED\|WNOHANG returns -1/ECHILD without consuming it. WEXITED\|WNOHANG then returns the normal-exit siginfo. This is a source expectation, not an executed result or bug classification. |
++
++The contracts are [contracts.md](/home/chin39/Documents/play/specula-profile/reports/flock-wait-handoff-2026-10-05/wait-reap/contracts.md). The new controls use direct syscalls and a fresh child per row. Exit values 0, 37 and 255 are retained for WR-02 as required by that contract. The setup handshake prevents live-child queries from racing with an early exit. Successful WNOWAIT output establishes the zombie for CF, LX and ready schedules.
++
++WR-08's late-output history cannot be established with the recorder and delay control inactive. WR-09 and WR-10 cannot establish first scan, registration, notification, recheck, token or park timing without implementation traces. These windows are reported as `NOT_ESTABLISHED_OPPORTUNISTIC`, even when all syscall outcomes match. User-space flags and sleeps establish no internal window. Outcome evidence establishes neither mutex order nor wake-path coverage.
++
++## WR-LX source detail
++
++The helper return value in the task description is not the final syscall return. In Linux v6.16.5 `kernel/exit.c:1167-1168`, `wait_task_zombie` returns zero when WEXITED is absent. For this non-ptraced single-threaded zombie, `wait_consider_task` immediately returns that helper result at `1485-1494`, before clearing `notask_error`. `__do_wait` initializes `notask_error` to -ECHILD at `1660` and returns it at `1689-1694`. The libc syscall conversion therefore gives -1 with errno ECHILD. The child remains available to the following WEXITED call. The source archive is [kernel/exit.c](/home/chin39/Documents/play/specula-profile-local-artifacts/flock-wait-2026-10-05/linux-v6.16.5/kernel/exit.c:1167).
++
++The pinned Asterinas zombie branch does not test WEXITED before selection and consuming reap. This supports recording the two calls and comparing them with the Linux-source outcome. It is not an observed reproduction and is not labelled a bug.
++
++## CPU evidence, preserved boundaries and validation
++
++Linux outcome containers retain the two-CPU quota and add a cpuset selecting two eligible host CPUs. Fixture metadata saves the affinity and online counts before pinning the parent to one CPU. The report distinguishes eligible control CPUs from all online host CPUs. The guest remains SMP=2, with nproc, fixture counts and boot records cross-checked. The existing BusyBox/probe code is untouched. Asterinas reports Linux in uname for glibc compatibility, so the guest's attribution comes from runner/boot provenance.
++
++The image pin, network policy, memory admission function, BusyBox/probe handling, kernel patch, recorder/hooks, spec and modeling brief are unchanged. The runner skips clock/calibration execution in outcome mode and retains bounded per-case execution. On a failed outcome case it removes the container, writes the available outcome evidence and continues. No gate, image or build failure is treated as a completed runtime matrix.
++
++[v6-static-checks.json](v6-static-checks.json) records syntax checks, preservation checks and artifact verification. C checking uses `-fsyntax-only` for Linux and `__asterinas__` branches and creates no binary. The local Nix clang wrapper injects a linker-only argument, so `-Wno-unused-command-line-argument` suppresses that wrapper warning during syntax-only checking. Python bytecode is directed to `/tmp`, outside the source and snapshot.
++
++Docker, builds, QEMU, TLC, fixture/control execution and collector execution are NOT RUN. The required O1 through O5 statuses are in [STATUS.md](../STATUS.md). [candidate-v6/hashes.json](candidate-v6/hashes.json) binds the snapshot, and [correction-v5-v6.diff](correction-v5-v6.diff) covers changed live files and new review records against HEAD, excluding the duplicated snapshot and the diff itself. The full path inventory is [v6-files.txt](v6-files.txt). The independent reviewer must review before the controller binds an approval receipt. The author has not approved or committed this candidate.
+diff --git a/harness/evidence/v6-files.txt b/harness/evidence/v6-files.txt
+new file mode 100644
+index 0000000..aecaa22
+--- /dev/null
++++ b/harness/evidence/v6-files.txt
+@@ -0,0 +1,43 @@
++harness/INSTRUMENTATION.md
++harness/STATUS.md
++harness/cases.tsv
++harness/evidence/candidate-v6/INSTRUMENTATION.md
++harness/evidence/candidate-v6/STATUS.md
++harness/evidence/candidate-v6/apply.sh
++harness/evidence/candidate-v6/cases.tsv
++harness/evidence/candidate-v6/clean.sh
++harness/evidence/candidate-v6/evidence/applied.json
++harness/evidence/candidate-v6/evidence/clock-method-v4.md
++harness/evidence/candidate-v6/evidence/clock-method-v5.md
++harness/evidence/candidate-v6/evidence/outcome-mode-v6.md
++harness/evidence/candidate-v6/evidence/v5-inputs.json
++harness/evidence/candidate-v6/evidence/v6-inputs.json
++harness/evidence/candidate-v6/evidence/v6-static-checks.json
++harness/evidence/candidate-v6/hashes.json
++harness/evidence/candidate-v6/patches/instrumentation.patch
++harness/evidence/candidate-v6/review-gate.json
++harness/evidence/candidate-v6/run.sh
++harness/evidence/candidate-v6/src/Makefile
++harness/evidence/candidate-v6/src/boot.py
++harness/evidence/candidate-v6/src/collect.py
++harness/evidence/candidate-v6/src/collect_outcome.py
++harness/evidence/candidate-v6/src/initramfs.py
++harness/evidence/candidate-v6/src/instrument.py
++harness/evidence/candidate-v6/src/nproc_probe.c
++harness/evidence/candidate-v6/src/review_gate.py
++harness/evidence/candidate-v6/src/wait_calibration.c
++harness/evidence/candidate-v6/src/wait_reap_trace.c
++harness/evidence/candidate-v6/src/wr_syscall.rs
++harness/evidence/candidate-v6/src/wr_trace.rs
++harness/evidence/correction-v5-v6.diff
++harness/evidence/outcome-mode-v6.md
++harness/evidence/v6-files.txt
++harness/evidence/v6-inputs.json
++harness/evidence/v6-static-checks.json
++harness/review-gate.json
++harness/run.sh
++harness/src/boot.py
++harness/src/collect.py
++harness/src/collect_outcome.py
++harness/src/review_gate.py
++harness/src/wait_reap_trace.c
+diff --git a/harness/evidence/v6-inputs.json b/harness/evidence/v6-inputs.json
+new file mode 100644
+index 0000000..0191990
+--- /dev/null
++++ b/harness/evidence/v6-inputs.json
+@@ -0,0 +1,50 @@
++{
++  "candidate": "v6",
++  "workspace_baseline": "e9893140ebd3403ee99ccbb79ef98dc923da3fdf",
++  "source": {
++    "path": "/home/chin39/Documents/play/Specula/runs/asterinas-child-wait-reap-20261004T160159Z/asterinas-child-wait-reap/source",
++    "commit": "0c60537098f4c2949ad2d382aaf499de72263d76",
++    "tree": "4693fdec88cd7da14bed4f1541eba593f123059c",
++    "access": "READ_ONLY"
++  },
++  "linux_oracle": {
++    "path": "/home/chin39/Documents/play/specula-profile-local-artifacts/flock-wait-2026-10-05/linux-v6.16.5",
++    "version": "v6.16.5",
++    "commit": "4645fefac0b24d509b962c096b0327e87f34b1d2"
++  },
++  "reference_sha256": {
++    "/home/chin39/Documents/play/specula-profile/reports/flock-wait-handoff-2026-10-05/wait-reap/contracts.md": "b0398a42c9ccfe551d8cd47cad45b7ac130e075e1a42c829a98ec762ccc19096",
++    "/home/chin39/Documents/play/specula-profile/reports/flock-wait-handoff-2026-10-05/wait-reap/harness-fix-2026-10-06/review-v5f.md": "4a6b83d75fa693dc7b5fc9a4db58fa10b11588d1a7e9f5010a5b7f5d1ba540ea",
++    "/home/chin39/Documents/play/specula-profile/reports/flock-wait-handoff-2026-10-05/wait-reap/harness-fix-2026-10-06/review-v5-memgate-coordinator.md": "f066e9ca9150d2e0510a1aadc4342bd3929427b0ddcc0279fc52630679065b4a",
++    "/home/chin39/Documents/play/specula-profile-local-artifacts/flock-wait-2026-10-05/linux-v6.16.5/kernel/exit.c": "0af79a5bf713512ba7b255c5b21d70a5bd8955c3976e77de4e840948d0785908",
++    "/home/chin39/Documents/play/Specula/runs/asterinas-child-wait-reap-20261004T160159Z/asterinas-child-wait-reap/source/kernel/core/src/process/wait.rs": "6591eb9912c2e0374b61f4c62dc09317e97a3d069897c5e883c8c1e4c471a14f",
++    "/home/chin39/Documents/play/Specula/runs/asterinas-child-wait-reap-20261004T160159Z/asterinas-child-wait-reap/source/kernel/core/src/syscall/wait4.rs": "1c91f491697c2b7ef2e7bbf77ec4b09f6d122a3957851d5f7b53534d7b788a50",
++    "/home/chin39/Documents/play/Specula/runs/asterinas-child-wait-reap-20261004T160159Z/asterinas-child-wait-reap/source/kernel/core/src/syscall/waitid.rs": "75a1f5084999d72445603398ff837040c3324876bccde9f4da2e7f7e18e27038",
++    "/home/chin39/Documents/play/Specula/runs/asterinas-child-wait-reap-20261004T160159Z/asterinas-child-wait-reap/source/kernel/core/src/net/uts_ns.rs": "1bb50853b60fbd2fe5d584e5cb8412794786d138fc4dc3596a21284e580086ff",
++    "/home/chin39/Documents/play/Specula/runs/asterinas-child-wait-reap-20261004T160159Z/asterinas-child-wait-reap/source/ostd/src/wr_trace.rs": "ec9aed3f6b032b626f86ff8a97636ecaa37e6f3fa037662264889cd445232219",
++    "/home/chin39/Documents/play/Specula/runs/asterinas-child-wait-reap-20261004T160159Z/asterinas-child-wait-reap/source/kernel/core/src/syscall/wr_syscall.rs": "aee0e9ad96b463d2524a5ad5498b665b8dc6e5be37cad99309b8e0576f21d38b"
++  },
++  "protected_workspace_sha256": {
++    "harness/apply.sh": "88ee9bbdf9ddc932e2752a72698f529e3454ae93353b01687ae6a48142c0d448",
++    "harness/clean.sh": "3c4f08d4c83a9fa1477ea55b2ab779851f1bf3fa5ff27b6bfc8470a74021b044",
++    "harness/evidence/applied.json": "1e0fba48688badb9a8faf82632a6c9f0524d5ec3961733ff52ae03315728cc8d",
++    "harness/patches/instrumentation.patch": "10de68e9ba57e7749ecb5dbbc86ebc0c2fd838858e7ae5eebe42f3a56ee005fb",
++    "harness/src/Makefile": "124457dd18d700a8a3080f87956e34f578da7ef982b3aa8cbfafe965be1c14bb",
++    "harness/src/initramfs.py": "ee83062435d51ac1563cd638c1e06bf8c5da13392aa40f0f945e25d331c096e4",
++    "harness/src/instrument.py": "3cdd3187ca71d4f3705063e010ebea20995d30947f08f84ef8544128a4e21ef7",
++    "harness/src/nproc_probe.c": "3eb8516d5a452957ded5d66c98e1068d6941a0d998981bd6c2b04c8a7241b78f",
++    "harness/src/wait_calibration.c": "e591d0b635f3854038d8323ba03565a359fc38768b0bfc3173d61d08e04671c3",
++    "harness/src/wr_syscall.rs": "aee0e9ad96b463d2524a5ad5498b665b8dc6e5be37cad99309b8e0576f21d38b",
++    "harness/src/wr_trace.rs": "ec9aed3f6b032b626f86ff8a97636ecaa37e6f3fa037662264889cd445232219",
++    "modeling-brief.md": "617152b69d965ae31c904d458561ffe9d2842ba959a4d9bf328fa00e7d45c93f",
++    "spec/MC.tla": "3b8fcf0190aaebe3af50c25f02861959ce6d4c2e9dd85d25a76d1bd2ef134927",
++    "spec/Trace.cfg": "82d1903ce6ef8e20be1f15cd152ad8c2f3553a7cfdb15673493baf5cfac498b0",
++    "spec/Trace.tla": "94268b234a91a0182cc1c298ca9d04e000d2d62c8f60882e841d93c0ecaa05c3",
++    "spec/TraceSearch.cfg": "a4fa6a110e244d50ae2275d2e6f3d2a9d64e689314fbe1232bf5e390387bb824",
++    "spec/base.tla": "abe074fc44af1d20769708c927dc0826284e2b31c512e02ba12bc460b8104f10",
++    "spec/instrumentation-spec.md": "69d549309d139255ad1debc1083f3c7dd6584259bf1fc05f5dbd605581e6668d"
++  },
++  "scope": "Preparation and static checks only. No installed receipt rebinding or execution.",
++  "baseline_note": "The live HEAD run.sh includes the separately approved memory-gate amendment. The historical candidate-v5 snapshot remains unchanged.",
++  "reported_clock_rejection": "WR_CLOCK_UNSUPPORTED actor=3 cpu=1 vendor=AuthenticAMD max=80000022 features=178bfbff invariant=0"
++}
+diff --git a/harness/evidence/v6-static-checks.json b/harness/evidence/v6-static-checks.json
+new file mode 100644
+index 0000000..f77fd50
+--- /dev/null
++++ b/harness/evidence/v6-static-checks.json
+@@ -0,0 +1,303 @@
++{
++  "candidate": "v6",
++  "baseline": "e9893140ebd3403ee99ccbb79ef98dc923da3fdf",
++  "scope": "Static and syntax checks only; no harness modules executed.",
++  "commands": [
++    {
++      "argv": [
++        "python3",
++        "-m",
++        "py_compile",
++        "harness/src/boot.py",
++        "harness/src/collect.py",
++        "harness/src/collect_outcome.py",
++        "harness/src/initramfs.py",
++        "harness/src/instrument.py",
++        "harness/src/review_gate.py"
++      ],
++      "exit_code": 0,
++      "stdout": "",
++      "stderr": ""
++    },
++    {
++      "argv": [
++        "bash",
++        "-n",
++        "harness/run.sh"
++      ],
++      "exit_code": 0,
++      "stdout": "",
++      "stderr": ""
++    },
++    {
++      "argv": [
++        "bash",
++        "-n",
++        "harness/apply.sh"
++      ],
++      "exit_code": 0,
++      "stdout": "",
++      "stderr": ""
++    },
++    {
++      "argv": [
++        "bash",
++        "-n",
++        "harness/clean.sh"
++      ],
++      "exit_code": 0,
++      "stdout": "",
++      "stderr": ""
++    },
++    {
++      "argv": [
++        "bash",
++        "-n",
++        "/tmp/wr-v6-syntax-i8r3vb2f/embedded-0.sh"
++      ],
++      "exit_code": 0,
++      "stdout": "",
++      "stderr": ""
++    },
++    {
++      "argv": [
++        "bash",
++        "-n",
++        "/tmp/wr-v6-syntax-i8r3vb2f/embedded-1.sh"
++      ],
++      "exit_code": 0,
++      "stdout": "",
++      "stderr": ""
++    },
++    {
++      "argv": [
++        "bash",
++        "-n",
++        "/tmp/wr-v6-syntax-i8r3vb2f/embedded-2.sh"
++      ],
++      "exit_code": 0,
++      "stdout": "",
++      "stderr": ""
++    },
++    {
++      "argv": [
++        "bash",
++        "-n",
++        "/tmp/wr-v6-syntax-i8r3vb2f/embedded-3.sh"
++      ],
++      "exit_code": 0,
++      "stdout": "",
++      "stderr": ""
++    },
++    {
++      "argv": [
++        "bash",
++        "-n",
++        "/tmp/wr-v6-syntax-i8r3vb2f/init.sh"
++      ],
++      "exit_code": 0,
++      "stdout": "",
++      "stderr": ""
++    },
++    {
++      "argv": [
++        "cc",
++        "-fsyntax-only",
++        "-pthread",
++        "-Wall",
++        "-Wextra",
++        "-Werror",
++        "-Wno-unused-command-line-argument",
++        "harness/src/wait_reap_trace.c"
++      ],
++      "exit_code": 0,
++      "stdout": "",
++      "stderr": ""
++    },
++    {
++      "argv": [
++        "cc",
++        "-fsyntax-only",
++        "-pthread",
++        "-Wall",
++        "-Wextra",
++        "-Werror",
++        "-Wno-unused-command-line-argument",
++        "-D__asterinas__",
++        "harness/src/wait_reap_trace.c"
++      ],
++      "exit_code": 0,
++      "stdout": "",
++      "stderr": ""
++    },
++    {
++      "argv": [
++        "git",
++        "diff",
++        "--check"
++      ],
++      "exit_code": 0,
++      "stdout": "",
++      "stderr": ""
++    }
++  ],
++  "preservation": {
++    "original_fixture_helpers_and_main_after_mode_dispatch": "BYTE_IDENTICAL",
++    "existing_collector_functions": [
++      "calibration",
++      "call",
++      "collect",
++      "cpu_evidence",
++      "decode",
++      "encode_intervals",
++      "out",
++      "queue",
++      "read_records",
++      "remaining",
++      "require",
++      "signed",
++      "write_json"
++    ],
++    "existing_collector_functions_comparison": "AST_IDENTICAL",
++    "memory_admission_function": "BYTE_IDENTICAL",
++    "fixture_build_busybox_and_probe_commands": "BYTE_IDENTICAL",
++    "kernel_build_commands": "BYTE_IDENTICAL",
++    "image_daemon_and_network_policy": "IDENTICAL",
++    "protected_workspace_sha256": {
++      "harness/apply.sh": "88ee9bbdf9ddc932e2752a72698f529e3454ae93353b01687ae6a48142c0d448",
++      "harness/clean.sh": "3c4f08d4c83a9fa1477ea55b2ab779851f1bf3fa5ff27b6bfc8470a74021b044",
++      "harness/evidence/applied.json": "1e0fba48688badb9a8faf82632a6c9f0524d5ec3961733ff52ae03315728cc8d",
++      "harness/patches/instrumentation.patch": "10de68e9ba57e7749ecb5dbbc86ebc0c2fd838858e7ae5eebe42f3a56ee005fb",
++      "harness/src/Makefile": "124457dd18d700a8a3080f87956e34f578da7ef982b3aa8cbfafe965be1c14bb",
++      "harness/src/initramfs.py": "ee83062435d51ac1563cd638c1e06bf8c5da13392aa40f0f945e25d331c096e4",
++      "harness/src/instrument.py": "3cdd3187ca71d4f3705063e010ebea20995d30947f08f84ef8544128a4e21ef7",
++      "harness/src/nproc_probe.c": "3eb8516d5a452957ded5d66c98e1068d6941a0d998981bd6c2b04c8a7241b78f",
++      "harness/src/wait_calibration.c": "e591d0b635f3854038d8323ba03565a359fc38768b0bfc3173d61d08e04671c3",
++      "harness/src/wr_syscall.rs": "aee0e9ad96b463d2524a5ad5498b665b8dc6e5be37cad99309b8e0576f21d38b",
++      "harness/src/wr_trace.rs": "ec9aed3f6b032b626f86ff8a97636ecaa37e6f3fa037662264889cd445232219",
++      "modeling-brief.md": "617152b69d965ae31c904d458561ffe9d2842ba959a4d9bf328fa00e7d45c93f",
++      "spec/MC.tla": "3b8fcf0190aaebe3af50c25f02861959ce6d4c2e9dd85d25a76d1bd2ef134927",
++      "spec/Trace.cfg": "82d1903ce6ef8e20be1f15cd152ad8c2f3553a7cfdb15673493baf5cfac498b0",
++      "spec/Trace.tla": "94268b234a91a0182cc1c298ca9d04e000d2d62c8f60882e841d93c0ecaa05c3",
++      "spec/TraceSearch.cfg": "a4fa6a110e244d50ae2275d2e6f3d2a9d64e689314fbe1232bf5e390387bb824",
++      "spec/base.tla": "abe074fc44af1d20769708c927dc0826284e2b31c512e02ba12bc460b8104f10",
++      "spec/instrumentation-spec.md": "69d549309d139255ad1debc1083f3c7dd6584259bf1fc05f5dbd605581e6668d"
++    },
++    "read_only_reference_hashes": "UNCHANGED"
++  },
++  "embedded_python_heredocs_compiled": 4,
++  "c_syntax_note": "An earlier plain -Werror check stopped on the Nix clang wrapper injecting -Wl,-dynamic-linker during syntax-only compilation. Suppressing only unused-command-line-argument allowed both source branches to pass. No binary was built.",
++  "outcome_fixture_forbidden_calls": "No fixture stamp, clock check, calibration, recorder control or trace printer in the outcome helpers.",
++  "case_coverage": {
++    "WR-01": [
++      "nohang-37",
++      "consume-0",
++      "consume-255"
++    ],
++    "WR-02": [
++      "nohang-37",
++      "consume-0",
++      "consume-255"
++    ],
++    "WR-04": [
++      "observe-consume4"
++    ],
++    "WR-03": [
++      "observe-consumeid"
++    ],
++    "WR-05": [
++      "observe-consumeid"
++    ],
++    "WR-06": [
++      "consumers44-park",
++      "consumers44-ready"
++    ],
++    "WR-10": [
++      "consumers44-park",
++      "consumersii-park",
++      "consumers4i-park",
++      "consumersi4-park"
++    ],
++    "WR-07": [
++      "consumersii-park",
++      "consumersii-ready",
++      "consumers4i-park",
++      "consumersi4-park",
++      "consumers4i-race",
++      "consumersii-race"
++    ],
++    "WR-09": [
++      "consumers4i-race",
++      "consumersii-race"
++    ],
++    "WR-08": [
++      "observer-consume4",
++      "observer-consumeid"
++    ],
++    "WR-SQ": [
++      "siginfo-zero",
++      "siginfo-poison"
++    ],
++    "WR-CF": [
++      "copyout-wait4",
++      "copyout-waitid",
++      "copyout-nowait"
++    ],
++    "WR-LX": [
++      "zombie-without-wexited"
++    ]
++  },
++  "case_counts": {
++    "both": 15,
++    "outcome_only": 6,
++    "planned_linux_runs": 21,
++    "planned_guest_runs": 21
++  },
++  "gate": "INCOMPLETE for v6, no self-approval or reviewed-input rebinding.",
++  "gate_scope_check": "Static inspection: outcome requires OUTCOME_ONLY; all existing clock collection calls require CONSISTENCY_UNDER_SAMPLED_CLOCK_BOUND. Receipt execution NOT RUN.",
++  "outcome_oracle_check": "Static inspection of the call plan, buffer decoder and history comparison only. The WR-LX first syscall expects ECHILD after following wait_consider_task and __do_wait, then a successful WEXITED wait.",
++  "not_run": [
++    "Docker",
++    "builds",
++    "QEMU",
++    "TLC",
++    "Linux fixture",
++    "Asterinas fixture",
++    "collector including synthetic execution",
++    "review receipt execution",
++    "source installation"
++  ],
++  "blocked": {
++    "implementation_trace_validation": "BLOCKED_ENVIRONMENT; reported AMD KVM non-invariant TSC."
++  },
++  "semantic_input_sha256": {
++    "src/Makefile": "124457dd18d700a8a3080f87956e34f578da7ef982b3aa8cbfafe965be1c14bb",
++    "src/boot.py": "c89fdf8b0105775e53e173941909d4978247dbcca70ca132608781501c21a0ff",
++    "src/collect.py": "1a5bb46944104a65aed8e34eee7c048c7d87e9774b75ea060401cbd0e7bba08f",
++    "src/collect_outcome.py": "94a563da5905689c110f609d608e72541a5f0d588e50b4e7831212a20089be13",
++    "src/initramfs.py": "ee83062435d51ac1563cd638c1e06bf8c5da13392aa40f0f945e25d331c096e4",
++    "src/instrument.py": "3cdd3187ca71d4f3705063e010ebea20995d30947f08f84ef8544128a4e21ef7",
++    "src/nproc_probe.c": "3eb8516d5a452957ded5d66c98e1068d6941a0d998981bd6c2b04c8a7241b78f",
++    "src/review_gate.py": "5d0ebc742f17a49f53b79f42dd19195dc42fe94097ae20acbc0ff7032105a500",
++    "src/wait_calibration.c": "e591d0b635f3854038d8323ba03565a359fc38768b0bfc3173d61d08e04671c3",
++    "src/wait_reap_trace.c": "7afafd78c0a3c15540252c77d260c72598ae404d6a09920f6d6eb03aed39031a",
++    "src/wr_syscall.rs": "aee0e9ad96b463d2524a5ad5498b665b8dc6e5be37cad99309b8e0576f21d38b",
++    "src/wr_trace.rs": "ec9aed3f6b032b626f86ff8a97636ecaa37e6f3fa037662264889cd445232219",
++    "run.sh": "6f0cf772a4e1b9ffecaf5f74e0ba8c5688e96157ef7e2f175939d5d70f5a2a41",
++    "cases.tsv": "e41813141c7aeb3f9ccaf5fe023d8d19fe19a8b8c275408b5f6e3af8d72e4b9e",
++    "review-gate.json": "0158555420008a013db090442a4f8dd48ef9bedc59d4d3f4e096fb1f45f352f7",
++    "INSTRUMENTATION.md": "981fce04ee3d7c000e562044419e5a06d467fb91b70582bb437cc26c1241961e",
++    "STATUS.md": "05047292ab7e422497dc025da64293e249e40559461fe3eba8e416b0698be457",
++    "evidence/outcome-mode-v6.md": "05f55403ef92af50dc752b605cf5da07720abb43137e5b1cf323d5f03132d88b",
++    "evidence/v6-inputs.json": "435ba914e0fade23fa70921c45bb4191b68fe7da75d9fda78811c0cd856baf3b"
++  },
++  "snapshot_verification": {
++    "status": "PASS",
++    "manifested_files": 27,
++    "checks": [
++      "Every manifested file matches its live counterpart.",
++      "Every snapshot file except hashes.json is manifested.",
++      "All manifest hashes match."
++    ]
++  }
++}
+diff --git a/harness/src/collect_outcome.py b/harness/src/collect_outcome.py
+new file mode 100644
+index 0000000..4da92bf
+--- /dev/null
++++ b/harness/src/collect_outcome.py
+@@ -0,0 +1,279 @@
++#!/usr/bin/env python3
++"""Compare syscall outcomes with the pinned Linux source contract, without clocks."""
++import errno
++import hashlib
++import json
++from pathlib import Path
++import struct
++
++from review_gate import check as check_review
++
++HERE = Path(__file__).resolve().parent.parent
++SIGINFO = ("si_signo", "si_errno", "si_code", "si_pid", "si_uid", "si_status")
++NOHANG, STOPPED, EXITED, NOWAIT = 1, 2, 4, 0x01000000
++
++
++def require(condition, message):
++    if not condition:
++        raise ValueError(message)
++
++
++def case_named(name):
++    rows = [line.split() for line in (HERE / "cases.tsv").read_text().splitlines()
++            if line.strip() and not line.startswith("#")]
++    matches = [row for row in rows if row[0] == name]
++    require(len(matches) == 1 and len(matches[0]) == 8, "unknown or ambiguous case")
++    _, scenario, value, delay, pair, readiness, wr_ids, modes = matches[0]
++    return dict(name=name, scenario=scenario, exit_value=int(value), exit_delay_us=int(delay),
++                pair=pair, readiness=readiness, wr_ids=wr_ids.split(","), modes=modes)
++
++
++def call_plan(case):
++    """The plan fixes API, flags, buffer and allowed result before reading the log."""
++    result = []
++
++    def add(purpose, api, options, oracle, actor="w1", buffer=None):
++        result.append(dict(actor=actor, call_index=1 + sum(c["actor"] == actor for c in result),
++                           purpose=purpose, api=api, options=options, oracle=oracle,
++                           buffer=buffer or ("status-sentinel" if api == "wait4" else "siginfo-zero")))
++
++    scenario = case["scenario"]
++    ready = case["readiness"] == "ready"
++    if ready:
++        add("establish-zombie", "waitid", EXITED | NOWAIT, "event")
++    if scenario == "compete":
++        for actor, code in zip(("w1", "w2"), case["pair"]):
++            add("consume", "wait4" if code == "4" else "waitid", 0 if code == "4" else EXITED,
++                "event-or-echild", actor)
++    elif scenario == "overlap":
++        add("observer", "waitid", EXITED | NOWAIT, "event-or-echild")
++        api = "wait4" if case["pair"][1] == "4" else "waitid"
++        add("consume", api, 0 if api == "wait4" else EXITED, "event", "w2")
++    elif scenario in ("cf4", "cfid", "cfnowait"):
++        api = "wait4" if scenario == "cf4" else "waitid"
++        options = 0 if api == "wait4" else EXITED
++        add("fault", api, options | (NOWAIT if scenario == "cfnowait" else 0), "efault", buffer="PROT_NONE")
++        add("after-fault", api, options | NOHANG, "event" if scenario == "cfnowait" else "echild")
++    elif scenario == "lx":
++        # wait_consider_task returns the zombie helper's zero without clearing
++        # notask_error, so __do_wait returns ECHILD for this single-thread child.
++        add("without-wexited", "waitid", STOPPED | NOHANG, "echild")
++        add("with-wexited", "waitid", EXITED | NOHANG, "event")
++    else:
++        require(scenario in ("nohang", "observe4", "observeid", "sq-zero", "sq-poison"), "unsupported case scenario")
++        if scenario.startswith("sq-"):
++            add("live-siginfo", "waitid", EXITED | NOHANG, "zero",
++                buffer="siginfo-zero" if scenario == "sq-zero" else "siginfo-poison")
++        elif scenario == "nohang":
++            add("live-wait4", "wait4", NOHANG, "unchanged")
++            add("live-waitid", "waitid", EXITED | NOHANG, "zero")
++        if scenario.startswith("observe"):
++            add("observe-1", "waitid", EXITED | NOWAIT, "event")
++            add("observe-2", "waitid", EXITED | NOWAIT | NOHANG, "event")
++        api = "waitid" if scenario == "observeid" else "wait4"
++        add("consume", api, EXITED if api == "waitid" else 0, "event")
++    add("post-waitid", "waitid", EXITED | NOWAIT, "echild")
++    add("post-wait4", "wait4", NOHANG, "echild")
++    return result
++
++
++def expected_results(plan, meta):
++    event = dict(return_value=meta.get("child_pid", "CHILD_PID") if plan["api"] == "wait4" else 0,
++                 errno=0, fields={"status": meta["exit_value"] << 8} if plan["api"] == "wait4" else
++                 dict(si_signo=17, si_errno=0, si_code=1, si_pid=meta.get("child_pid", "CHILD_PID"),
++                      si_uid=meta.get("child_uid", "CHILD_UID"), si_status=meta["exit_value"]))
++    echild = dict(return_value=-1, errno=errno.ECHILD, fields="NOT_COMPARED_ON_ERROR")
++    return {
++        "event": [event], "echild": [echild], "event-or-echild": [event, echild],
++        "efault": [dict(return_value=-1, errno=errno.EFAULT, fields="INACCESSIBLE")],
++        "zero": [dict(return_value=0, errno=0, fields=dict.fromkeys(SIGINFO, 0))],
++        "unchanged": [dict(return_value=0, errno=0, fields={"status": -999}, bytes="UNCHANGED")],
++    }[plan["oracle"]]
++
++
++def matches(call, expected):
++    if call["return"] != expected["return_value"] or call["errno"] != expected["errno"]:
++        return False
++    if isinstance(expected["fields"], dict) and call["after"]["fields"] != expected["fields"]:
++        return False
++    return expected.get("bytes") != "UNCHANGED" or call["after"]["bytes"] == call["before"]["bytes"]
++
++
++def validate_meta(meta, case, linux_control):
++    require(set(meta) == {"mode", "scenario", "pair", "child_pid", "child_uid", "exit_value", "exit_delay_us",
++                         "already_exited", "online_cpus", "affinity_count", "selected_cpus", "sigchld",
++                         "sa_nocldwait", "sigchld_blocked", "kernel_recorder", "observer_delay_control",
++                         "kernel", "libc", "cpu_identity"}, "invalid outcome metadata fields")
++    require(meta["mode"] == "outcome" and meta["kernel_recorder"] == "NOT_ARMED" and
++            meta["observer_delay_control"] == "INACTIVE", "outcome mode or recorder state mismatch")
++    require(all(meta[k] == case[k] for k in ("scenario", "pair", "exit_value", "exit_delay_us")) and
++            meta["already_exited"] == (case["readiness"] == "ready"), "case arguments mismatch")
++    require(all(type(meta[k]) is int and meta[k] >= 0 for k in
++                ("child_pid", "child_uid", "exit_value", "exit_delay_us", "online_cpus", "affinity_count")) and
++            meta["child_pid"] > 0, "invalid fixture identity")
++    cpus = meta["selected_cpus"]
++    require(meta["affinity_count"] == 2 and isinstance(cpus, list) and len(cpus) == 2 and
++            all(type(c) is int and c >= 0 for c in cpus) and cpus[0] != cpus[1], "fixture requires two eligible CPUs")
++    require(meta["sigchld"] == "SIG_DFL" and meta["sa_nocldwait"] is False and
++            meta["sigchld_blocked"] is True, "signal contract mismatch")
++    # The pinned Asterinas UTS namespace also reports Linux for libc compatibility.
++    # The guest identity comes from the runner and its boot records.
++    require(isinstance(meta["kernel"], str) and meta["kernel"].startswith("Linux ") and
++            isinstance(meta["libc"], str) and meta["libc"].startswith("glibc "), "system identity mismatch")
++    cpu = meta["cpu_identity"]
++    require(set(cpu) == {"cpu", "vendor", "max_extended", "features_edx", "invariant_edx",
++                         "hypervisor_present", "hypervisor_vendor"}, "invalid CPUID fields")
++    require(cpu["cpu"] == cpus[0] and all(type(cpu[k]) is int and 0 <= cpu[k] < 2**32
++            for k in ("max_extended", "features_edx", "invariant_edx")) and
++            all(isinstance(cpu[k], str) and len(cpu[k]) <= 12 for k in ("vendor", "hypervisor_vendor")) and
++            type(cpu["hypervisor_present"]) is bool, "invalid CPUID identity")
++
++
++def validate_call(call, meta):
++    require(set(call) == {"actor", "call_index", "purpose", "api", "syscall_number", "options", "pid", "idtype",
++                         "rusage", "buffer", "return", "errno", "before", "after"}, "invalid syscall fields")
++    require(call["actor"] in ("w1", "w2") and call["api"] in ("wait4", "waitid") and
++            isinstance(call["purpose"], str), "invalid syscall identity")
++    require(all(type(call[k]) is int for k in ("call_index", "syscall_number", "options", "pid", "return", "errno")) and
++            call["call_index"] > 0 and call["errno"] >= 0, "invalid syscall numbers")
++    wait4 = call["api"] == "wait4"
++    require(call["syscall_number"] == (61 if wait4 else 247) and call["pid"] == meta["child_pid"] and
++            call["idtype"] == (None if wait4 else "P_PID") and call["rusage"] is None, "syscall argument mismatch")
++    require(call["buffer"] in ("PROT_NONE", "status-sentinel") if wait4 else
++            call["buffer"] in ("PROT_NONE", "siginfo-zero", "siginfo-poison"), "invalid buffer kind")
++    for phase in ("before", "after"):
++        output = call[phase]
++        require(set(output) == {"accessible", "fields", "bytes"}, "invalid output fields")
++        if call["buffer"] == "PROT_NONE":
++            require(output == dict(accessible=False, fields=None, bytes=None), "inaccessible output was read")
++            continue
++        require(output["accessible"] is True and isinstance(output["bytes"], str) and
++                len(output["bytes"]) == (8 if wait4 else 256), "missing output bytes")
++        raw = bytes.fromhex(output["bytes"])
++        require(len(raw) == (4 if wait4 else 128), "invalid output bytes")
++        if wait4:
++            fields = dict(status=struct.unpack("<i", raw)[0])
++        else:
++            fields = dict(zip(SIGINFO, struct.unpack("<iii4xiIi", raw[:28])))
++        require(output["fields"] == fields, "decoded output fields disagree with bytes")
++    if call["buffer"] != "PROT_NONE":
++        before = bytes.fromhex(call["before"]["bytes"])
++        require(before == (struct.pack("<i", -999) if wait4 else
++                           bytes([0xa5 if call["buffer"] == "siginfo-poison" else 0]) * 128), "incorrect initial sentinel")
++
++
++def cpu_counts(lines, meta, log, linux_control):
++    prefix = "WR_CONTROL_NPROC " if linux_control else "WR_GUEST_NPROC "
++    counts = [int(line[len(prefix):]) for line in lines if line.startswith(prefix)]
++    require(counts == [2], "missing, duplicate or non-SMP=2 CPU evidence")
++    result = dict(measured_nproc=counts[0], eligible_cpus=meta["affinity_count"],
++                  online_cpus=meta["online_cpus"], selected_cpus=meta["selected_cpus"],
++                  scope="two-CPU Linux control affinity" if linux_control else "Asterinas guest SMP")
++    if not linux_control:
++        command = json.loads(log.with_suffix(".command.json").read_text())
++        require(command.count("-smp") == 1 and command[command.index("-smp") + 1] == "2" and
++                meta["online_cpus"] == 2 and meta["selected_cpus"] == [0, 1], "guest CPU counts disagree")
++        boot = json.loads(log.with_suffix(".outcome.json").read_text())
++        require(boot["fixture_complete"] is True and boot["guest_nproc"] == boot["boot_smp"] == 2 and
++                boot["qemu_returncode"] == 0 and boot["termination"] == "QMP quit after fixture completion", "incomplete guest boot")
++        result["boot_smp"] = 2
++    return result
++
++
++def collect(log, output, case_name, linux_control=False, run_exit_code=0):
++    check_review(outcome=True)
++    require(output.name.endswith(".outcome.json") and not output.exists(), "use a new .outcome.json output")
++    # Boot supervision uses the same suffix beside the log, so collection must use
++    # a separate directory to preserve both records.
++    require(output.resolve() != log.with_suffix(".outcome.json").resolve(), "output would overwrite boot supervision")
++    case = case_named(case_name)
++    plan = call_plan(case)
++    report = dict(schema="asterinas-wait-reap-outcomes-v6", mode="outcome", case=case,
++                  evidence_class="OUTCOME_ONLY_NO_IMPLEMENTATION_TRACE", implementation_trace="NONE",
++                  trace_validation="BLOCKED_ENVIRONMENT",
++                  trace_validation_reason=dict(reason="AMD Ryzen 9 9950X KVM guest with kvm-clock and non-invariant TSC; the approved method requires GenuineIntel and invariant TSC.",
++                      basis="First admitted v5 Linux control, reported 2026-10-10",
++                      observed_admission_cpuid=dict(actor=3, cpu=1, vendor="AuthenticAMD", max_extended="80000022",
++                                                    features_edx="178bfbff", invariant_edx="0")),
++                  environment="linux-control" if linux_control else "asterinas-guest",
++                  source="0c60537098f4c2949ad2d382aaf499de72263d76",
++                  linux_oracle=dict(version="v6.16.5", commit="4645fefac0b24d509b962c096b0327e87f34b1d2",
++                      contract="wait-reap/contracts.md", anchors="kernel/exit.c:1167-1179,1181-1191,1485-1494,1660-1694,1800-1827,1841-1873"),
++                  raw_log=dict(path=str(log.resolve()), evidence_class="NON_TRACE_DIAGNOSTIC_MATERIAL"),
++                  review_gate_sha256=hashlib.sha256((HERE / "review-gate.json").read_bytes()).hexdigest(),
++                  run_exit_code=run_exit_code, fixture_complete=False, cpu_count=None, no_hang="inconclusive",
++                  comparison="inconclusive", bug_classification="NOT_ASSESSED", calls=[], problems=[])
++    meta, calls = None, {}
++    stage = "reading the raw log"
++    try:
++        payload = log.read_bytes()
++        report["raw_log"]["sha256"] = hashlib.sha256(payload).hexdigest()
++        lines = payload.decode().replace("\r", "").splitlines()
++        # Only these two allowlisted JSON records can enter the report. Trace
++        # transports are rejected and never copied, even into a failure message.
++        stage = "checking the outcome transport"
++        allowed = ("WR_OUTCOME_META ", "WR_OUTCOME_CALL ", "WR_CONTROL_NPROC ", "WR_GUEST_NPROC ")
++        markers = {"WR_OUTCOME_COMPLETE", "WR_OUTCOME_SETUP_FAILED"}
++        require(all(not line.startswith("WR_") or line in markers or line.startswith(allowed) for line in lines),
++                "unexpected recorder or clock transport in outcome log")
++        stage = "checking fixture metadata"
++        metadata = [json.loads(line[len("WR_OUTCOME_META "):]) for line in lines if line.startswith("WR_OUTCOME_META ")]
++        require(len(metadata) == 1, "missing or duplicate outcome metadata")
++        candidate = metadata[0]
++        validate_meta(candidate, case, linux_control)
++        meta = candidate
++        report["metadata"] = meta
++        stage = "checking syscall records"
++        for line in lines:
++            if not line.startswith("WR_OUTCOME_CALL "):
++                continue
++            call = json.loads(line[len("WR_OUTCOME_CALL "):])
++            validate_call(call, meta)
++            key = (call["actor"], call["call_index"])
++            require(key not in calls and key[1] == 1 + sum(k[0] == key[0] for k in calls), "duplicate or missing call index")
++            calls[key] = call
++        stage = "checking CPU and boot evidence"
++        report["cpu_count"] = cpu_counts(lines, meta, log, linux_control)
++        report["fixture_complete"] = lines.count("WR_OUTCOME_COMPLETE") == 1
++        stage = "checking fixture completion"
++        require(report["fixture_complete"] and run_exit_code == 0 and "WR_OUTCOME_SETUP_FAILED" not in lines,
++                "fixture incomplete or execution limit reached")
++        require(set(calls) == {(p["actor"], p["call_index"]) for p in plan}, "missing or unexpected syscall results")
++    except (ValueError, KeyError, TypeError, IndexError, AttributeError, OSError, struct.error) as error:
++        report["problems"].append(f"Evidence incomplete at {stage} ({type(error).__name__}); inspect the non-trace diagnostic log.")
++
++    known = meta or dict(exit_value=case["exit_value"])
++    setup_ok = True
++    for p in plan:
++        call = calls.get((p["actor"], p["call_index"]))
++        expected = expected_results(p, known)
++        arguments_ok = call is not None and all(call[k] == p[k] for k in ("purpose", "api", "options", "buffer"))
++        comparison = "inconclusive"
++        if arguments_ok and setup_ok:
++            comparison = "match" if any(matches(call, e) for e in expected) else "mismatch"
++        elif call is not None and not arguments_ok:
++            report["problems"].append("Observed call arguments differ from the case plan.")
++        if p["purpose"] == "establish-zombie":
++            setup_ok = comparison == "match"
++        report["calls"].append(dict(planned_call=p, observed=call, expected_linux_source=expected, comparison=comparison))
++    history = dict(expected="Every planned call completes; post-consumption waits return ECHILD.", comparison="inconclusive")
++    if not report["problems"] and setup_ok:
++        report["no_hang"] = "match"
++        comparison = "match" if all(c["comparison"] == "match" for c in report["calls"]) else "mismatch"
++        if case["scenario"] == "compete":
++            consumers = [c for c in report["calls"] if c["planned_call"]["purpose"] == "consume"]
++            successes = sum(matches(c["observed"], c["expected_linux_source"][0]) for c in consumers)
++            losers = sum(matches(c["observed"], c["expected_linux_source"][1]) for c in consumers)
++            history["expected"] = "Exactly one consumer obtains the exit status, the other gets ECHILD, and both complete."
++            if (successes, losers) != (1, 1):
++                comparison = "mismatch"
++        history["comparison"] = comparison
++        report["comparison"] = comparison
++    report["history"] = history
++    report["coverage"] = {wr: dict(outcome_comparison=report["comparison"],
++        internal_window="NOT_ESTABLISHED_OPPORTUNISTIC" if wr in ("WR-08", "WR-09", "WR-10") else "NOT_ASSESSED")
++        for wr in case["wr_ids"]}
++    output.parent.mkdir(parents=True, exist_ok=True)
++    with output.open("x") as stream:
++        stream.write(json.dumps(report, indent=2) + "\n")
++    print(json.dumps(dict(output=str(output), comparison=report["comparison"], trace_validation=report["trace_validation"])))

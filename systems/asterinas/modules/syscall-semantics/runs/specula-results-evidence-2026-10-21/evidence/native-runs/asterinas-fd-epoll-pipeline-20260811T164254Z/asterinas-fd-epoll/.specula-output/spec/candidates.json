@@ -1,0 +1,172 @@
+{
+  "schema_version": "2",
+  "system": "Asterinas FD Lifecycle and Epoll",
+  "generated_by": "consolidate",
+  "findings": [
+    {
+      "id": "MC-1",
+      "title": "epoll EFAULT loses edge-triggered readiness",
+      "source": "model-checking",
+      "scenario": "S2 copyout atomicity",
+      "severity": "High",
+      "invariant": "MCDeliveryCommitOnCopyout",
+      "config": "MC_hunt_s2_copyout.cfg",
+      "counterexample": "spec/output/MC_hunt_s2_copyout_round2_bfs.out",
+      "affected_code": [
+        "kernel/core/src/syscall/epoll.rs:129",
+        "kernel/core/src/events/epoll/file.rs:244"
+      ],
+      "summary": "EpollFile::wait removes an edge-triggered ready entry before sys_epoll_wait copies it to user memory. If that copy faults, the syscall returns EFAULT but the ready edge is not restored, so a later valid epoll_wait sees no event. The bounded model reaches the lost-undelivered epoch in nine states and the public eventfd reproduction observes the missing redelivery in an SMP=2 Asterinas VM.",
+      "dedup_note": "also covers code-review Scenario 2 (same edge-triggered pre-copyout delivery-commit mechanism)"
+    },
+    {
+      "id": "MC-2",
+      "title": "epoll EFAULT disables one-shot interest before delivery",
+      "source": "model-checking",
+      "scenario": "S2 one-shot delivery",
+      "severity": "High",
+      "invariant": "MCOneShotDisabledIffDelivered",
+      "config": "MC_hunt_s2_oneshot.cfg",
+      "counterexample": "spec/output/MC_hunt_s2_oneshot_round2_bfs.out",
+      "affected_code": [
+        "kernel/core/src/events/epoll/entry.rs:136",
+        "kernel/core/src/syscall/epoll.rs:145"
+      ],
+      "summary": "Entry::poll disables an EPOLLONESHOT observer when it observes readiness, before the selected event is copied to user memory. A copyout EFAULT therefore leaves an event that was never delivered permanently disabled until EPOLL_CTL_MOD. The ten-state model trace and the SMP=2 public eventfd test both show this behavior.",
+      "dedup_note": "also covers code-review Scenario 2 (same one-shot pre-copyout delivery-commit mechanism)"
+    },
+    {
+      "id": "MC-3",
+      "title": "final close leaves a dead epoll interest entry",
+      "source": "model-checking",
+      "scenario": "S2 epoll lifecycle",
+      "severity": "Medium",
+      "invariant": "MCNoDeadInterest",
+      "config": "MC_hunt_s2_epoll_delivery.cfg",
+      "counterexample": "spec/output/MC_hunt_s2_epoll_delivery_round2_bfs.out",
+      "affected_code": [
+        "kernel/core/src/fs/file/file_table.rs:196",
+        "kernel/core/src/events/epoll/file.rs:259",
+        "kernel/core/src/events/epoll/entry.rs:46"
+      ],
+      "summary": "The epoll key includes the weak file-object identity, preventing descriptor-number reuse from retargeting a watch, but final close has no immediate epoll cleanup hook. The dead weak entry remains in the interest set until a later ready-list scan notices it. The seven-state model trace is directly observable through a stale /proc/self/fdinfo entry in the SMP=2 VM test.",
+      "dedup_note": "also covers the epoll-key and final-close portions of code-review Scenario 1 and Scenario 2 (same weak-OFD identity and interest-cleanup mechanisms)"
+    },
+    {
+      "id": "MC-4",
+      "title": "consumed timerfd remains ready through the poll cache",
+      "source": "model-checking",
+      "scenario": "S3 readiness cache",
+      "severity": "High",
+      "invariant": "MCCachedReadinessSound",
+      "config": "MC_hunt_s3_cache.cfg",
+      "counterexample": "spec/output/MC_hunt_s3_cache_round2_bfs.out",
+      "affected_code": [
+        "kernel/core/src/time/timerfd.rs:177",
+        "kernel/core/src/process/signal/poll.rs:106"
+      ],
+      "summary": "Timerfd expiration invalidates and caches readiness, but a successful read clears ticks without invalidating the shared Pollee cache. A subsequent zero-timeout poll can report POLLIN even though the next read returns EAGAIN. The nine-state model trace and public timerfd reproduction both show stale readiness.",
+      "dedup_note": "also covers code-review Scenario 3 (same timerfd consumed-readiness cache-invalidation mechanism)"
+    },
+    {
+      "id": "MC-5",
+      "title": "signalfd mask update does not publish readiness",
+      "source": "model-checking",
+      "scenario": "S4 signal-mask transition",
+      "severity": "High",
+      "invariant": "MCRegisteredTransitionNotLost",
+      "config": "MC_hunt_s4_mask_transition.cfg",
+      "counterexample": "spec/output/MC_hunt_s4_mask_transition_round2_bfs.out",
+      "affected_code": [
+        "kernel/core/src/syscall/signalfd.rs:103",
+        "kernel/core/src/syscall/signalfd.rs:161",
+        "kernel/core/src/process/posix_thread/mod.rs:266"
+      ],
+      "summary": "Updating an existing signalfd mask only stores the new mask. A signal that was already pending can become readable under that new mask without notifying the thread or process signal-queue poller registered by epoll. The temporal counterexample reaches the lost transition in eight states and the SMP=2 signalfd test times out instead of receiving the pending signal.",
+      "dedup_note": "also covers the mask-update notification portion of code-review Scenario 4 (same pending-signal transition mechanism)"
+    },
+    {
+      "id": "MC-6",
+      "title": "poll returns timeout after timerfd becomes readable",
+      "source": "model-checking",
+      "scenario": "S5 timeout arbitration",
+      "severity": "High",
+      "invariant": "MCVisibleReadyWinsTerminalRace",
+      "config": "MC_hunt_s5_arbitration.cfg",
+      "counterexample": "spec/output/MC_hunt_s5_arbitration_round2_bfs.out",
+      "affected_code": [
+        "kernel/core/src/syscall/poll.rs:108",
+        "kernel/core/src/process/signal/pause.rs:171"
+      ],
+      "summary": "The timeout return path in do_poll does not rescan descriptors after the waiting primitive returns ETIME. A timerfd can increment its readable tick counter at the timeout boundary, yet poll returns zero; an immediate read then succeeds. The six-state model trace is reproduced in repeated SMP=2 timerfd stress runs.",
+      "dedup_note": "also covers the poll terminal-rescan portion of code-review Scenario 5 (same timeout/readiness arbitration mechanism)"
+    },
+    {
+      "id": "CR-1",
+      "title": "captured FD operations and exec cutover may lose OFD identity",
+      "source": "code-review",
+      "scenario": "Scenario 1",
+      "severity": "High",
+      "invariant": null,
+      "config": null,
+      "counterexample": null,
+      "affected_code": [
+        "kernel/core/src/fs/file/file_table.rs:169",
+        "kernel/core/src/fs/file/file_table.rs:326",
+        "kernel/core/src/syscall/dup.rs:24",
+        "kernel/core/src/syscall/execve.rs:161"
+      ],
+      "summary": "Numeric FD slots can be reused while a captured operation, duplicated descriptor, or shared status remains attached to the original open file description (OFD). The reviewed lookup, replacement, deferred-cleanup, and close-on-exec paths must preserve that OFD identity rather than re-resolving the reused number. MC-3 covers the epoll-key and final-close portion of this scenario, but it does not cover captured-operation, duplication, or exec-cutover sites. Confirmation should exercise close/reuse, dup, and exec interleavings while checking slot identity separately from the captured OFD."
+    },
+    {
+      "id": "CR-4",
+      "title": "signalfd epoll registration may bind readiness to the wrong thread",
+      "source": "code-review",
+      "scenario": "Scenario 4",
+      "severity": "High",
+      "invariant": null,
+      "config": null,
+      "counterexample": null,
+      "affected_code": [
+        "kernel/core/src/syscall/signalfd.rs:207",
+        "kernel/core/src/process/posix_thread/mod.rs:266",
+        "kernel/core/src/process/signal/sig_queues.rs:38"
+      ],
+      "summary": "SignalFile::poll evaluates and registers signalfd readiness against the current thread, even though another thread may later wait on or read the shared descriptor. A signal pending for that waiter could make a direct signalfd read readable without waking the queue selected when epoll_ctl ran. MC-5 covers the distinct missing-notification path when an existing signalfd mask is updated, but it does not cover registration-thread versus wait-thread identity. Confirmation should use two threads that split epoll_ctl from epoll_wait or read and compare the wakeup with direct readability."
+    },
+    {
+      "id": "CR-5",
+      "title": "epoll and mask-taking waits may bypass terminal readiness arbitration",
+      "source": "code-review",
+      "scenario": "Scenario 5",
+      "severity": "High",
+      "invariant": null,
+      "config": null,
+      "counterexample": null,
+      "affected_code": [
+        "kernel/core/src/events/epoll/file.rs:225",
+        "kernel/core/src/syscall/ppoll.rs:31",
+        "kernel/core/src/syscall/pselect6.rs:33",
+        "kernel/core/src/syscall/epoll.rs:114",
+        "kernel/core/src/process/signal/mod.rs:64"
+      ],
+      "summary": "The epoll, ppoll, pselect6, and epoll_pwait paths combine terminal timeout or signal selection with temporary signal-mask handling. Each path must rescan registered descriptors before returning and restore the saved mask on every terminal path. MC-6 covers the poll/timerfd timeout race, but it does not cover EpollFile::wait or the mask-taking syscall paths. Confirmation should race readiness, timeout, and signals on those paths and inspect both the return value and post-return signal mask."
+    },
+    {
+      "id": "CR-6",
+      "title": "nested epoll cycle checks and synchronous callbacks may deadlock",
+      "source": "code-review",
+      "scenario": "Scenario 6",
+      "severity": "Low",
+      "invariant": null,
+      "config": null,
+      "counterexample": null,
+      "affected_code": [
+        "kernel/core/src/events/epoll/file.rs:64",
+        "kernel/core/src/events/epoll/entry.rs:307",
+        "kernel/core/src/events/subject.rs:126"
+      ],
+      "summary": "EpollFile::add_interest accepts epoll targets without self or cycle validation, and readiness propagation invokes observers synchronously while ready-set and observer-set locks are held. A self-edge or two-epoll back-edge could create unsupported cyclic propagation or a lock-order cycle during callback delivery. This scenario was not model-checked and remains a candidate even though the current test suite blocklists cycle conformance. Confirmation should bound the graph to two epoll instances and separate unsupported topology from any failure of a supported acyclic path."
+    }
+  ]
+}

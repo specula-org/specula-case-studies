@@ -1,0 +1,148 @@
+{
+  "schema_version": "2",
+  "system": "asterinas-syscall-regular-file-partial-progress",
+  "generated_by": "consolidate",
+  "findings": [
+    {
+      "id": "MC-1",
+      "title": "A positive read prefix is exposed but returned as EFAULT",
+      "source": "model-checking",
+      "scenario": "Scenario 1 - positive copy progress",
+      "severity": "High",
+      "invariant": "MCReportedCoversVisibleCopy",
+      "config": "MC_hunt_scenario_1_positive_copy_progress.cfg",
+      "counterexample": "spec/output/MC_hunt_scenario_1_positive_copy_progress_bfs.out",
+      "affected_code": [
+        "ostd/src/mm/io/mod.rs:354",
+        "kernel/core/src/vm/page_cache/vmo/mod.rs:557",
+        "kernel/core/src/fs/fs_impls/ext2/inode/file.rs:304",
+        "kernel/core/src/error.rs:209",
+        "kernel/core/src/fs/file/inode_handle.rs:297"
+      ],
+      "summary": "A fallible read advances the user VmWriter by a positive prefix before returning a page fault. The VMO/filesystem path converts the tuple error into scalar EFAULT and drops the count. InodeHandle therefore leaves the shared offset unchanged and the syscall reports no bytes even though the user buffer changed. The result, visible copy, and OFD progress disagree.",
+      "dedup_note": "Also covers code-review Scenario 1 (positive copy progress erased at the VMO boundary) on the read path; same tuple-to-scalar erasure at ostd/src/mm/io/mod.rs and kernel/core/src/error.rs:209 that the Scenario cites. Scenario 1's write-path half is carried by MC-2."
+    },
+    {
+      "id": "MC-2",
+      "title": "A retained write prefix is returned as EFAULT with no offset progress",
+      "source": "model-checking",
+      "scenario": "Scenarios 1 and 2 - positive write progress",
+      "severity": "High",
+      "invariant": "MCMixedPageRetainedPrefixReported",
+      "config": "MC_hunt_scenario_1_mixed_page_prefix.cfg",
+      "counterexample": "spec/output/MC_hunt_scenario_1_mixed_page_prefix_bfs.out",
+      "affected_code": [
+        "ostd/src/mm/io/mod.rs:354",
+        "kernel/core/src/vm/page_cache/vmo/mod.rs:734",
+        "kernel/core/src/fs/fs_impls/ext2/inode/file.rs:353",
+        "kernel/core/src/error.rs:209",
+        "kernel/core/src/fs/file/inode_handle.rs:367"
+      ],
+      "summary": "An earlier ext2 buffered page can be copied and dirtied before a later Uninit page faults. Rollback preserves that in-place dirty prefix, but scalar error conversion erases cumulative progress. The syscall returns EFAULT and does not advance the shared offset although file data changed. Retained data, reported bytes, and offset accounting diverge.",
+      "dedup_note": "Also covers code-review Scenario 1 (count erasure) on the write path, and code-review Scenario 2's ext2 buffered publication case — the up-to-date page dirtied after a positive fault while an Uninit overwrite page stays unpublished (vmo/mod.rs:724-751, ext2/inode/file.rs:204-271). Scenario 2's ramfs case is on MC-4 and its direct-I/O case is on MC-6."
+    },
+    {
+      "id": "MC-3",
+      "title": "Ramfs can copy beyond logical EOF and report only the EOF snapshot",
+      "source": "model-checking",
+      "scenario": "Scenario 4 - positional I/O and EOF snapshots",
+      "severity": "Medium",
+      "invariant": "MCReportedCoversVisibleCopy",
+      "config": "MC_hunt_scenario_4_positional_offset.cfg",
+      "counterexample": "spec/output/MC_hunt_scenario_4_positional_offset_bfs.out",
+      "affected_code": [
+        "kernel/core/src/fs/fs_impls/ramfs/fs.rs:701",
+        "kernel/core/src/vm/page_cache/mod.rs:181",
+        "kernel/core/src/vm/page_cache/vmo/mod.rs:535",
+        "kernel/core/src/fs/file/inode_handle.rs:400"
+      ],
+      "summary": "Ramfs snapshots logical EOF to compute its return value but passes the original writer to a page-cache VMO whose page-aligned capacity can exceed EOF. The VMO can modify more of the user buffer than the returned length accounts for. Positional OFD neutrality remains intact, but copied and reported progress diverge. Limiting the writer to read_len closes the gap.",
+      "dedup_note": "Also covers code-review Scenario 4 (ramfs snapshots size outside the page-cache mutex and does not limit the writer to EOF, ramfs/fs.rs:701-710 and page_cache/mod.rs:181-186). Scenario 4's positional offset-neutrality baseline was model-checked and held (MCPositionalOffsetStable did not fail); its readv mixed-generation half is carried by MC-5."
+    },
+    {
+      "id": "MC-4",
+      "title": "Ramfs publishes file size before a write that copies no bytes",
+      "source": "model-checking",
+      "scenario": "Scenario 2 - backend publication",
+      "severity": "Medium",
+      "invariant": "MCFileSizeMatchesProgress",
+      "config": "MC_hunt_scenario_2_backend_publication.cfg",
+      "counterexample": "spec/output/MC_hunt_scenario_2_backend_publication_bfs.out",
+      "affected_code": [
+        "kernel/core/src/fs/fs_impls/ramfs/fs.rs:795",
+        "kernel/core/src/vm/page_cache/vmo/mod.rs:569"
+      ],
+      "summary": "Ramfs expands inode size and updates metadata from the requested end before the fallible user copy. A zero-prefix fault then returns an error without restoring the old size. The file grows even though no data was copied, committed, or reported. Zero-length writes beyond EOF reach the same publication ordering.",
+      "dedup_note": "Also covers code-review Scenario 2's ramfs case — an extending request's full end and timestamps published before copy with no rollback (ramfs/fs.rs:721-756). Scenario 2's ext2 buffered case is on MC-2 and its fragmented O_DIRECT case is on MC-6."
+    },
+    {
+      "id": "MC-5",
+      "title": "Vectored I/O is not atomic on a shared open-file description",
+      "source": "model-checking",
+      "scenario": "Scenario 3 / MC1 - vector atomicity",
+      "severity": "High",
+      "invariant": "MCLaterIovecFaultLinearizable",
+      "config": "MC_hunt_finding_mc1_later_iovec_fault.cfg",
+      "counterexample": "spec/output/MC_hunt_finding_mc1_later_iovec_fault_bfs.out",
+      "affected_code": [
+        "kernel/core/src/syscall/preadv.rs:169",
+        "kernel/core/src/syscall/pwritev.rs:165",
+        "kernel/core/src/fs/file/inode_handle.rs:288",
+        "kernel/core/src/fs/file/inode_handle.rs:348"
+      ],
+      "summary": "readv and writev loop over independent scalar FileLike operations. The shared OFD lock is released after each iovec, allowing another shared operation or delayed data effect to intervene before the next entry. A later entry can then fault after positive progress while the wrapper returns only the earlier entry count. No single vector-call linearization point explains the offset and data history.",
+      "dedup_note": "Also covers code-review Scenario 3 (a vector call is multiple shared-offset critical sections; preadv.rs:152-174, pwritev.rs:148-170, offset lock spanning only one scalar backend call at inode_handle.rs:273-320), and the readv mixed-generation half of code-review Scenario 4."
+    },
+    {
+      "id": "MC-6",
+      "title": "Ext2 direct write returns while an earlier submitted BIO remains live",
+      "source": "model-checking",
+      "scenario": "Scenario 2 / MC2 - delayed direct completion",
+      "severity": "High",
+      "invariant": "MCNoUnaccountedPendingEffect",
+      "config": "MC_hunt_finding_mc2_direct_completion.cfg",
+      "counterexample": "spec/output/MC_hunt_finding_mc2_direct_completion_bfs.out",
+      "affected_code": [
+        "kernel/core/src/fs/fs_impls/ext2/inode/file.rs:516",
+        "kernel/core/src/fs/fs_impls/ext2/inode/file.rs:590",
+        "kernel/libs/io-util/src/batch.rs:107",
+        "kernel/core/comps/block/src/bio.rs:278"
+      ],
+      "summary": "A direct write submits one mapped range, then a later range's user copy faults. The error path skips IoBatch::wait_all, rolls back metadata, releases locks, and returns EFAULT. IoBatch has no drop-time wait or cancel, so the submitted BIO remains live and may publish data after the failed attempt. That effect can also intervene with a later operation.",
+      "dedup_note": "Also covers code-review Scenario 2's fragmented ext2 O_DIRECT case — each completed range submitted before copying the next, with a later fault skipping wait_all (ext2/inode/file.rs:365-406, block/src/bio.rs:100-150)."
+    },
+    {
+      "id": "MC-7",
+      "title": "An O_APPEND fault leaves the shared offset at EOF",
+      "source": "model-checking",
+      "scenario": "Scenario 5 - append failure",
+      "severity": "Medium",
+      "invariant": "MCSharedOffsetMatchesReported",
+      "config": "MC_hunt_scenario_5_append_failure.cfg",
+      "counterexample": "spec/output/MC_hunt_scenario_5_append_failure_bfs.out",
+      "affected_code": [
+        "kernel/core/src/fs/file/inode_handle.rs:361"
+      ],
+      "summary": "InodeHandle assigns EOF directly to the shared offset before calling the fallible O_APPEND backend. A zero-prefix fault takes the error arm, which does not restore the previous offset. The syscall reports no bytes while duplicated descriptors observe an OFD position jump. Publishing the append position only after nonnegative progress would keep the result and offset consistent.",
+      "dedup_note": "Also covers code-review Scenario 5 (append positioning commits before write success; `*offset = path.size()` precedes the fallible `file_ops.write_at(...)?` at inode_handle.rs:308-320)."
+    },
+    {
+      "id": "CR-1",
+      "title": "Restart consumes an errno without progress provenance",
+      "source": "code-review",
+      "scenario": "Scenario 6 - restart and progress provenance",
+      "severity": "Medium",
+      "invariant": null,
+      "config": null,
+      "counterexample": null,
+      "affected_code": [
+        "kernel/core/src/syscall/read.rs:27",
+        "kernel/core/src/syscall/write.rs:27",
+        "kernel/core/src/process/signal/mod.rs:54",
+        "kernel/core/src/process/signal/mod.rs:145",
+        "kernel/core/src/thread/task.rs:83"
+      ],
+      "summary": "The scalar read and write syscall wrappers translate any EINTR from the backend into ERESTARTSYS without consulting how many bytes were copied or committed, and SA_RESTART signal delivery then restores the original arguments and rewinds the instruction pointer. Because restartability is encoded as a bare errno, a backend that interrupts after positive progress would have that progress replayed: the restarted attempt repeats an already committed effect and can advance the shared offset twice. Model checking of this scenario produced no pinned-backend counterexample — the inspected ext2/ramfs page waits are uninterruptible and user faults return EFAULT, so no regular-file path returns EINTR today; the violations only appear under the reference-only EnableReferenceInterruptible capability. The design risk is structural rather than currently reachable, and the brief rates it Low priority with the suggested fix being an outcome type that distinguishes zero progress from committed progress instead of an errno."
+    }
+  ]
+}

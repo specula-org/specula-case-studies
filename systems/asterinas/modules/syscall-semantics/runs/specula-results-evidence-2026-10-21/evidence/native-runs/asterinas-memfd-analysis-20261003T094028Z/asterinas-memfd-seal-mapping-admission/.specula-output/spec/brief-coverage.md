@@ -1,0 +1,69 @@
+# Brief coverage audit
+
+This suite models Category B concurrency for Asterinas source `0c60537098f4c2949ad2d382aaf499de72263d76`. It follows the revised brief's one seal, eligibility, mapping-owner and revocation protocol. The configuration audit below remains unchanged. Phase 2.5 supplied genuine kernel traces, and Phase 3 now accepts all 90 traces and has completed all ten MC configurations. The [validation report](bug-report.md) records the current results and limits. Earlier NOT_RUN statements in the generation history below describe that earlier stage.
+
+## Scenario coverage
+
+| Brief §2 | Source transitions and distinctions | Targeting configuration | Reachable workload |
+|---|---|---|---|
+| 1. Admission determines eligibility and accounting | `MmapFdMode`, `MemfdCheckWritable`, `MappedVmoNew`, merge/publication, and `VmarUnlock` keep requested permissions, retained MAY, the tracking decision and the counter reservation separate. | `MC_hunt_scenario1_protocol.cfg`, `MC_hunt_scenario1.cfg`, `MC_hunt_TV1a.cfg`, `MC_hunt_TV1b.cfg` | Publish WRITE or FUTURE, then admit READ through rw, rw2, or ro descriptions. Private mappings and requested shared WRITE are controls. Attempt a later WRITE upgrade and unmap. The protocol configuration completes the same admission plans without an expected TV-1 stop. |
+| 2. Publication overlaps admission and retained eligibility | `MemfdAddSealsLock/Check`, `WritableMappingDeny`, `MemfdPublishSeals`, `MemfdAddSealsUnlock`, `MemfdGetSeals` and the separate map check/RMW retain both lock scopes. | `MC_hunt_scenario2.cfg`, `MC_hunt_scenario2_default_seal.cfg` | The map and first seal request share round 1. A valid schedule checks admission, publishes FUTURE on the other thread, then acquires and publishes the mapping. Another lets WRITE denial win before the acquisition RMW. Later protection uses retained MAY. |
+| 3. Ownership survives transformations and revocation | Split duplication precedes owner transfer. Merge duplication precedes both old-owner drops. Removal detaches, updates PTEs, dispatches, synchronizes and finally drops. Translation records retain admission generations across owner changes. | `MC_hunt_scenario3.cfg` | Map three pages, fault WRITE on each, protect the middle READ, upgrade it and remerge, remove the middle, remove the left, then remove the final right page. Seal attempts overlap every important stage. Offset and file-description controls exercise unsuccessful merge predicates. |
+| 4. Operation-specific failures | The protection loop retains its ordered snapshot, per-segment checks, absent-start compensation and completed prefix. Fixed replacement uses the ordinary removal loop before seal validation. Seal publication follows successful denial. | `MC_hunt_scenario4.cfg`, `MC_hunt_TV2.cfg` | Change an eligible prefix before EACCES at ro or ENOMEM at a hole. Attempt combined WRITE/FUTURE/SEAL while busy. Under an already published FUTURE seal, attempt both full and middle MAP_FIXED replacements. |
+
+These are executable input schedules in `MC.tla`, not alternative transition relations. Every configuration extends the same `base.tla`. Round barriers constrain only new requests. All steps of an admitted request remain enabled until they complete. Thread-role assignments are symmetric.
+
+## Property wiring
+
+`MC.tla` extends `base`, so the named operators below are directly available to every MC configuration. These are the enabled, uncommented predicates read from the cfg files. `MC.cfg` checks structural and seal-protocol safety during convergence, with the other scenario predicates listed as comments. The expected compatibility failures have independent configurations.
+
+| Brief §5 property | Definition / observation boundary | Enabled hunt configuration |
+|---|---|---|
+| TypeAndIdentity | `base!TypeAndIdentity` checks owner ranges, disjoint installed ranges, complete retained permission sets, file-description identity, immutable admission generations and backing offsets. It is a target property of scenario 3, not incidental hunt overhead. | `MC_hunt_scenario3.cfg` |
+| TrackedOwnershipConservation | `base!TrackedOwnershipConservation` compares the counter with all live tracked wrappers, including reservations and split/merge temporaries. | `MC_hunt_scenario3.cfg` |
+| SealPublicationAndFreeze | `base!SealPublicationAndFreeze` checks publication and per-operation history under the seal mutex. WRITE implies denial. Busy/frozen requests publish no bits. | Every `MC_hunt_*.cfg` |
+| RetainedWriteEligibility | `base!RetainedWriteEligibility` checks current access against MAY and preserves the admission-time seal observation across later protection and representation changes. | `MC_hunt_scenario1_protocol.cfg`, `MC_hunt_scenario1.cfg`, `MC_hunt_scenario2.cfg`, `MC_hunt_scenario2_default_seal.cfg`, `MC_hunt_scenario3.cfg` |
+| RevocationBeforeOwnerRelease | `base!RevocationBeforeOwnerRelease` checks live owner coverage of generation-specific translations, retired translations and release-time completion. | `MC_hunt_scenario3.cfg`, `MC_hunt_scenario4.cfg` |
+| ReadOnlyAdmissionCompatibility | `base!ReadOnlyAdmissionCompatibility` is the conjunction of the following two independent manifestations. | `MC_hunt_scenario1.cfg` |
+| ReadOnlyAdmissionAfterWrite | TV-1a specializes the preceding contract to READ admission after observed WRITE. An overlapping check before WRITE is deliberately not classified by return order. | `MC_hunt_TV1a.cfg` |
+| ReadOnlyAdmissionNoFalseBusy | TV-1b specializes it to a quiescent WRITE denial with no semantically eligible owner, including the falsely tracked post-FUTURE READ map. | `MC_hunt_TV1b.cfg` |
+| SealRejectedReplacement | `base!SealRejectedReplacement` compares before/after page observations only for the specified already-sealed shared WRITE replacement. | `MC_hunt_TV2.cfg` |
+| ProtectionPrefixEffects | `base!ProtectionPrefixEffects` checks completed-prefix permissions, unchanged suffix/outside pages, generation/offset identity and retained MAY. It permits successful prefix effects on failure. | `MC_hunt_scenario4.cfg` |
+
+## Findings and known controls
+
+Brief §6.1 contains **no additional model-checkable finding**. There is no missing finding-to-config row and no synthetic injected defect. Brief §6.2's known controls remain distinct:
+
+| Existing attribution | Source-reachable trigger | Expected predicate failure | Independent configuration |
+|---|---|---|---|
+| TV-1 / AST-73, manifestation a | WRITE denial and publication finish. READ via rw passes the seal check with MAY_WRITE removed, retains tracking, then fails the acquisition RMW with EPERM. | `ReadOnlyAdmissionAfterWrite` | `MC_hunt_TV1a.cfg` |
+| TV-1 / AST-73, manifestation b | FUTURE publishes, READ via rw becomes ineligible but tracked, then a quiescent WRITE attempt sees the positive counter. | `ReadOnlyAdmissionNoFalseBusy` | `MC_hunt_TV1b.cfg` |
+| TV-2 / AST-75 | An existing writable map is fully or partly removed before a new shared WRITE MAP_FIXED request observes FUTURE and fails with EPERM. | `SealRejectedReplacement` | `MC_hunt_TV2.cfg` |
+
+These controls originated in source analysis and were subsequently observed by the Phase 2.5 differential harness. Phase 3 reproduced their model counterexamples and revalidated the captured traces. TV-1a and TV-1b remain one defect, reported as MC-1. TV-2 is MC-2. No new runtime execution or repair verification is claimed by this phase. The Linux oracles use the saved v6.18 snapshots: `mm__memfd.c:282-305,373-407`, `mm__vma.c:2731-2744`, `mm__mmap.c:485-491`, and `mm__mprotect.c:931-1005`. The selected replacement placement was also checked against v6.16 in the input analysis.
+
+## Bounds and abstraction limits
+
+The configurations use two syscall threads, three page-sized address slots and six reusable owner IDs. At most three nonoverlapping pieces cover the modeled address space. A split adds its right wrapper before truncating the left. A merge temporarily adds one duplicate before either input is dropped. Consequently these schedules need at most four simultaneous live wrappers. Six slots leave additional headroom, and an exhausted pool raises an assertion instead of silently disabling a reactive step. `MCStructural` independently checks the four-owner bound.
+
+The finite driver bounds client requests by the selected script length. The longest script pair is the lifecycle case: nine requests on the mapping thread and seven on the seal thread. Each script is run with both thread assignments. No counter limits an internal retry, completion or destruction. There is no state-space constraint that prunes counterexamples and no view that discards input counters. The base environment remains unbounded.
+
+The P1/P2 revision changes no bound, driver plan, symmetry definition or invariant. P2 adds a configuration with `Scenario="scenario1"`, `SealPublicationAndFreeze` and `RetainedWriteEligibility`, matching the reviewer's protocol-only configuration. Every existing configuration keeps its enabled predicates. The compatibility hunts retain their expected failures.
+
+Admission generations are never reused during a run. Owner slots can be reused because a translation refers to its admission generation, not a wrapper slot. One fixed inode/VMO is an explicit scope assumption. The model retains the identity of three stable file descriptions: the created rw handle, a separately opened rw2 handle and a separately opened ro handle. Actual modes must be checked by the harness.
+
+The pt/tlb abstraction records ordinary shared access and one representative remote cached translation. It preserves an old translation until synchronization, with page faults excluded by the VMAR write lock. It assumes the checked ordinary TLB/IPI substrate and does not verify CPU activation, page-table hierarchy, physical-frame reclamation, hardware failure or unconditional progress. No scheduler or IPI fairness property is asserted.
+
+P1 corrects cursor stepping to select the next existing PTE in ascending address order. `take_next` and `protect_next` skip absent entries inside the source call (`ostd/src/mm/page_table/cursor/mod.rs:484-564`). The unmap loop finishes on `None` (`ostd/src/mm/vm_space.rs:475-482`), and protect finishes on `None` or range end (`kernel/core/src/vm/vmar/vm_mapping.rs:865-871`). Only returned mapped pages enter `touched`. A range with no PTEs goes directly to its completion event. The existing action/wrapper/event pairs remain one-to-one, and the trace wrappers additionally compare the returned page range. Post-state equality and the absence of silent actions remain unchanged.
+
+All normal mappings use a free address selected by the allocator, while MAP_FIXED uses the requested address. The model does not reproduce the allocator's search policy, limits or allocation failures. It treats READ/WRITE/EXEC as complete permission sets, with WRITE implying READ for the selected x86-64 ordinary-page cases. The supplied MC plans exercise READ and READ|WRITE. Private mappings are admission/ownership controls. Read fault-around, private faults and COW are excluded. Ordinary shared WRITE faults prime the access projection.
+
+Finite schedules do not cover arbitrary repeated syscalls, more than three pages, more than two concurrent callers, every permission combination or every defensive branch. The source's absent-snapshot-entry compensation remains represented even if these plans do not reach it. Excluded MAP_SHARED_VALIDATE, exec seals, huge pages, GUP/DMA, resizing, fork/exec/exit, mremap and other filesystems are not inferred from a bounded result. ftruncate belongs to setup.
+
+The user's priorities map directly to the four rows above. BOUNDARY-VALIDATION is checked at FD and seal admission. NO-STALE-ACCESS is qualified to the ordinary generation-tagged revocation substrate. FAILURE-ATOMICITY uses the operation-specific seal, prefix and replacement contracts. OBJECT-IDENTITY-STABILITY follows admission generations, offsets and file descriptions across owner changes. None of these names is an assumed successful outcome.
+
+## Generation checks and remaining work
+
+All three TLA+ modules passed syntax and semantic analysis after the revision. The static audit found 32 base actions, 32 trace wrappers and 32 instrumentation entries, and verified every §5 safety predicate against the actual hunt files. All ten MC configurations were rerun. The standard configuration completed with 40,745 distinct states. The new scenario-1 protocol configuration completed 1,674 distinct states to depth 58 with zero queued states and no enabled invariant violation or deadlock. Scenario 2, the default-SEAL control, scenario 3 and scenario 4 also completed without a violated enabled property. The original scenario-1 compatibility hunt and the three dedicated TV configurations retained their expected counterexamples. These are accounted for individually in the [check report](generation-checks/README.md) and preserved logs/JSON.
+
+The trace specification uses per-thread timeboxes, calls each full base action, validates exact post-state records, has no silent actions, and enables `TraceMatched`. All synthetic fixtures were regenerated, and all ten checks met their expected outcomes. The unfaulted three-page TV-2 replacement has zero PTE-removal events and one cursor completion. Its reviewer-derived fixture matched and produced a `TraceNotComplete` complete-path witness at `l=32` for 31 events. The corrupted seal snapshot still failed `TraceMatched`. These fixtures are not implementation traces. The instrumentation handoff specifies every event, capture boundary, raw result and identity normalization. Kernel reproduction and genuine trace validation remain NOT_RUN. The supplied generation review is addressed by this revision, whose subsequent independent review remains NOT_RUN.

@@ -1,0 +1,112 @@
+--- candidate-v2/STATUS.md
++++ candidate-v3/STATUS.md
+@@ -2,7 +2,7 @@
+ 
+ The harness is incomplete. Real source instrumentation, the regression fixtures, apply/cleanup scripts, the guarded build/run/collection entry point and the Phase 3 guide are present. There are no collected implementation traces and no trace-validation result.
+ 
+-The independent v1 review found four material issues. The proposed correction moves imports after inner documentation, captures the false park-check end directly after its load, and adds same-interface consumers and an observer/consumer fixture. Exact-version re-review is pending. The clock issue remains open: unfenced TSC reads and sample handshakes do not establish the operation intervals required by this TraceSpec. The gate blocks dependent execution and grouped trace production until the controller supplies an admissible method and obtains independent approval.
++The independent v1 review found four material issues. The proposed correction moves imports after inner documentation, captures the false park-check end directly after its load, and adds same-interface consumers and an observer/consumer fixture. The v2 independent review closed the import and park-check placement findings statically, and confirmed that the missing scenario paths now exist. It also found an incorrect kernel filename and Linux metadata that reported an unapplied guest-only delay. Candidate v3 directs OSDK output to `harness/build/kernel/asterinas-osdk-bin.elf` and records zero observer-delay cycles on Linux. Final exact-version review is pending. The clock issue remains open: unfenced TSC reads and sample handshakes do not establish the operation intervals required by this TraceSpec. The gate blocks dependent execution and grouped trace production until the controller supplies an admissible method and obtains independent approval.
+ 
+ The host's observed available memory has also remained below the resource policy's 10 GiB kernel-build threshold. Each `run.sh` attempt records a fresh reading. The controller owns admission and the held heavy-stage lock. This worker has not reacquired it or launched another pipeline phase.
+ 
+--- candidate-v2/evidence/applied.json
++++ candidate-v3/evidence/applied.json
+@@ -18,7 +18,7 @@
+     "test/initramfs/src/regression/process/Makefile": "52e77399113a2ec9227425bc21d9445ea49715e0b1b8792e71796161568a0fbe",
+     "ostd/src/wr_trace.rs": "7b883bb76828bc2039020cfe6e2e09e33cf3242f276ddf164aa6f7562978f13c",
+     "kernel/core/src/syscall/wr_syscall.rs": "aee0e9ad96b463d2524a5ad5498b665b8dc6e5be37cad99309b8e0576f21d38b",
+-    "test/initramfs/src/regression/process/wait_reap_trace/wait_reap_trace.c": "b649c793598d2981f59a25309194ebfa3202ae656a8b5c1ef603ee0212723d3e",
++    "test/initramfs/src/regression/process/wait_reap_trace/wait_reap_trace.c": "1437deb6fbd7b77faccfc76b96d75b4cca2b2d501f3d5b029c266b9c543c27fd",
+     "test/initramfs/src/regression/process/wait_reap_trace/wait_calibration.c": "e591d0b635f3854038d8323ba03565a359fc38768b0bfc3173d61d08e04671c3",
+     "test/initramfs/src/regression/process/wait_reap_trace/Makefile": "124457dd18d700a8a3080f87956e34f578da7ef982b3aa8cbfafe965be1c14bb"
+   }
+--- candidate-v2/review-gate.json
++++ candidate-v3/review-gate.json
+@@ -1,8 +1,8 @@
+ {
+   "status": "INCOMPLETE",
+   "blocking_finding": "R2: unfenced TSC does not establish the required operation interval ordering",
+-  "review": "evidence/review-v1.md",
+-  "review_sha256": "84f96ba7d8d48e73f3a4d14b40ea0fe318dbbf7badcd93f86fad281eacbf085f",
++  "review": "evidence/review-v2.md",
++  "review_sha256": "119a2d239343f432911349c6161d8a02edd949ad010ce3514fab93369f658cc6",
+   "reviewed_inputs": {},
+   "controller_action": "Arrange an admissible clock method and independent exact-version review before affected build, guest collection, or trace verification. Preserve this campaign and its prior candidates."
+ }
+--- candidate-v2/run.sh
++++ candidate-v3/run.sh
+@@ -38,7 +38,9 @@
+     --cpus=2 --memory=8g --memory-swap=8g --pids-limit=512 --network=none \
+     -v "$lane_dir:/work" -w /work/source "$image_id" bash -euc '
+     export CARGO_BUILD_JOBS=2
+-    gcc --version
++    cc --version
++    readlink -f /usr/bin/cc
++    sha256sum /usr/include/x86_64-linux-gnu/sys/wait.h /usr/include/x86_64-linux-gnu/sys/syscall.h /usr/include/x86_64-linux-gnu/bits/types/siginfo_t.h /usr/lib/x86_64-linux-gnu/libc.a
+     rustc --version
+     ldd --version
+     timeout 120 make -C test/initramfs/src/regression/process/wait_reap_trace \
+@@ -85,10 +87,11 @@
+     timeout 900 cargo build --manifest-path osdk/Cargo.toml --locked --target-dir /work/.specula-output/harness/build/osdk
+     cd kernel
+     timeout 1500 /work/.specula-output/harness/build/osdk/debug/cargo-osdk osdk build --release \
+-        --target-arch x86_64 --boot-method vmm-direct --strip-elf
++        --target-arch x86_64 --boot-method vmm-direct --strip-elf \
++        --output /work/.specula-output/harness/build/kernel
+     ' >"$evidence/kernel-build.log" 2>&1
+ 
+-kernel_path="$source_dir/target/osdk/aster-kernel-osdk-bin.qemu_elf"
++kernel_path="$harness_dir/build/kernel/asterinas-osdk-bin.elf"
+ test -s "$kernel_path"
+ sha256sum "$kernel_path" >"$evidence/kernel.sha256"
+ for binary in wait_reap_trace wait_calibration; do
+@@ -103,7 +106,7 @@
+         --cpus=2 --memory=8g --memory-swap=8g --pids-limit=512 --network=none --device=/dev/kvm \
+         -v "$lane_dir:/work" "$image_id" \
+         timeout 120 python3 /work/.specula-output/harness/src/boot.py \
+-        --kernel /work/source/target/osdk/aster-kernel-osdk-bin.qemu_elf \
++        --kernel /work/.specula-output/harness/build/kernel/asterinas-osdk-bin.elf \
+         --initramfs /work/.specula-output/harness/build/wait_reap_trace.cpio \
+         --log "/work/.specula-output/harness/evidence/$attempt/guest-$case_name.log" "$scenario" "$value" "$delay" "$pair" "$readiness"
+     python3 "$harness_dir/src/collect.py" "$evidence/guest-$case_name.log" \
+@@ -113,7 +116,7 @@
+     --cpus=2 --memory=8g --memory-swap=8g --pids-limit=512 --network=none --device=/dev/kvm \
+     -v "$lane_dir:/work" "$image_id" \
+     timeout 120 python3 /work/.specula-output/harness/src/boot.py \
+-    --kernel /work/source/target/osdk/aster-kernel-osdk-bin.qemu_elf \
++    --kernel /work/.specula-output/harness/build/kernel/asterinas-osdk-bin.elf \
+     --initramfs /work/.specula-output/harness/build/wait_calibration.cpio \
+     --log "/work/.specula-output/harness/evidence/$attempt/guest-calibration.log" --calibration calibration 37 0
+ wc -l "$lane_dir/.specula-output/traces/"*"$attempt.ndjson"
+--- candidate-v2/src/wait_reap_trace.c
++++ candidate-v3/src/wait_reap_trace.c
+@@ -68,11 +68,19 @@
+     assert(pthread_sigmask(SIG_SETMASK, NULL, &mask) == 0);
+     assert(sigismember(&mask, SIGCHLD) == 1);
+ }
++static unsigned long observer_delay_cycles(void)
++{
++#ifdef __asterinas__
++    return overlap ? 50000000UL : 0UL;
++#else
++    return 0;
++#endif
++}
+ static int control(int command, int actor)
+ {
+ #ifdef __asterinas__
+     return syscall(SYS_prctl, 0x53575000 + command, actor, child,
+-                   overlap && actor == 1 ? 50000000UL : 0UL, 0);
++                   actor == 1 ? observer_delay_cycles() : 0UL, 0);
+ #else
+     (void)command;
+     (void)actor;
+@@ -296,7 +304,7 @@
+            (uintptr_t)waiters[0].output, (uintptr_t)waiters[1].output,
+            identity.sysname, identity.release, identity.machine, gnu_get_libc_version(),
+            CALIBRATION_SAMPLES, cpus[0], cpus[1], delay_us, pair, already_exited ? "true" : "false",
+-           overlap ? 50000000UL : 0UL);
++           observer_delay_cycles());
+     for (int i = 0; i < CALIBRATION_SAMPLES; ++i)
+         printf("WR_CLOCK %" PRIu64 " %" PRIu64 " %" PRIu64 " %" PRIu64 "\n",
+                clock_samples[i][0], clock_samples[i][1], clock_samples[i][2], clock_samples[i][3]);

@@ -1,0 +1,711 @@
+diff --git a/kernel/core/src/process/exit.rs b/kernel/core/src/process/exit.rs
+index c29879578..e13f02d13 100644
+--- a/kernel/core/src/process/exit.rs
++++ b/kernel/core/src/process/exit.rs
+@@ -1,5 +1,7 @@
+ // SPDX-License-Identifier: MPL-2.0
+ 
++use ostd::wr_trace as wr;
++
+ use core::sync::atomic::Ordering;
+ 
+ use super::{INIT_PROCESS_PID, Pid, Process, pid_table};
+@@ -184,4 +186,5 @@ fn send_child_death_signal(current_process: &Process) {
+         parent.enqueue_signal(Box::new(signal));
+     };
+     parent.children_wait_queue().wake_all();
++    wr::exit_done();
+ }
+diff --git a/kernel/core/src/process/pid_table.rs b/kernel/core/src/process/pid_table.rs
+index de49d1d85..16d9e7414 100644
+--- a/kernel/core/src/process/pid_table.rs
++++ b/kernel/core/src/process/pid_table.rs
+@@ -7,6 +7,8 @@
+ //! the kernel objects that share the same numeric identifier, which eliminates
+ //! the need for separate per-type lookup tables.
+ 
++use ostd::wr_trace as wr;
++
+ use alloc::collections::btree_map::Entry;
+ 
+ use super::{Pgid, Pid, Process, ProcessGroup, Session, Sid};
+@@ -156,8 +158,10 @@ impl PidTable {
+             // `clear_process` will assert the process slot is not empty.
+             self.process_count -= 1;
+ 
++            let wr_start = wr::stamp();
+             pid_entry.clear_process();
+             pid_entry.clear_thread();
++            if pid as u64 == wr::child_pid() { wr::waiter_event(7, wr_start, &[]); }
+             // Drop the locked PID entry before removing the B-tree entry.
+             pid_entry.is_empty()
+         };
+diff --git a/kernel/core/src/process/posix_thread/mod.rs b/kernel/core/src/process/posix_thread/mod.rs
+index 77b93bd0a..310a5f4d0 100644
+--- a/kernel/core/src/process/posix_thread/mod.rs
++++ b/kernel/core/src/process/posix_thread/mod.rs
+@@ -1,5 +1,7 @@
+ // SPDX-License-Identifier: MPL-2.0
+ 
++use ostd::wr_trace as wr;
++
+ use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+ 
+ use aster_rights::{ReadDupOp, ReadOp, ReadWriteOp};
+@@ -177,12 +179,19 @@ impl PosixThread {
+     pub(crate) fn set_signalled_waker(&self, waker: Arc<Waker>, reason: PauseReason) {
+         let mut signalled_waker = self.signalled_waker.lock();
+         assert!(signalled_waker.is_none());
++        let wr_start = wr::stamp();
++        let wr_key = waker.trace_call();
+         *signalled_waker = Some((waker, reason));
++        if wr_key != wr::NO_CALL { wr::waiter_event(15, wr_start, &[]); }
+     }
+ 
+     /// Clears the signalled waker of this thread.
+     pub(crate) fn clear_signalled_waker(&self) {
+-        *self.signalled_waker.lock() = None;
++        let mut slot = self.signalled_waker.lock();
++        let wr_key = slot.as_ref().map_or(wr::NO_CALL, |(w, _)| w.trace_call());
++        let wr_start = wr::stamp();
++        *slot = None;
++        if wr_key != wr::NO_CALL { wr::waiter_event(23, wr_start, &[]); }
+     }
+ 
+     /// Returns the sleeping state of this thread.
+@@ -248,9 +257,15 @@ impl PosixThread {
+ 
+     /// Wakes up the signalled waker.
+     pub(crate) fn wake_signalled_waker(&self) {
+-        if let Some((waker, _)) = &*self.signalled_waker.lock() {
+-            waker.wake_up();
+-        }
++        let wr_start = wr::stamp();
++        let slot = self.signalled_waker.lock();
++        let wr_actor = wr::actor_for_tid(self.tid() as u64);
++        let wr_key = slot.as_ref().map_or(wr::NO_CALL, |(w, _)| w.trace_call());
++        wr::signal_get(wr_start, wr_actor, wr_key);
++        if let Some((waker, _)) = &*slot { waker.wake_up(); }
++        let wr_start = wr::stamp();
++        drop(slot);
++        wr::wake_finish(wr_start, wr_key, 1);
+     }
+ 
+     /// Enqueues a thread-directed signal.
+diff --git a/kernel/core/src/process/process/mod.rs b/kernel/core/src/process/process/mod.rs
+index c8e6949bc..5e0c1b225 100644
+--- a/kernel/core/src/process/process/mod.rs
++++ b/kernel/core/src/process/process/mod.rs
+@@ -1,5 +1,7 @@
+ // SPDX-License-Identifier: MPL-2.0
+ 
++use ostd::wr_trace as wr;
++
+ use core::{
+     sync::atomic::{AtomicBool, AtomicI16, AtomicU32, Ordering},
+     time::Duration,
+@@ -643,7 +645,10 @@ impl Process {
+             return;
+         }
+ 
++        let wr_start = wr::stamp();
+         self.sig_queues.enqueue(signal);
++        let wr_notify = wr::child() && self.pid() as u64 == wr::parent_pid();
++        if wr_notify { wr::signal_enqueued(wr_start); }
+ 
+         for task in self.tasks.lock().as_slice() {
+             let posix_thread = task.as_posix_thread().unwrap();
+@@ -654,6 +659,7 @@ impl Process {
+             // Reference: <https://elixir.bootlin.com/linux/v6.17/source/kernel/signal.c#L969>.
+             posix_thread.wake_signalled_waker();
+         }
++        if wr_notify { let start = wr::stamp(); wr::emit(35, start, wr::stamp(), wr::NO_CALL, &[]); }
+     }
+ 
+     /// Clears the parent death signal.
+diff --git a/kernel/core/src/process/signal/pause.rs b/kernel/core/src/process/signal/pause.rs
+index 9477c7e14..89f887f66 100644
+--- a/kernel/core/src/process/signal/pause.rs
++++ b/kernel/core/src/process/signal/pause.rs
+@@ -1,5 +1,7 @@
+ // SPDX-License-Identifier: MPL-2.0
+ 
++use ostd::wr_trace as wr;
++
+ use ostd::sync::{WaitQueue, Waiter};
+ 
+ use super::sig_mask::SigMask;
+@@ -147,6 +149,7 @@ impl Pause for Waiter {
+         };
+ 
+         let cancel_cond = || {
++            let wr_start = wr::stamp();
+             let has_pending = match reason {
+                 PauseReason::StopByPtrace => posix_thread.has_pending_sigkill(),
+                 _ => posix_thread.has_pending(),
+@@ -158,6 +161,7 @@ impl Pause for Waiter {
+                     "the current thread is interrupted by a signal",
+                 ));
+             }
++            wr::waiter_event(17, wr_start, &[has_pending as u64, timeout.is_some() as u64]);
+             Ok(())
+         };
+ 
+@@ -237,6 +241,7 @@ impl Pause for WaitQueue {
+             return Ok(res);
+         }
+ 
++        wr::arm_pair();
+         let (waiter, _) = Waiter::new_pair();
+         let cond = || {
+             self.enqueue(waiter.waker());
+diff --git a/kernel/core/src/process/status.rs b/kernel/core/src/process/status.rs
+index cfe77afc5..d744b4c32 100644
+--- a/kernel/core/src/process/status.rs
++++ b/kernel/core/src/process/status.rs
+@@ -2,6 +2,8 @@
+ 
+ //! The process status.
+ 
++use ostd::wr_trace as wr;
++
+ use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+ 
+ use ostd::sync::SpinLock;
+@@ -50,7 +52,10 @@ impl ProcessStatus {
+     /// after it.
+     pub(super) fn set_zombie(&self) {
+         // Use the `Release` memory order to make the exit code visible.
++        let wr_start = wr::stamp();
+         self.is_zombie.store(true, Ordering::Release);
++        let wr_end = wr::stamp();
++        if wr::child() { wr::emit(31, wr_start, wr_end, wr::NO_CALL, &[]); }
+     }
+ }
+ 
+@@ -74,7 +79,10 @@ impl ProcessStatus {
+ 
+     /// Sets the exit code.
+     pub(super) fn set_exit_code(&self, exit_code: ExitCode) {
++        let wr_start = wr::stamp();
+         self.exit_code.store(exit_code, Ordering::Relaxed);
++        let wr_end = wr::stamp();
++        if wr::child() { wr::emit(30, wr_start, wr_end, wr::NO_CALL, &[exit_code as u64]); }
+     }
+ }
+ 
+diff --git a/kernel/core/src/process/wait.rs b/kernel/core/src/process/wait.rs
+index 7bf641737..898c121c1 100644
+--- a/kernel/core/src/process/wait.rs
++++ b/kernel/core/src/process/wait.rs
+@@ -1,5 +1,7 @@
+ // SPDX-License-Identifier: MPL-2.0
+ 
++use ostd::wr_trace as wr;
++
+ use super::{
+     ExitCode, Pid, Process,
+     process_filter::ProcessFilter,
+@@ -73,12 +75,13 @@ pub(crate) fn do_wait(
+                 };
+ 
+                 let has_unready_child = match try_wait_children(&child_filter, wait_options, ctx) {
+-                    WaitResult::Found(status) => return Some(Ok(Some(status))),
++                    WaitResult::Found(status) => { wr::decision(10, wr::stamp()); return Some(Ok(Some(status))); },
+                     WaitResult::MatchedButUnready => true,
+                     WaitResult::NoMatch => false,
+                 };
+ 
+                 if !has_unready_tracee && !has_unready_child {
++                    wr::decision(11, wr::stamp());
+                     return Some(Err(Error::with_message(
+                         Errno::ECHILD,
+                         "the process has no child to wait",
+@@ -86,6 +89,7 @@ pub(crate) fn do_wait(
+                 }
+ 
+                 if wait_options.contains(WaitOptions::WNOHANG) {
++                    wr::decision(12, wr::stamp());
+                     return Some(Ok(None));
+                 }
+ 
+@@ -96,7 +100,7 @@ pub(crate) fn do_wait(
+                     )));
+                 }
+ 
+-                // wait
++                wr::decision(13, wr::stamp());
+                 None
+             })
+         },
+@@ -290,16 +294,22 @@ fn try_wait_children(
+     // Acquire the children lock at first to prevent race conditions.
+     // We want to ensure that multiple waiting threads
+     // do not return the same waited process status.
++    let wr_start = wr::stamp();
+     let mut children_lock = ctx.process.children().lock();
++    wr::waiter_event(2, wr_start, &[]);
+     let children_mut = children_lock.as_mut().unwrap();
+ 
+     let mut fallback_result = WaitResult::NoMatch;
+ 
++    let wr_match_start = wr::stamp();
++    let mut wr_matched = false;
+     for child in children_mut.values() {
+         if !wait_filter(child.pid(), child, child_filter) {
+             continue;
+         }
+ 
++        wr_matched = true;
++        wr::waiter_event(3, wr_match_start, &[1]);
+         // We have found at least one child matching `child_filter`.
+         fallback_result = WaitResult::MatchedButUnready;
+ 
+@@ -307,8 +317,13 @@ fn try_wait_children(
+             continue;
+         }
+ 
+-        if child.status().is_zombie() {
++        let wr_start = wr::stamp();
++        let wr_zombie = child.status().is_zombie();
++        wr::waiter_event(4, wr_start, &[wr_zombie as u64]);
++        if wr_zombie {
++            let wr_start = wr::stamp();
+             let child = child.clone();
++            wr::waiter_event(5, wr_start, &[child.pid() as u64, wait_options.contains(WaitOptions::WNOWAIT) as u64]);
+             if !wait_options.contains(WaitOptions::WNOWAIT) {
+                 reap_zombie_child(
+                     child.pid(),
+@@ -316,6 +331,9 @@ fn try_wait_children(
+                     ctx.process.reaped_children_stats(),
+                 );
+             }
++            let wr_start = wr::stamp();
++            drop(children_lock);
++            wr::waiter_event(9, wr_start, &[]);
+             return WaitResult::Found(WaitStatus::Zombie(child));
+         }
+ 
+@@ -332,6 +350,10 @@ fn try_wait_children(
+         return WaitResult::Found(wait_status);
+     }
+ 
++    if !wr_matched { wr::waiter_event(3, wr_match_start, &[0]); }
++    let wr_start = wr::stamp();
++    drop(children_lock);
++    wr::waiter_event(9, wr_start, &[]);
+     fallback_result
+ }
+ 
+@@ -341,7 +363,9 @@ fn reap_zombie_child(
+     children_lock: &mut BTreeMap<Pid, Arc<Process>>,
+     reaped_children_stats: &Mutex<ReapedChildrenStats>,
+ ) -> ExitCode {
++    let wr_start = wr::stamp();
+     let child_process = children_lock.remove(&child_pid).unwrap();
++    wr::waiter_event(6, wr_start, &[children_lock.contains_key(&child_pid) as u64]);
+     assert!(child_process.status().is_zombie());
+ 
+     let mut pid_table = pid_table::pid_table_mut();
+@@ -371,5 +395,8 @@ fn reap_zombie_child(
+     kernel_time += child_process.prof_clock().kernel_clock().read_time();
+     reaped_children_stats.lock().add(user_time, kernel_time);
+ 
+-    child_process.status().exit_code()
++    let wr_start = wr::stamp();
++    let code = child_process.status().exit_code();
++    wr::waiter_event(8, wr_start, &[]);
++    code
+ }
+diff --git a/kernel/core/src/syscall/mod.rs b/kernel/core/src/syscall/mod.rs
+index 2b5dfbef6..76ee090ff 100644
+--- a/kernel/core/src/syscall/mod.rs
++++ b/kernel/core/src/syscall/mod.rs
+@@ -198,6 +198,7 @@ mod uname;
+ mod unlink;
+ mod unshare;
+ mod utimens;
++mod wr_syscall;
+ mod wait4;
+ mod waitid;
+ mod write;
+diff --git a/kernel/core/src/syscall/prctl.rs b/kernel/core/src/syscall/prctl.rs
+index c26b3ef6a..c6c5bb8a0 100644
+--- a/kernel/core/src/syscall/prctl.rs
++++ b/kernel/core/src/syscall/prctl.rs
+@@ -20,6 +20,7 @@ pub(super) fn sys_prctl(
+     arg5: u64,
+     ctx: &Context,
+ ) -> Result<SyscallReturn> {
++    if let Some(result) = super::wr_syscall::control(option, arg2, arg3, arg4, ctx) { return result; }
+     let prctl_cmd = PrctlCmd::from_args(option, arg2, arg3, arg4, arg5)?;
+     debug!("prctl_cmd = {:x?}", prctl_cmd);
+ 
+diff --git a/kernel/core/src/syscall/wait4.rs b/kernel/core/src/syscall/wait4.rs
+index 7e0a6d0c8..95d9554bd 100644
+--- a/kernel/core/src/syscall/wait4.rs
++++ b/kernel/core/src/syscall/wait4.rs
+@@ -1,5 +1,7 @@
+ // SPDX-License-Identifier: MPL-2.0
+ 
++use ostd::wr_trace as wr;
++
+ use ostd::mm::VmIo;
+ 
+ use super::{SyscallReturn, getrusage::rusage_t};
+@@ -8,7 +10,13 @@ use crate::{
+     process::{ProcessFilter, WaitOptions, WaitStatus, do_wait, posix_thread::AsPosixThread},
+ };
+ 
+-pub(super) fn sys_wait4(
++pub(super) fn sys_wait4(wait_pid: u64, status_ptr: u64, wait_options: u32, rusage_addr: Vaddr, ctx: &Context) -> Result<SyscallReturn> {
++    let result = sys_wait4_inner(wait_pid, status_ptr, wait_options, rusage_addr, ctx);
++    super::wr_syscall::returned(&result);
++    result
++}
++
++fn sys_wait4_inner(
+     wait_pid: u64,
+     status_ptr: u64,
+     wait_options: u32,
+@@ -33,6 +41,7 @@ pub(super) fn sys_wait4(
+         );
+     }
+ 
++    super::wr_syscall::begin(4, wait_pid, 0, wait_options.bits() as u64, rusage_addr as u64, status_ptr, ctx)?;
+     let wait_status =
+         do_wait(process_filter, wait_options, ctx).map_err(|err| match err.error() {
+             Errno::EINTR => Error::new(Errno::ERESTARTSYS),
+@@ -42,9 +51,13 @@ pub(super) fn sys_wait4(
+         return Ok(SyscallReturn::Return(0 as _));
+     };
+ 
++    let wr_start = wr::stamp();
+     let (return_pid, status_code) = (wait_status.pid(), calculate_status_code(&wait_status));
++    wr::waiter_event(25, wr_start, &[status_code as u64, return_pid as u64]);
+     if status_ptr != 0 {
++        let wr_start = wr::stamp();
+         ctx.user_space().write_val(status_ptr as _, &status_code)?;
++        super::wr_syscall::copyout(wr_start, 4, status_ptr, ctx)?;
+     }
+ 
+     if rusage_addr != 0 {
+@@ -57,6 +70,9 @@ pub(super) fn sys_wait4(
+         ctx.user_space().write_val(rusage_addr, &rusage)?;
+     }
+ 
++    let wr_start = wr::stamp();
++    drop(wait_status);
++    wr::waiter_event(28, wr_start, &[]);
+     Ok(SyscallReturn::Return(return_pid as _))
+ }
+ 
+diff --git a/kernel/core/src/syscall/waitid.rs b/kernel/core/src/syscall/waitid.rs
+index fc175eaa8..e79b5f328 100644
+--- a/kernel/core/src/syscall/waitid.rs
++++ b/kernel/core/src/syscall/waitid.rs
+@@ -1,5 +1,7 @@
+ // SPDX-License-Identifier: MPL-2.0
+ 
++use ostd::wr_trace as wr;
++
+ use ostd::mm::VmIo;
+ 
+ use super::SyscallReturn;
+@@ -17,7 +19,13 @@ use crate::{
+     },
+ };
+ 
+-pub(super) fn sys_waitid(
++pub(super) fn sys_waitid(which: u64, upid: u64, infoq_addr: u64, options: u64, _rusage_addr: u64, ctx: &Context) -> Result<SyscallReturn> {
++    let result = sys_waitid_inner(which, upid, infoq_addr, options, _rusage_addr, ctx);
++    super::wr_syscall::returned(&result);
++    result
++}
++
++fn sys_waitid_inner(
+     which: u64,
+     upid: u64,
+     infoq_addr: u64,
+@@ -40,6 +48,7 @@ pub(super) fn sys_waitid(
+         );
+     }
+ 
++    super::wr_syscall::begin(247, upid, which, options, _rusage_addr, infoq_addr, ctx)?;
+     let wait_status =
+         do_wait(process_filter, wait_options, ctx).map_err(|err| match err.error() {
+             Errno::EINTR => Error::new(Errno::ERESTARTSYS),
+@@ -51,10 +60,13 @@ pub(super) fn sys_waitid(
+     };
+ 
+     if infoq_addr != 0 {
++        wr::delay_output();
++        let wr_start = wr::stamp();
+         let siginfo = {
+             let (si_code, si_status) = calculate_si_code_and_si_status(&wait_status);
+             let pid = wait_status.pid();
+             let uid = wait_status.uid();
++            wr::waiter_event(26, wr_start, &[wr::read_code(), pid as u64, u32::from(uid) as u64]);
+ 
+             let mut siginfo = siginfo_t::new(SIGCHLD, si_code);
+             siginfo.set_pid_uid(pid, uid);
+@@ -63,9 +75,14 @@ pub(super) fn sys_waitid(
+             siginfo
+         };
+ 
++        let wr_start = wr::stamp();
+         ctx.user_space().write_val(infoq_addr as usize, &siginfo)?;
++        super::wr_syscall::copyout(wr_start, 247, infoq_addr, ctx)?;
+     }
+ 
++    let wr_start = wr::stamp();
++    drop(wait_status);
++    wr::waiter_event(28, wr_start, &[]);
+     Ok(SyscallReturn::Return(0))
+ }
+ 
+@@ -87,6 +104,7 @@ fn calculate_si_code_and_si_status(wait_status: &WaitStatus) -> (i32, i32) {
+     match wait_status {
+         WaitStatus::Zombie(process) => {
+             let exit_code = process.status().exit_code();
++            wr::save_code(exit_code as u64);
+             parse_exit_code(exit_code)
+         }
+         WaitStatus::Stop(_process, signum) => (CLD_STOPPED, signum.as_u8() as i32),
+diff --git a/ostd/src/lib.rs b/ostd/src/lib.rs
+index 1dcc3d8ed..121f9b243 100644
+--- a/ostd/src/lib.rs
++++ b/ostd/src/lib.rs
+@@ -48,6 +48,7 @@ pub mod prelude;
+ pub mod smp;
+ pub mod sync;
+ pub mod task;
++pub mod wr_trace;
+ pub mod timer;
+ pub mod user;
+ pub mod util;
+diff --git a/ostd/src/sync/wait.rs b/ostd/src/sync/wait.rs
+index c1b7b9e5a..b46f5fee0 100644
+--- a/ostd/src/sync/wait.rs
++++ b/ostd/src/sync/wait.rs
+@@ -4,7 +4,7 @@ use alloc::{collections::VecDeque, sync::Arc};
+ use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+ 
+ use super::{LocalIrqDisabled, SpinLock};
+-use crate::task::{Task, scheduler};
++use crate::{task::{Task, scheduler}, wr_trace as wr};
+ 
+ // # Explanation on the memory orders
+ //
+@@ -109,27 +109,27 @@ impl WaitQueue {
+ 
+     /// Wakes up all waiting threads, returning the number of threads that were woken up.
+     pub fn wake_all(&self) -> usize {
+-        // Fast path
+-        if self.is_empty() {
+-            return 0;
+-        }
+-
++        let traced = wr::child() && wr::queue(self as *const Self as usize);
++        let start = wr::stamp();
++        let count = self.num_wakers.fetch_add(0, Ordering::Release);
++        let end = wr::stamp();
++        if traced { wr::emit(39, start, end, wr::NO_CALL, &[count as u64]); }
++        if count == 0 { return 0; }
+         let mut num_woken = 0;
+-
+         loop {
++            let start = wr::stamp();
+             let mut wakers = self.wakers.lock();
+             let Some(waker) = wakers.pop_front() else {
++                if traced { wr::emit(41, start, wr::stamp(), wr::NO_CALL, &[0]); }
+                 break;
+             };
+-            self.num_wakers.fetch_sub(1, Ordering::Release);
+-            // Avoid holding lock when calling `wake_up`
++            let count = self.num_wakers.fetch_sub(1, Ordering::Release) - 1;
++            let data = if traced { trace_queue(&wakers, count) } else { [0; 34] };
+             drop(wakers);
+-
+-            if waker.wake_up() {
+-                num_woken += 1;
+-            }
++            if traced { wr::emit(40, start, wr::stamp(), waker.trace_call, &data[..2 + data[1] as usize * 2]); }
++            if waker.wake_up() { num_woken += 1; }
++            if traced { wr::wake_finish(wr::stamp(), waker.trace_call, 2); }
+         }
+-
+         num_woken
+     }
+ 
+@@ -144,11 +144,28 @@ impl WaitQueue {
+     #[doc(hidden)]
+     pub fn enqueue(&self, waker: Arc<Waker>) {
+         let mut wakers = self.wakers.lock();
++        let wr_start = wr::stamp();
+         wakers.push_back(waker);
+-        self.num_wakers.fetch_add(1, Ordering::Acquire);
++        let count = self.num_wakers.fetch_add(1, Ordering::Acquire) + 1;
++        let wr_end = wr::stamp();
++        if wr::queue(self as *const Self as usize) && wr::waiting() {
++            let data = trace_queue(&wakers, count);
++            wr::emit(16, wr_start, wr_end, wr::call(), &data[..2 + data[1] as usize * 2]);
++        }
+     }
+ }
+ 
++fn trace_queue(wakers: &VecDeque<Arc<Waker>>, count: u32) -> [u64; 34] {
++    let mut data = [0; 34];
++    data[0] = count as u64;
++    data[1] = wakers.len().min(16) as u64;
++    for (i, waker) in wakers.iter().take(16).enumerate() {
++        data[2 + i * 2] = waker.trace_call[0];
++        data[3 + i * 2] = waker.trace_call[1];
++    }
++    data
++}
++
+ impl Default for WaitQueue {
+     fn default() -> Self {
+         Self::new()
+@@ -172,6 +189,7 @@ impl !Sync for Waiter {}
+ /// A waker can be created by calling [`Waiter::new_pair`]. This method creates an `Arc<Waker>` that can
+ /// be used across different threads.
+ pub struct Waker {
++    trace_call: wr::Call,
+     has_woken: AtomicBool,
+     task: Arc<Task>,
+ }
+@@ -179,10 +197,13 @@ pub struct Waker {
+ impl Waiter {
+     /// Creates a waiter and its associated [`Waker`].
+     pub fn new_pair() -> (Self, Arc<Waker>) {
+-        let waker = Arc::new(Waker {
++        let wr_start = wr::stamp();
++        let mut waker = Arc::new(Waker {
++            trace_call: wr::NO_CALL,
+             has_woken: AtomicBool::new(false),
+             task: Task::current().unwrap().cloned(),
+         });
++        Arc::get_mut(&mut waker).unwrap().trace_call = wr::pair(wr_start);
+         let waiter = Self {
+             waker: waker.clone(),
+         };
+@@ -250,6 +271,7 @@ impl Drop for Waiter {
+ }
+ 
+ impl Waker {
++    pub fn trace_call(&self) -> wr::Call { self.trace_call }
+     /// Wakes up the associated [`Waiter`].
+     ///
+     /// This method returns `true` if the waiter is woken by this call. It returns `false` if the
+@@ -260,25 +282,40 @@ impl Waker {
+     /// delivered, _or_ that the waiter will be dropped after being woken. It's up to the caller to
+     /// handle the latter case properly to avoid missing the wake event.
+     pub fn wake_up(&self) -> bool {
+-        if self.has_woken.swap(true, Ordering::Release) {
+-            return false;
+-        }
++        let wr_start = wr::stamp();
++        let old = self.has_woken.swap(true, Ordering::Release);
++        let wr_end = wr::stamp();
++        let traced = wr::child() && self.trace_call != wr::NO_CALL;
++        if traced { wr::emit(36, wr_start, wr_end, self.trace_call, &[old as u64]); }
++        if old { return false; }
++        let wr_start = wr::stamp();
+         scheduler::unpark_target(self.task.clone());
++        if traced { wr::emit(37, wr_start, wr::stamp(), self.trace_call, &[]); }
+ 
+         true
+     }
+ 
+     #[track_caller]
+     fn do_wait(&self) {
+-        while !self.has_woken.swap(false, Ordering::Acquire) {
++        loop {
++            let wr_start = wr::stamp();
++            let old = self.has_woken.swap(false, Ordering::Acquire);
++            let wr_end = wr::stamp();
++            let traced = self.trace_call != wr::NO_CALL && self.trace_call == wr::call();
++            if traced { wr::emit(18, wr_start, wr_end, self.trace_call, &[old as u64]); }
++            if old { break; }
++            if traced { wr::set_park(true); }
+             scheduler::park_current(|| self.has_woken.load(Ordering::Acquire));
++            if traced { wr::set_park(false); }
+         }
+     }
+ 
+     fn close(&self) {
+         // This must use `Ordering::Acquire`, although we do not care about the return value. See
+         // the memory order explanation at the top of the file for details.
++        let wr_start = wr::stamp();
+         let _ = self.has_woken.swap(true, Ordering::Acquire);
++        wr::close(wr_start, self.trace_call);
+     }
+ }
+ 
+diff --git a/ostd/src/task/scheduler/mod.rs b/ostd/src/task/scheduler/mod.rs
+index 87ea90175..827d12f89 100644
+--- a/ostd/src/task/scheduler/mod.rs
++++ b/ostd/src/task/scheduler/mod.rs
+@@ -449,12 +449,15 @@ where
+ {
+     let mut current = None;
+     let mut is_first_try = true;
++    let wr_start = crate::wr_trace::stamp();
++    let mut wr_dequeued = false;
+ 
+     reschedule(|local_rq: &mut dyn LocalRunQueue| {
+         let next_task_opt = if is_first_try {
+-            if has_unparked() {
+-                return ReschedAction::DoNothing;
+-            }
++            let observed = has_unparked();
++            let wr_check_end = crate::wr_trace::stamp();
++            if observed { return ReschedAction::DoNothing; }
++            if crate::wr_trace::parking() { crate::wr_trace::emit(19, wr_start, wr_check_end, crate::wr_trace::call(), &[0]); }
+             is_first_try = false;
+ 
+             // Note the race conditions: the current task may be woken after the above `has_unparked`
+@@ -467,7 +470,10 @@ where
+             // after more complex schedulers are introduced.
+ 
+             let should_pick_next = local_rq.update_current(UpdateFlags::Wait);
++            let wr_dequeue_start = crate::wr_trace::stamp();
+             current = local_rq.dequeue_current();
++            wr_dequeued = true;
++            crate::wr_trace::dequeue_pending(wr_dequeue_start);
+             should_pick_next.then(|| local_rq.pick_next())
+         } else {
+             local_rq.try_pick_next()
+@@ -483,6 +489,10 @@ where
+ 
+         ReschedAction::Retry
+     });
++    if crate::wr_trace::parking() {
++        if wr_dequeued { crate::wr_trace::waiter_event(21, crate::wr_trace::stamp(), &[]); }
++        else { crate::wr_trace::waiter_event(19, wr_start, &[1]); }
++    }
+ }
+ 
+ /// Unblocks a target task.
+@@ -577,6 +587,7 @@ where
+         scheduler_singleton().mut_local_rq_with(&mut |rq| {
+             action = f(rq);
+         });
++        crate::wr_trace::park_released();
+ 
+         match action {
+             ReschedAction::DoNothing => {
+diff --git a/test/initramfs/src/regression/process/Makefile b/test/initramfs/src/regression/process/Makefile
+index 6157f894a..d0c8a77bb 100644
+--- a/test/initramfs/src/regression/process/Makefile
++++ b/test/initramfs/src/regression/process/Makefile
+@@ -11,6 +11,7 @@ SUBDIRS := \
+ 	personality \
+ 	prctl \
+ 	pthread \
++	wait_reap_trace \
+ 	ptrace \
+ 	sched \
+ 	signal \

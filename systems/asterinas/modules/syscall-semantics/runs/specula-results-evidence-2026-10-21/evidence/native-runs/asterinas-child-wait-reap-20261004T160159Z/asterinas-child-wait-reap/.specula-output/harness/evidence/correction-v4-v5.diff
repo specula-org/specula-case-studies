@@ -1,0 +1,1095 @@
+diff --git a/harness/INSTRUMENTATION.md b/harness/INSTRUMENTATION.md
+index cbf4ba2..f4b84de 100644
+--- a/harness/INSTRUMENTATION.md
++++ b/harness/INSTRUMENTATION.md
+@@ -1,6 +1,6 @@
+ # Wait/reap trace instrumentation
+ 
+-This guide is for the controller and Phase 3 worker adjusting the Phase 2.5 harness. The harness modifies the real Asterinas checkout at `0c60537098f4c2949ad2d382aaf499de72263d76`. Candidate v4 is **incomplete** and diagnostic only. No v4 source installation, build, guest, Linux control or trace validation has run. Read [STATUS.md](STATUS.md), [the v3 independent review](evidence/review-v3.md) and [the v4 clock method](evidence/clock-method-v4.md) before review or execution. V4 awaits independent review and cannot produce grouped TraceSpec input.
++This guide is for the controller and Phase 3 worker adjusting the Phase 2.5 harness. The harness modifies the real Asterinas checkout at `0c60537098f4c2949ad2d382aaf499de72263d76`. Candidate v5 adds an opt-in consistency mode and remains **incomplete pending independent review**. No v5 source installation, build, guest, Linux control, collector execution or trace validation has run. Read [STATUS.md](STATUS.md), [the v4 clock analysis](evidence/clock-method-v4.md) and [the v5 encoding and claim](evidence/clock-method-v5.md) before review or execution. V4 remains preserved as diagnostic only. V5 does not close R2 for real global order or store visibility.
+ 
+ ## Apply and run
+ 
+@@ -9,16 +9,18 @@ The controller must retain the existing `heavy.lock` allocation. This worker mus
+ From `.specula-output`, the intended entry point is:
+ 
+ ```sh
+-bash harness/run.sh
++bash harness/run.sh --diagnostic
++# After independent approval explicitly covering the consistency scope:
++bash harness/run.sh --consistency
+ ```
+ 
+-Use this entry point only in the controller's installed lane layout. The current entry point exits 78 at the unresolved review gate, before applying source changes or invoking Docker. It records the live memory reading and gate disposition under a new `harness/evidence/<UTC>-<PID>-<UUID>/` directory. The reviewer/controller must bind the exact candidate, clock-method note and installed receipt before allowing dependent execution. Both execution and collection check the receipt. Approval of diagnostic collection does not enable grouped traces: v4 has a separate unconditional refusal for that output.
++Use this entry point only in the controller's installed lane layout. The current entry point exits 78 at the unresolved review gate, before applying source changes or invoking Docker. It records the live memory reading and gate disposition under a new `harness/evidence/<UTC>-<PID>-<UUID>/` directory. The reviewer/controller must bind the exact candidate, clock-method note and installed receipt before allowing dependent execution. Both execution and collection require an `APPROVED` receipt naming v5 and hashing the live semantic inputs, both clock notes and `candidate-v5/hashes.json`. The checker verifies the frozen snapshot too. A receipt with `approval_scope: DIAGNOSTIC_ONLY` admits diagnostics. Grouped output additionally requires `approval_scope: CONSISTENCY_UNDER_SAMPLED_CLOCK_BOUND` and the explicit `--consistency` flag. The author leaves the receipt `INCOMPLETE`. Python optimization is refused because it disables existing assertion-based checks.
+ 
+-The remaining script path builds the fixture with the repository's regression Makefile, runs Linux controls inside the pinned project container, checks memory again, builds the checkout's own OSDK and kernel, boots each guest scenario, and decodes the serial transport into diagnostic per-actor JSON and a calibration report. These steps are prepared but have not been executed on the corrected candidate. The selected image is the lane's `asterinas/dev:0.18.1-20260926`, pinned by ID `sha256:897cb1b354b3d7d28184d7a417c27565390fc3fa6886b328d2588e6de93c1dab`. This static task did not inspect its local installation or tools. The runner inspects that exact ID and uses `--pull=never`. Missing images or tools must stop the controller attempt. Each container name starts with `specula-wait-reap-20261005` and includes an attempt UUID and a distinct stage/case suffix. Only guest runs expose `/dev/kvm`, individually. No host `/dev` bind mount is used.
++After the review gate, memory admission precedes source application and all execution. The remaining script path builds the fixture with the repository's regression Makefile, runs Linux controls inside the pinned project container, checks memory again, builds the checkout's own OSDK and kernel, boots each guest scenario, and decodes the serial transport into diagnostic per-actor JSON and a calibration report. In consistency mode it also writes grouped input and a collection sidecar when every refusal check and the interval encoding succeed. These steps are prepared but have not been executed on the corrected candidate. The selected image is the lane's `asterinas/dev:0.18.1-20260926`, pinned by ID `sha256:897cb1b354b3d7d28184d7a417c27565390fc3fa6886b328d2588e6de93c1dab`. This static task did not inspect its local installation or tools. The runner inspects that exact ID and uses `--pull=never`. Missing images or tools must stop the controller attempt. Each container name starts with `specula-wait-reap-20261005` and includes an attempt UUID and a distinct stage/case suffix. Only guest runs expose `/dev/kvm`, individually. No host `/dev` bind mount is used.
+ 
+ Builds and tests have outer `timeout` bounds of at most 30 minutes. A timeout stops that attempt without an automatic retry. Preserve the log and distinguish an execution limit from a demonstrated lost wakeup. QEMU is stopped through QMP only after the fixture emits its completion marker. That stop is recorded separately from a timeout or guest exit.
+ 
+-`apply.sh` checks the source pin and refuses to replace preexisting edits to any touched file. Its receipt binds all 20 installed files. Reapplication verifies those hashes and checks that all copied candidate files match the installed files. It refuses a stale v3 installation when the v4 recorder or fixture differs. The preserved `evidence/applied.json` still describes v3. After approval, the controller must preserve that receipt, use `clean.sh` with it, apply v4 and bind the new receipt before execution. This task did not apply or clean anything. `clean.sh` restores only those owned files, and refuses to proceed if their contents changed after apply. It does not reset unrelated tracked files or remove the preexisting `.codex/` directory.
++`apply.sh` checks the source pin and refuses to replace preexisting edits to any touched file. Its receipt binds all 20 installed files. Reapplication verifies those hashes and checks that all copied candidate files match the installed files. It refuses a stale v3 installation when the candidate recorder or fixture differs. The preserved `evidence/applied.json` still describes v3. After approval, the controller must preserve that receipt, use `clean.sh` with it, apply the reviewed v5 candidate and bind the new receipt before execution. This task did not apply or clean anything. `clean.sh` restores only those owned files, and refuses to proceed if their contents changed after apply. It does not reset unrelated tracked files or remove the preexisting `.codex/` directory.
+ 
+ ## Recording and decoding
+ 
+@@ -28,7 +30,11 @@ The fixture uses private `prctl` control values only in this instrumented kernel
+ 
+ The kernel serial transport uses `WR_RAW` records with a numeric event ID, real TSC values, the actor/generation pair, and saved operands or branch outcomes. `collect.py` decodes those records into the exact names and records required by `Trace.tla`. Its dispatch table does not execute the model or fill missing operations. `WR_USER` records independently capture direct libc `syscall` results, errno and output bytes. The merged `SysWaitReturn` retains the kernel's result and extends its interval through the caller's separately measured completion.
+ 
+-After independent approval of diagnostics, `run.sh` writes `evidence/<attempt>/guest-<case>.json` and `linux-<case>.json`. Each report contains CPU identity, CPUID bits, all pre/post calibration samples, conditional offset ranges, the measured bound, user outputs and evidence hashes. Guest event files are in the adjacent `<report-stem>-events/` directory. Their tag is `diagnostic`, their timestamps are `local_start_tsc` and `local_end_tsc`, and they retain observed per-actor order. They are not TraceSpec inputs.
++After independent approval, `run.sh` writes under `.specula-output/traces/`. Diagnostic mode, also the runner default, writes `<attempt>-guest-<case>.diagnostic.json` and `<attempt>-linux-<case>.diagnostic.json`. Each successful report contains CPU identity, CPUID bits, all pre/post calibration samples, conditional offset ranges, the measured bound, user outputs and evidence hashes. Adjacent `<report-stem>-events/<actor>.json` files wrap the local event arrays with the evidence class and claim. Their event tag is `diagnostic`, their timestamps are `local_start_tsc` and `local_end_tsc`, and they retain observed per-actor order. Diagnostics remain `INELIGIBLE` and `LOCAL_STREAM_ORDER_ONLY`.
++
++Consistency mode produces that same guest diagnostic bundle, plus `<attempt>-guest-<case>.ndjson` and `<attempt>-guest-<case>.collection.json`. The grouped file is one JSON object with the unchanged TraceData schema and exact event envelopes. Its top-level fields carry the label, fixed claim, sampled bound, encoding identifier, CPU evidence and raw-log/review-receipt hashes. The sidecar binds the grouped and diagnostic files by SHA-256 and retains the full calibration. A collection refusal writes the diagnostic and, in consistency mode, the sidecar with `grouped_trace: REFUSED` and the reason, exits 65, and emits no grouped file. Raw serial logs remain in `harness/evidence/<attempt>/`. Existing output paths are never overwritten. Linux controls remain diagnostic only.
++
++Each guest initramfs contains the pinned image's static BusyBox. Before actor registration or any measured interval, `/init` runs `/bin/busybox nproc`, prints `WR_GUEST_NPROC`, then executes the unchanged fixture with its original arguments. The image build path checks the `sh` and `nproc` applets and absence of an ELF interpreter, and records the binary hash and program headers. Missing tools stop the attempt. `boot.py` saves the actual command, including `-smp 2`, and its outcome records the guest count. The collector requires guest `nproc == -smp == WR_META.smp` and affinity CPUs within that count. Linux logs separately record `WR_CONTROL_NPROC`. Container CPU quotas are not guest CPU counts. BusyBox availability and guest execution are still unverified at runtime.
+ 
+ ## Clock method and acceptance limit
+ 
+@@ -38,7 +44,13 @@ The C fixture checks invariant TSC, `CPUID.80000007H:EDX[8]`, TSC/SSE2 support a
+ 
+ This is a conditional sampled bound. Invariant TSC and matching pre/post samples cannot exclude an offset excursion or drift during the scenario, especially under virtualization. `run_wide_bound_cycles` remains `null`. There is no v4 runtime value yet. No interval is widened using model expectations, and a small sampled offset is not treated as zero.
+ 
+-`collect.py` requires `--diagnostic` to emit anything after the review and calibration checks. The default collection path refuses grouped output even if a reviewer later approves the candidate. The code no longer compresses timestamps, constructs global rankings or computes cross-actor overlap from these clocks. Diagnostics are labelled `INELIGIBLE` and `LOCAL_STREAM_ORDER_ONLY`. `Trace.tla` and its interval semantics are unchanged. A future acceptance method must justify all global-effect intervals, establish a run-wide clock bound, and respect the model's local non-overlap constraint. R2 remains open until independent review resolves those obligations.
++Every v5 collector report, diagnostic event-file envelope, grouped TraceData object and collection sidecar carries `evidence_class: "CONSISTENCY_UNDER_SAMPLED_CLOCK_BOUND"` and this fixed `claim` text:
++
++> An accepted TraceSearch.cfg witness shows that the observed per-event arguments and post-states are consistent with some model interleaving that respects each actor's local order and the recorded cross-actor interval constraints after widening by the sampled calibration bound. It does not establish the real global order, store-visibility timing, or a run-wide clock bound. A rejection is a candidate mismatch that must be re-examined against the clock limits before any model or kernel conclusion.
++
++For each different-CPU actor pair, the same invocation's sampled bound `B` changes the comparison to `end + B < start - B`, equivalently `end + 2B < start`. Both endpoints are widened. Same-CPU cross-actor comparisons retain their local clock relation. Actor arrays retain their observed order. The encoder uses only timestamps, actor CPUs and `B`. It solves endpoint inequalities that preserve every widened cross-actor comparison, including every absent edge, together with `start <= end` and `previous.end <= next.start`. Equal endpoint ranks are permitted. A constraint cycle containing a strict edge makes exact scalar encoding impossible, so collection records `UNREPRESENTABLE_LOCAL_ORDER` and refuses instead of clipping uncertainty or selecting an offset from a model witness. See the [proof and encoding](evidence/clock-method-v5.md).
++
++V4's one-sided argument about premature ends still applies under its stated assumptions: shortening ends adds precedence constraints, so it can cause rejection without establishing actual visibility order on acceptance. Widening removes uncertain cross-CPU edges. Unseen offset excursions, unsound environment assumptions and the loss of correlations between endpoint errors can still allow interleavings absent from the real execution. These risks weaken the evidence without reversing the fixed claim. Only consistency with the supplied constraints is asserted. No runtime bound has been measured, and `run_wide_bound_cycles` remains `null` in diagnostic and sidecar calibration records.
+ 
+ ## Scenarios and evidence
+ 
+@@ -48,9 +60,9 @@ The zero-delay competition cases may exercise WR-09, and the delayed-exit cases
+ 
+ `wait_calibration.c` is separate from all primary traces. It records zeroed and poisoned WR-SQ output, plus WR-CF consuming and nonconsuming output faults and their subsequent waits. Neither calibration has been run on Linux or Asterinas. The prepared Linux control uses the host Linux kernel through a Docker process, not the archived Linux v6.16.5 source oracle. Its actual uname, libc, binary and header identities must be recorded at execution. No source comparison is runtime evidence.
+ 
+-The diagnostic collector reports event counts and observed coverage. All runtime coverage is `NOT_RUN`. Cross-actor overlap quality cannot be assessed until comparability is established. No quality threshold or final-state check is relaxed, and diagnostic records cannot establish WR-08/09/10 timing across actors.
++The diagnostic collector reports event counts and observed coverage. All runtime coverage is `NOT_RUN`. Overlap introduced by uncertainty is not observed physical overlap and is not a concurrency-quality result. Neither output mode establishes WR-08/09/10 physical timing. All model final-state and post-state checks remain unchanged.
+ 
+-`Trace.tla` has 41 exact `ExpectedPost` arms and `ValidatePostState(e) == e.post = ExpectedPost(e)`. Every field produced by the decoder has a corresponding check. This was inspected statically. No L2 runtime validation has occurred. Only after a future reviewed candidate can emit sound grouped input, use `TraceSearch.cfg` for the quick check through the installed `run_trace_validation` tool or resource-budgeted TLC wrapper. Acceptance requires the exact `TraceNoCompleteMatch` violation, all preceding invariants intact, and a retained complete witness with all cursors exhausted. Exhaustion without a witness rejects the supplied trace. A timeout, other invariant violation or evaluation error is inconclusive. The optional universal `Trace.cfg` check has the different semantics described in `spec/instrumentation-spec.md`.
++`Trace.tla` has 41 exact `ExpectedPost` arms and `ValidatePostState(e) == e.post = ExpectedPost(e)`. Every field produced by the decoder has a corresponding check. This was inspected statically. No L2 runtime validation has occurred. Only after independent v5 approval and successful consistency collection, use `TraceSearch.cfg` for the quick check through the installed `run_trace_validation` tool or resource-budgeted TLC wrapper. Acceptance requires the exact `TraceNoCompleteMatch` violation, all preceding invariants intact, and a retained complete witness with all cursors exhausted. Exhaustion without a witness is a candidate mismatch under the fixed claim and requires clock-limit re-examination. A timeout, other invariant violation or evaluation error is inconclusive. The optional universal `Trace.cfg` check has the different semantics described in `spec/instrumentation-spec.md`.
+ 
+ ## Make a reviewed correction
+ 
+@@ -60,7 +72,7 @@ To add a field, save its actual operand or result at the hook and extend that ev
+ 
+ To add an event, allocate its transport ID in `collect.py`, insert the real hook through `instrument.py`, and document the source boundary below. A new event or changed TraceSpec arm is a semantic correction. For a moved capture point, record the start before the operation and save the end immediately at its required completion boundary. Serialize only the saved values. The false park check ends directly after the saved load while its runqueue guard remains held. The true branch ends only after `reschedule` returns and releases that guard. Dequeue and resume stay separate.
+ 
+-After edits, create a new immutable candidate, record the diff and reason, and obtain independent review of its exact hashes. Candidate v4 is preserved in `evidence/candidate-v4`, with its hashes and `evidence/correction-v3-v4.diff`. The author does not approve the change. Only after material findings are closed may the controller allow the affected build, guest or trace/TLC rerun. Return unresolved review to the controller as incomplete and continue this same campaign when it is closed.
++After edits, create a new immutable candidate, record the diff and reason, and obtain independent review of its exact hashes. Candidate v4 remains preserved in `evidence/candidate-v4`. Candidate v5 is frozen in `evidence/candidate-v5`, with `hashes.json` and the separate `evidence/correction-v4-v5.diff`. The author does not approve the change. Only after material findings are closed may the controller allow the affected build, guest or trace/TLC rerun. Return unresolved review to the controller as incomplete and continue this same campaign when it is closed.
+ 
+ ## Installed hook locations
+ 
+diff --git a/harness/STATUS.md b/harness/STATUS.md
+index 788babd..421e54d 100644
+--- a/harness/STATUS.md
++++ b/harness/STATUS.md
+@@ -1,37 +1,43 @@
+ # Phase 2.5 status
+ 
+-Candidate v4 is implemented as a diagnostic candidate. **R2 remains open, and the review gate is `INCOMPLETE`.** Execution-ordered timestamps do not bound the global visibility of every plain store, and the proposed finite calibration cannot establish a run-wide clock bound. The [clock-method note](evidence/clock-method-v4.md) gives the source analysis, per-operation table, calibration derivation, acceptance/rejection consequences and independent review obligations.
++Candidate v5 implements an explicit `--consistency` collector/runner mode alongside diagnostics. The review gate remains `INCOMPLETE`, naming v5 as awaiting independent review. R2's real-global-order, store-visibility and run-wide-clock obligations remain open. The [v5 method](evidence/clock-method-v5.md) builds on the preserved v4 analysis and defines a weaker claim that the controller can review separately.
+ 
+-No v4 source application, build, Docker invocation, guest, Linux control, calibration measurement, collector execution or TLC run occurred in this task. The author has not approved the candidate. No commit was made.
++Every grouped trace, collection sidecar and diagnostic envelope carries `evidence_class: "CONSISTENCY_UNDER_SAMPLED_CLOCK_BOUND"` and this fixed `claim` text:
++
++> An accepted TraceSearch.cfg witness shows that the observed per-event arguments and post-states are consistent with some model interleaving that respects each actor's local order and the recorded cross-actor interval constraints after widening by the sampled calibration bound. It does not establish the real global order, store-visibility timing, or a run-wide clock bound. A rejection is a candidate mismatch that must be re-examined against the clock limits before any model or kernel conclusion.
++
++No v5 source application, build, Docker invocation, Linux control, guest, calibration measurement, collector/encoder execution or TLC run occurred. No implementation trace or measured B was generated. The author has not approved or committed the change.
+ 
+ ## Required criteria
+ 
+-PASS below means the specified static implementation or records passed inspection. It does not certify a compiled binary or runtime behavior.
++PASS here means static implementation and artifact checks only. It does not certify an executed collector, a compiled binary, a guest CPU count or a TraceSearch result. Independent review remains pending.
+ 
+-| Criterion | Status | Evidence and remaining limit |
++| Criterion | Status | Evidence and limit |
+ | --- | --- | --- |
+-| H1-clock | BLOCKED | `src/wr_trace.rs` and `src/wait_reap_trace.c` use `lfence; rdtsc; lfence`. The per-operation table is in `evidence/clock-method-v4.md`. Local execution ordering is implemented, but plain-store global-effect containment is not established. Rust compilation and disassembly are not run. |
+-| H2-calibration | NOT RUN | The C fixture implements per-actor invariant-TSC checks and 64 pre/64 post samples on the actual affinity CPUs in both guest and Linux control. `src/collect.py` records conditional phase bounds and refuses missing, inconsistent or greater-than-100,000-tick bounds. No runtime bound exists. `evidence/v4-static-checks.json` records `null`, not zero. A run-wide drift guarantee is also unresolved. |
+-| H3-collector | PASS | Static inspection of `src/collect.py` confirms unchanged 41-event decoding, removal of global timestamp ranks and grouped serialization, and unconditional refusal of the default grouped path. Diagnostics preserve local ticks and order, are tagged `diagnostic`, and report `INELIGIBLE`. `spec/` is unchanged. Collector execution was not run. |
+-| H4-container-image | PASS | Every `run.sh` container uses `specula-wait-reap-20261005`, an attempt UUID and a stage/case suffix. The image is `asterinas/dev:0.18.1-20260926`, ID `sha256:897cb1b354b3d7d28184d7a417c27565390fc3fa6886b328d2588e6de93c1dab`, with `--pull=never`. Local image/tool inspection was not run. |
+-| H5-records | PASS | `evidence/candidate-v4/hashes.json`, `evidence/correction-v3-v4.diff`, `evidence/v4-inputs.json`, `evidence/v4-static-checks.json`, this page, `INSTRUMENTATION.md` and `review-gate.json` preserve the candidate and its limits. The gate states that v4 awaits independent clock-method review. |
++| V1-label | PASS | `src/collect.py` defines one fixed class and claim used by every output envelope. The text also appears verbatim here, in `INSTRUMENTATION.md` and in `evidence/clock-method-v5.md`. Labels are top-level because TraceShapeOK forbids extra event fields. Output execution is NOT RUN. |
++| V2-widening | PASS | `src/collect.py::encode_intervals` uses `end + 2B < start` across CPUs, with the same invocation's B, and unchanged comparisons on the same CPU. It preserves all cross-actor comparisons and local shape through endpoint constraints, with a recorded impossibility refusal for strict cycles. `evidence/clock-method-v5.md` gives the equivalence and one-sided acceptance/rejection argument. No model order is used. Encoder execution is NOT RUN. |
++| V3-refusals | PASS | The shared read path retains every v4 calibration, decoding and completeness refusal. `src/review_gate.py` requires APPROVED, candidate v5, current/frozen hashes and an explicit consistency scope for grouped mode. `review-gate.json` remains INCOMPLETE. Static comparisons are recorded in `evidence/v5-static-checks.json`. |
++| V4-runner | PASS | `run.sh` admits review and memory before execution and prepares diagnostics, grouped NDJSON and sidecars in `.specula-output/traces/`. `src/initramfs.py` runs guest BusyBox nproc before the fixture, `src/boot.py` records the boot command/outcome, and collection cross-checks nproc, -smp and fixture count. The v4 container naming and image pin are unchanged. Docker, tools, builds, CPU measurements and output production are NOT RUN. |
++| V5-records | PASS | `evidence/candidate-v5/hashes.json`, `evidence/correction-v4-v5.diff`, `evidence/v5-inputs.json`, `evidence/v5-static-checks.json` and `evidence/v5-files.txt` preserve the candidate, static checks and changed-file inventory. V4 and older artifacts remain unchanged. The current gate awaits independent review. |
+ 
+-## Static checks and preserved inputs
++## Encoding and remaining risk
+ 
+-Python `py_compile`, Bash `bash -n`, both Linux and Asterinas C `cc -fsyntax-only` variants, and `git diff --check` passed. The first C check stopped because the Nix compiler wrapper adds a linker argument that is unused during syntax checking. The successful retries disabled only that driver diagnostic and retained `-Wall -Wextra -Werror`. Exact commands, exits and output are in [v4-static-checks.json](evidence/v4-static-checks.json). No C binary was produced. These checks do not assemble or validate Rust code generation.
++Both endpoints of every cross-CPU comparison receive B ticks of uncertainty. Actor-local intervals are not independently widened or clipped. An endpoint graph represents exactly the retained cross-actor relation and the original actor non-overlap rule. Zero-weight cycles become equal ranks. A cycle with a strict edge proves the relation cannot be encoded by the unchanged scalar interface and produces `UNREPRESENTABLE_LOCAL_ORDER`, diagnostics and a refusal sidecar without grouped output. The implementation audits all pairwise comparisons before serialization.
+ 
+-Static AST comparison confirms that the 41-event list and `decode()` body match v3. The hook patch, cases, accepted spec and modeling brief are byte-identical. All 19 frozen v3 candidate entries and all 20 installed-source receipt entries were rehashed and matched. The installed source remains v3. The old `evidence/applied.json` is historical evidence, not a v4 application receipt. [v4-inputs.json](evidence/v4-inputs.json) records the pins and hashes.
++Under the v4 assumptions, a premature store end can add false precedence edges and cause rejection. It does not identify the actual visibility order on acceptance. Conversely, unsampled offset excursions, environment or compiler failures, and discarded correlations between endpoint uncertainties can remove actual constraints and make the search more permissive than the real execution. These limits weaken the evidence without reversing the fixed consistency claim. Full samples and `run_wide_bound_cycles: null` remain in the diagnostic and sidecar. Raw ticks never become claimed global timestamps.
+ 
+-The [v3 independent review](evidence/review-v3.md) remains the latest independent review. R1 and R3-R6 retain their prior dispositions. V4 changes no hook placement, expected outcome or scenario. It adds no scheduling wait while holding a modeled lock. The calibration waits occur outside the recorded protocol. The corrected image and container names follow this lane's execution contract.
++## Static checks and preserved inputs
+ 
+-The author considered LFENCE, RDTSCP, full store-draining fences, later existing protocol drains and a single-CPU restriction. The method note explains why none closes the current full contract within the retained observation interface and available environment evidence. This is an incomplete result for R2, not a claim that every possible nonintrusive method is impossible.
++[evidence/v5-static-checks.json](evidence/v5-static-checks.json) records Python compilation for syntax without executing harness code, Bash syntax checks including embedded shell programs, JSON parsing, document claim equality, source AST comparisons, preserved-input hashes and `git diff --check`. No C or Rust source changed, and no native compilation or disassembly was run. The collector and encoder have not been exercised, even with synthetic data.
+ 
+-## Controller continuation
++The 41-event list, full decoder, calibration routine, hook generator/patch, stamps, fixture, cases and expected outcomes remain identical to v4. All protected `spec/` files and `modeling-brief.md` remain identical. The read-only source is still the installed v3 candidate on Asterinas `0c60537098f4c2949ad2d382aaf499de72263d76`, and its recorded file hashes remain unchanged. The historical `evidence/applied.json` is not a v5 installation receipt. [v5-inputs.json](evidence/v5-inputs.json) records those distinctions.
++
++V4 remains frozen at workspace commit `9a09d42` and in `evidence/candidate-v4/`, including its diagnostic-only conclusion. [correction-v4-v5.diff](evidence/correction-v4-v5.diff) covers changed/new live candidate files, excluding the duplicated snapshot and the diff itself. The snapshot manifest hashes all files within candidate-v5 except itself. The changed-file list separately includes the complete snapshot and outer records.
+ 
+-Obtain independent review of the exact v4 snapshot and clock note. A reviewer may assess this diagnostic-only disposition without claiming TraceSpec acceptance. The gate checker now requires the clock note and current guide/status hashes in any later receipt. The execution gate precedes application and Docker cleanup setup.
++## Controller continuation
+ 
+-Before any later authorized installation, preserve the v3 receipt and use the existing cleanup/apply workflow under controller ownership. `instrument.py` now refuses to call a stale v3 copy an idempotent v4 application. Bind the new installed receipt before running the reviewed candidate. The controller still owns resource admission and the existing heavy-stage lock. No lock was acquired here.
++Obtain independent review of the exact v5 snapshot, live semantic inputs and clock note. For later grouped collection, the receipt must name v5, state APPROVED, bind the required hashes and authorize `CONSISTENCY_UNDER_SAMPLED_CLOCK_BOUND`. A diagnostic-only receipt uses `DIAGNOSTIC_ONLY`. No such approval exists now. The controller owns installation, installed-receipt rebinding, resource admission and the existing heavy-stage lock. No lock was acquired here.
+ 
+-If diagnostic execution is approved later, the reports can establish observed branch values, local event order, syscall outputs and conditional sampled clock intervals for that execution. They cannot establish cross-actor interval overlap, the decisive WR-08/09/10 timing, protocol acceptance/rejection or weak-memory correctness. Unique reaping, retained WNOWAIT output, notification progress and publication visibility remain unobserved for v4. WR-SQ/WR-CF remain separate, unexecuted controls, and optional `ParkCurrentSpurious` stays uncovered.
++Before execution, preserve and clean the installed v3 files under controller ownership, install the reviewed candidate, and bind its installed receipt. Invoke `bash harness/run.sh --diagnostic` for local diagnostic records or explicitly choose `--consistency` for both diagnostics and eligible grouped inputs. The runner defaults to diagnostics. It preserves the v4 image `asterinas/dev:0.18.1-20260926`, ID `sha256:897cb1b354b3d7d28184d7a417c27565390fc3fa6886b328d2588e6de93c1dab`, and `specula-wait-reap-20261005-<attempt>-<stage/case>` names. BusyBox static linkage and required applets are checked during that future attempt, before guest packaging.
+ 
+-A future acceptance candidate must establish global-effect intervals for every operation and an independently supported run-wide clock bound. It must retain the unchanged TraceSpec interval and completion checks. Preserve v1-v4, their corrections and reviews, and continue this campaign without reporting Phase 2.5 as passed.
++Retain diagnostics and collection sidecars even when encoding refuses. When collection succeeds, use only the full-witness `TraceSearch.cfg` criterion described in the method note and retain the witness. Uncertainty-induced overlap is not observed physical overlap. WR-08/09/10 timing, weak-memory correctness and optional spurious scheduling remain unproved. WR-SQ/WR-CF remain separate controls. This static candidate does not complete Phase 2.5.
+diff --git a/harness/review-gate.json b/harness/review-gate.json
+index 34b0f1e..6a60763 100644
+--- a/harness/review-gate.json
++++ b/harness/review-gate.json
+@@ -1,10 +1,10 @@
+ {
+   "status": "INCOMPLETE",
+-  "blocking_finding": "R2: v4 awaits independent review of the clock method. LFENCE brackets local execution, but plain-store visibility and a run-wide cross-CPU offset/drift bound remain unproved. Grouped traces stay disabled.",
+-  "review": "evidence/review-v3.md",
+-  "review_sha256": "c19e74e09b8d89cc67d96d3a1e65d07ba9f81dc65d9c2f1f968d3760342971db",
++  "blocking_finding": "Candidate v5 awaits independent review of labelled sampled-bound consistency, exact cross-actor interval encoding, all v4 refusals and CPU-count evidence. R2 global-order and store-visibility obligations remain open. No v5 execution is approved.",
++  "review": null,
++  "review_sha256": null,
+   "reviewed_inputs": {},
+-  "controller_action": "Review the frozen v4 clock method and diagnostic-only disposition. Before applying v4, preserve and clean the v3 installation using its receipt. No v4 source apply, build, Linux control, guest or TLC has been run. Approval of diagnostics does not authorize trace acceptance.",
+-  "candidate": "v4",
++  "controller_action": "Independently review candidate-v5/hashes.json, live semantic inputs and clock-method-v5.md. An APPROVED receipt must bind v5 and explicitly authorize CONSISTENCY_UNDER_SAMPLED_CLOCK_BOUND for grouped mode, or DIAGNOSTIC_ONLY. Preserve and clean the existing v3 installation under controller ownership, apply the approved candidate and bind its installed receipt. No v5 apply, build, Docker, Linux control, guest, collector execution or TLC has run. The author does not approve this change.",
++  "candidate": "v5",
+   "approval_scope": "NONE"
+ }
+diff --git a/harness/run.sh b/harness/run.sh
+index 9fcf159..e5a49b7 100755
+--- a/harness/run.sh
++++ b/harness/run.sh
+@@ -1,10 +1,18 @@
+ #!/usr/bin/env bash
+ set -euo pipefail
++mode="${1:---diagnostic}"
++if (( $# > 1 )) || [[ "$mode" != --diagnostic && "$mode" != --consistency ]]; then
++    printf 'Usage: %s [--diagnostic|--consistency]\n' "$0" >&2
++    exit 64
++fi
++gate_args=()
++[[ "$mode" != --consistency ]] || gate_args+=(--consistency)
+ harness_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+ lane_dir="$(cd -- "$harness_dir/../.." && pwd)"
+ source_dir="$lane_dir/source"
+ attempt="$(date -u +%Y%m%dT%H%M%SZ)-$$-$(python3 -c 'import uuid; print(uuid.uuid4().hex)')"
+ evidence="$harness_dir/evidence/$attempt"
++traces="$harness_dir/../traces"
+ mkdir -p "$evidence" "$harness_dir/build"
+ image_ref=asterinas/dev:0.18.1-20260926
+ image_id=sha256:897cb1b354b3d7d28184d7a417c27565390fc3fa6886b328d2588e6de93c1dab
+@@ -20,12 +28,33 @@ Path(sys.argv[1],'preflight-memory.json').write_text(json.dumps({
+   'utc':datetime.datetime.now(datetime.timezone.utc).isoformat(),
+   'MemAvailable_kB':mem['MemAvailable'], 'required_kernel_build_kB':10*1024*1024},indent=2)+'\n')
+ PY
+-if ! python3 "$harness_dir/src/review_gate.py" >"$evidence/review-gate.log" 2>&1; then
++if ! python3 "$harness_dir/src/review_gate.py" "${gate_args[@]}" >"$evidence/review-gate.log" 2>&1; then
+     cp "$harness_dir/review-gate.json" "$evidence/review-gate.json"
+     printf '%s\n' '{"status":"INCOMPLETE_REVIEW_GATE","build":"NOT_RUN","linux_control":"NOT_RUN","asterinas_runtime":"NOT_RUN","trace_validation":"NOT_RUN"}' >"$evidence/status.json"
+     cat "$evidence/review-gate.log"
+     exit 78
+ fi
++
++admit_memory() {
++    python3 - "$evidence" "$1" <<'PY'
++from pathlib import Path
++import datetime,json,sys
++mem={k:int(v.split()[0]) for k,v in (line.split(':',1) for line in Path('/proc/meminfo').read_text().splitlines())}
++passed=mem['MemAvailable']>=10*1024*1024
++stage=sys.argv[2]
++data={'utc':datetime.datetime.now(datetime.timezone.utc).isoformat(), 'MemAvailable_kB':mem['MemAvailable'],
++      'required_kB':10*1024*1024, 'stage':stage, 'admitted':passed}
++Path(sys.argv[1],stage+'-memory-admission.json').write_text(json.dumps(data,indent=2)+'\n')
++print(json.dumps(data))
++if not passed:
++    Path(sys.argv[1],'status.json').write_text(json.dumps({'status':'INCOMPLETE_RESOURCE_ADMISSION',
++      'linux_control':'EXECUTED_SEE_LOGS' if stage=='kernel-build' else 'NOT_RUN',
++      'asterinas_runtime':'NOT_RUN','trace_validation':'NOT_RUN'},indent=2)+'\n')
++    raise SystemExit(75)
++PY
++}
++admit_memory pre-execution
++mkdir -p "$traces"
+ bash "$harness_dir/apply.sh" >"$evidence/apply.log" 2>&1
+ printf '%s %s\n' "$image_ref" "$image_id" >"$evidence/image-pin.txt"
+ "${docker_cmd[@]}" image inspect "$image_id" >"$evidence/container-image.json"
+@@ -52,7 +81,17 @@ timeout 180 "${docker_cmd[@]}" run --rm --pull=never --name "$container_name" \
+     timeout 120 make -C test/initramfs/src/regression/process/wait_reap_trace \
+         TEST_PLATFORM=linux OUTPUT_DIR=/work/.specula-output/harness/build/linux \
+         BUILD_DIR=/work/.specula-output/harness/build/linux-deps
++    /bin/busybox --list | grep -Fx sh
++    /bin/busybox --list | grep -Fx nproc
++    readelf -l /bin/busybox > /work/.specula-output/harness/build/busybox-program-headers.txt
++    if grep -q INTERP /work/.specula-output/harness/build/busybox-program-headers.txt; then
++        printf "Guest CPU probe requires static BusyBox.\n" >&2
++        exit 1
++    fi
++    cp /bin/busybox /work/.specula-output/harness/build/guest/busybox
+     ' >"$evidence/fixture-build.log" 2>&1
++sha256sum "$harness_dir/build/guest/busybox" >"$evidence/guest-busybox.sha256"
++cp "$harness_dir/build/busybox-program-headers.txt" "$evidence/"
+ 
+ while read -r case_name scenario value delay pair readiness; do
+     [[ -z "$case_name" || "$case_name" == \#* ]] && continue
+@@ -60,32 +99,21 @@ while read -r case_name scenario value delay pair readiness; do
+     timeout 30 "${docker_cmd[@]}" run --rm --pull=never --name "$container_name" \
+         --cpus=2 --memory=8g --memory-swap=8g --pids-limit=512 --network=none \
+         -v "$harness_dir/build/linux:/fixture:ro" "$image_id" \
+-        timeout 25 /fixture/process/wait_reap_trace/wait_reap_trace "$scenario" "$value" "$delay" "$pair" "$readiness" \
++        bash -euc 'count=$(nproc); printf "WR_CONTROL_NPROC %s\n" "$count"; exec timeout 25 /fixture/process/wait_reap_trace/wait_reap_trace "$@"' \
++        fixture "$scenario" "$value" "$delay" "$pair" "$readiness" \
+         >"$evidence/linux-$case_name.log" 2>&1
+     python3 "$harness_dir/src/collect.py" --diagnostic --linux-control \
+-        "$evidence/linux-$case_name.log" "$evidence/linux-$case_name.json"
++        "$evidence/linux-$case_name.log" "$traces/$attempt-linux-$case_name.diagnostic.json"
+ done <"$harness_dir/cases.tsv"
+ container_name="$container_base-linux-calibration"
+ timeout 30 "${docker_cmd[@]}" run --rm --pull=never --name "$container_name" \
+     --cpus=2 --memory=8g --memory-swap=8g --pids-limit=512 --network=none \
+     -v "$harness_dir/build/linux:/fixture:ro" "$image_id" \
+-    timeout 25 /fixture/process/wait_reap_trace/wait_calibration >"$evidence/linux-calibration.log" 2>&1
++    bash -euc 'count=$(nproc); printf "WR_CONTROL_NPROC %s\n" "$count"; exec timeout 25 /fixture/process/wait_reap_trace/wait_calibration' \
++    >"$evidence/linux-calibration.log" 2>&1
+ sha256sum "$harness_dir"/build/{guest,linux}/process/wait_reap_trace/* >"$evidence/binaries.sha256"
+ 
+-python3 - "$evidence" <<'PY'
+-from pathlib import Path
+-import datetime,json,sys
+-mem={k:int(v.split()[0]) for k,v in (line.split(':',1) for line in Path('/proc/meminfo').read_text().splitlines())}
+-passed=mem['MemAvailable']>=10*1024*1024
+-data={'utc':datetime.datetime.now(datetime.timezone.utc).isoformat(), 'MemAvailable_kB':mem['MemAvailable'],
+-      'required_kB':10*1024*1024, 'kernel_build_admitted':passed}
+-Path(sys.argv[1],'memory-admission.json').write_text(json.dumps(data,indent=2)+'\n')
+-print(json.dumps(data))
+-if not passed:
+-    Path(sys.argv[1],'status.json').write_text(json.dumps({'status':'INCOMPLETE_RESOURCE_ADMISSION',
+-      'linux_control':'EXECUTED_SEE_LOGS','asterinas_runtime':'NOT_RUN','trace_validation':'NOT_RUN'},indent=2)+'\n')
+-    raise SystemExit(75)
+-PY
++admit_memory kernel-build
+ 
+ container_name="$container_base-kernel-build"
+ timeout 1800 "${docker_cmd[@]}" run --rm --pull=never --name "$container_name" \
+@@ -104,7 +132,8 @@ test -s "$kernel_path"
+ sha256sum "$kernel_path" >"$evidence/kernel.sha256"
+ for binary in wait_reap_trace wait_calibration; do
+     python3 "$harness_dir/src/initramfs.py" \
+-        "$harness_dir/build/guest/process/wait_reap_trace/$binary" "$harness_dir/build/$binary.cpio"
++        "$harness_dir/build/guest/process/wait_reap_trace/$binary" "$harness_dir/build/guest/busybox" \
++        "$harness_dir/build/$binary.cpio"
+ done
+ sha256sum "$harness_dir/build/"*.cpio >"$evidence/initramfs.sha256"
+ 
+@@ -118,8 +147,9 @@ while read -r case_name scenario value delay pair readiness; do
+         --kernel /work/.specula-output/harness/build/kernel/asterinas-osdk-bin.elf \
+         --initramfs /work/.specula-output/harness/build/wait_reap_trace.cpio \
+         --log "/work/.specula-output/harness/evidence/$attempt/guest-$case_name.log" "$scenario" "$value" "$delay" "$pair" "$readiness"
+-    python3 "$harness_dir/src/collect.py" --diagnostic "$evidence/guest-$case_name.log" \
+-        "$evidence/guest-$case_name.json"
++    output="$traces/$attempt-guest-$case_name.diagnostic.json"
++    [[ "$mode" != --consistency ]] || output="$traces/$attempt-guest-$case_name.ndjson"
++    python3 "$harness_dir/src/collect.py" "$mode" "$evidence/guest-$case_name.log" "$output"
+ done <"$harness_dir/cases.tsv"
+ container_name="$container_base-guest-calibration"
+ timeout 125 "${docker_cmd[@]}" run --rm --pull=never --name "$container_name" \
+@@ -130,4 +160,5 @@ timeout 125 "${docker_cmd[@]}" run --rm --pull=never --name "$container_name" \
+     --initramfs /work/.specula-output/harness/build/wait_calibration.cpio \
+     --log "/work/.specula-output/harness/evidence/$attempt/guest-calibration.log" --calibration calibration 37 0
+ printf 'Collection evidence: %s\n' "$evidence"
+-printf 'Diagnostic records are INELIGIBLE for TraceSpec acceptance. No grouped traces were emitted.\n'
++printf 'Collection mode: %s. Output directory: %s\n' "$mode" "$traces"
++printf 'Diagnostics are INELIGIBLE. Any grouped output carries the sampled-bound consistency claim. Trace validation was NOT_RUN.\n'
+diff --git a/harness/src/boot.py b/harness/src/boot.py
+index f01649a..fba9193 100644
+--- a/harness/src/boot.py
++++ b/harness/src/boot.py
+@@ -30,6 +30,8 @@ marker = b"WR_CALIBRATION_COMPLETE" if a.calibration else b"WR_COMPLETE"
+ started = time.monotonic()
+ process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+ matched = False
++guest_nproc = None
++qmp_stopped = False
+ try:
+     selector = selectors.DefaultSelector()
+     selector.register(process.stdout, selectors.EVENT_READ)
+@@ -50,6 +52,13 @@ try:
+                 break
+         if not matched:
+             raise TimeoutError("guest fixture did not complete within 110 seconds")
++    counts = [int(line.split()[1]) for line in a.log.read_text().replace("\r", "").splitlines()
++              if line.startswith("WR_GUEST_NPROC ")]
++    if len(counts) != 1:
++        raise RuntimeError("missing or duplicate guest nproc evidence")
++    guest_nproc = counts[0]
++    if guest_nproc != int(command[command.index("-smp") + 1]):
++        raise RuntimeError("guest nproc does not match boot -smp")
+     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as qmp:
+         qmp.settimeout(5)
+         qmp.connect(qmp_path)
+@@ -58,6 +67,7 @@ try:
+         qmp.recv(65536)
+         qmp.sendall(b'{"execute":"quit"}\r\n')
+     process.wait(timeout=5)
++    qmp_stopped = True
+ finally:
+     if process.poll() is None:
+         process.terminate()
+@@ -69,6 +79,7 @@ finally:
+     Path(qmp_path).unlink(missing_ok=True)
+     a.log.with_suffix(".outcome.json").write_text(json.dumps({
+         "fixture_complete": matched, "qemu_returncode": process.returncode,
++        "guest_nproc": guest_nproc, "boot_smp": int(command[command.index("-smp") + 1]),
+         "elapsed_seconds": time.monotonic() - started,
+-        "termination": "QMP quit after fixture completion" if matched else "incomplete execution",
++        "termination": "QMP quit after fixture completion" if qmp_stopped else "incomplete execution",
+     }, indent=2) + "\n")
+diff --git a/harness/src/collect.py b/harness/src/collect.py
+index 0d39da5..19d7ed0 100644
+--- a/harness/src/collect.py
++++ b/harness/src/collect.py
+@@ -1,7 +1,8 @@
+ #!/usr/bin/env python3
+ """Decode observed records. This never executes a model or fills missing events."""
+ import argparse
+-from collections import Counter
++from bisect import bisect_right
++from collections import Counter, deque
+ import hashlib
+ import json
+ from pathlib import Path
+@@ -18,6 +19,16 @@ WakeSignalledWakerGet ProcessSignalLoopDone WakerWakeUp SchedulerUnparkTarget Wa
+ WaitQueueWakeAllCheck WaitQueueWakeAllPop WaitQueueWakeAllDone""".split()
+ ACTORS = {0: "none", 1: "w1", 2: "w2", 3: "child"}
+ PIN = "0c60537098f4c2949ad2d382aaf499de72263d76"
++EVIDENCE_CLASS = "CONSISTENCY_UNDER_SAMPLED_CLOCK_BOUND"
++CLAIM = (
++    "An accepted TraceSearch.cfg witness shows that the observed per-event arguments and post-states "
++    "are consistent with some model interleaving that respects each actor's local order and the "
++    "recorded cross-actor interval constraints after widening by the sampled calibration bound. "
++    "It does not establish the real global order, store-visibility timing, or a run-wide clock bound. "
++    "A rejection is a candidate mismatch that must be re-examined against the clock limits before "
++    "any model or kernel conclusion."
++)
++LABEL = dict(evidence_class=EVIDENCE_CLASS, claim=CLAIM)
+ 
+ 
+ def signed(n):
+@@ -113,7 +124,7 @@ def decode(actor, record, users):
+     return dict(tag="trace", actor=actor, event=event, start=start, end=end, args=args, post=post)
+ 
+ 
+-# This is an admission threshold for diagnostic samples, not a drift guarantee.
++# This is an admission threshold for sampled consistency, not a drift guarantee.
+ CLOCK_SAMPLES = 64
+ MAX_OFFSET_BOUND_CYCLES = 100_000
+ 
+@@ -184,29 +195,24 @@ def calibration(lines, meta):
+                 assumption="One constant B-minus-A offset during each calibration epoch; not established for the run")
+ 
+ 
+-def collect(log, output, diagnostic=False, linux_control=False):
+-    check_review()
++def read_records(log, linux_control):
+     lines = log.read_text(errors="strict").replace("\r", "").splitlines()
+     assert lines.count("WR_COMPLETE") == 1, "missing or duplicate fixture completion"
+     metadata = [json.loads(s[8:]) for s in lines if s.startswith("WR_META ")]
+     assert len(metadata) == 1
+     meta = metadata[0]
+     clock = calibration(lines, meta)
+-    # Receipt approval cannot turn local store completion into visibility or
+-    # a finite calibration into a run-wide clock guarantee. No override exists.
+-    require(diagnostic, "R2: grouped trace disabled in v4; store visibility and run-wide clock bounds are unproved")
+-    require(output.suffix == ".json", "diagnostic output must use .json, not a grouped .ndjson name")
+     users = {}
+     for s in lines:
+         if s.startswith("WR_USER "):
+             u = json.loads(s[8:]); k = (u["actor"], u["generation"])
+-            assert k not in users
++            assert k not in users, "duplicate user call"
+             users[k] = u
+     streams, headers = {a: [] for a in ("w1", "w2", "child")}, {}
+     for s in lines:
+         if s.startswith("WR_STREAM "):
+             a, count, drops = map(int, s.split()[1:])
+-            assert a not in headers and drops == 0
++            assert a not in headers and drops == 0, "duplicate stream header or dropped events"
+             headers[a] = count
+         elif s.startswith("WR_RAW "):
+             a, *words = map(int, s.split()[1:])
+@@ -215,49 +221,220 @@ def collect(log, output, diagnostic=False, linux_control=False):
+         require(not headers and not any(streams.values()), "Linux control contains kernel trace records")
+         require(meta["kernel"].startswith("Linux "), "control is not identified as Linux")
+     else:
+-        assert set(headers) == {1, 2, 3}
++        assert set(headers) == {1, 2, 3}, "missing or unexpected stream header"
+         for a, events in streams.items():
+-            assert len(events) == headers[{"w1": 1, "w2": 2, "child": 3}[a]]
++            assert len(events) == headers[{"w1": 1, "w2": 2, "child": 3}[a]], "stream count mismatch"
+             assert all(x["end"] <= y["start"] for x, y in zip(events, events[1:])), f"{a}: local interval overlap"
+-        assert sum(e["event"] == "SysWaitReturn" for es in streams.values() for e in es) == len(users)
++        assert sum(e["event"] == "SysWaitReturn" for es in streams.values() for e in es) == len(users), "return-count mismatch"
+     all_events = [e for es in streams.values() for e in es]
+     require(bool(users), "no user calls recorded")
+     for e in all_events + list(users.values()):
+         lo, hi = clock["local_windows"][e["actor"]]
+         require(lo <= e["start"] <= e["end"] <= hi, "event outside local pre/post calibration window")
++    return lines, meta, clock, users, streams
++
++
++def cpu_evidence(lines, meta, log, linux_control):
++    prefix = "WR_CONTROL_NPROC " if linux_control else "WR_GUEST_NPROC "
++    counts = [int(s[len(prefix):]) for s in lines if s.startswith(prefix)]
++    require(len(counts) == 1 and counts[0] >= 2, "missing or invalid invocation nproc evidence")
++    result = dict(nproc=counts[0], scope="linux-control" if linux_control else "asterinas-guest",
++                  fixture_smp=meta["smp"])
++    if not linux_control:
++        path = log.with_suffix(".command.json")
++        command = json.loads(path.read_text())
++        require(command.count("-smp") == 1, "missing or duplicate boot -smp")
++        smp = int(command[command.index("-smp") + 1])
++        require(smp == counts[0] == meta["smp"], "guest nproc, boot -smp and fixture CPU counts disagree")
++        require(all(0 <= cpu < smp for cpu in meta["cpu_affinity"]), "affinity outside guest CPU count")
++        result.update(boot_smp=smp, boot_command=command,
++                      boot_command_sha256=hashlib.sha256(path.read_bytes()).hexdigest())
++    return result
++
++
++def encode_intervals(streams, clock):
++    """Encode exactly the widened cross-actor comparisons, or refuse."""
++    nodes = []
++    offsets = {}
++    for actor, events in streams.items():
++        offsets[actor] = len(nodes)
++        nodes.extend((actor, i, endpoint) for i in range(len(events)) for endpoint in ("start", "end"))
++    graph = [[] for _ in nodes]
++    reverse = [[] for _ in nodes]
++
++    def edge(left, right, distance):
++        # Every edge means rank[right] >= rank[left] + distance.
++        graph[left].append((right, distance))
++        reverse[right].append(left)
++
++    starts = {a: [e["start"] for e in es] for a, es in streams.items()}
++    bound = clock["sampled_abs_bound_cycles"]
++    for actor, events in streams.items():
++        for i, event in enumerate(events):
++            start = offsets[actor] + 2 * i
++            end = start + 1
++            edge(start, end, 0)
++            if i + 1 < len(events):
++                edge(end, end + 1, 0)
++            for other, other_events in streams.items():
++                if other == actor:
++                    continue
++                margin = 2 * bound if clock["actor_cpu"][actor] != clock["actor_cpu"][other] else 0
++                split = bisect_right(starts[other], event["end"] + margin)
++                # Local monotonicity makes these two boundary constraints
++                # equivalent to comparing this end with every other start.
++                if split < len(other_events):
++                    edge(end, offsets[other] + 2 * split, 1)
++                if split:
++                    edge(offsets[other] + 2 * (split - 1), end, 0)
++
++    # Zero-distance cycles mean equality. A cycle containing a strict edge
++    # proves that no scalar intervals satisfy both required relations.
++    seen, order = set(), []
++    for root in range(len(nodes)):
++        stack = [(root, False)]
++        while stack:
++            node, finished = stack.pop()
++            if finished:
++                order.append(node)
++            elif node not in seen:
++                seen.add(node)
++                stack.append((node, True))
++                stack.extend((n, False) for n, _ in graph[node] if n not in seen)
++    component = [-1] * len(nodes)
++    count = 0
++    for root in reversed(order):
++        if component[root] != -1:
++            continue
++        stack = [root]
++        component[root] = count
++        while stack:
++            for node in reverse[stack.pop()]:
++                if component[node] == -1:
++                    component[node] = count
++                    stack.append(node)
++        count += 1
++    dag, indegree = [[] for _ in range(count)], [0] * count
++    for left, edges in enumerate(graph):
++        for right, distance in edges:
++            a, b = component[left], component[right]
++            if a == b:
++                require(distance == 0,
++                        f"UNREPRESENTABLE_LOCAL_ORDER: strict {nodes[left]} < {nodes[right]} "
++                        "lies in a constraint cycle; no exact TraceShapeOK encoding exists")
++            else:
++                dag[a].append((b, distance))
++                indegree[b] += 1
++    ready = deque(i for i, degree in enumerate(indegree) if degree == 0)
++    ranks = [0] * count
++    while ready:
++        node = ready.popleft()
++        for other, distance in dag[node]:
++            ranks[other] = max(ranks[other], ranks[node] + distance)
++            indegree[other] -= 1
++            if indegree[other] == 0:
++                ready.append(other)
++    encoded = {a: [dict(e, start=ranks[component[offsets[a] + 2 * i]],
++                           end=ranks[component[offsets[a] + 2 * i + 1]])
++                   for i, e in enumerate(es)] for a, es in streams.items()}
++    # Audit the complete relation, including absent edges and touching ends.
++    # This checks the encoding itself without consulting any model state.
++    for actor, events in streams.items():
++        local = encoded[actor]
++        require(all(e["start"] <= e["end"] for e in local) and
++                all(x["end"] <= y["start"] for x, y in zip(local, local[1:])), "encoding broke local order")
++        for other, other_events in streams.items():
++            if actor == other:
++                continue
++            margin = 2 * bound if clock["actor_cpu"][actor] != clock["actor_cpu"][other] else 0
++            for i, event in enumerate(events):
++                for j, following in enumerate(other_events):
++                    require((event["end"] + margin < following["start"]) ==
++                            (local[i]["end"] < encoded[other][j]["start"]),
++                            "encoding changed a widened cross-actor comparison")
++    return encoded
++
++
++def write_json(path, data, compact=False):
++    with path.open("x") as stream:
++        stream.write(json.dumps(data, **({"separators": (",", ":")} if compact else {"indent": 2})) + "\n")
++
++
++def collect(log, output, consistency=False, linux_control=False):
++    check_review(consistency=consistency)
++    require(not (consistency and linux_control), "Linux controls cannot emit kernel TraceData")
++    require(output.suffix == (".ndjson" if consistency else ".json"), "incorrect output suffix for collection mode")
++    diagnostic = output.with_suffix(".diagnostic.json") if consistency else output
++    sidecar = output.with_suffix(".collection.json") if consistency else None
++    raw_dir = diagnostic.parent / (diagnostic.stem + "-events")
++    for path in (output, diagnostic, sidecar, raw_dir):
++        require(path is None or not path.exists(), f"refusing to overwrite collection evidence: {path}")
+     output.parent.mkdir(parents=True, exist_ok=True)
+-    require(not output.exists(), "refusing to overwrite a diagnostic report")
+-    raw_dir = output.parent / (output.stem + "-events")
+-    raw_dir.mkdir(exist_ok=False)
+-    # Retain each stream's observed order and raw local ticks. These files have
+-    # neither TraceData's schema nor trace tags and cannot be fed to Trace.tla.
+-    for a, events in streams.items():
+-        records = [dict(tag="diagnostic", actor=e["actor"], event=e["event"],
+-                        local_start_tsc=e["start"], local_end_tsc=e["end"],
+-                        args=e["args"], post=e["post"]) for e in events]
+-        (raw_dir / f"{a}.json").write_text(json.dumps(records, indent=2) + "\n")
+-    report = dict(schema="asterinas-wait-reap-diagnostic-v4", source=PIN, metadata=meta,
++    report = dict(LABEL, schema="asterinas-wait-reap-diagnostic-v5", source=PIN,
+                   environment="linux-control" if linux_control else "asterinas-guest",
+-                  events=len(all_events), coverage=dict(Counter(e["event"] for e in all_events)),
+-                  clock=clock, user_calls=list(users.values()),
++                  input_path=str(log.resolve()),
+                   input_sha256=hashlib.sha256(log.read_bytes()).hexdigest(),
+-                  event_files={p.name: hashlib.sha256(p.read_bytes()).hexdigest() for p in sorted(raw_dir.iterdir())},
++                  review_gate_sha256=hashlib.sha256((Path(__file__).resolve().parent.parent / "review-gate.json").read_bytes()).hexdigest(),
+                   acceptance="INELIGIBLE", grouped_trace="NOT_EMITTED",
+                   ordering="LOCAL_STREAM_ORDER_ONLY",
+                   blockers=["plain-store global visibility is not bracketed",
+                             "cross-CPU offset/drift has no run-wide guarantee"])
+-    with output.open("x") as f:
+-        f.write(json.dumps(report, indent=2) + "\n")
+-    print(json.dumps({"report": str(output), "clock_status": clock["status"],
+-                      "sampled_abs_bound_cycles": clock["sampled_abs_bound_cycles"],
+-                      "acceptance": "INELIGIBLE", "grouped_trace": "NOT_EMITTED"}, indent=2))
++    grouped = None
++    try:
++        lines, meta, clock, users, streams = read_records(log, linux_control)
++        report.update(metadata=meta, clock=clock, user_calls=list(users.values()),
++                      events=sum(map(len, streams.values())),
++                      coverage=dict(Counter(e["event"] for es in streams.values() for e in es)))
++        raw_dir.mkdir(exist_ok=False)
++        for actor, events in streams.items():
++            records = [dict(tag="diagnostic", actor=e["actor"], event=e["event"],
++                            local_start_tsc=e["start"], local_end_tsc=e["end"],
++                            args=e["args"], post=e["post"]) for e in events]
++            write_json(raw_dir / f"{actor}.json", dict(LABEL, acceptance="INELIGIBLE", events=records))
++        report["event_files"] = {p.name: hashlib.sha256(p.read_bytes()).hexdigest() for p in sorted(raw_dir.iterdir())}
++        report["cpu_count"] = cpu_evidence(lines, meta, log, linux_control)
++        if consistency:
++            encoded = encode_intervals(streams, clock)
++            grouped = {k: meta[k] for k in ("child_pid", "child_uid", "exit_value", "smp", "concurrent", "buffers", "sigchld", "sa_nocldwait", "sigchld_blocked", "valid_buffers", "rusage_null")}
++            grouped.update(LABEL, schema="asterinas-wait-reap-timebox-v1", source=PIN,
++                           waiters=["w1", "w2"], traces=encoded, cpu_count=report["cpu_count"],
++                           interval_encoding="exact-cross-actor-constraints-v5",
++                           sampled_abs_bound_cycles=clock["sampled_abs_bound_cycles"],
++                           run_wide_clock_bound="UNESTABLISHED", store_visibility_timing="UNESTABLISHED",
++                           cross_cpu_endpoint_widening_cycles=clock["sampled_abs_bound_cycles"],
++                           same_cpu_endpoint_widening_cycles=0, validation="NOT_RUN",
++                           input_sha256=report["input_sha256"], review_gate_sha256=report["review_gate_sha256"])
++            report["grouped_trace"] = "EMITTED"
++    except (AssertionError, ValueError, KeyError, IndexError, TypeError, OSError) as error:
++        grouped = None
++        report.update(grouped_trace="REFUSED" if consistency else "NOT_EMITTED",
++                      refusal=f"{type(error).__name__}: {error}")
++    write_json(diagnostic, report)
++    if sidecar:
++        manifest = dict(report, schema="asterinas-wait-reap-collection-v5",
++                        diagnostic_file=diagnostic.name,
++                        diagnostic_sha256=hashlib.sha256(diagnostic.read_bytes()).hexdigest(),
++                        validation="NOT_RUN", acceptance="NOT_VALIDATED" if grouped else "INELIGIBLE")
++        if grouped:
++            write_json(output, grouped, compact=True)
++            manifest.update(output_file=output.name, output_sha256=hashlib.sha256(output.read_bytes()).hexdigest(),
++                            interval_encoding=grouped["interval_encoding"], ordering="LOCAL_ORDER_AND_WIDENED_CROSS_ACTOR_CONSTRAINTS",
++                            cross_cpu_endpoint_widening_cycles=clock["sampled_abs_bound_cycles"],
++                            same_cpu_endpoint_widening_cycles=0)
++        write_json(sidecar, manifest)
++    print(json.dumps(dict(LABEL, report=str(diagnostic), grouped_trace=report["grouped_trace"],
++                          refusal=report.get("refusal")), indent=2))
++    if "refusal" in report:
++        raise SystemExit(65)
+ 
+ 
+ if __name__ == "__main__":
+     p = argparse.ArgumentParser()
+-    p.add_argument("--diagnostic", action="store_true", help="write ineligible local records only")
++    mode = p.add_mutually_exclusive_group(required=True)
++    mode.add_argument("--diagnostic", action="store_true", help="write ineligible local records only")
++    mode.add_argument("--consistency", action="store_true", help="also emit labelled sampled-bound TraceData")
+     p.add_argument("--linux-control", action="store_true", help="expect user calls without kernel records")
+     p.add_argument("log", type=Path)
+     p.add_argument("output", type=Path)
+     args = p.parse_args()
+-    collect(args.log, args.output, args.diagnostic, args.linux_control)
++    collect(args.log, args.output, args.consistency, args.linux_control)
+diff --git a/harness/src/initramfs.py b/harness/src/initramfs.py
+index 795a73b..8e933b2 100644
+--- a/harness/src/initramfs.py
++++ b/harness/src/initramfs.py
+@@ -1,13 +1,23 @@
+ #!/usr/bin/env python3
+-"""Package the statically linked regression executable as /init."""
++"""Measure guest CPUs before executing the unchanged regression fixture."""
+ from pathlib import Path
+ import stat
+ import sys
+ 
+-binary, destination = map(Path, sys.argv[1:])
++INIT = b'''#!/bin/busybox sh
++set -eu
++count=$(/bin/busybox nproc)
++printf 'WR_GUEST_NPROC %s\\n' "$count"
++exec /fixture "$@"
++'''
++
++binary, busybox, destination = map(Path, sys.argv[1:])
+ with destination.open("wb") as stream:
+     for index, (name, payload, mode) in enumerate([
+-        ("init", binary.read_bytes(), stat.S_IFREG | 0o755),
++        ("bin", b"", stat.S_IFDIR | 0o755),
++        ("bin/busybox", busybox.read_bytes(), stat.S_IFREG | 0o755),
++        ("init", INIT, stat.S_IFREG | 0o755),
++        ("fixture", binary.read_bytes(), stat.S_IFREG | 0o755),
+         ("TRAILER!!!", b"", 0),
+     ], 1):
+         name = name.encode() + b"\0"
+diff --git a/harness/src/review_gate.py b/harness/src/review_gate.py
+index e29f416..60f89c9 100644
+--- a/harness/src/review_gate.py
++++ b/harness/src/review_gate.py
+@@ -5,26 +5,41 @@ import json
+ from pathlib import Path
+ 
+ 
+-def check():
++def check(consistency=False):
++    if not __debug__:
++        raise RuntimeError("Python optimization disables required refusal checks")
+     harness = Path(__file__).resolve().parent.parent
+     gate = json.loads((harness / "review-gate.json").read_text())
+     if gate["status"] != "APPROVED":
+         raise RuntimeError(gate["blocking_finding"])
++    assert gate["candidate"] == "v5", "review receipt is not for candidate v5"
++    scopes = {"DIAGNOSTIC_ONLY", "CONSISTENCY_UNDER_SAMPLED_CLOCK_BOUND"}
++    assert gate["approval_scope"] in scopes, "review receipt has no collection scope"
++    if consistency:
++        assert gate["approval_scope"] == "CONSISTENCY_UNDER_SAMPLED_CLOCK_BOUND", "grouped consistency mode is not approved"
+     review = harness / gate["review"]
+     assert hashlib.sha256(review.read_bytes()).hexdigest() == gate["review_sha256"]
+     inputs = gate["reviewed_inputs"]
+     required = {str(p.relative_to(harness)) for p in (harness / "src").iterdir() if p.is_file()}
+     required.update({"run.sh", "apply.sh", "cases.tsv", "patches/instrumentation.patch", "evidence/applied.json"})
+-    required.update({"INSTRUMENTATION.md", "STATUS.md", "evidence/clock-method-v4.md"})
++    required.update({"INSTRUMENTATION.md", "STATUS.md", "evidence/clock-method-v4.md",
++                     "evidence/clock-method-v5.md", "evidence/v5-inputs.json", "evidence/candidate-v5/hashes.json"})
+     required.update("../spec/" + p for p in ("base.tla", "Trace.tla", "Trace.cfg", "TraceSearch.cfg", "instrumentation-spec.md"))
+     assert required <= set(inputs), "review receipt does not cover every semantic input"
+     for name, expected in inputs.items():
+         assert hashlib.sha256((harness / name).read_bytes()).hexdigest() == expected, f"changed reviewed input: {name}"
++    snapshot = harness / "evidence/candidate-v5"
++    for name, expected in json.loads((snapshot / "hashes.json").read_text()).items():
++        assert hashlib.sha256((snapshot / name).read_bytes()).hexdigest() == expected, f"changed frozen v5 input: {name}"
+ 
+ 
+ if __name__ == "__main__":
++    import argparse
++    parser = argparse.ArgumentParser()
++    parser.add_argument("--consistency", action="store_true")
++    args = parser.parse_args()
+     try:
+-        check()
++        check(consistency=args.consistency)
+     except (RuntimeError, AssertionError, KeyError, OSError) as error:
+         print(f"INCOMPLETE_REVIEW_GATE: {error}")
+         raise SystemExit(78)
+diff --git a/harness/evidence/clock-method-v5.md b/harness/evidence/clock-method-v5.md
+new file mode 100644
+index 0000000..03a5b07
+--- /dev/null
++++ b/harness/evidence/clock-method-v5.md
+@@ -0,0 +1,85 @@
++# Candidate v5 sampled-bound consistency
++
++This note is for the independent reviewer and controller. V5 adds an explicit consistency mode to the v4 collector. It retains v4's execution-ordered stamps, calibration and refusals. It changes no measured bridge, hook, event mapping, scenario, expected outcome or model file. The [v4 analysis](clock-method-v4.md), especially its “Consequences for acceptance and rejection,” remains the starting point. Its global-store and run-wide-clock obligations remain unresolved. V5 changes the permitted claim, not those obligations.
++
++The gate is `INCOMPLETE`, naming v5. This document is an implementation argument awaiting independent review. No candidate execution, clock measurement, generated implementation trace, build, Docker invocation, guest or TLC run occurred. [v5-inputs.json](v5-inputs.json) binds the v4 baseline, protected inputs and still-installed v3 source. [candidate-v5/hashes.json](candidate-v5/hashes.json) binds the frozen candidate.
++
++## Fixed evidence class and claim
++
++Every grouped TraceData object and its collection sidecar carries `evidence_class: "CONSISTENCY_UNDER_SAMPLED_CLOCK_BOUND"` and this exact `claim` text. Diagnostic reports, diagnostic event-file envelopes and the collector's result message carry the same label and conditional claim. Diagnostics themselves remain `INELIGIBLE`.
++
++> An accepted TraceSearch.cfg witness shows that the observed per-event arguments and post-states are consistent with some model interleaving that respects each actor's local order and the recorded cross-actor interval constraints after widening by the sampled calibration bound. It does not establish the real global order, store-visibility timing, or a run-wide clock bound. A rejection is a candidate mismatch that must be re-examined against the clock limits before any model or kernel conclusion.
++
++The grouped file remains one JSON object using `asterinas-wait-reap-timebox-v1`. Additional labels live at the top level because `TraceShapeOK` requires exactly seven fields in each event. The 41 decoder arms, argument records and post-states are unchanged. The diagnostic/sidecar calibration retains `run_wide_bound_cycles: null`. Emitting a grouped file leaves its validation `NOT_RUN`, and its sidecar acceptance `NOT_VALIDATED`.
++
++An accepted witness means the specific `TraceNoCompleteMatch` counterexample in `TraceSearch.cfg`, with preceding invariants intact, all cursors exhausted and `TraceEndOK` satisfied. Search exhaustion without that witness is the candidate mismatch described above. A timeout, another invariant failure or an evaluation error is inconclusive. `Trace.cfg` has a different universal property and does not substitute for this existential search.
++
++## Comparison rule
++
++The collector first performs the unchanged calibration on the raw log from this invocation. Let `B` be its `sampled_abs_bound_cycles`, the maximum absolute endpoint across both phase offset intervals. B is not supplied by a caller, reused from a Linux control or chosen from a model result. The fixed 100,000-tick admission threshold remains an operational cutoff.
++
++For events `e` and `f` belonging to different actors, define the retained precedence relation `P`:
++
++```text
++If actor_cpu[e] != actor_cpu[f]:
++    P(e, f) iff e.end + B < f.start - B
++            iff e.end + 2*B < f.start
++Otherwise:
++    P(e, f) iff e.end < f.start
++```
++
++Thus every cross-CPU comparison widens both endpoints, including the reference CPU's endpoint. The extra slack is deliberate. At equality there is no edge, matching the unchanged strict comparison in `ViablePIDs`. Different actors sharing one CPU use the same local clock and need no cross-CPU offset allowance. V4's CPU-affinity assumptions still apply. Per-actor arrays and local order never change.
++
++The raw starts retain the same `lfence; rdtsc; lfence` assembly and compiler barriers. No source stamp is moved, replaced or tightened. The already-approved kernel/user return merge still ends at the observed user completion and still refuses inversion. The scalar integers supplied to TraceData below encode relations between these observed intervals. They are neither new measurements nor a recovered execution schedule. Raw local ticks remain in the diagnostic files.
++
++## Exact encoding with local non-overlap
++
++Writing `[start-B,end+B]` into every event would make nearby events of the same actor overlap. Choosing one CPU shift could instead impose edges not justified by the whole uncertainty interval. V5 therefore represents the widened cross-actor relation directly, without selecting a clock offset or consulting the model.
++
++Create two integer variables `S_e,E_e` for each event in observed array order. A directed edge `u -> v` of weight `d` means `v >= u+d`. The constraints are:
++
++1. `S_e -> E_e` with weight 0 enforces an event's valid interval.
++2. `E_e -> S_next` with weight 0 enforces the unchanged actor non-overlap rule.
++3. For every ordered pair of different-actor events with `P(e,f)`, `E_e -> S_f` has weight 1. It retains that strict precedence edge.
++4. For every such pair without `P(e,f)`, `S_f -> E_e` has weight 0. It prevents the encoding from inventing a precedence edge, including at touching endpoints.
++
++`encode_intervals()` constructs an equivalent sparse graph. Raw starts in each actor are nondecreasing after the existing local check. For each event end and other actor, `bisect_right(starts, end + margin)` splits starts into the nonpreceding prefix and strictly preceding suffix, with `margin = 2B` across CPUs and 0 on the same CPU. Only the last prefix start and first suffix start need edges. The local chain makes all earlier starts no larger and all later starts no smaller. Empty prefixes/suffixes need no corresponding edge.
++
++All weights are 0 or 1. A strongly connected component containing a weight-1 edge implies `x >= x+1` along a cycle, so no scalar encoding can satisfy the exact relation and local shape. Collection records `UNREPRESENTABLE_LOCAL_ORDER`, identifying the strict endpoint pair in that component, in the diagnostic and sidecar. It emits no grouped trace. It neither clips uncertainty nor drops a constraint. Because the graph includes all required comparisons or equivalent boundary constraints, this is an impossibility result for the unchanged scalar interface, not a model mismatch.
++
++Otherwise, all internal component edges have weight 0 and their endpoints can share a rank. Collapse those components and assign longest-path ranks in the resulting acyclic graph. Starting every rank at zero satisfies nonnegativity. For each edge, the destination rank is at least the source rank plus its weight. This satisfies all four constraint classes. The resulting ranks are bounded by the number of endpoints and retain actor array order. They need not retain irrelevant start/start or end/end comparisons across actors.
++
++Before serialization, the collector independently checks every ordered cross-actor pair against `P`, including absent edges, plus every local shape inequality. Therefore a successful encoding has exactly the desired `end < start` relation and satisfies the local interval requirement. The encoder reads timestamps, actor identities and their calibrated CPU mapping. It copies events without interpreting names, arguments or post-states. No model execution or model order participates.
++
++## Sound direction and residual limits
++
++Widening removes cross-CPU precedence edges from the raw comparison. It cannot add them because `B >= 0`. The exact encoding neither adds nor removes an edge from that widened relation. `Trace.tla` searches its interleavings while preserving each actor's array order. A retained complete witness therefore establishes precisely the consistency claim above.
++
++V4's premature-store-end argument remains one-sided under sound starts, comparable clocks and fixed actor order. If an observed end is earlier than a sound visibility end, then any precedence implied by the sound end is also implied by the observed end. This inclusion still holds after adding the same B to both possible ends. The premature end may add false edges and cause rejection. An accepted witness is also compatible with removing those extra edges, but that does not identify the actual visibility order. V5 does not extend store ends or supply a missing visibility guarantee.
++
++Other risks can make the search more permissive than the real execution:
++
++- Finite calibration can miss an offset excursion, rate difference or hypervisor adjustment between samples. A misplaced start or end can remove an actual precedence edge. Matching pre/post intervals do not exclude this.
++- The assumed execution-fence contract, affinity compliance and compiler output remain environment/binary obligations. V5 neither observes every kernel CPU assignment nor supplies disassembly.
++- Independent endpoint envelopes discard correlations. A witness satisfying all pairwise widened comparisons need not correspond to one fixed offset or a physically realized clock trajectory, even if errors happened to remain within B.
++- Instrumentation latency and compiler barriers can alter which schedules occur. Evidence from the instrumented execution is not a weak-memory correctness proof for uninstrumented executions.
++
++These risks weaken the evidential value of a witness. They do not invert or enlarge its fixed claim into a statement about actual global order. Rejection likewise remains a candidate mismatch requiring clock-limit re-examination, not a kernel or model finding.
++
++## Refusals, output and admission
++
++The original calibration and decode functions are retained. Collection still refuses unsupported/missing CPUID, wrong or duplicate actor CPUs, absent pre/post phases or samples, duplicate/reordered indices, local sample inversions/regressions, inconsistent phase intersections, disjoint phase intervals, bounds above threshold, out-of-window events/user calls, incomplete fixture completion, dropped/truncated streams, truncated queues, local event overlap, return-count mismatch and kernel/user inversion. Optional spurious scheduling remains refused. No refusal is bypassed by consistency mode. An optimized Python interpreter is also refused because it removes the existing assertions.
++
++Both entry points check an `APPROVED` v5 receipt and semantic hashes. Grouped mode additionally needs the receipt scope `CONSISTENCY_UNDER_SAMPLED_CLOCK_BOUND` and the explicit `--consistency` flag. The required hashes cover current source helpers, runner, hooks, cases, installed receipt, model inputs, guide/status, both clock notes, v5 inputs and the frozen v5 manifest. The checker also verifies every snapshot entry. A diagnostic-only receipt cannot enable grouped output. The current gate remains `INCOMPLETE` with no author approval.
++
++After gate and memory admission, `run.sh --consistency` prepares diagnostic JSON, grouped `.ndjson` and `.collection.json` under `.specula-output/traces/`, using attempt-and-case names. All raw logs stay under `harness/evidence/<attempt>/`. If collection refuses, diagnostics and a refusal sidecar survive, no grouped trace is written, and the runner stops. Default/`--diagnostic` collection emits no grouped file. Linux controls remain diagnostic only. No output is overwritten.
++
++Guest `/init` runs the pinned image's static BusyBox `nproc` before executing the unchanged fixture. Each log records `WR_GUEST_NPROC`. Its boot command records the actual `-smp`, and its outcome records both values. Collection requires those values to equal the fixture's CPU count and checks affinity against that count. Linux `nproc` evidence is labelled separately. The runner checks BusyBox applets/static linkage and retains its hash before packaging. This small bootstrap precedes recorder reset and calibration and adds no synchronization to a measured bridge.
++
++Memory admission now precedes application and any execution, with a second live check immediately before kernel build. V4's container prefix, attempt UUID and stage/case suffixes remain. The image remains `asterinas/dev:0.18.1-20260926`, pinned to `sha256:897cb1b354b3d7d28184d7a417c27565390fc3fa6886b328d2588e6de93c1dab`, with `--pull=never`. Actual image/app availability, guest counts and measured bounds remain `NOT_RUN`.
++
++## Independent review boundary
++
++Review the comparison equivalence, sparse-graph reduction, equality handling and impossibility refusal against the unchanged `TraceShapeOK` and `ViablePIDs`. Check that every v4 refusal remains on the shared path and that no gate, diagnostic or Linux-control path can accidentally authorize grouped output. Verify the fixed claim in code and both operational documents, snapshot hashes, exact CPU-count provenance and preservation of source/model inputs. The author ran only syntax and static identity checks recorded in [v5-static-checks.json](v5-static-checks.json). Encoder/collector execution and independent review are `NOT_RUN`.
++
++Any later controller run still needs reviewed installation and installed-file hashes, binary disassembly, the actual calibration/CPUID/affinity records and complete raw evidence. It may yield labelled consistency evidence without resolving the stronger v4 clock/visibility obligations. Preserve v1-v5 and their correction artifacts. Do not report real-global-order validation or Phase 2.5 completion from this static change.
+diff --git a/harness/evidence/v5-files.txt b/harness/evidence/v5-files.txt
+new file mode 100644
+index 0000000..f688a39
+--- /dev/null
++++ b/harness/evidence/v5-files.txt
+@@ -0,0 +1,39 @@
++MODIFIED harness/INSTRUMENTATION.md
++MODIFIED harness/STATUS.md
++ADDED harness/evidence/candidate-v5/INSTRUMENTATION.md
++ADDED harness/evidence/candidate-v5/STATUS.md
++ADDED harness/evidence/candidate-v5/apply.sh
++ADDED harness/evidence/candidate-v5/cases.tsv
++ADDED harness/evidence/candidate-v5/clean.sh
++ADDED harness/evidence/candidate-v5/evidence/applied.json
++ADDED harness/evidence/candidate-v5/evidence/clock-method-v4.md
++ADDED harness/evidence/candidate-v5/evidence/clock-method-v5.md
++ADDED harness/evidence/candidate-v5/evidence/v4-inputs.json
++ADDED harness/evidence/candidate-v5/evidence/v4-static-checks.json
++ADDED harness/evidence/candidate-v5/evidence/v5-inputs.json
++ADDED harness/evidence/candidate-v5/evidence/v5-static-checks.json
++ADDED harness/evidence/candidate-v5/hashes.json
++ADDED harness/evidence/candidate-v5/patches/instrumentation.patch
++ADDED harness/evidence/candidate-v5/review-gate.json
++ADDED harness/evidence/candidate-v5/run.sh
++ADDED harness/evidence/candidate-v5/src/Makefile
++ADDED harness/evidence/candidate-v5/src/boot.py
++ADDED harness/evidence/candidate-v5/src/collect.py
++ADDED harness/evidence/candidate-v5/src/initramfs.py
++ADDED harness/evidence/candidate-v5/src/instrument.py
++ADDED harness/evidence/candidate-v5/src/review_gate.py
++ADDED harness/evidence/candidate-v5/src/wait_calibration.c
++ADDED harness/evidence/candidate-v5/src/wait_reap_trace.c
++ADDED harness/evidence/candidate-v5/src/wr_syscall.rs
++ADDED harness/evidence/candidate-v5/src/wr_trace.rs
++ADDED harness/evidence/clock-method-v5.md
++ADDED harness/evidence/correction-v4-v5.diff
++ADDED harness/evidence/v5-files.txt
++ADDED harness/evidence/v5-inputs.json
++ADDED harness/evidence/v5-static-checks.json
++MODIFIED harness/review-gate.json
++MODIFIED harness/run.sh
++MODIFIED harness/src/boot.py
++MODIFIED harness/src/collect.py
++MODIFIED harness/src/initramfs.py
++MODIFIED harness/src/review_gate.py
+diff --git a/harness/evidence/v5-inputs.json b/harness/evidence/v5-inputs.json
+new file mode 100644
+index 0000000..361c303
+--- /dev/null
++++ b/harness/evidence/v5-inputs.json
+@@ -0,0 +1,65 @@
++{
++  "utc": "2026-10-05T18:57:35.487344+00:00",
++  "workspace_v4_head": "9a09d4271172cdc5c7808f7a34115d166529072b",
++  "source_root": "/home/chin39/Documents/play/Specula/runs/asterinas-child-wait-reap-20261004T160159Z/asterinas-child-wait-reap/source",
++  "source_head": "0c60537098f4c2949ad2d382aaf499de72263d76",
++  "source_tree": "4693fdec88cd7da14bed4f1541eba593f123059c",
++  "protected_inputs_sha256": {
++    "modeling-brief.md": "617152b69d965ae31c904d458561ffe9d2842ba959a4d9bf328fa00e7d45c93f",
++    "spec/MC.tla": "3b8fcf0190aaebe3af50c25f02861959ce6d4c2e9dd85d25a76d1bd2ef134927",
++    "spec/Trace.cfg": "82d1903ce6ef8e20be1f15cd152ad8c2f3553a7cfdb15673493baf5cfac498b0",
++    "spec/Trace.tla": "94268b234a91a0182cc1c298ca9d04e000d2d62c8f60882e841d93c0ecaa05c3",
++    "spec/TraceSearch.cfg": "a4fa6a110e244d50ae2275d2e6f3d2a9d64e689314fbe1232bf5e390387bb824",
++    "spec/base.tla": "abe074fc44af1d20769708c927dc0826284e2b31c512e02ba12bc460b8104f10",
++    "spec/instrumentation-spec.md": "69d549309d139255ad1debc1083f3c7dd6584259bf1fc05f5dbd605581e6668d"
++  },
++  "installed_candidate": "v3",
++  "v5_applied": false,
++  "installed_source_sha256": {
++    "ostd/src/lib.rs": "acc93d827d3b3d3272da051161e88f435255425400e08fc3667199c755d6cbaa",
++    "kernel/core/src/syscall/mod.rs": "f92b828c3becdcdd3d5311481f7fde262fabdae72497edb9badc1d68665b6482",
++    "kernel/core/src/syscall/prctl.rs": "a59528cd446cbb07a9bbe0a8021b2bbf374a6e76bcce685a8506d8e027fb8fc8",
++    "kernel/core/src/syscall/wait4.rs": "1c91f491697c2b7ef2e7bbf77ec4b09f6d122a3957851d5f7b53534d7b788a50",
++    "kernel/core/src/syscall/waitid.rs": "75a1f5084999d72445603398ff837040c3324876bccde9f4da2e7f7e18e27038",
++    "kernel/core/src/process/wait.rs": "6591eb9912c2e0374b61f4c62dc09317e97a3d069897c5e883c8c1e4c471a14f",
++    "kernel/core/src/process/pid_table.rs": "c07b2b498375a5be48d2114357aaca1036d2367dc8c876e42d1b1540f7cac28b",
++    "kernel/core/src/process/status.rs": "35930b477736595748f08c73e97d052c7841240385d5395789fd6c1cd8f54d6b",
++    "kernel/core/src/process/signal/pause.rs": "41f07bc9e62acadf6c7fac53467ab9926e5ccdb60c54d93f64e1762f088f582f",
++    "kernel/core/src/process/posix_thread/mod.rs": "3d6d588ef244fabc616ab94db45e0f2f7afa09f92cfb4a0ec588ede82f1e9dcc",
++    "kernel/core/src/process/process/mod.rs": "0bbae0b5c78dc3f0bf935956f6be545aa4756b079c20e3a71e4077916fa7c680",
++    "kernel/core/src/process/exit.rs": "9af4203cdde3f5943fc7ef9acae04de9dd215c0eb9c928537dc56a1c6a9716fd",
++    "ostd/src/sync/wait.rs": "9ca169153a14e7169de647d43f8d09c1b78e0edfd3428358bf899572b4ce511a",
++    "ostd/src/task/scheduler/mod.rs": "4a6602138bf8fb1074f60bcbb885fc120f17253fe65879fb895fb09cfe768df7",
++    "test/initramfs/src/regression/process/Makefile": "52e77399113a2ec9227425bc21d9445ea49715e0b1b8792e71796161568a0fbe",
++    "ostd/src/wr_trace.rs": "7b883bb76828bc2039020cfe6e2e09e33cf3242f276ddf164aa6f7562978f13c",
++    "kernel/core/src/syscall/wr_syscall.rs": "aee0e9ad96b463d2524a5ad5498b665b8dc6e5be37cad99309b8e0576f21d38b",
++    "test/initramfs/src/regression/process/wait_reap_trace/wait_reap_trace.c": "1437deb6fbd7b77faccfc76b96d75b4cca2b2d501f3d5b029c266b9c543c27fd",
++    "test/initramfs/src/regression/process/wait_reap_trace/wait_calibration.c": "e591d0b635f3854038d8323ba03565a359fc38768b0bfc3173d61d08e04671c3",
++    "test/initramfs/src/regression/process/wait_reap_trace/Makefile": "124457dd18d700a8a3080f87956e34f578da7ef982b3aa8cbfafe965be1c14bb"
++  },
++  "additional_source_sha256": {
++    "ostd/src/sync/mutex.rs": "af64fd9e97afbaa399277683c570fa314b3ff63f3a5599b434a59dfbd275e71e",
++    "ostd/src/sync/spin.rs": "b88c56aeb40d3ddb55c7e65691fa2519997ba92b795f1b01801d5af03da9fc73",
++    "kernel/core/src/sched/sched_class/mod.rs": "b506d98f66793b0c65f63f5de56d52cbf97f065bf64e7f0999c031b811ea46a6"
++  },
++  "unchanged_v4_inputs_sha256": {
++    "cases.tsv": "eba30152db35a608f521984474ad0ad7bab0ef67e7785b7259b50a116003efbc",
++    "src/Makefile": "124457dd18d700a8a3080f87956e34f578da7ef982b3aa8cbfafe965be1c14bb",
++    "src/wait_reap_trace.c": "c321494aed02c1bfb89d676b7c2c1ed5f1ecd9c9923400be76f43a929d232e12",
++    "src/wait_calibration.c": "e591d0b635f3854038d8323ba03565a359fc38768b0bfc3173d61d08e04671c3",
++    "src/wr_trace.rs": "ec9aed3f6b032b626f86ff8a97636ecaa37e6f3fa037662264889cd445232219",
++    "src/wr_syscall.rs": "aee0e9ad96b463d2524a5ad5498b665b8dc6e5be37cad99309b8e0576f21d38b",
++    "src/instrument.py": "3cdd3187ca71d4f3705063e010ebea20995d30947f08f84ef8544128a4e21ef7",
++    "patches/instrumentation.patch": "10de68e9ba57e7749ecb5dbbc86ebc0c2fd838858e7ae5eebe42f3a56ee005fb",
++    "evidence/hooks.json": "8d7864cfb37f2b99885bb3403de77f7e7551766d378841345d5b4ae231327f89",
++    "evidence/applied.json": "1e0fba48688badb9a8faf82632a6c9f0524d5ec3961733ff52ae03315728cc8d",
++    "evidence/clock-method-v4.md": "fcaca87d2aa3f748f9e0dff21faa9b1ee242f1d9cd4170be48e8f8e03130134d"
++  },
++  "preserved_manifests_sha256": {
++    "evidence/candidate-v1/hashes.json": "033da3a79244740318d39509eefa347cd19427ae0518d6b158867150c1228fb4",
++    "evidence/candidate-v2/hashes.json": "e273e0c92860823fa5cffd1d01a96995134742d1ba13af00ca103df22c1dc42a",
++    "evidence/candidate-v3/hashes.json": "18705706b2f93983edd6b8e998da1b8d9e46edb5df04b439b4ff7ff32182cae3",
++    "evidence/candidate-v4/hashes.json": "327158a7ac531d0a003816b2ae864f3dc9f9c4dd04e038899fa5b759e2ba1eaa"
++  },
++  "v4_inputs_sha256": "5e6d26270802b9cc0b1fd4beea0a22d06e346e43cdf9317c9190a60153d3b8e7"
++}
+diff --git a/harness/evidence/v5-static-checks.json b/harness/evidence/v5-static-checks.json
+new file mode 100644
+index 0000000..eef7726
+--- /dev/null
++++ b/harness/evidence/v5-static-checks.json
+@@ -0,0 +1,125 @@
++{
++  "utc": "2026-10-05T18:58:57.293449+00:00",
++  "scope": "Syntax and static identity only. No harness code or synthetic trace was executed.",
++  "commands": [
++    {
++      "command": [
++        "python3",
++        "-c",
++        "from pathlib import Path\nfor p in sorted(Path('harness/src').glob('*.py')):\n    compile(p.read_bytes(), str(p), 'exec')\n    print(p)\n"
++      ],
++      "exit_code": 0,
++      "output": "harness/src/boot.py\nharness/src/collect.py\nharness/src/initramfs.py\nharness/src/instrument.py\nharness/src/review_gate.py\n"
++    },
++    {
++      "command": [
++        "bash",
++        "-n",
++        "harness/run.sh",
++        "harness/apply.sh",
++        "harness/clean.sh"
++      ],
++      "exit_code": 0,
++      "output": ""
++    },
++    {
++      "command": [
++        "bash",
++        "-n"
++      ],
++      "exit_code": 0,
++      "output": "",
++      "stdin": "#!/bin/busybox sh\nset -eu\ncount=$(/bin/busybox nproc)\nprintf 'WR_GUEST_NPROC %s\\n' \"$count\"\nexec /fixture \"$@\"\n"
++    },
++    {
++      "command": [
++        "bash",
++        "-n"
++      ],
++      "exit_code": 0,
++      "output": "",
++      "stdin": "\n    export CARGO_BUILD_JOBS=2\n    cc --version\n    readlink -f /usr/bin/cc\n    sha256sum /usr/include/x86_64-linux-gnu/sys/wait.h /usr/include/x86_64-linux-gnu/sys/syscall.h /usr/include/x86_64-linux-gnu/bits/types/siginfo_t.h /usr/lib/x86_64-linux-gnu/libc.a\n    rustc --version\n    ldd --version\n    timeout 120 make -C test/initramfs/src/regression/process/wait_reap_trace \\\n        TEST_PLATFORM=asterinas OUTPUT_DIR=/work/.specula-output/harness/build/guest \\\n        BUILD_DIR=/work/.specula-output/harness/build/guest-deps\n    timeout 120 make -C test/initramfs/src/regression/process/wait_reap_trace \\\n        TEST_PLATFORM=linux OUTPUT_DIR=/work/.specula-output/harness/build/linux \\\n        BUILD_DIR=/work/.specula-output/harness/build/linux-deps\n    /bin/busybox --list | grep -Fx sh\n    /bin/busybox --list | grep -Fx nproc\n    readelf -l /bin/busybox > /work/.specula-output/harness/build/busybox-program-headers.txt\n    if grep -q INTERP /work/.specula-output/harness/build/busybox-program-headers.txt; then\n        printf \"Guest CPU probe requires static BusyBox.\\n\" >&2\n        exit 1\n    fi\n    cp /bin/busybox /work/.specula-output/harness/build/guest/busybox\n    "
++    },
++    {
++      "command": [
++        "bash",
++        "-n"
++      ],
++      "exit_code": 0,
++      "output": "",
++      "stdin": "count=$(nproc); printf \"WR_CONTROL_NPROC %s\\n\" \"$count\"; exec timeout 25 /fixture/process/wait_reap_trace/wait_reap_trace \"$@\""
++    },
++    {
++      "command": [
++        "bash",
++        "-n"
++      ],
++      "exit_code": 0,
++      "output": "",
++      "stdin": "count=$(nproc); printf \"WR_CONTROL_NPROC %s\\n\" \"$count\"; exec timeout 25 /fixture/process/wait_reap_trace/wait_calibration"
++    },
++    {
++      "command": [
++        "bash",
++        "-n"
++      ],
++      "exit_code": 0,
++      "output": "",
++      "stdin": "\n    export CARGO_BUILD_JOBS=2 CARGO_NET_OFFLINE=true OSDK_LOCAL_DEV=1\n    timeout 900 cargo build --manifest-path osdk/Cargo.toml --locked --target-dir /work/.specula-output/harness/build/osdk\n    cd kernel\n    timeout 1500 /work/.specula-output/harness/build/osdk/debug/cargo-osdk osdk build --release \\\n        --target-arch x86_64 --boot-method vmm-direct --strip-elf \\\n        --output /work/.specula-output/harness/build/kernel\n    "
++    },
++    {
++      "command": [
++        "git",
++        "diff",
++        "--check"
++      ],
++      "exit_code": 0,
++      "output": ""
++    }
++  ],
++  "static_assertions": {
++    "decoder_mapping_41_and_body_unchanged": true,
++    "calibration_and_support_functions_ast_identical_to_v4": true,
++    "all_shared_v4_read_checks_ast_identical_ignoring_assert_messages": true,
++    "fixed_claim_verbatim_in_all_three_documents": true,
++    "gate_v5_incomplete_no_author_approval": true,
++    "python_syntax_files": 5,
++    "embedded_shell_scripts_syntax_checked": 5,
++    "embedded_python_heredocs_syntax_checked": 2,
++    "protected_inputs_and_installed_source_verified": "evidence/v5-inputs.json"
++  },
++  "runtime": {
++    "source_apply": "NOT_RUN",
++    "docker_including_image_inspect": "NOT_RUN",
++    "native_builds": "NOT_RUN",
++    "linux_control": "NOT_RUN",
++    "guest": "NOT_RUN",
++    "guest_nproc": "NOT_RUN",
++    "calibration_measurement": "NOT_RUN",
++    "encoder_execution": "NOT_RUN",
++    "collector_execution": "NOT_RUN",
++    "tlc": "NOT_RUN",
++    "independent_review": "NOT_RUN"
++  },
++  "recorded_sampled_bound_cycles": null,
++  "actual_guest_cpu_count": null,
++  "checked_source_sha256": {
++    "src/Makefile": "124457dd18d700a8a3080f87956e34f578da7ef982b3aa8cbfafe965be1c14bb",
++    "src/boot.py": "6328a279f03d7d085fcc598573f763c7cf8438232db9385f401aca7bcd417511",
++    "src/collect.py": "f47ea876227669dd3ded951d661a1716b9c8b75b2cc2abfc25575dbd20e7d283",
++    "src/initramfs.py": "a89ecd347eadb36b2a25c16d8cd96dd3c04964bd50c6bd0ff570d4e186c72561",
++    "src/instrument.py": "3cdd3187ca71d4f3705063e010ebea20995d30947f08f84ef8544128a4e21ef7",
++    "src/review_gate.py": "2d23fd66b008a1f41938dd4fee0348397af01949133b7c7af30581399c9dae9e",
++    "src/wait_calibration.c": "e591d0b635f3854038d8323ba03565a359fc38768b0bfc3173d61d08e04671c3",
++    "src/wait_reap_trace.c": "c321494aed02c1bfb89d676b7c2c1ed5f1ecd9c9923400be76f43a929d232e12",
++    "src/wr_syscall.rs": "aee0e9ad96b463d2524a5ad5498b665b8dc6e5be37cad99309b8e0576f21d38b",
++    "src/wr_trace.rs": "ec9aed3f6b032b626f86ff8a97636ecaa37e6f3fa037662264889cd445232219"
++  },
++  "checked_runner_sha256": "a31c69536a7b5ba8bdac945c773b98cbf830a7fb493600934659612d083ef8f8",
++  "checked_gate_sha256": "ae959debfa74d06722d44cbc56c7f0484d41258427eaca1fafa000ca6a919b93",
++  "checked_document_sha256": {
++    "INSTRUMENTATION.md": "3e5e8f0fcd7de09c4bc0a72ed026d597b3c7cdcfda890f48433132820c4e7e06",
++    "STATUS.md": "88f6b43c9d8d7b4350af1a268ccf1f89ee43e18d19f60e1f584dc88efd45b4a3",
++    "evidence/clock-method-v5.md": "252e97d05d2216ef6714f2679169e00a8c56df7d5d5d16bac1007bf67528c752"
++  }
++}

@@ -1,0 +1,57 @@
+MC-3 Level-3 reproduction patch — timing-only, no logic change.
+Applied at build time to the throwaway build copy
+confirmation/MC-3/kernel-src (the pristine worktree is left untouched).
+Effect: a prctl(0x53504551)-armed thread busy-waits inside
+ExfatInode::write_at between the release of the preparation write guard
+and the reacquisition of the upgradeable guard — the exact counterexample
+window (MC_hunt_s2_exfat_extent_bfs1 states 8-11). Default disarmed = no-op.
+
+diff --git a/kernel/core/src/tla_trace.rs b/kernel/core/src/tla_trace.rs
+--- a/kernel/core/src/tla_trace.rs
++++ b/kernel/core/src/tla_trace.rs
+@@ struct Recorder {
+     overflow: bool,
+     records: Vec<Receipt>,
++    /// MC-3 repro hook: busy-wait iterations at the exFAT write_at
++    /// release-preparation/acquire-copy window. 0 = disarmed (default).
++    mc3_iters: u64,
+ }
+@@ impl Recorder {
+-         overflow: false, records: Vec::new() }
++         overflow: false, records: Vec::new(), mc3_iters: 0 }
+@@ pub(crate) fn control(option: i32, tid: usize, unit: usize, fault: usize) -> Result<usize> {
++    if option == 0x53504551 {
++        // MC-3 repro hook control: arg2=1 arms with arg3 busy-wait
++        // iterations, arg2=0 disarms. Timing-only; no logic altered.
++        with(|r| r.mc3_iters = if tid == 1 { unit as u64 } else { 0 });
++        return Ok(0);
++    }
+     if option == 0x53504543 {
+@@
+ pub(crate) fn last_end() -> u64 { with(|r| r.records.last().map(|e| e.end).unwrap_or_else(stamp)).unwrap_or_else(stamp) }
++
++/// MC-3 repro hook: when armed via prctl(0x53504551), busy-wait at the exact
++/// counterexample window (after ExfatWriteAtReleasePreparation, before
++/// reacquiring the guard for the copy). No locks are held while spinning;
++/// only this thread's timing is dilated, the system's logic is unchanged.
++pub(crate) fn mc3_release_hook() {
++    let iters = with(|r| r.mc3_iters).unwrap_or(0);
++    for _ in 0..iters {
++        core::hint::spin_loop();
++    }
++}
+diff --git a/kernel/core/src/syscall/prctl.rs b/kernel/core/src/syscall/prctl.rs
+--- a/kernel/core/src/syscall/prctl.rs
++++ b/kernel/core/src/syscall/prctl.rs
+@@
+-    if option == 0x53504543 || option == 0x53504544 {
++    if option == 0x53504543 || option == 0x53504544 || option == 0x53504551 {
+diff --git a/kernel/core/src/fs/fs_impls/exfat/inode.rs b/kernel/core/src/fs/fs_impls/exfat/inode.rs
+--- a/kernel/core/src/fs/fs_impls/exfat/inode.rs
++++ b/kernel/core/src/fs/fs_impls/exfat/inode.rs
+@@
+         crate::tla_trace::event("ExfatWriteAtReleasePreparation", crate::tla_trace::last_end(), [0; 8]);
++        crate::tla_trace::mc3_release_hook();
+         let specula_start = crate::tla_trace::stamp();
+         // Locks released here, so that file write can be parallelized.
+         let inner = self.inner.upread();

@@ -1,0 +1,76 @@
+{
+  "schema_version": "2",
+  "system": "asterinas-unix-dgram-scm-rights",
+  "generated_by": "consolidate",
+  "findings": [
+    {
+      "id": "MC-1",
+      "title": "AST-32: Failed SCM_RIGHTS number publication retains an installed FD",
+      "source": "model-checking",
+      "scenario": "Scenario 3, including PEEK publication from Scenario 2",
+      "severity": "Medium",
+      "invariant": "NoFailedNumberInstalled",
+      "config": "MC_hunt_AST32_install.cfg",
+      "counterexample": "spec/output/validation-20261010T015405Z/MC_hunt_AST32_install.log",
+      "affected_code": [
+        "kernel/core/src/net/socket/unix/ctrl_msg.rs:184",
+        "kernel/core/src/net/socket/util/message_header.rs:115"
+      ],
+      "summary": "This is existing AST-32, with zero new defect identities. FileMessage installs each referenced file before copying its FD integer, so the failed entry remains installed after temporary cleanup. A second counterexample violates ReportedPrefixMatchesLinux because a later number fault leaves the successful prefix valid but reports zero control length. Linux reserves, copies and then installs, and reports the delivered prefix. This validation result does not replace the later confirmation and review stages.",
+      "dedup_note": "also covers code-review Scenario 3 (same per-FD install-before-number-copy and reported-prefix/MSG_CTRUNC mechanism at FileMessage::write_to and message_header.rs). Its counterexample additionally traverses Scenario 2's PEEK-clone publication route, but that selection/publication interleaving mechanism itself reported no violation and is emitted separately as CR-2."
+    },
+    {
+      "id": "MC-2",
+      "title": "AST-36: Ordinary payload faults retain the datagram",
+      "source": "model-checking",
+      "scenario": "Scenario 4 bounded payload-fault consumption/PEEK control",
+      "severity": "Medium",
+      "invariant": "PayloadFaultConsumptionMatchesLinux",
+      "config": "MC_hunt_AST36.cfg",
+      "counterexample": "spec/output/validation-20261010T015405Z/MC_hunt_AST36.log",
+      "affected_code": [
+        "kernel/core/src/net/socket/unix/datagram/message.rs:285"
+      ],
+      "summary": "This is the existing AST-36 boundary control, not a new defect identity. Asterinas returns from a failed payload copy before ordinary dequeue, retaining the same message and its SCM_RIGHTS references for retry. Linux unlinks the ordinary receive before copying and releases that reference on failure. PEEK retains the message in both implementations, and the remaining Asterinas queue references are accounted for.",
+      "dedup_note": "also covers code-review Scenario 4 (same payload-fault-before-dequeue consumption mechanism at MessageReceiver::try_recv)."
+    },
+    {
+      "id": "CR-1",
+      "title": "Scenario 1: Captured object ownership survives descriptor reuse and release",
+      "source": "code-review",
+      "scenario": "Scenario 1",
+      "severity": "High",
+      "invariant": null,
+      "config": null,
+      "counterexample": null,
+      "affected_code": [
+        "kernel/core/src/net/socket/unix/ctrl_msg.rs:103-113",
+        "kernel/core/src/net/socket/unix/ctrl_msg.rs:139-148",
+        "kernel/core/src/net/socket/unix/ctrl_msg.rs:222-240",
+        "kernel/core/src/net/socket/unix/ctrl_msg.rs:304-310",
+        "kernel/core/src/net/socket/unix/datagram/message.rs:79-96",
+        "kernel/core/src/net/socket/unix/datagram/message.rs:262-270",
+        "kernel/core/src/fs/file/file_table.rs:190-205",
+        "kernel/core/src/syscall/close.rs:22-35"
+      ],
+      "summary": "Code-review mechanism hypothesis: SCM_RIGHTS captures owned references to file objects, so descriptor-number reuse or sender close after a successful send must not change which objects the queued and delivered references name. The hypothesized defect class is an ownership-accounting break, where a reference vanishes or gains an unexplained owner across capture, enqueue move, PEEK clone, normal-receive move, installation clone, temporary release, FD removal/drop, or final queue disposal. Model checking hunted this scenario with five MC_hunt_scenario1* configurations spanning shared and separate file tables and PEEK/ordinary layouts; the three exhaustive rows completed with no violation and the two 30-minute budget rows ended with no reported violation. No MC candidate carries this mechanism (MC-1 is the AST-32 publication order and MC-2 the AST-36 consumption boundary), so it proceeds as a code-review candidate with counterexample null. Confirmation should decide whether the executed bounds establish the ownership-conservation contract or leave it unverified."
+    },
+    {
+      "id": "CR-2",
+      "title": "Scenario 2: Queue selection and ancillary completion have different orders",
+      "source": "code-review",
+      "scenario": "Scenario 2",
+      "severity": "High",
+      "invariant": null,
+      "config": null,
+      "counterexample": null,
+      "affected_code": [
+        "kernel/core/src/net/socket/unix/datagram/message.rs:179-217",
+        "kernel/core/src/net/socket/unix/ctrl_msg.rs:141-148",
+        "kernel/core/src/net/socket/unix/ctrl_msg.rs:304-310",
+        "kernel/core/src/syscall/recvmsg.rs:32-52"
+      ],
+      "summary": "Code-review mechanism hypothesis: datagram queue selection serializes message identity and consumption under the queue mutex, but ancillary FD publication happens after the lock is released, so publications from an earlier PEEK and a later ordinary receive can interleave. The hypothesized defect class is an identity or consumption break, such as the message being consumed twice, a PEEK publication delivering moved rights, or stale rights being published after consumption. Model checking hunted this scenario with four MC_hunt_scenario2* configurations; all reported no violation of the at-most-once consumption and PEEK queue-preservation properties within the executed bounds (three exhaustive, one budget-ended). MC-1's AST-32 counterexample does traverse a PEEK-clone publication route drawn from this scenario, but its root cause is the Scenario 3 install-before-number-copy order, so this interleaving mechanism is not covered by an MC candidate. Confirmation should evaluate whether the selection/publication interleaving contract holds at the pinned source or needs evidence beyond the model-checked bounds."
+    }
+  ]
+}

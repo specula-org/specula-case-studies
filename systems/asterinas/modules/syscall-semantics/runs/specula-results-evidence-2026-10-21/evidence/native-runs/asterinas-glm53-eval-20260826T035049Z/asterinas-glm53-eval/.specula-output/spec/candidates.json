@@ -1,0 +1,122 @@
+{
+  "schema_version": "2",
+  "system": "asterinas-glm53-eval",
+  "generated_by": "consolidate",
+  "findings": [
+    {
+      "id": "MC-1",
+      "title": "A Later readv Fault Can Hide a Positive Copy Prefix",
+      "source": "model-checking",
+      "scenario": "1 - positive progress is collapsed before result and offset commit",
+      "severity": "High",
+      "invariant": "MCReadReturnCoversCopies",
+      "config": "MC_hunt_s1_partial_progress.cfg",
+      "counterexample": "spec/output/MC_hunt_s1_partial_progress_bfs.out",
+      "affected_code": [
+        "ostd/src/mm/io/mod.rs:347",
+        "kernel/core/src/error.rs:209",
+        "kernel/core/src/vm/page_cache/vmo/mod.rs:558",
+        "kernel/core/src/fs/file/inode_handle.rs:298",
+        "kernel/core/src/syscall/preadv.rs:168",
+        "kernel/core/src/syscall/pwritev.rs:164"
+      ],
+      "summary": "A later readv iovec can copy a positive prefix before faulting, but tuple conversion drops that copied count. InodeHandle sees only an error, leaves the shared offset unchanged for the prefix, and the vector loop returns only earlier iovecs. User memory therefore contains more newly copied data than the return value and offset delta report. The trace-valid writev capture shows the corresponding committed-data form of the same progress-erasure mechanism.",
+      "dedup_note": "Also covers code-review Scenario 1 (same mechanism and sites: read_fallible returns (error, copied) but the tuple conversion at kernel/core/src/error.rs:209 discards the count before result aggregation and offset commit; the scalar form was kept as a positive control per the brief). Also covers the brief's code-review-only item 'PageCache/filesystem APIs have no owner for an error plus partial count' (Section 6.3)."
+    },
+    {
+      "id": "MC-2",
+      "title": "RamFS and exFAT Cached Reads Copy Beyond Logical EOF",
+      "source": "model-checking",
+      "scenario": "2 - filesystem adapters copy outside logical progress",
+      "severity": "High",
+      "invariant": "MCNoReadPastEOF",
+      "config": "MC_hunt_s2_unbounded_read.cfg",
+      "counterexample": "spec/output/MC_hunt_s2_unbounded_read_bfs.out",
+      "affected_code": [
+        "kernel/core/src/fs/fs_impls/ramfs/fs.rs:704",
+        "kernel/core/src/fs/fs_impls/exfat/inode.rs:649",
+        "kernel/core/src/vm/page_cache/mod.rs:181",
+        "kernel/core/src/vm/page_cache/vmo/mod.rs:534"
+      ],
+      "summary": "RamFS and exFAT compute an EOF-limited result but pass the original destination writer into the page cache. The cache is page-aligned and may be larger than logical EOF, while Vmo::read clips only against that capacity. A read at EOF can consequently alter user memory or fault on an address that should not be accessed, even though the filesystem reports zero logical bytes.",
+      "dedup_note": "Also covers code-review Scenario 2, unbounded-read half (same mechanism and sites: adapters compute an EOF-limited result but pass the unrestricted destination writer into the page-aligned cache). Also subsumes the brief's test-verifiable item TV-1."
+    },
+    {
+      "id": "MC-3",
+      "title": "A Zero-Progress RamFS Write Can Publish the Full Requested EOF",
+      "source": "model-checking",
+      "scenario": "2 - filesystem adapters publish outside logical progress",
+      "severity": "High",
+      "invariant": "MCNoNominalEOFOnFault",
+      "config": "MC_hunt_s2_prepublished_write.cfg",
+      "counterexample": "spec/output/MC_hunt_s2_prepublished_write_bfs.out",
+      "affected_code": [
+        "kernel/core/src/fs/fs_impls/ramfs/fs.rs:747",
+        "kernel/core/src/fs/fs_impls/ramfs/fs.rs:755",
+        "kernel/core/src/fs/fs_impls/ramfs/fs.rs:761",
+        "kernel/core/src/fs/fs_impls/ramfs/fs.rs:775"
+      ],
+      "summary": "RamFS publishes inode size and cache growth from the full requested write before it copies from user memory. If that fallible copy faults with zero progress, the error path returns EFAULT without restoring the metadata. The file therefore remains extended to the full requested end despite having committed and reported no bytes. A prefix fault can likewise publish an EOF beyond the committed prefix.",
+      "dedup_note": "Also covers code-review Scenario 2, prepublished-write half (same mechanism and site: RamFS publishes requested EOF and cache growth before the fallible user copy with no rollback). Also subsumes the brief's test-verifiable item TV-2."
+    },
+    {
+      "id": "MC-4",
+      "title": "Vectored I/O Is Not Atomic Against a Shared-Offset Competitor",
+      "source": "model-checking",
+      "scenario": "3 - vectored I/O releases serialization between entries",
+      "severity": "High",
+      "invariant": "MCVectorSingleLinearization",
+      "config": "MC_hunt_s3_vector_linearization.cfg",
+      "counterexample": "spec/output/MC_hunt_s3_vector_linearization_bfs.out",
+      "affected_code": [
+        "kernel/core/src/syscall/preadv.rs:159",
+        "kernel/core/src/syscall/pwritev.rs:155",
+        "kernel/core/src/fs/file/inode_handle.rs:292",
+        "kernel/core/src/fs/file/inode_handle.rs:346"
+      ],
+      "summary": "readv and writev call the scalar file operation separately for every iovec. Each scalar call independently acquires and releases the shared open-description offset lock, so a competing operation can commit between vector entries. The counterexample commit order is readv iovec 1, scalar write, readv iovec 2, which no serial ordering of the two API calls can explain. A deterministic trace-valid writev witness confirms the same unlocked boundary in the implementation.",
+      "dedup_note": "Also covers code-review Scenario 3 (same mechanism and sites: readv/writev invoke the scalar file operation once per iovec, each independently locking and unlocking the shared open-description offset)."
+    },
+    {
+      "id": "CR-1",
+      "title": "pread64/pwrite64 Must Leave the Shared Open-Description Offset Unchanged (no MC violation found)",
+      "source": "code-review",
+      "scenario": "4 - positional offset isolation",
+      "severity": "Medium",
+      "invariant": null,
+      "config": null,
+      "counterexample": null,
+      "affected_code": [
+        "kernel/core/src/fs/file/file_table.rs:117",
+        "kernel/core/src/fs/file/inode_handle.rs:280",
+        "kernel/core/src/fs/file/inode_handle.rs:389",
+        "kernel/core/src/fs/file/inode_handle.rs:412",
+        "kernel/core/src/syscall/pread64.rs:33",
+        "kernel/core/src/syscall/pwrite64.rs:33"
+      ],
+      "summary": "Duplicated or forked descriptors share one Arc<dyn FileLike> and therefore one InodeHandle::offset, while positional read_at/write_at (inode_handle.rs:389,412) never touch that offset — only the shared scalar paths (inode_handle.rs:280,328) advance it under the offset mutex. The Linux-visible contract under test is that pread64/pwrite64 observably leave the shared offset unchanged and race consistently with shared-offset I/O on the same open-file description; positional data effects may interleave freely. Model checking hunted this with MC_hunt_s4_positional_isolation.cfg (complete BFS to depth 19 over 2016 distinct states, plus a >464M-state simulation) and found no violation, and the brief's code analysis judged the target code correct. It is emitted as a candidate anyway because confirmation, not consolidation, decides bug status — for example an adapter path that attributes positional progress to the shared offset would violate the contract."
+    },
+    {
+      "id": "CR-2",
+      "title": "Vectored and Positional Syscalls Lack the EINTR-to-ERESTARTSYS Restart Translation",
+      "source": "code-review",
+      "scenario": "1 (restart sub-mechanism) - EINTR-to-ERESTARTSYS translation divergence, code-review-only",
+      "severity": "Medium",
+      "invariant": null,
+      "config": null,
+      "counterexample": null,
+      "affected_code": [
+        "kernel/core/src/syscall/read.rs:38",
+        "kernel/core/src/syscall/write.rs:38",
+        "kernel/core/src/syscall/preadv.rs:134",
+        "kernel/core/src/syscall/pwritev.rs:134",
+        "kernel/core/src/syscall/pread64.rs:33",
+        "kernel/core/src/syscall/pwrite64.rs:33",
+        "kernel/core/src/process/signal/mod.rs:54",
+        "kernel/core/src/process/signal/mod.rs:145",
+        "kernel/core/src/thread/task.rs:83"
+      ],
+      "summary": "Scalar read/write translate EINTR to ERESTARTSYS at kernel/core/src/syscall/read.rs:38 and write.rs:38, letting the signal machinery rewind the whole syscall when SA_RESTART is set; the vectored and positional wrappers (preadv.rs, pwritev.rs, pread64.rs, pwrite64.rs) contain no such translation (verified: no EINTR handling in those files) and would surface a raw EINTR to userspace instead. Whole-syscall restart (signal/mod.rs rewind, task.rs restart bookkeeping) is safe only when committed progress is zero, so any regular-file path that returns EINTR after committing bytes could replay committed data or advance the shared offset twice. No current local regular-file path returns EINTR after progress, so this was deliberately never model-checked (the modeling rules exclude an adversarial EINTR producer) and has no counterexample. Confirmation should audit remote or future regular-file implementations and this translation asymmetry before enabling restart fault injection."
+    }
+  ]
+}
