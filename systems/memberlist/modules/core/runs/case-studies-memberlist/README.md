@@ -1,4 +1,4 @@
-# memberlist / core / case-studies:memberlist
+# HashiCorp memberlist / core / case-studies:memberlist
 
 This directory is the canonical record of one experiment run.
 
