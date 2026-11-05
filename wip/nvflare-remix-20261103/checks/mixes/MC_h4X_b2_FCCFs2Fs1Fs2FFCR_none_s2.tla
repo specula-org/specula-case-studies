@@ -1,0 +1,11 @@
+---- MODULE MC_h4X_b2_FCCFs2Fs1Fs2FFCR_none_s2 ----
+EXTENDS Mix, Props, GenericProps, PropsMR, TLC
+CONSTANTS s1, s2
+MCGrain == [JobSP |-> "F", JobCP |-> "C", RunCJ |-> "C", TaskCJ |-> "C", Trainer |-> "C", PaySrc |-> "C", PayRcv |-> "F", CommSJ |-> "F", WfSJ |-> "C", Net |-> "R"]
+MCSiteGrain == ("TaskCJ" :> (s1 :> "C" @@ s2 :> "F") @@ "Trainer" :> (s1 :> "F" @@ s2 :> "C") @@ "PaySrc" :> (s1 :> "C" @@ s2 :> "F"))
+MCFaults == {}
+MCProfile == {}
+MCSym == Permutations(Sites)
+
+GNext == Next \/ ((DoneStutter \/ ((AtBoundAny \/ KnownStuck) /\ UNCHANGED portVars)) /\ UNCHANGED privVars)
+====

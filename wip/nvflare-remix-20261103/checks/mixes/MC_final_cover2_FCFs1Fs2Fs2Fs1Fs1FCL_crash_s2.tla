@@ -1,0 +1,9 @@
+---- MODULE MC_final_cover2_FCFs1Fs2Fs2Fs1Fs1FCL_crash_s2 ----
+EXTENDS Mix, Props, TLC
+CONSTANTS s1, s2
+MCGrain == [JobSP |-> "F", JobCP |-> "C", RunCJ |-> "C", TaskCJ |-> "C", Trainer |-> "C", PaySrc |-> "C", PayRcv |-> "C", CommSJ |-> "F", WfSJ |-> "C", Net |-> "L"]
+MCSiteGrain == ("RunCJ" :> (s1 :> "F" @@ s2 :> "C") @@ "TaskCJ" :> (s1 :> "C" @@ s2 :> "F") @@ "Trainer" :> (s1 :> "C" @@ s2 :> "F") @@ "PaySrc" :> (s1 :> "F" @@ s2 :> "C") @@ "PayRcv" :> (s1 :> "F" @@ s2 :> "C"))
+MCFaults == {"cjCrash", "taskTimeout"}
+MCSym == Permutations(Sites)
+
+====

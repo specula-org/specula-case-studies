@@ -1,0 +1,10 @@
+---- MODULE MC_blind1_CFs2CFs1FCFFCR_timeouts_s2 ----
+EXTENDS Mix, Props, GenericProps, TLC
+CONSTANTS s1, s2
+MCGrain == [JobSP |-> "C", JobCP |-> "C", RunCJ |-> "C", TaskCJ |-> "C", Trainer |-> "F", PaySrc |-> "C", PayRcv |-> "F", CommSJ |-> "F", WfSJ |-> "C", Net |-> "R"]
+MCSiteGrain == ("JobCP" :> (s1 :> "C" @@ s2 :> "F") @@ "TaskCJ" :> (s1 :> "F" @@ s2 :> "C"))
+MCFaults == {"taskTimeout", "submitTimeout", "pullTimeout", "txTimeout", "rpcTimeout", "resultWaitTimeout"}
+MCSym == Permutations(Sites)
+
+GNext == Next \/ (DoneStutter /\ UNCHANGED privVars)
+====

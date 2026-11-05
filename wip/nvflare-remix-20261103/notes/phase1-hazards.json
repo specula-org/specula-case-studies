@@ -1,0 +1,3867 @@
+{
+ "meta": {
+  "pin": "c411a201ead0ec2d4bd0df27fc8b88955c086cfd",
+  "inputs": [
+   "inputs/phase1/v2",
+   "inputs/phase1/v1",
+   "inputs/phase-1.5.md",
+   "inputs/seeds/*/integration-handoff.md",
+   "inputs/seeds/{job,payload}/spec/findings.json",
+   "inputs/vertical-slice"
+  ],
+  "evidence_note": "All hazards are static (Phase 1 or this note). 'verified' lists anchors re-read at the pin during this analysis; nothing was executed, model checked or reproduced. Seed 'REPRODUCED' items refer to the seed run's own evidence.",
+  "status_labels": [
+   "candidate-MC",
+   "candidate-test",
+   "review-only",
+   "known-open",
+   "known-accepted",
+   "fixed-baseline",
+   "historical-lineage",
+   "contract-baseline",
+   "intentional-policy",
+   "unresolved",
+   "derived-new"
+  ]
+ },
+ "groups": [
+  {
+   "id": "G1",
+   "name": "SP.Job",
+   "process": "SP",
+   "component": "job",
+   "status": "core",
+   "mechanisms": [
+    "JobRunner scheduling loop: online/study/min/required-site filtering and resource probes that create reservation tokens (job_scheduler.py:119-290)",
+    "deploy, start claim under _start_lock/_starting_jobs vs pre-run abort (job_runner.py:687-824)",
+    "non-strict START replies and active-site narrowing (job_runner.py:338-415)",
+    "RUNNING metadata write after the claim lock is released (#5301)",
+    "SJ launch + registration after launch return; abort pops ownership after terminate (server_engine.py:316-329,386-410)",
+    "completion thread: SJ handle wait, infra > RC-file > worker error precedence, run_aborted latch (job_runner.py:492-636; server_engine.py:204-235; fed_utils.py:557-574)",
+    "pending client-outcome wait (default 900 s) after SJ exit; grace expiry finalizes from server outcome",
+    "archive with 60 s retry + success latch, then terminal metadata (job_runner.py:535-686); read-merge-write metadata without CAS (filesystem_storage.py:251-275; job_def_manager.py:459-481)",
+    "JOB_COMPLETED/JOB_ABORTED handlers reclaim scheduler capacity",
+    "fed_server client-outcome receipt, heartbeat/dead-client (fed_server.py:910-1115); admin abort and Session.abort_job retry"
+   ],
+   "source_files": [
+    "private/fed/server/job_runner.py",
+    "app_common/job_schedulers/job_scheduler.py",
+    "private/fed/server/server_engine.py",
+    "private/fed/server/fed_server.py",
+    "apis/impl/job_def_manager.py",
+    "app_common/storages/filesystem_storage.py"
+   ],
+   "port": {
+    "messages_out": [
+     "CHECK_RESOURCES(job,site,req)",
+     "CANCEL_RESOURCE(token)",
+     "START_JOB(job,site,token)",
+     "ABORT_JOB(job)",
+     "SJ spawn / SJ abort"
+    ],
+    "messages_in": [
+     "reservation reply(token|fail)",
+     "START reply(ok|err|timeout)",
+     "OUTCOME(job,site,rc)",
+     "UPDATE_RUN_STATUS from SJ",
+     "SJ exit rc",
+     "heartbeat"
+    ],
+    "shared_state": [
+     "jobStatus[j] (persisted, user-visible)",
+     "terminal[j]",
+     "activeSites[j]",
+     "pendingOutcomes[j]",
+     "serverOutcome[j]",
+     "schedRunning",
+     "abortIntent[j]"
+    ]
+   },
+   "coarse_must_keep": "claim atomic vs pre-run abort; terminal only after SJ exit and (all active outcomes OR grace expiry OR abort); lost START reply narrows active sites; capacity reclaimed on JOB_* event, independent of CP physical settlement",
+   "fine_adds": "scheduler-loop vs completion-thread split, RUNNING write outside lock, archive retry/latch, non-CAS metadata, admin-abort retries",
+   "slice_actions": [
+    "ServerLaunch",
+    "SendStart",
+    "ObserveOutcome",
+    "ServerExit",
+    "FinalizeJob"
+   ]
+  },
+  {
+   "id": "G2",
+   "name": "CP.Res",
+   "process": "CP",
+   "component": "job/resources",
+   "status": "core",
+   "mechanisms": [
+    "AutoCleanResourceManager reserve/cancel/allocate/free under one lock; per-check TTL expiry of unallocated tokens (auto_clean_resource_manager.py:102-172)",
+    "List/GPU/Passthrough managers (unit vs memory sharing; passthrough has no ledger)",
+    "CheckResource/CancelResource request processors (scheduler_cmds.py:67-96,143+)",
+    "NOT included: the resource consumer's environment write (moved to CP.Exec; see B03)"
+   ],
+   "source_files": [
+    "app_common/resource_managers/*.py",
+    "private/fed/client/scheduler_cmds.py (check/cancel)"
+   ],
+   "port": {
+    "messages_out": [
+     "reservation reply(token|fail)"
+    ],
+    "messages_in": [
+     "CHECK_RESOURCES",
+     "CANCEL_RESOURCE",
+     "allocate(token) and free(alloc) calls from CP.Exec"
+    ],
+    "shared_state": [
+     "pool[c] (free units)",
+     "resv[c][token]=(job,units,ttl)",
+     "alloc[c][j]",
+     "freeCalls[c][j]"
+    ]
+   },
+   "coarse_must_keep": "set-valued pool; nondeterministic expiry of unallocated tokens; cancel never frees an allocation; free returns units immediately with no live-use check",
+   "fine_adds": "deque multiplicity, TTL counters, GPU-memory sharing vs exclusive units",
+   "slice_actions": [
+    "Reserve",
+    "RM part of Allocate/FreeAllocation"
+   ]
+  },
+  {
+   "id": "G3",
+   "name": "CP.Exec",
+   "process": "CP",
+   "component": "job/launch",
+   "status": "core",
+   "mechanisms": [
+    "StartJobProcessor: allocate -> consumer.consume -> start_app -> free on exception (scheduler_cmds.py:103-140)",
+    "resource consumer writes CP-global CUDA_VISIBLE_DEVICES (gpu_resource_consumer.py:25-33; list_resource_consumer.py:31-37)",
+    "JobExecutor registration: pending handle, abort latch, restart record; waiter thread started after _launch_job (client_executor.py:345-371)",
+    "_launch_job: fresh cj_launch_id, JOB_HANDLE_CALLBACK accepted-handle install, terminate+wait on post-launch failure (client_executor.py:373-417)",
+    "notify_job_status: launch-id fencing, legacy None accepted, STOPPED absorbing (client_executor.py:430-442)",
+    "waiter: wait, restart eligibility (leaf, rc class, can_restart, no abort/STOPPED, budget), _restart_job without re-consume (client_executor.py:722-758)",
+    "terminal outcome report once (no retry) -> credential removal -> free -> unregister (client_executor.py:760-841)",
+    "backend launchers: Process env snapshot os.environ.copy, group drain, bootstrap-marker check (process_launcher.py:60-162); Docker/K8s/Slurm as profile variants (k8s_launcher.py:381-508,699-742,1058-1059,1468-1503)",
+    "K8s WorkspaceTransferManager: per-job token record; publish_results authorize -> download -> extract (unlocked) -> remove_job(job_id) (workspace_cell_transfer.py:333-475)"
+   ],
+   "source_files": [
+    "private/fed/client/scheduler_cmds.py",
+    "private/fed/client/client_executor.py",
+    "app_common/resource_consumers/*.py",
+    "app_common/job_launcher/process_launcher.py",
+    "app_opt/job_launcher/{docker_launcher,k8s_launcher,workspace_cell_transfer}.py",
+    "app_opt/job_launcher/slurm/*"
+   ],
+   "port": {
+    "messages_out": [
+     "START reply",
+     "OUTCOME(job,site,rc)",
+     "spawn(j,gen,env,launchId) of CJ",
+     "publish_results reply"
+    ],
+    "messages_in": [
+     "START_JOB / ABORT_JOB from SP",
+     "READY/STOPPED(job,launchId|None) from CJ",
+     "CJ exit(rc)",
+     "publish_results(job,token,ref) from CJ (K8s)"
+    ],
+    "shared_state": [
+     "cpEnv[c] (process-global, mutable)",
+     "launch[c][j]: seq of gens {launchId, env, handle in pending|alive|exited(rc)|settled}",
+     "cpStatus[c][j] in STARTING|STARTED|STOPPED",
+     "abortReq[c][j]",
+     "restartAttempts[c][j]",
+     "wsRecord[c][j]={gen,token} (K8s)",
+     "outcomeSent[c][j]"
+    ]
+   },
+   "coarse_must_keep": "child env := cpEnv at spawn (port-visible); restart only after old gen exited and not STOPPED/aborted; stale-gen notifications dropped, None accepted; one outcome report, no retry; free after report",
+   "fine_adds": "pending vs accepted handle, launch-exception unwind, waiter-thread start, per-backend can_restart predicates, ws-transfer handler internal steps",
+   "slice_actions": [
+    "Allocate",
+    "Launch",
+    "ReceiveReady",
+    "ObserveChildExit",
+    "ReportOutcome",
+    "OutcomeReportReturned",
+    "FreeAllocation"
+   ]
+  },
+  {
+   "id": "G4",
+   "name": "SJ.Ctl",
+   "process": "SJ",
+   "component": "fedavg/workflow",
+   "status": "core",
+   "mechanisms": [
+    "ServerRunner run: START_RUN, workflow sequence, START_WORKFLOW + current_wf under wf_lock, control_flow outside lock, finalize (stop_controller, communicator.finalize_run, END_WORKFLOW), panic on workflow exception (server_runner.py:131-201)",
+    "run end: status=done under wf_lock, ABOUT_TO_END_RUN, END_RUN aux fire-and-forget (timeout 0), persist, readiness, END_RUN event, then ReliableMessage/streamer/DownloadService shutdown (server_runner.py:205-237)",
+    "controller policy variants: FedAvg sampling/send_model/per-round failed-closed lock/shape-safe reject/zero-accepted fatal/aggregate/update/save (fedavg.py:194-409); BaseModelController instance-wide dynamic error context (base_model_controller.py:161-165,342-375); SAG broadcast_and_wait -> abort-only check -> aggregate/convert/save (scatter_and_gather.py:248-456); Cyclic relay; CSE standing tasks (ccwf/cse_server_ctl.py:167-205); CCWF server supervisor"
+   ],
+   "source_files": [
+    "private/fed/server/server_runner.py (run/workflow parts)",
+    "app_common/workflows/{fedavg,base_model_controller,model_controller,scatter_and_gather,cyclic_ctl}.py",
+    "app_common/ccwf/{server_ctl,cse_server_ctl}.py"
+   ],
+   "port": {
+    "messages_out": [
+     "END_RUN to every CJ (fire-and-forget)",
+     "UPDATE_RUN_STATUS to SP",
+     "calls to SJ.Assign: schedule/broadcast(task,targets,min,timeout,cb), cancel_task, wait_for_task",
+     "calls to SJ.Model: accept/aggregate/reset/save"
+    ],
+    "messages_in": [
+     "callback frames (assignment,result) from SJ.Assign",
+     "task completion status OK|ERROR|TIMEOUT|CANCELLED",
+     "accept/aggregate/save outcomes from SJ.Model",
+     "abort from SP"
+    ],
+    "shared_state": [
+     "currentWf / wfOpen",
+     "round",
+     "roundGuard{failed,closed}",
+     "published[gen]{provenance}",
+     "savedGen",
+     "panic/abortLatch",
+     "endRunSent",
+     "runStatus"
+    ]
+   },
+   "coarse_must_keep": "per policy: which completion statuses and aggregator outcomes block publication; END_RUN is fire-and-forget and precedes SJ's own DownloadService shutdown",
+   "fine_adds": "per-controller control flow, dynamic error context, round-guard lock, workflow switch timing",
+   "slice_actions": [
+    "WorkflowOpened",
+    "StartRound",
+    "ScheduleTask",
+    "CountContribution",
+    "PublishDecision",
+    "CloseRound",
+    "WorkflowDone",
+    "SendEndRun"
+   ]
+  },
+  {
+   "id": "G5",
+   "name": "SJ.Assign",
+   "process": "SJ",
+   "component": "fedavg/task-authority",
+   "status": "core",
+   "mechanisms": [
+    "WFCommServer task table and locks (_controller_lock, _task_lock, Task.cb_lock, _dead_clients_lock)",
+    "get-task selection/resend loop, ClientTask + attempt UUID creation (wf_comm_server.py:230-395)",
+    "check/claim/process/finish submission, duplicate replay, bounded retired LRU, first-late hook, legacy unfenced hook (wf_comm_server.py:417-672)",
+    "task monitor timeout/exit/retire/task_done; dead-client watch (wf_comm_server.py:1179-1310,1312-1428)",
+    "cancel_task mark-only (963); wait_for_task returns on completion status before task_done (1353-1367); finalize_run clears maps (1013-1046)",
+    "ServerRunner get-task path: processing_tasks, OUT filters, cookie/authority rebinding, AFTER_TASK_DATA_FILTER hook (server_runner.py:264-440)",
+    "ServerRunner submission path under wf_lock: peer/job/attempt/workflow validation, unresolved LazyDownloadRef -> RETRY, claim before IN filters, rebinding, finish in finally (server_runner.py:456-612); TASK_CHECK handler; filter chain (task_utils.py:61-89)"
+   ],
+   "source_files": [
+    "apis/impl/wf_comm_server.py",
+    "apis/impl/{bcast,send,seq_relay,any_relay}_manager.py",
+    "private/fed/server/server_runner.py (task/submission parts)",
+    "apis/utils/task_utils.py"
+   ],
+   "port": {
+    "messages_out": [
+     "TASK_ASSIGNMENT(assignment tuple, input ref) / TRY_AGAIN",
+     "RESULT_RECEIPT(RECEIVED|TASK_CLOSED|RETRY)",
+     "TASK_CHECK reply",
+     "callback frames to SJ.Ctl"
+    ],
+    "messages_in": [
+     "GET_TASK",
+     "materialized RESULT_ENVELOPE (from SJ.PayRcv)",
+     "TASK_CHECK",
+     "schedule/cancel/wait from SJ.Ctl"
+    ],
+    "shared_state": [
+     "tasks (sequence)",
+     "clientTasks[t] (SEQUENCE, not set)",
+     "ctMap",
+     "assignment tuple (job,wf,site,taskName,clientTaskId,attemptId)",
+     "receipt[a] in none|claimed|finished",
+     "cbFrame[a] in idle|running|ok|raised",
+     "completion[t]",
+     "retired cache",
+     "processingClients"
+    ]
+   },
+   "coarse_must_keep": "authority tuple; claim at most once per fenced attempt; callback may raise -> completion ERROR without abort; completion visible to wait before task_done; RECEIVED vs TASK_CLOSED; first late result in same workflow allowed",
+   "fine_adds": "resend loop, list multiplicity, retired-cache eviction, dead-client policy, filter replacement/rebinding, processing tracker",
+   "slice_actions": [
+    "PublishAssignment",
+    "ClaimResult",
+    "FinishContributionCallback",
+    "PublishReceipt"
+   ]
+  },
+  {
+   "id": "G6",
+   "name": "SJ.Model",
+   "process": "SJ (instantiated at CJ aggregator for Swarm)",
+   "component": "fedavg/model",
+   "status": "core",
+   "mechanisms": [
+    "DXOAggregator.accept catches only shape error (173-178); InTime aggregator lock (225-247); WeightedAggregationHelper per-key mutation, no rollback, history appended after loop (weighted_aggregation_helper.py:192-286)",
+    "LazyAggregator queue acceptance (lazy.py:109-188)",
+    "lazy materialization: LazyTensorDict/_LazyRef per-key open, model_id generation check, shared _TempDirRef (lazy_tensor_dict.py:157-310); offload context owner/cleanup (tensor_disk_offload_context.py:49-127)",
+    "conversion (full_model_shareable_generator.py:56-76); persistors: PT staged fsync/replace (file_model_persistor.py:308-363), NP direct np.save (np_model_persistor.py:103-114), pre/save/post filters (model_persistor 48-58), DiskFedAvg .next/replace/rename (disk_fedavg_components.py:194-300); model selector events"
+   ],
+   "source_files": [
+    "app_common/aggregators/*.py",
+    "app_opt/pt/lazy_tensor_dict.py",
+    "app_common/utils/tensor_disk_offload_context.py",
+    "app_common/shareablegenerators/*",
+    "app_opt/pt/file_model_persistor.py",
+    "app_common/np/np_model_persistor.py",
+    "app_common/workflows/disk_fedavg_components.py"
+   ],
+   "port": {
+    "messages_out": [
+     "accept -> accepted|safeRejected|raises-after-partial",
+     "aggregate -> model{provenance,poisoned}",
+     "save -> ok|failBeforeReplace|failAfterReplace"
+    ],
+    "messages_in": [
+     "accept(result obj)",
+     "aggregate()",
+     "reset()",
+     "save(model)",
+     "lazy refs from SJ.PayRcv"
+    ],
+    "shared_state": [
+     "contrib[a] in none|accepting|accepted|safeRejected|partialFailed",
+     "accState{provenance,poisoned}",
+     "modelGen / savedGen",
+     "offloadRoot{owner,closed}",
+     "backingGen"
+    ]
+   },
+   "coarse_must_keep": "partialFailed accept outcome that leaves the accumulator poisoned; save failure after replace (artifact exists + exception)",
+   "fine_adds": "per-key mutation and per-key lazy I/O; persistor stages",
+   "slice_actions": [
+    "PublishAggregate (aggregate part)",
+    "SaveModel"
+   ]
+  },
+  {
+   "id": "G7",
+   "name": "PaySrc",
+   "process": "per serving process: CJ.PaySrc (slice result), SJ.PaySrc (task input), TP.PaySrc (external/attach)",
+   "component": "payload/source",
+   "status": "core",
+   "mechanisms": [
+    "process-global DownloadService producer tables: new_transaction/add_object under _tx_lock -> outcome_lock (download_service.py:1315-1401)",
+    "ViaDownloader publication: prepare objects -> tx -> receivers -> add refs; default UUID refs; pass-through keeps original FQCN/ref (via_downloader.py:513-650,720-897)",
+    "serve handler with active ops, DATA/EOF, serve nonce (download_service.py:1674-1821,307-424); unknown ref -> INVALID_REQUEST, finished-ref tombstones (1681-1707)",
+    "confirm handler: nonce-fenced, first final status wins (307-424,669-895); cancel handler keyed by (ref,requester) only, fails all unfinished sibling refs (1822-1855; wire 2124-2137)",
+    "budget/monitor snapshot-then-recheck; tx TTL; termination unlink+marker -> drain (OP_DRAIN_TIMEOUT 60) -> snapshot -> callbacks -> release -> receipt -> waiters; settlement claim (897-1002,1404-1605,1451-1455)",
+    "source-failure notices (1173-1312); shutdown resolves waiters done+None and clears tables (1463-1507); Cacheable/FileDownloadable sources"
+   ],
+   "source_files": [
+    "fuel/f3/streaming/download_service.py",
+    "fuel/f3/streaming/transfer_outcome.py",
+    "fuel/utils/fobs/decomposers/via_downloader.py",
+    "fuel/f3/streaming/{cacheable,file_downloader,obj_downloader}.py"
+   ],
+   "port": {
+    "messages_out": [
+     "PAYLOAD_REPLY(DATA|EOF|ERROR, nonce)",
+     "INVALID_REQUEST for unknown ref",
+     "source-failure notice"
+    ],
+    "messages_in": [
+     "PAYLOAD_PULL(ref,state)",
+     "RECEIVER_CONFIRM(ref,nonce,status)",
+     "CANCEL(ref,requester)",
+     "register(tx,refs,receiver contract) from producer",
+     "shutdown from process teardown"
+    ],
+    "shared_state": [
+     "txs[p][x]{refs, receiverContract(ids|count), acquired, final[r], state live|retiring|settled, outcome}",
+     "refTable[p][ref] -> x",
+     "waiters[x]",
+     "sourceHeld[obj]",
+     "tombstones"
+    ]
+   },
+   "coarse_must_keep": "COMPLETED only if every required receiver succeeded on every ref (identity mode); FAILED on TTL/cancel; shutdown -> waiter None and refs gone (pull -> INVALID_REQUEST); cancel keyed by ref without generation when explicit reuse enabled; progress separate from outcome",
+   "fine_adds": "active-op drain, settlement claim, budget snapshot/recheck, pipelined EOF vs cancel, legacy EOF mode",
+   "slice_actions": [
+    "RegisterResultPayload",
+    "AcquirePayload",
+    "ConfirmReceiver",
+    "RetireTransaction",
+    "ReleaseSource",
+    "RecordTransferOutcome",
+    "CompleteSettlement"
+   ]
+  },
+  {
+   "id": "G8",
+   "name": "PayRcv",
+   "process": "per receiving process: SJ.PayRcv (slice result), CJ.PayRcv (task input; Attach eager result)",
+   "component": "payload/receiver",
+   "status": "core",
+   "mechanisms": [
+    "Cell.Adapter.call: full decode before the application callback; DownloadCancelled -> SERVICE_UNAVAILABLE; any other decode failure of a streamed SUBMIT_UPDATE in SJ -> os._exit(1) (cell.py:96-149)",
+    "ViaDownloader eager download/recompose vs LazyDownloadRef pass-through (via_downloader.py:859-897,972-1027)",
+    "_download_object loop: TIMEOUT retry/backoff, non-OK rc -> cancel + download_failed, EOF -> download_completed -> confirm SUCCESS/FAILED, pipelining (download_service.py:2043-2366)",
+    "consumers incl. disk offload (tensor_downloader.py:217-365) under offload-context admission and _io_lock; local abort from own DownloadService shutdown is typed DownloadCancelled (1501)"
+   ],
+   "source_files": [
+    "fuel/f3/cellnet/cell.py",
+    "fuel/utils/fobs/decomposers/via_downloader.py",
+    "fuel/f3/streaming/download_service.py (receiver side)",
+    "app_opt/pt/tensor_downloader.py"
+   ],
+   "port": {
+    "messages_out": [
+     "PAYLOAD_PULL",
+     "RECEIVER_CONFIRM",
+     "CANCEL"
+    ],
+    "messages_in": [
+     "RESULT_ENVELOPE stream head with descriptors",
+     "PAYLOAD_REPLY"
+    ],
+    "shared_state": [
+     "rcv[p][d] in pulling|materialized|failed|cancelled",
+     "materialized object (eager value | lazy ref{backingGen})",
+     "decodeOutcome",
+     "sjFatalExit"
+    ]
+   },
+   "coarse_must_keep": "materialize before dispatch; confirm after materialize but before the application handler; failure classification local-cancel vs remote/other -> SJ fatal exit",
+   "fine_adds": "retry/backoff, pipelined speculative requests, per-chunk consumer",
+   "slice_actions": [
+    "ReceiveEnvelope",
+    "RequestPayload",
+    "ReceivePayloadData",
+    "MaterializeResult",
+    "SendConfirm"
+   ]
+  },
+  {
+   "id": "G9",
+   "name": "CJ.Runner",
+   "process": "CJ",
+   "component": "job+fedavg (client side)",
+   "status": "core",
+   "mechanisms": [
+    "init_run -> on_ready READY notify (client_runner.py:791-822)",
+    "_try_run sequential main pull loop (585-654); task processing: validation, IN filters, materialize, executor dispatch, abort check, OUT filters (288-583)",
+    "AUX DO_TASK calls the same pipeline directly; task_lock only guards running_tasks (1091-1097,267-280)",
+    "result submission: TASK_CHECK loop, new msg_root per try, SUBMISSION_ATTEMPTED, RECEIVED/TASK_CLOSED (656-789)",
+    "END_RUN handler only triggers run_abort_signal (1084-1089); TaskExecutionInterrupted skips STOPPED (808-819); run finally shuts ReliableMessage/streamer/DownloadService (814-821)",
+    "CJ process teardown: STOPPED best-effort (15 s) -> Cell stop -> archive upload via bootstrap cell -> F3 teardown -> exit (client_app_runner.py:51-101,190-240; worker_process.py:127-198; job_process_cleanup.py:24-66)"
+   ],
+   "source_files": [
+    "private/fed/client/client_runner.py",
+    "private/fed/client/client_app_runner.py",
+    "private/fed/app/client/worker_process.py",
+    "private/fed/app/job_process_cleanup.py"
+   ],
+   "port": {
+    "messages_out": [
+     "GET_TASK",
+     "RESULT_ENVELOPE (serialization registers a PaySrc tx per try)",
+     "TASK_CHECK",
+     "READY/STOPPED(job,launchId)",
+     "publish_results (K8s)",
+     "exit(rc)",
+     "execute(task)/abort to CJ.Trainer"
+    ],
+    "messages_in": [
+     "TASK_ASSIGNMENT",
+     "RESULT_RECEIPT",
+     "TASK_CHECK reply",
+     "END_RUN",
+     "result from CJ.Trainer"
+    ],
+    "shared_state": [
+     "cjPhase[c][gen] in init|ready|running|stopping|exited",
+     "runAbort",
+     "currentTask",
+     "submitAttempt[a]{try,msgRoot,tx}",
+     "readySent / stoppedSent"
+    ]
+   },
+   "coarse_must_keep": "submission local timeout -> retry with a new tx while the remote side continues; END_RUN may arrive during an in-flight submit; teardown shuts DownloadService (clears refs) before exit; STOPPED may be skipped or lost",
+   "fine_adds": "TASK_CHECK sub-loop, filter/materialize steps, AUX concurrency",
+   "slice_actions": [
+    "InitializeRunner",
+    "RunnerReady",
+    "SendReady",
+    "RequestTask",
+    "DeliverAssignment",
+    "PublishResultEnvelope",
+    "ReceiveReceipt",
+    "ReceiveEndRun",
+    "StopClientRunner"
+   ]
+  },
+  {
+   "id": "P1",
+   "name": "CJ.Trainer",
+   "process": "CJ",
+   "component": "trainer (placeholder; slice uses in-process coarse)",
+   "status": "placeholder",
+   "mechanisms": [
+    "ClientAPIExecutor (client_api_executor.py:327-453); InProcessBackend execute poll loop + _local_result callback (in_process_backend.py:96-330); DataBus publish waits for callbacks (data_bus.py:113-142); in-process trainer API send/clear/receive (client/in_process/api.py:186-331)",
+    "ExternalProcessBackend launch/session/execute gate/accepted-source monitor/reaper/finalize (external_process_backend.py:179-1377)",
+    "AttachBackend result_wait_timeout, current-task cleanup, finalize/listener close (attach_backend.py:173-410,614-639,802-819); CellBackendBase acceptance under _task_lock (cell_backend.py:174-374)",
+    "LearnerExecutor/ModelLearnerExecutor init flag (learner_executor.py:80-82; model_learner_executor.py:105-115)"
+   ],
+   "source_files": [
+    "app_common/executors/client_api/*.py",
+    "client/in_process/*.py",
+    "fuel/data_event/data_bus.py",
+    "app_common/executors/{learner_executor,model_learner_executor}.py"
+   ],
+   "port": {
+    "messages_out": [
+     "result|error to CJ.Runner",
+     "ABORT/SHUTDOWN/RESULT_ACCEPTED|REJECTED to TP",
+     "source-failure notice"
+    ],
+    "messages_in": [
+     "execute(task)/abort",
+     "RESULT_READY/heartbeat from TP"
+    ],
+    "shared_state": [
+     "inSlot[c]{gen,params}",
+     "resultSlot[c]",
+     "trainerPC",
+     "canonical[task]{resultId,attempt}",
+     "sourceLive/sourceTask",
+     "trainerAlive",
+     "bootstrapMarker (read by CP.Exec)"
+    ]
+   },
+   "coarse_must_keep": "in-process: result visible to executor BEFORE trainer-side cleanup completes; attach: canonical acceptance is a separate step after transfer completion; external: monitor acts on a captured snapshot",
+   "fine_adds": "mode-specific locks, gates, reapers",
+   "slice_actions": [
+    "InProcessTrainerPublish",
+    "BuildSubmission"
+   ]
+  },
+  {
+   "id": "P2",
+   "name": "TP.Trainer",
+   "process": "TP (external trainer process / Attach peer)",
+   "component": "trainer (placeholder)",
+   "status": "placeholder",
+   "mechanisms": [
+    "CellClientAPI send: call-scoped FOBS waiters, RESULT_READY (external one request; Attach two attempts + RESULT_STATUS), source barrier, clear_cache, RESULT_SOURCE_SETTLED retries, SHUTDOWN/ABORT (client/cell/api.py:453-648,773-915)",
+    "AttachTrainerSession retries/status/_resolve_ambiguous_result (attach_session.py:260-537); heartbeat; HELLO/SESSION_READY",
+    "hosts the TP.PaySrc instance"
+   ],
+   "source_files": [
+    "client/cell/api.py",
+    "client/cell/attach_session.py",
+    "client/cell/attach_rendezvous.py"
+   ],
+   "port": {
+    "messages_out": [
+     "RESULT_READY",
+     "RESULT_STATUS",
+     "RESULT_SOURCE_SETTLED",
+     "heartbeat"
+    ],
+    "messages_in": [
+     "RESULT_ACCEPTED/REJECTED",
+     "status reply",
+     "ABORT/SHUTDOWN",
+     "task"
+    ],
+    "shared_state": [
+     "tpSend[r] in pending|success|failed",
+     "attempts[r]",
+     "waiters[r][attempt]"
+    ]
+   },
+   "coarse_must_keep": "send success may be inferred from waiters when control replies are lost (Attach)",
+   "fine_adds": "retry and status recovery",
+   "slice_actions": []
+  },
+  {
+   "id": "P3",
+   "name": "W.Worker",
+   "process": "CP + CJ + worker pod",
+   "component": "task worker (placeholder)",
+   "status": "placeholder",
+   "mechanisms": [
+    "TaskWorkerExecutor physical attempt = hash(cj_launch_id, server attempt) (task_worker_executor.py:159-175)",
+    "task_worker protocol/artifacts/runtime/worker/supervisor (supervisor.py:155-205,293-307,380-489)",
+    "CP K8sTaskService exact (task,attempt), replay fence, identity-checked forget (k8s_task_service.py:213-311); K8s task launcher"
+   ],
+   "source_files": [
+    "private/fed/client/task_worker_executor.py",
+    "private/fed/task_worker/*.py",
+    "app_opt/task_launcher/*.py"
+   ],
+   "port": {
+    "messages_out": [
+     "completion/receipt",
+     "TaskExecutionInterrupted"
+    ],
+    "messages_in": [
+     "assignment",
+     "abort"
+    ],
+    "shared_state": [
+     "physicalAttempt",
+     "taskOwnerSettled",
+     "committedResult/checkpoint",
+     "receipt-gated release"
+    ]
+   },
+   "coarse_must_keep": "task-owner settlement gates CJ replacement; replay fence outlives payload release",
+   "fine_adds": "supervisor/artifact protocol",
+   "slice_actions": []
+  },
+  {
+   "id": "P4",
+   "name": "CJ.CCWF",
+   "process": "CJ",
+   "component": "client-side workflow (Swarm/CCWF; placeholder)",
+   "status": "placeholder",
+   "mechanisms": [
+    "ClientSideController set_learn_task busy replacement -> _abort_current_task fires ABORT_TASK; own handle_event(ABORT_TASK) -> asked_to_stop + finalize; learn loop exit (client_ctl.py:198-205,415-486)",
+    "Swarm Gatherer gather (reply_time before accept) / is_done (unlocked) / monitor aggregate-distribute (swarm_client_ctl.py:116-287,643-708); AUX learn request returns OK regardless (583-599)",
+    "event dispatch includes the emitter (apis/utils/event.py:50-73); uses a CJ.Model instance"
+   ],
+   "source_files": [
+    "app_common/ccwf/{client_ctl,swarm_client_ctl,ccwf_job}.py",
+    "apis/utils/event.py"
+   ],
+   "port": {
+    "messages_out": [
+     "AUX learn/result/report"
+    ],
+    "messages_in": [
+     "AUX learn/result",
+     "events"
+    ],
+    "shared_state": [
+     "learnTask",
+     "askedToStop",
+     "workflowDone",
+     "gather[r]{replied,acceptDone,frozen}"
+    ]
+   },
+   "coarse_must_keep": "self-delivered ABORT_TASK; reply marker separate from accept",
+   "fine_adds": "threads and locks",
+   "slice_actions": []
+  },
+  {
+   "id": "I0",
+   "name": "Net (+Events)",
+   "process": "all",
+   "component": "infrastructure",
+   "status": "infrastructure",
+   "mechanisms": [
+    "VSNetworkV1 message store; Cell request = fresh waiter, send/remote-process/reply separate, local timeout removes waiter without cancelling remote work, late replies dropped (cell.py:518-653)",
+    "fault toggles per message kind: drop, delay/reorder, duplicate, local timeout; silent peer not evicted (#5431)",
+    "byte-stream fine variant only for T-1 (stream_utils.py:98-102, byte_streamer.py)",
+    "Events: synchronous, reentrant, emitter included, handler exceptions swallowed and recorded (apis/utils/event.py:27-84)"
+   ],
+   "source_files": [
+    "fuel/f3/cellnet/cell.py",
+    "fuel/f3/streaming/*",
+    "apis/utils/event.py"
+   ],
+   "port": {
+    "messages_out": [],
+    "messages_in": [],
+    "shared_state": [
+     "networkState",
+     "sendSeq"
+    ]
+   },
+   "coarse_must_keep": "reliable eventual delivery unless a fault toggle is enabled",
+   "fine_adds": "stream-id allocation, ACK maps",
+   "slice_actions": [
+    "DeliverMessage"
+   ]
+  }
+ ],
+ "boundaries": [
+  {
+   "id": "B01",
+   "between": [
+    "SP.Job",
+    "CP.Res"
+   ],
+   "class": "benign",
+   "why": "token request/reply and CANCEL; RM ops are lock-atomic; reply timeout is cleaned by TTL",
+   "cut_rule": "cut OK; port = token, expiry event",
+   "hazards": [
+    "H34"
+   ]
+  },
+  {
+   "id": "B02",
+   "between": [
+    "SP.Job",
+    "CP.Exec"
+   ],
+   "class": "bug-prone",
+   "why": "START reply loss does not undo launch; non-strict replies narrow active sites; OUTCOME sent once without retry; 900 s grace; abort vs start",
+   "cut_rule": "process boundary, cut forced; port must carry START/ABORT/OUTCOME with Net drop/timeout",
+   "hazards": [
+    "H19",
+    "H20",
+    "H32",
+    "H33",
+    "H36"
+   ]
+  },
+  {
+   "id": "B03",
+   "between": [
+    "CP.Res",
+    "CP.Exec"
+   ],
+   "class": "benign",
+   "why": "after moving the consumer env write into CP.Exec, only allocate(token)/free(alloc) cross; the bad decisions (free while live, env reuse) are made inside CP.Exec",
+   "cut_rule": "cut OK; CP.Res coarse suffices for every listed hazard",
+   "hazards": [
+    "H08",
+    "H19",
+    "H21"
+   ]
+  },
+  {
+   "id": "B04",
+   "between": [
+    "CP.Exec (consumer env)",
+    "CP.Exec (launcher/restart)"
+   ],
+   "class": "bug-prone",
+   "why": "process-global env written on initial START only, snapshotted at every spawn incl. restart (MC-8)",
+   "cut_rule": "do NOT cut; keep inside CP.Exec",
+   "hazards": [
+    "H08"
+   ]
+  },
+  {
+   "id": "B05",
+   "between": [
+    "CP.Exec",
+    "CJ.Runner"
+   ],
+   "class": "bug-prone",
+   "why": "launch generation fencing (legacy None accepted), STOPPED best-effort/skipped, exit rc drives restart, K8s publish_results handler outlives its CJ (600 s request timeout)",
+   "cut_rule": "process boundary; port must carry launchId on READY/STOPPED, exit rc, publish_results request + handler continuation after requester timeout",
+   "hazards": [
+    "H07",
+    "H08",
+    "H35",
+    "H36"
+   ]
+  },
+  {
+   "id": "B06",
+   "between": [
+    "SP.Job",
+    "SJ.Ctl"
+   ],
+   "class": "benign",
+   "why": "narrow: spawn, run status, abort, exit rc; but SJ exit rc may come from PayRcv os._exit (H29/H30)",
+   "cut_rule": "cut OK; port = SJ exit cause/rc",
+   "hazards": [
+    "H22",
+    "H29",
+    "H30"
+   ]
+  },
+  {
+   "id": "B07",
+   "between": [
+    "SJ.Ctl",
+    "SJ.Assign"
+   ],
+   "class": "bug-prone",
+   "why": "callback exception -> Task ERROR (not abort); wait_for_task returns before task_done; cancel_task mark-only vs admitted callback; finalize clears maps; overlapping standing tasks share controller fields (TV-1)",
+   "cut_rule": "cut OK only if the port carries callback frames with raised/ok, completion status set separately from task_done, and multiple standing tasks",
+   "hazards": [
+    "H04",
+    "H11",
+    "H18",
+    "H37"
+   ]
+  },
+  {
+   "id": "B08",
+   "between": [
+    "SJ.Ctl",
+    "SJ.Model"
+   ],
+   "class": "bug-prone",
+   "why": "accept can raise after partial mutation; aggregate publishes whatever state exists; save can fail after replace",
+   "cut_rule": "cut OK only if coarse SJ.Model exposes partialFailed/poisoned and failAfterReplace outcomes",
+   "hazards": [
+    "H04",
+    "H39",
+    "H45",
+    "H47"
+   ]
+  },
+  {
+   "id": "B09",
+   "between": [
+    "SJ.PayRcv",
+    "SJ.Assign"
+   ],
+   "class": "benign",
+   "why": "Cell decodes fully before dispatch; handler sees a materialized envelope (unresolved lazy ref -> RETRY)",
+   "cut_rule": "cut OK; port = materialized envelope + decode outcome",
+   "hazards": [
+    "H31"
+   ]
+  },
+  {
+   "id": "B10",
+   "between": [
+    "PayRcv",
+    "PaySrc"
+   ],
+   "class": "benign",
+   "why": "well-defined pull/reply/confirm/cancel protocol; MC-9 and S1 live inside PaySrc given adversarial delivery, so a coarse receiver that emits any legal message sequence suffices",
+   "cut_rule": "cut OK; port = messages incl. CANCEL(ref,requester), nonce on confirm, INVALID_REQUEST for unknown ref",
+   "hazards": [
+    "H09",
+    "H25",
+    "H29",
+    "H30"
+   ]
+  },
+  {
+   "id": "B11",
+   "between": [
+    "SJ.PayRcv",
+    "SJ.Model"
+   ],
+   "class": "bug-prone",
+   "why": "disk-offload lazy refs: per-key I/O at accept time, offload-root cleanup, model_id generation (eager profile: benign)",
+   "cut_rule": "cut OK if port carries lazy ref with backingGen and per-key failure possibility",
+   "hazards": [
+    "H04",
+    "H38"
+   ]
+  },
+  {
+   "id": "B12",
+   "between": [
+    "SJ.Assign",
+    "CJ.Runner"
+   ],
+   "class": "bug-prone",
+   "why": "lost/late assignment replies + GET_TASK retry (T-2); submit local timeout while server claims/callbacks; TASK_CHECK receipts",
+   "cut_rule": "process boundary; port = assignment tuple, receipts, retries with Net faults",
+   "hazards": [
+    "H11",
+    "H31"
+   ]
+  },
+  {
+   "id": "B13",
+   "between": [
+    "SJ.Ctl",
+    "CJ.Runner"
+   ],
+   "class": "bug-prone",
+   "why": "END_RUN is fire-and-forget and can overtake an in-flight straggler submission",
+   "cut_rule": "process boundary; port = END_RUN message",
+   "hazards": [
+    "H30"
+   ]
+  },
+  {
+   "id": "B14",
+   "between": [
+    "CJ.Runner",
+    "CJ.PaySrc"
+   ],
+   "class": "bug-prone",
+   "why": "one tx per submission try; msg_root deletion is not retirement; run-finally DownloadService.shutdown clears refs while a remote receiver may still pull",
+   "cut_rule": "cut OK; port = register per try, shutdown event",
+   "hazards": [
+    "H29",
+    "H30",
+    "H31"
+   ]
+  },
+  {
+   "id": "B15",
+   "between": [
+    "CJ.Runner",
+    "CJ.Trainer"
+   ],
+   "class": "bug-prone",
+   "why": "executor returns on result visibility while trainer cleanup is pending; AUX DO_TASK overlaps main loop; error results do not stop the run",
+   "cut_rule": "cut OK only if CJ.Trainer port exposes inSlot generation and trainer tail as separate steps",
+   "hazards": [
+    "H02",
+    "H13",
+    "H15"
+   ]
+  },
+  {
+   "id": "B16",
+   "between": [
+    "CJ.Trainer",
+    "TP.Trainer"
+   ],
+   "class": "bug-prone",
+   "why": "RESULT_READY/REJECTED/STATUS/ABORT/heartbeat with selective loss; stale monitor snapshot; settlement ACK vs listener close",
+   "cut_rule": "process boundary; port = control messages with loss + heartbeat liveness",
+   "hazards": [
+    "H01",
+    "H03",
+    "H24"
+   ]
+  },
+  {
+   "id": "B17",
+   "between": [
+    "CJ.Trainer/TP",
+    "PaySrc/PayRcv"
+   ],
+   "class": "bug-prone",
+   "why": "Attach: eager CJ decode confirms before acceptance; external: source-live latch and monitor tied to source task",
+   "cut_rule": "cut OK if port carries waiter outcomes and confirm-before-dispatch ordering",
+   "hazards": [
+    "H01",
+    "H03"
+   ]
+  },
+  {
+   "id": "B18",
+   "between": [
+    "CJ.Trainer",
+    "CP.Exec"
+   ],
+   "class": "bug-prone",
+   "why": "external trainer bootstrap marker / process-group ownership gates CJ restart (#5550)",
+   "cut_rule": "cut OK; port = bootstrapMarker, trainer group alive",
+   "hazards": [
+    "H49"
+   ]
+  },
+  {
+   "id": "B19",
+   "between": [
+    "W.Worker",
+    "CP.Exec / CJ.Runner / SJ.Assign"
+   ],
+   "class": "bug-prone",
+   "why": "physical attempt vs server assignment, task-owner settlement before CJ replacement, receipt-gated artifact release",
+   "cut_rule": "placeholder; port = physicalAttempt, taskOwnerSettled, receipt",
+   "hazards": [
+    "H07",
+    "H50"
+   ]
+  },
+  {
+   "id": "B20",
+   "between": [
+    "CJ.CCWF",
+    "CJ.Model / peer CJ.CCWF / Events"
+   ],
+   "class": "bug-prone",
+   "why": "reply marker before accept with unlocked monitor; self-delivered ABORT_TASK",
+   "cut_rule": "keep Gatherer+monitor+set_learn_task inside CJ.CCWF; CJ.Model coarse OK",
+   "hazards": [
+    "H05",
+    "H06"
+   ]
+  },
+  {
+   "id": "B21",
+   "between": [
+    "SJ.Ctl (targets)",
+    "SJ.Assign (task-data hook) / tensor plugin"
+   ],
+   "class": "bug-prone",
+   "why": "plugin barrier waits for len(engine.get_clients()) while the controller sampled a subset",
+   "cut_rule": "cut OK if port carries selected targets and registered clients separately",
+   "hazards": [
+    "H14"
+   ]
+  },
+  {
+   "id": "B22",
+   "between": [
+    "any",
+    "Net"
+   ],
+   "class": "benign",
+   "why": "coarse Net with fault toggles is sufficient except T-1 (stream-id allocation needs a fine byte-stream variant)",
+   "cut_rule": "infrastructure",
+   "hazards": [
+    "H10",
+    "H40"
+   ]
+  },
+  {
+   "id": "B23",
+   "between": [
+    "SP.Job (scheduler loop)",
+    "SP.Job (completion thread / admin abort)"
+   ],
+   "class": "bug-prone",
+   "why": "claim vs abort (fixed) and RUNNING write after terminal (#5301) are intra-SP thread races",
+   "cut_rule": "do NOT cut; keep inside SP.Job",
+   "hazards": [
+    "H22",
+    "H23"
+   ]
+  }
+ ],
+ "hazards": [
+  {
+   "id": "H01",
+   "phase1_refs": [
+    "v2 MC-1/TP-A",
+    "v1 MC-2",
+    "Scenario 4"
+   ],
+   "description": "Attach send() succeeds and clears trainer data from completed transfer waiters although CJ rejected/never canonicalized the result",
+   "mechanisms": [
+    "TP Attach session RESULT_READY 2 attempts + RESULT_STATUS + _resolve_ambiguous_result",
+    "CJ PayRcv eager decode, confirm SUCCESS before handler",
+    "TP.PaySrc waiter outcome COMPLETED",
+    "CJ AttachBackend result_wait_timeout/current-task cleanup",
+    "CJ CellBackendBase acceptance under _task_lock",
+    "Net"
+   ],
+   "groups": [
+    "P2 TP.Trainer",
+    "P1 CJ.Trainer",
+    "G8 CJ.PayRcv",
+    "G7 TP.PaySrc",
+    "I0 Net"
+   ],
+   "processes": [
+    "TP",
+    "CJ"
+   ],
+   "interleaving_or_failure": "CJ task timeout or END_RUN close between receiver confirm and application handler; RESULT_REJECTED / status / ABORT replies selectively lost on both attempts; status UNKNOWN",
+   "source_anchors": [
+    "client/cell/attach_session.py:441-459",
+    "fuel/f3/cellnet/cell.py:96-142",
+    "download_service.py:2287-2305",
+    "cell_backend.py:195-252",
+    "attach_backend.py:619-639",
+    "client/cell/api.py:541-559"
+   ],
+   "verified_at_pin": [
+    "attach_session.py:441-459",
+    "cell.py:96-149"
+   ],
+   "status": "candidate-MC (static)",
+   "crossing_state": "resultId/attemptId, tx outcome COMPLETED, RESULT_READY reply, RESULT_STATUS UNKNOWN, canonical[task], current task/closed, send success + clear_cache",
+   "boundaries": [
+    "B16",
+    "B17"
+   ]
+  },
+  {
+   "id": "H02",
+   "phase1_refs": [
+    "v2 MC-2/TP-C",
+    "Scenario 5"
+   ],
+   "description": "Previous in-process send()'s post-publish cleanup nulls the next task's freshly delivered input; next receive waits forever",
+   "mechanisms": [
+    "CJ in-process trainer thread send(): publish_result then clear fl_model",
+    "DataBus publish waits only for callbacks",
+    "InProcessBackend execute poll returns on _local_result",
+    "ClientRunner submit + fetch next task",
+    "GLOBAL_RESULT callback _set_received_shareable"
+   ],
+   "groups": [
+    "P1 CJ.Trainer",
+    "G9 CJ.Runner",
+    "G5 SJ.Assign"
+   ],
+   "processes": [
+    "CJ (trainer thread, runner thread)",
+    "SJ"
+   ],
+   "interleaving_or_failure": "no fault: trainer thread paused after publish_result returns from callbacks but before clear; runner submits task k, SJ assigns task k+1, callback stores new FLModel, old sender clears it (default clear_cache=True, job lifetime)",
+   "source_anchors": [
+    "client/in_process/api.py:212-227,311-331",
+    "in_process_backend.py:206-219,324-330",
+    "client_runner.py:585-592,644-654",
+    "data_bus.py:124-142"
+   ],
+   "verified_at_pin": [
+    "client/in_process/api.py:205-232,318-331",
+    "in_process_backend.py:200-222,320-330"
+   ],
+   "status": "candidate-MC (static); reachable in the slice's own in-process profile once rounds >= 2",
+   "crossing_state": "resultSlot, inSlot(fl_model) generation, receive_called, executor return PC, next TASK_ASSIGNMENT",
+   "boundaries": [
+    "B15"
+   ]
+  },
+  {
+   "id": "H03",
+   "phase1_refs": [
+    "v2 MC-3/TP-D",
+    "Scenario 5"
+   ],
+   "description": "Stale accepted-source monitor for task A stops the reused launch_once trainer now serving task B",
+   "mechanisms": [
+    "CJ ExternalProcessBackend _monitor_accepted_result_source snapshot under _result_failure_lock",
+    "_fail_accepted_result_source identity check (returns False)",
+    "unconditional _stop_trainer",
+    "TP heartbeat/disconnect",
+    "TP.PaySrc settlement clears source-live",
+    "next task acceptance"
+   ],
+   "groups": [
+    "P1 CJ.Trainer",
+    "P2 TP.Trainer",
+    "G7 TP.PaySrc"
+   ],
+   "processes": [
+    "CJ",
+    "TP"
+   ],
+   "interleaving_or_failure": "monitor observes heartbeat timeout / disconnect grace, pauses; A settles, route recovers, B accepted; monitor resumes and stops trainer",
+   "source_anchors": [
+    "external_process_backend.py:1239-1294"
+   ],
+   "verified_at_pin": [
+    "external_process_backend.py:1239-1296"
+   ],
+   "status": "candidate-MC (static)",
+   "crossing_state": "result_source_task_id, result_source_live, peer_silent_for, cell connected, trainer process/session",
+   "boundaries": [
+    "B16",
+    "B17"
+   ]
+  },
+  {
+   "id": "H04",
+   "phase1_refs": [
+    "v2 MC-4/WF-C2",
+    "v1 MC-4",
+    "Scenario 6"
+   ],
+   "description": "SAG aggregates/saves an accumulator partially mutated by a contribution whose accept raised (Task ERROR, no abort)",
+   "mechanisms": [
+    "SJ.Model weighted helper per-key mutation, history appended at end",
+    "lazy per-key materialization (disk offload)",
+    "DXOAggregator catches only shape error",
+    "WFComm callback catch -> Task ERROR, finish_submission",
+    "wait_for_task returns on any completion",
+    "SAG control_flow abort-only check -> aggregate/convert/save"
+   ],
+   "groups": [
+    "G4 SJ.Ctl",
+    "G5 SJ.Assign",
+    "G6 SJ.Model",
+    "G8 SJ.PayRcv"
+   ],
+   "processes": [
+    "SJ"
+   ],
+   "interleaving_or_failure": "I/O failure on a later lazy tensor after shape preflight and after earlier keys mutated totals; >= 1 other healthy contribution",
+   "source_anchors": [
+    "weighted_aggregation_helper.py:192-264",
+    "wf_comm_server.py:657-672,1353-1358",
+    "scatter_and_gather.py:285-337",
+    "lazy_tensor_dict.py:206-217,268-293"
+   ],
+   "verified_at_pin": [
+    "scatter_and_gather.py:285-300"
+   ],
+   "status": "candidate-MC (static); FedAvg guard #5293/#5295 is the negative control",
+   "crossing_state": "contrib state partial, Task completion ERROR, aggregate provenance, saved model generation",
+   "boundaries": [
+    "B07",
+    "B08",
+    "B11"
+   ]
+  },
+  {
+   "id": "H05",
+   "phase1_refs": [
+    "v2 MC-5/WF-C3",
+    "v1 MC-3",
+    "Scenario 7"
+   ],
+   "description": "Swarm all-reply gather closes and publishes before the last required reply has entered aggregator.accept",
+   "mechanisms": [
+    "CJ.CCWF Gatherer.gather sets reply_time under Gatherer.lock then BEFORE_CONTRIBUTION_ACCEPT then accept",
+    "monitor thread is_done unlocked -> aggregate -> distribute/next round",
+    "CJ.Model InTime accept lock"
+   ],
+   "groups": [
+    "P4 CJ.CCWF",
+    "G6 CJ.Model"
+   ],
+   "processes": [
+    "CJ (aggregator site)",
+    "CJ (trainers)"
+   ],
+   "interleaving_or_failure": "slow synchronous contribution-event handler / scheduling delay between reply marker and accept; learn_task_timeout=None, all-required",
+   "source_anchors": [
+    "swarm_client_ctl.py:192-229,263-287,643-669"
+   ],
+   "verified_at_pin": [
+    "swarm_client_ctl.py:190-229,260-290"
+   ],
+   "status": "candidate-MC (static)",
+   "crossing_state": "trainer_statuses reply_time, accept in-progress, aggregate frozen, next-round state",
+   "boundaries": [
+    "B20"
+   ]
+  },
+  {
+   "id": "H06",
+   "phase1_refs": [
+    "v2 MC-6/WF-C4",
+    "Scenario 7"
+   ],
+   "description": "Supported Swarm busy replacement fires ABORT_TASK that its own controller handles as permanent stop; successor acknowledged but never executed",
+   "mechanisms": [
+    "CJ.CCWF set_learn_task (allow_busy_task) -> _abort_current_task -> fire ABORT_TASK",
+    "own handle_event ABORT_TASK -> asked_to_stop + finalize",
+    "learn loop exit",
+    "_try_process_learn_request returns OK",
+    "event dispatch includes emitter"
+   ],
+   "groups": [
+    "P4 CJ.CCWF",
+    "I0 Events"
+   ],
+   "processes": [
+    "CJ (trainer site)",
+    "CJ (aggregator site)"
+   ],
+   "interleaving_or_failure": "next-round learn request reaches a trainer still finishing the previous round after aggregator min/grace progress (no message fault)",
+   "source_anchors": [
+    "client_ctl.py:201-205,417-486",
+    "swarm_client_ctl.py:378-388,583-599",
+    "client_json_config.py:200-207,229-240",
+    "apis/utils/event.py:50-73"
+   ],
+   "verified_at_pin": [
+    "client_ctl.py:198-205,415-457"
+   ],
+   "status": "candidate-MC (source-established, test-first OK)",
+   "crossing_state": "learn_task, asked_to_stop, workflow_done, AUX reply OK",
+   "boundaries": [
+    "B20"
+   ]
+  },
+  {
+   "id": "H07",
+   "phase1_refs": [
+    "v2 MC-7/L-C4",
+    "Scenario 2"
+   ],
+   "description": "Admitted publish_results handler for the old K8s CJ removes the replacement launch's workspace transfer record by job id",
+   "mechanisms": [
+    "CP WorkspaceTransferManager handler authorize -> download -> extract unlocked -> remove_job(job_id)",
+    "CP.Exec K8s can_restart (pod UID/shutdown/task owners) + new token",
+    "CJ worker_process upload at exit",
+    "TaskExecutionInterrupted skips STOPPED",
+    "W task-owner settlement"
+   ],
+   "groups": [
+    "G3 CP.Exec",
+    "G9 CJ.Runner",
+    "P3 W.Worker",
+    "I0 Net"
+   ],
+   "processes": [
+    "CP",
+    "CJ(gen1)",
+    "CJ(gen2)"
+   ],
+   "interleaving_or_failure": "old CJ fails after its upload reached CP (or request times out at 600 s while extraction runs); STOPPED skipped/lost; replacement installs token; old handler finishes and pops current record",
+   "source_anchors": [
+    "workspace_cell_transfer.py:429-475",
+    "k8s_launcher.py:381-386,715-742,1058-1059",
+    "client_runner.py:808-819",
+    "supervisor.py:293-307"
+   ],
+   "verified_at_pin": [
+    "workspace_cell_transfer.py:346-350,429-475"
+   ],
+   "status": "candidate-MC (static; slow-handler premise)",
+   "crossing_state": "wsRecord[job]{gen,token}, handler-local record snapshot, launch generation, STOPPED, upload request/timeout",
+   "boundaries": [
+    "B05",
+    "B19"
+   ]
+  },
+  {
+   "id": "H08",
+   "phase1_refs": [
+    "v2 MC-8/L-C5",
+    "v1 MC-1",
+    "Scenario 2",
+    "seed job CR-1 lineage"
+   ],
+   "description": "Process CJ restart for job A snapshots CP-global CUDA_VISIBLE_DEVICES last written by job B while A still owns its own allocation",
+   "mechanisms": [
+    "CP.Res per-job allocation",
+    "consumer env write on initial START only",
+    "_restart_job -> _launch_job without consume",
+    "ProcessJobLauncher os.environ.copy at spawn"
+   ],
+   "groups": [
+    "G3 CP.Exec",
+    "G2 CP.Res",
+    "G9 CJ.Runner",
+    "G1 SP.Job"
+   ],
+   "processes": [
+    "CP",
+    "CJ(A gen1/gen2)",
+    "CJ(B)"
+   ],
+   "interleaving_or_failure": "max_jobs>=2; A gets GPU0, B gets GPU1 (env overwritten); A's CJ crashes with restartable rc after READY; restart copies GPU1",
+   "source_anchors": [
+    "scheduler_cmds.py:117-131",
+    "gpu_resource_consumer.py:25-33",
+    "list_resource_consumer.py:31-37",
+    "client_executor.py:65-71,722-758",
+    "process_launcher.py:128-158"
+   ],
+   "verified_at_pin": [
+    "scheduler_cmds.py:115-136",
+    "client_executor.py:722-758",
+    "process_launcher.py:125-160"
+   ],
+   "status": "candidate-MC (strong static)",
+   "crossing_state": "alloc[A], cpEnv, childEnv[A,gen2], launch generation, restart record",
+   "boundaries": [
+    "B03",
+    "B04",
+    "B05"
+   ]
+  },
+  {
+   "id": "H09",
+   "phase1_refs": [
+    "v2 MC-9/TP-E",
+    "Scenario 8"
+   ],
+   "description": "Delayed CANCEL for an old transaction fails all unfinished refs of a new transaction that reused the same explicit ref id",
+   "mechanisms": [
+    "PaySrc _handle_cancel keyed by (ref,requester)",
+    "ref reuse after retirement clears tombstone",
+    "nonce-fenced confirm (contrast)",
+    "PayRcv sends CANCEL",
+    "Net delay"
+   ],
+   "groups": [
+    "G7 PaySrc",
+    "G8 PayRcv",
+    "I0 Net"
+   ],
+   "processes": [
+    "source process",
+    "receiver process"
+   ],
+   "interleaving_or_failure": "CANCEL delayed past old tx retirement (TTL/delete); caller re-registers ref R in new tx; same receiver acquires; CANCEL lands",
+   "source_anchors": [
+    "download_service.py:307-424,1398-1400,1824-1855,2124-2137",
+    "obj_downloader.py:81-95"
+   ],
+   "verified_at_pin": [
+    "download_service.py:1822-1855"
+   ],
+   "status": "candidate-MC (API-specific; default UUID refs exclude it)",
+   "crossing_state": "refTable[R], acquired receivers, final[r] per ref, CANCEL(ref,requester) without generation",
+   "boundaries": [
+    "B10"
+   ]
+  },
+  {
+   "id": "H10",
+   "phase1_refs": [
+    "v2 T-1/SH-1",
+    "Scenario 8"
+   ],
+   "description": "gen_stream_id returns the global counter after releasing its lock; concurrent sends can share a stream id and steal ACK/remove ownership",
+   "mechanisms": [
+    "stream_utils gen_stream_id",
+    "Cell broadcast concurrent workers",
+    "ByteStreamer tx map insert/ACK/remove by SID"
+   ],
+   "groups": [
+    "I0 Net (byte-stream fine)"
+   ],
+   "processes": [
+    "any sender (e.g. SJ broadcast)"
+   ],
+   "interleaving_or_failure": "two threads increment then both read; second map insert overwrites first",
+   "source_anchors": [
+    "stream_utils.py:98-102",
+    "cell.py:330-338",
+    "byte_streamer.py:240,721-725,858-906"
+   ],
+   "verified_at_pin": [],
+   "status": "candidate-test",
+   "crossing_state": "SID, tx map entry, ACK routing",
+   "boundaries": [
+    "B22"
+   ]
+  },
+  {
+   "id": "H11",
+   "phase1_refs": [
+    "v2 T-2/WF-C1",
+    "Scenario 3"
+   ],
+   "description": "Resend selected but loop continues; a later NO_BLOCK task resets the flag; same ClientTask appended twice; monitor double-pop KeyError kills retirement",
+   "mechanisms": [
+    "SJ.Assign get-task loop (resend_task reset per iteration)",
+    "send path appends as new",
+    "task monitor retire pops ctMap twice",
+    "SJ.Ctl CSE two standing tasks with disjoint targets",
+    "CJ.Runner GET_TASK retry after lost reply"
+   ],
+   "groups": [
+    "G5 SJ.Assign",
+    "G4 SJ.Ctl",
+    "G9 CJ.Runner",
+    "I0 Net"
+   ],
+   "processes": [
+    "SJ",
+    "CJ(C)",
+    "CJ(D)"
+   ],
+   "interleaving_or_failure": "TASK_ASSIGNMENT for A lost/late; client C retries GET_TASK before A's result while standing B excludes C",
+   "source_anchors": [
+    "wf_comm_server.py:238-280,371-375,1201-1264",
+    "ccwf/cse_server_ctl.py:167-205"
+   ],
+   "verified_at_pin": [
+    "wf_comm_server.py:236-292,368-378,1255-1264"
+   ],
+   "status": "candidate-test (source-established)",
+   "crossing_state": "task.client_tasks multiplicity, _client_task_map, last_client_task_map, monitor thread alive",
+   "boundaries": [
+    "B07",
+    "B12"
+   ]
+  },
+  {
+   "id": "H13",
+   "phase1_refs": [
+    "v2 T-4/TP-R3"
+   ],
+   "description": "Learner is_initialized set before fallible initialize; tolerated first failure lets a later task run on a half-initialized learner",
+   "mechanisms": [
+    "CJ LearnerExecutor/ModelLearnerExecutor init flag",
+    "CJ.Runner error reply",
+    "SJ SAG ignore_result_error=True advances with other sites"
+   ],
+   "groups": [
+    "P1 CJ.Trainer",
+    "G9 CJ.Runner",
+    "G4 SJ.Ctl"
+   ],
+   "processes": [
+    "CJ",
+    "SJ"
+   ],
+   "interleaving_or_failure": "transient initialize exception on first task",
+   "source_anchors": [
+    "learner_executor.py:80-82",
+    "model_learner_executor.py:105-115",
+    "scatter_and_gather.py:407-441"
+   ],
+   "verified_at_pin": [],
+   "status": "candidate-test",
+   "crossing_state": "is_initialized, error rc, next-round assignment",
+   "boundaries": [
+    "B15"
+   ]
+  },
+  {
+   "id": "H14",
+   "phase1_refs": [
+    "v2 T-5/WF-C5",
+    "Scenario 9"
+   ],
+   "description": "Sampled FedAvg + tensor-stream plugin: server task-data barrier waits for all connected clients though only the selected one is assigned; healthy run panics",
+   "mechanisms": [
+    "SJ.Ctl FedAvg sampling (num_clients=min_clients)",
+    "SJ.Assign TRY_AGAIN for non-target before filter event; processing_tasks rejects retries",
+    "TensorServerStreamer AFTER_TASK_DATA_FILTER wait for len(engine.get_clients())",
+    "CJ tensor client"
+   ],
+   "groups": [
+    "G4 SJ.Ctl",
+    "G5 SJ.Assign",
+    "plugin (SJ+CJ)"
+   ],
+   "processes": [
+    "SJ",
+    "CJ(selected)",
+    "CJ(unselected)"
+   ],
+   "interleaving_or_failure": "no fault; deadline expiry -> system_panic",
+   "source_anchors": [
+    "recipe/fedavg.py:203-205,454-487",
+    "recipe/spec.py:596-661",
+    "tensor_stream/server.py:172-174,239-270",
+    "sender.py:93-115"
+   ],
+   "verified_at_pin": [],
+   "status": "candidate-test (configuration/integration)",
+   "crossing_state": "selected targets vs registered clients, side-stream send count",
+   "boundaries": [
+    "B21"
+   ]
+  },
+  {
+   "id": "H15",
+   "phase1_refs": [
+    "v2 CR-1/TP-B"
+   ],
+   "description": "AUX DO_TASK and main pull loop can execute concurrently against one InProcessBackend with shared input/result slots",
+   "mechanisms": [
+    "CJ.Runner _handle_do_task direct _process_task",
+    "running_tasks lock only",
+    "InProcessBackend shared _local_result/input slot",
+    "AuxRunner no per-executor gate"
+   ],
+   "groups": [
+    "G9 CJ.Runner",
+    "P1 CJ.Trainer"
+   ],
+   "processes": [
+    "CJ"
+   ],
+   "interleaving_or_failure": "custom TaskController DO_TASK concurrent with pull-loop task",
+   "source_anchors": [
+    "client_runner.py:1091-1097,267-280,448",
+    "in_process_backend.py:175-219,324-330",
+    "private/aux_runner.py:99-173"
+   ],
+   "verified_at_pin": [],
+   "status": "review-only (needs a supported concurrent caller)",
+   "crossing_state": "result slot association, input slot",
+   "boundaries": [
+    "B15"
+   ]
+  },
+  {
+   "id": "H17",
+   "phase1_refs": [
+    "v2 CR-3/TP-R2"
+   ],
+   "description": "FileDownloadable samples size once and reopens; a truncated source returns empty OK chunks and keeps the tx active",
+   "mechanisms": [
+    "PaySrc FileDownloadable",
+    "file owner (archive/workspace or worker artifacts)"
+   ],
+   "groups": [
+    "G7 PaySrc",
+    "P3 W.Worker"
+   ],
+   "processes": [
+    "source process"
+   ],
+   "interleaving_or_failure": "source file mutated/truncated while published",
+   "source_anchors": [
+    "file_downloader.py:69-104"
+   ],
+   "verified_at_pin": [],
+   "status": "review-only (source-stability assumption)",
+   "crossing_state": "file content vs sampled size",
+   "boundaries": [
+    "B10"
+   ]
+  },
+  {
+   "id": "H18",
+   "phase1_refs": [
+    "v1 TV-1 (not carried into v2 list)"
+   ],
+   "description": "Overlapping nonblocking ModelController sends overwrite instance-wide _current_* error-tolerance context; A's error judged with B's targets/min and can panic",
+   "mechanisms": [
+    "SJ.Ctl BaseModelController send_model stores _current_min_responses/_current_num_targets/_current_failed_clients",
+    "result processing reads them",
+    "SJ.Assign two standing tasks"
+   ],
+   "groups": [
+    "G4 SJ.Ctl",
+    "G5 SJ.Assign"
+   ],
+   "processes": [
+    "SJ",
+    "CJ x>=3"
+   ],
+   "interleaving_or_failure": "send A (3 targets, min 2), then send B (1 target, min 1) before A ends; a client error on A",
+   "source_anchors": [
+    "base_model_controller.py:161-165,342-375",
+    "model_controller.py:74-105"
+   ],
+   "verified_at_pin": [
+    "base_model_controller.py:155-170,340-378"
+   ],
+   "status": "candidate-test (v1; still present at pin)",
+   "crossing_state": "dynamic error context, per-task failed clients",
+   "boundaries": [
+    "B07"
+   ]
+  },
+  {
+   "id": "H19",
+   "phase1_refs": [
+    "v2 L-C1",
+    "#5559",
+    "PR #5561 (unmerged)",
+    "Scenario 1"
+   ],
+   "description": "Launch exception after the backend accepted a handle pops CP registration and frees the allocation while execution may be live",
+   "mechanisms": [
+    "CP.Exec _launch_job JOB_HANDLE_CALLBACK",
+    "start_app except pops run_processes",
+    "StartJobProcessor free",
+    "SP scheduler reuse"
+   ],
+   "groups": [
+    "G3 CP.Exec",
+    "G2 CP.Res",
+    "G1 SP.Job"
+   ],
+   "processes": [
+    "CP",
+    "CJ/backend",
+    "SP"
+   ],
+   "interleaving_or_failure": "backend launch raises after accepting (e.g. K8s wait/timeout); replacement exception breaks to free",
+   "source_anchors": [
+    "client_executor.py:359-365,773-835",
+    "scheduler_cmds.py:133-136"
+   ],
+   "verified_at_pin": [
+    "client_executor.py:358-365",
+    "scheduler_cmds.py:133-136"
+   ],
+   "status": "known-open",
+   "crossing_state": "pending/accepted handle, registration, alloc free, capacity",
+   "boundaries": [
+    "B02",
+    "B03"
+   ]
+  },
+  {
+   "id": "H20",
+   "phase1_refs": [
+    "v2 L-C2",
+    "#5561"
+   ],
+   "description": "K8s deletion failure is mapped to TERMINATED, releasing transfer/secret and freeing resources; server abort pops ownership regardless of terminate outcome",
+   "mechanisms": [
+    "CP.Exec K8sJobHandle.terminate/wait",
+    "CP free",
+    "SP server_engine abort"
+   ],
+   "groups": [
+    "G3 CP.Exec",
+    "G2 CP.Res",
+    "G1 SP.Job"
+   ],
+   "processes": [
+    "CP",
+    "SP",
+    "backend"
+   ],
+   "interleaving_or_failure": "delete 5xx/transport failure leaves pod running",
+   "source_anchors": [
+    "k8s_launcher.py:409-436,477-489,699-705",
+    "client_executor.py:830-835",
+    "server_engine.py:386-410"
+   ],
+   "verified_at_pin": [],
+   "status": "known-open",
+   "crossing_state": "handle terminal flag vs physical pod, free",
+   "boundaries": [
+    "B02"
+   ]
+  },
+  {
+   "id": "H21",
+   "phase1_refs": [
+    "seed job MC-2 (historical, 53ba7ee)"
+   ],
+   "description": "Waiter-thread start failure after a successful spawn propagates to StartJobProcessor, which frees the allocation while the child lives with no waiter",
+   "mechanisms": [
+    "CP.Exec start_app: _launch_job then thread.start outside try",
+    "StartJobProcessor except -> free"
+   ],
+   "groups": [
+    "G3 CP.Exec",
+    "G2 CP.Res"
+   ],
+   "processes": [
+    "CP",
+    "CJ"
+   ],
+   "interleaving_or_failure": "thread creation failure (resource exhaustion)",
+   "source_anchors": [
+    "client_executor.py:345-371",
+    "scheduler_cmds.py:133-136"
+   ],
+   "verified_at_pin": [
+    "client_executor.py:345-371 (structure unchanged at pin)"
+   ],
+   "status": "historical-lineage (not reconfirmed; low plausibility)",
+   "crossing_state": "registration kept, allocation freed, child alive",
+   "boundaries": [
+    "B03"
+   ]
+  },
+  {
+   "id": "H22",
+   "phase1_refs": [
+    "#5301",
+    "seed job MC-4",
+    "Scenario 1/11"
+   ],
+   "description": "Delayed RUNNING write after claim restores RUNNING over a terminal status (metadata has no CAS)",
+   "mechanisms": [
+    "SP scheduler loop RUNNING write outside lock",
+    "SP completion thread terminal publish",
+    "SJ fast exit"
+   ],
+   "groups": [
+    "G1 SP.Job"
+   ],
+   "processes": [
+    "SP",
+    "SJ"
+   ],
+   "interleaving_or_failure": "SJ exits and completion publishes before the starter's RUNNING write",
+   "source_anchors": [
+    "job_runner.py:709-711,524-531",
+    "job_def_manager.py:459-481"
+   ],
+   "verified_at_pin": [],
+   "status": "known-accepted (closed, unfixed, P3)",
+   "crossing_state": "jobStatus[j]",
+   "boundaries": [
+    "B23",
+    "B06"
+   ]
+  },
+  {
+   "id": "H23",
+   "phase1_refs": [
+    "#5300",
+    "seed job MC-3"
+   ],
+   "description": "Pre-run abort vs deployment/start (stale DISPATCHED/RUNNING over ABORTED)",
+   "mechanisms": [
+    "SP _start_lock claim",
+    "admin abort"
+   ],
+   "groups": [
+    "G1 SP.Job"
+   ],
+   "processes": [
+    "SP"
+   ],
+   "interleaving_or_failure": "abort concurrent with start",
+   "source_anchors": [
+    "job_runner.py:687-824"
+   ],
+   "verified_at_pin": [],
+   "status": "fixed-baseline (startup claim); keep as guard",
+   "crossing_state": "startClaim, jobStatus",
+   "boundaries": [
+    "B23"
+   ]
+  },
+  {
+   "id": "H24",
+   "phase1_refs": [
+    "#5467",
+    "TP-K1"
+   ],
+   "description": "Attach trainer clears _result_send_active before RESULT_SOURCE_SETTLED is acknowledged; CJ finalize closes listener; trainer stuck in settlement retries",
+   "mechanisms": [
+    "TP CellClientAPI settlement retries",
+    "CJ AttachBackend finalize/listener close",
+    "SHUTDOWN reply"
+   ],
+   "groups": [
+    "P2 TP.Trainer",
+    "P1 CJ.Trainer"
+   ],
+   "processes": [
+    "TP",
+    "CJ"
+   ],
+   "interleaving_or_failure": "concurrent SHUTDOWN after successful payloads",
+   "source_anchors": [
+    "client/cell/api.py:580-622,908-915",
+    "attach_backend.py:375-392,802-819"
+   ],
+   "verified_at_pin": [],
+   "status": "known-open",
+   "crossing_state": "send-active latch, settled ACK, listener",
+   "boundaries": [
+    "B16"
+   ]
+  },
+  {
+   "id": "H25",
+   "phase1_refs": [
+    "payload seed MC-2 (S1)"
+   ],
+   "description": "Pipelined EOF resumes after cancellation committed receiver FAILED and publishes COMPLETED progress; terminal latch suppresses correction (strict outcome stays FAILED)",
+   "mechanisms": [
+    "PaySrc EOF serve vs cancel handler",
+    "progress callback latch",
+    "PayRcv pipelining"
+   ],
+   "groups": [
+    "G7 PaySrc",
+    "G8 PayRcv"
+   ],
+   "processes": [
+    "source",
+    "receiver"
+   ],
+   "interleaving_or_failure": "cancel concurrent with admitted EOF request",
+   "source_anchors": [
+    "seeds/payload/spec/output/MC_hunt_s1_progress_bfs.states.json (39-state CE)",
+    "download_service.py serve/cancel"
+   ],
+   "verified_at_pin": [],
+   "status": "known current behavior (REPRODUCED in seed; no false success)",
+   "crossing_state": "progress state vs outcome",
+   "boundaries": [
+    "B10"
+   ]
+  },
+  {
+   "id": "H26",
+   "phase1_refs": [
+    "#5292",
+    "payload seed MC-1"
+   ],
+   "description": "Queued and inline settlement could both run callbacks/release after post-enqueue worker-creation failure",
+   "mechanisms": [
+    "PaySrc _finished_settlement_started claim"
+   ],
+   "groups": [
+    "G7 PaySrc"
+   ],
+   "processes": [
+    "source"
+   ],
+   "interleaving_or_failure": "submit failure after enqueue",
+   "source_anchors": [
+    "download_service.py:1451-1455"
+   ],
+   "verified_at_pin": [],
+   "status": "fixed-baseline (SettlementOnce)",
+   "crossing_state": "settlement claim",
+   "boundaries": []
+  },
+  {
+   "id": "H27",
+   "phase1_refs": [
+    "#5291",
+    "dc281702f0",
+    "2045dd3aa7",
+    "payload seed CR-2"
+   ],
+   "description": "Receiver contract (identities vs count) must match the caller fanout; early retirement before all receivers",
+   "mechanisms": [
+    "PaySrc receiver contract",
+    "Cell broadcast/fire-and-forget fanout",
+    "pass-through count-only"
+   ],
+   "groups": [
+    "G7 PaySrc",
+    "G4 SJ.Ctl (broadcast)",
+    "I0 Net"
+   ],
+   "processes": [
+    "SJ",
+    "CJ"
+   ],
+   "interleaving_or_failure": "multi-target publication",
+   "source_anchors": [
+    "cell.py:314-328,381-395",
+    "transfer_outcome.py:119-271"
+   ],
+   "verified_at_pin": [],
+   "status": "fixed-baseline (CompletionRequiresRequiredFinalReceivers)",
+   "crossing_state": "receiver ids/count, final statuses",
+   "boundaries": [
+    "B10"
+   ]
+  },
+  {
+   "id": "H29",
+   "phase1_refs": [
+    "shared notes 'Completion boundaries'",
+    "#5574 (typed cancel fix)",
+    "Scenario 1/8"
+   ],
+   "description": "Remote source loss while SJ decodes a streamed SUBMIT_UPDATE is fatal to SJ (os._exit(1)); a CJ crash mid-upload therefore fails the job even when CJ restart and min_clients would tolerate it",
+   "mechanisms": [
+    "SJ.PayRcv Cell.Adapter decode policy",
+    "receiver non-OK rc / retry exhaustion -> download_failed -> FOBS RuntimeError",
+    "CJ.PaySrc gone",
+    "CP.Exec restart",
+    "SP.Job outcome classification"
+   ],
+   "groups": [
+    "G8 SJ.PayRcv",
+    "G7 CJ.PaySrc",
+    "G3 CP.Exec",
+    "G1 SP.Job",
+    "G4 SJ.Ctl"
+   ],
+   "processes": [
+    "SJ",
+    "CJ",
+    "CP",
+    "SP"
+   ],
+   "interleaving_or_failure": "CJ crash/kill while SJ pulls its result; only a local DownloadService shutdown (typed DownloadCancelled) is non-fatal",
+   "source_anchors": [
+    "cell.py:118-135",
+    "download_service.py:2240-2270,2139-2144"
+   ],
+   "verified_at_pin": [
+    "cell.py:96-149",
+    "download_service.py:2240-2270"
+   ],
+   "status": "intentional-policy (code comment: exit to fail the job); model must include it",
+   "crossing_state": "decode outcome, SJ exit rc, CJ gen, job outcome",
+   "boundaries": [
+    "B10",
+    "B06",
+    "B14"
+   ]
+  },
+  {
+   "id": "H30",
+   "phase1_refs": [
+    "derived from H29 + server_runner run-end order + CJ END_RUN abort path (not a Phase 1 item)"
+   ],
+   "description": "Final-round straggler result still being pulled by SJ at END_RUN: END_RUN triggers CJ run_abort_signal, which aborts CJ's in-flight submit request locally; CJ leaves _try_run and run-finally DownloadService.shutdown clears its refs; SJ's next pull gets INVALID_REQUEST -> download_failed -> decode RuntimeError -> os._exit(1), unless SJ's own DownloadService shutdown (typed cancel) wins; a completed workflow becomes a failed job",
+   "mechanisms": [
+    "SJ.Ctl END_RUN fire-and-forget, readiness (default immediate), END_RUN handlers, then local DownloadService shutdown",
+    "CJ.Runner END_RUN -> run_abort_signal; communicator.submit_update passes run abort signal to cell.send_request; loop returns; run finally shutdown",
+    "CJ.PaySrc unknown ref -> INVALID_REQUEST",
+    "SJ.PayRcv non-OK rc -> download_failed -> decode RuntimeError -> os._exit(1)",
+    "SP.Job outcome precedence"
+   ],
+   "groups": [
+    "G4 SJ.Ctl",
+    "G9 CJ.Runner",
+    "G7 CJ.PaySrc",
+    "G8 SJ.PayRcv",
+    "G1 SP.Job"
+   ],
+   "processes": [
+    "SJ",
+    "CJ",
+    "SP"
+   ],
+   "interleaving_or_failure": "no timeout or crash needed: policy admits a last-round straggler (SAG min_clients<n + grace, ModelController min_responses/timeout) whose SJ-side download (large model) is still running when SJ sends END_RUN; race between CJ teardown and SJ END_RUN handlers + SJ DownloadService shutdown",
+   "source_anchors": [
+    "server_runner.py:205-237",
+    "tbi.py:59-95",
+    "client_runner.py:656-721,796-821,1084-1089",
+    "communicator.py:554-617",
+    "download_service.py:1681-1707,2240-2270",
+    "cell.py:118-135"
+   ],
+   "verified_at_pin": [
+    "server_runner.py:205-237",
+    "tbi.py:59-95",
+    "client_runner.py:656-721,796-821,1084-1089",
+    "communicator.py:617",
+    "download_service.py:1681-1707,2240-2270",
+    "cell.py:118-135"
+   ],
+   "status": "derived-new (this note; static, race timing unverified)",
+   "crossing_state": "END_RUN, run_abort_signal, in-flight submit, CJ refTable cleared, SJ decode outcome, SJ exit rc, terminal job status",
+   "boundaries": [
+    "B13",
+    "B14",
+    "B10",
+    "B06"
+   ]
+  },
+  {
+   "id": "H31",
+   "phase1_refs": [
+    "Scenario 3 'client TASK_CHECK/submission retries'",
+    "1.5 'Network/control request' contract",
+    "fedavg seed lost_ack_live/timeout_inflight"
+   ],
+   "description": "Result submission local timeout while SJ is still downloading/claiming; retry re-serializes (new tx) and TASK_CHECK; duplicate envelope replays RECEIVED; old attempt tx lingers until confirm/TTL",
+   "mechanisms": [
+    "CJ.Runner submit loop (new msg_root per try)",
+    "SJ.Assign check/claim/finish + TASK_CHECK",
+    "CJ.PaySrc one tx per try",
+    "SJ.PayRcv duplicate download",
+    "Net local timeout"
+   ],
+   "groups": [
+    "G9 CJ.Runner",
+    "G5 SJ.Assign",
+    "G7 CJ.PaySrc",
+    "G8 SJ.PayRcv",
+    "I0 Net"
+   ],
+   "processes": [
+    "CJ",
+    "SJ"
+   ],
+   "interleaving_or_failure": "submit timeout, lost RESULT_RECEIPT, duplicate delivery",
+   "source_anchors": [
+    "client_runner.py:656-721",
+    "wf_comm_server.py:417-672",
+    "server_runner.py:456-612",
+    "cell.py:518-653"
+   ],
+   "verified_at_pin": [
+    "client_runner.py:656-789"
+   ],
+   "status": "contract-baseline",
+   "crossing_state": "attempt/receipt, msg_root, tx per try, RECEIVED/TASK_CLOSED",
+   "boundaries": [
+    "B09",
+    "B12",
+    "B14"
+   ]
+  },
+  {
+   "id": "H32",
+   "phase1_refs": [
+    "lifecycle contracts 'Outcome' 1",
+    "brief 3.1 Launcher->runner"
+   ],
+   "description": "START reply lost/late: SP narrows active sites/pending outcomes while CP actually launched a CJ that participates",
+   "mechanisms": [
+    "SP non-strict start replies",
+    "CP.Exec launch",
+    "Net"
+   ],
+   "groups": [
+    "G1 SP.Job",
+    "G3 CP.Exec",
+    "I0 Net"
+   ],
+   "processes": [
+    "SP",
+    "CP",
+    "CJ"
+   ],
+   "interleaving_or_failure": "drop/delay START reply",
+   "source_anchors": [
+    "job_runner.py:338-415",
+    "client_executor.py:347-417"
+   ],
+   "verified_at_pin": [],
+   "status": "contract-baseline",
+   "crossing_state": "activeSites, pendingOutcomes vs launched CJ",
+   "boundaries": [
+    "B02"
+   ]
+  },
+  {
+   "id": "H33",
+   "phase1_refs": [
+    "lifecycle contracts 'Outcome' 4-5",
+    "OutcomePrecedenceAndPolicy"
+   ],
+   "description": "CP reports the terminal outcome once without retry; SP waits <= 900 s and then finalizes from the server outcome",
+   "mechanisms": [
+    "CP.Exec report-once/free",
+    "SP grace/precedence",
+    "Net"
+   ],
+   "groups": [
+    "G3 CP.Exec",
+    "G1 SP.Job",
+    "I0 Net"
+   ],
+   "processes": [
+    "CP",
+    "SP"
+   ],
+   "interleaving_or_failure": "OUTCOME lost; heartbeat/dead-client reconciliation",
+   "source_anchors": [
+    "client_executor.py:760-841",
+    "job_runner.py:492-636",
+    "fed_server.py:910-962"
+   ],
+   "verified_at_pin": [],
+   "status": "contract-baseline (policy)",
+   "crossing_state": "OUTCOME, pendingOutcomes, terminal",
+   "boundaries": [
+    "B02"
+   ]
+  },
+  {
+   "id": "H34",
+   "phase1_refs": [
+    "lifecycle working notes",
+    "ReservationOwnership"
+   ],
+   "description": "Reservation TTL can expire during a long deploy; START then fails at allocate; cancel can never free an allocated token",
+   "mechanisms": [
+    "SP deploy",
+    "CP.Res TTL/cancel/allocate"
+   ],
+   "groups": [
+    "G1 SP.Job",
+    "G2 CP.Res"
+   ],
+   "processes": [
+    "SP",
+    "CP"
+   ],
+   "interleaving_or_failure": "slow deployment, reply timeout",
+   "source_anchors": [
+    "auto_clean_resource_manager.py:102-172",
+    "job_scheduler.py:119-290"
+   ],
+   "verified_at_pin": [],
+   "status": "contract-baseline",
+   "crossing_state": "token, ttl, allocation",
+   "boundaries": [
+    "B01"
+   ]
+  },
+  {
+   "id": "H35",
+   "phase1_refs": [
+    "lifecycle 'Identity' bullet 4",
+    "seed job handoff",
+    "W02/W09"
+   ],
+   "description": "READY/STOPPED are launch-id fenced but legacy None is accepted; STOPPED is best-effort (15 s) or skipped (TaskExecutionInterrupted), making the exit restart-eligible",
+   "mechanisms": [
+    "CJ.Runner READY/STOPPED",
+    "CP.Exec notify fencing + restart eligibility"
+   ],
+   "groups": [
+    "G9 CJ.Runner",
+    "G3 CP.Exec",
+    "I0 Net"
+   ],
+   "processes": [
+    "CJ",
+    "CP"
+   ],
+   "interleaving_or_failure": "STOPPED lost/late after replacement; delayed READY from an old gen",
+   "source_anchors": [
+    "client_executor.py:430-442,722-758",
+    "client_app_runner.py:190-240",
+    "client_runner.py:808-819"
+   ],
+   "verified_at_pin": [
+    "client_executor.py:430-442"
+   ],
+   "status": "contract-baseline (StaleNotificationFenced)",
+   "crossing_state": "launchId, cpStatus, restart",
+   "boundaries": [
+    "B05"
+   ]
+  },
+  {
+   "id": "H36",
+   "phase1_refs": [
+    "client_executor register_handle comment",
+    "lifecycle contracts"
+   ],
+   "description": "Abort racing initial or replacement launch: pending handle published so abort can reclaim; abort latch blocks restart",
+   "mechanisms": [
+    "SP abort",
+    "CP.Exec abort_app/pending handle/restart",
+    "CJ"
+   ],
+   "groups": [
+    "G1 SP.Job",
+    "G3 CP.Exec",
+    "G9 CJ.Runner"
+   ],
+   "processes": [
+    "SP",
+    "CP",
+    "CJ"
+   ],
+   "interleaving_or_failure": "ABORT during restart window",
+   "source_anchors": [
+    "client_executor.py:345-417,722-758"
+   ],
+   "verified_at_pin": [
+    "client_executor.py:394-401,734-745"
+   ],
+   "status": "contract-baseline (guarded)",
+   "crossing_state": "abortReq, pending handle, launch gen",
+   "boundaries": [
+    "B02",
+    "B05"
+   ]
+  },
+  {
+   "id": "H37",
+   "phase1_refs": [
+    "Scenario 3",
+    "workflow notes connected baseline",
+    "fedavg seed S4/U2"
+   ],
+   "description": "Workflow switch/finalize, mark-only cancel and completion-before-task_done vs admitted callbacks and late results (first late in same workflow; maps cleared on finalize)",
+   "mechanisms": [
+    "SJ.Ctl workflow sequencing/cancel",
+    "SJ.Assign claim/dispatch/monitor/finalize"
+   ],
+   "groups": [
+    "G4 SJ.Ctl",
+    "G5 SJ.Assign"
+   ],
+   "processes": [
+    "SJ",
+    "CJ"
+   ],
+   "interleaving_or_failure": "late result / cancel during callback",
+   "source_anchors": [
+    "server_runner.py:131-184",
+    "wf_comm_server.py:963,1013-1046,1353-1367"
+   ],
+   "verified_at_pin": [],
+   "status": "contract-baseline (WorkflowAdmissionIdentity, FencedReceiptAtMostOnce)",
+   "crossing_state": "current_wf, retired cache, cbFrame, completion",
+   "boundaries": [
+    "B07"
+   ]
+  },
+  {
+   "id": "H38",
+   "phase1_refs": [
+    "Scenario 10"
+   ],
+   "description": "Disk-offload local ownership outlives the transfer: offload-root cleanup, DiskFedAvg replace/rename/retarget, model_id generation checks vs later materialization",
+   "mechanisms": [
+    "SJ.PayRcv disk consumer",
+    "SJ.Model LazyTensorDict/_TempDirRef, DiskFedAvg",
+    "SJ.Ctl workflow end cleanup"
+   ],
+   "groups": [
+    "G8 SJ.PayRcv",
+    "G6 SJ.Model",
+    "G4 SJ.Ctl"
+   ],
+   "processes": [
+    "SJ"
+   ],
+   "interleaving_or_failure": "cleanup or replacement while a lazy ref is still read",
+   "source_anchors": [
+    "tensor_disk_offload_context.py:49-127",
+    "lazy_tensor_dict.py:157-248",
+    "disk_fedavg_components.py:194-300"
+   ],
+   "verified_at_pin": [],
+   "status": "contract-baseline (LocalReferenceLifetime; no candidate)",
+   "crossing_state": "backingGen, offloadRoot closed, current/saved slot",
+   "boundaries": [
+    "B11"
+   ]
+  },
+  {
+   "id": "H39",
+   "phase1_refs": [
+    "Scenario 6/10"
+   ],
+   "description": "Persistence stages: PT in-memory update before file save, dir fsync after replace can fail; post-filter after publish; NP direct save; caller policy decides continuation",
+   "mechanisms": [
+    "SJ.Model persistors",
+    "SJ.Ctl save/continue policy"
+   ],
+   "groups": [
+    "G6 SJ.Model",
+    "G4 SJ.Ctl"
+   ],
+   "processes": [
+    "SJ"
+   ],
+   "interleaving_or_failure": "I/O failure before/after replace",
+   "source_anchors": [
+    "file_model_persistor.py:308-363",
+    "np_model_persistor.py:103-114"
+   ],
+   "verified_at_pin": [],
+   "status": "contract-baseline",
+   "crossing_state": "save outcome, artifact present",
+   "boundaries": [
+    "B08"
+   ]
+  },
+  {
+   "id": "H40",
+   "phase1_refs": [
+    "#5431/#5452",
+    "#5656"
+   ],
+   "description": "Silent transport peer stays READY (no receive-idle eviction); waits use wall clock",
+   "mechanisms": [
+    "Net heartbeat",
+    "every waiter"
+   ],
+   "groups": [
+    "I0 Net"
+   ],
+   "processes": [
+    "all"
+   ],
+   "interleaving_or_failure": "silent peer",
+   "source_anchors": [
+    "sfm/heartbeat_monitor.py:64-96",
+    "waiter_utils.py:52-63"
+   ],
+   "verified_at_pin": [],
+   "status": "known-open (liveness assumption)",
+   "crossing_state": "peer state",
+   "boundaries": [
+    "B22"
+   ]
+  },
+  {
+   "id": "H41",
+   "phase1_refs": [
+    "#5207",
+    "Scenario 11"
+   ],
+   "description": "Log collection/archive and JobStats status are separate from execution status; bounded drain",
+   "mechanisms": [
+    "SP JobLogReceiver/archive",
+    "CJ teardown upload",
+    "JobStatsReporter"
+   ],
+   "groups": [
+    "G1 SP.Job",
+    "G9 CJ.Runner"
+   ],
+   "processes": [
+    "SP",
+    "SJ",
+    "CJ"
+   ],
+   "interleaving_or_failure": "log stream EOF after terminal",
+   "source_anchors": [
+    "job_log_receiver.py:186-243",
+    "job_stats_reporter.py:1241-1293"
+   ],
+   "verified_at_pin": [],
+   "status": "known/unresolved contract (no invariant)",
+   "crossing_state": "log/archive state vs job status",
+   "boundaries": []
+  },
+  {
+   "id": "H42",
+   "phase1_refs": [
+    "CCManager",
+    "#5506 review"
+   ],
+   "description": "Optional CC validation failure stops all jobs and shuts the site (intentional cross-job effect)",
+   "mechanisms": [
+    "CCManager periodic validation",
+    "SP/CP global shutdown"
+   ],
+   "groups": [
+    "G1 SP.Job",
+    "G3 CP.Exec"
+   ],
+   "processes": [
+    "SP",
+    "CP"
+   ],
+   "interleaving_or_failure": "validation failure",
+   "source_anchors": [
+    "cc_manager.py:160-166,308-338,660-688"
+   ],
+   "verified_at_pin": [],
+   "status": "intentional-policy (optional toggle)",
+   "crossing_state": "global shutdown intent",
+   "boundaries": []
+  },
+  {
+   "id": "H45",
+   "phase1_refs": [
+    "#5528/PR #5529"
+   ],
+   "description": "Integral PyTorch accumulator can raise: one more source of 'accept raises' feeding H04",
+   "mechanisms": [
+    "SJ.Model accumulator"
+   ],
+   "groups": [
+    "G6 SJ.Model"
+   ],
+   "processes": [
+    "SJ"
+   ],
+   "interleaving_or_failure": "integral tensor",
+   "source_anchors": [
+    "weighted_aggregation_helper.py"
+   ],
+   "verified_at_pin": [],
+   "status": "known-open (abstract as generic accept exception)",
+   "crossing_state": "accept outcome",
+   "boundaries": [
+    "B08"
+   ]
+  },
+  {
+   "id": "H46",
+   "phase1_refs": [
+    "analysis-report §7 secondary"
+   ],
+   "description": "ServerRunner processing-client check/mark split",
+   "mechanisms": [
+    "SJ.Assign processing tracker"
+   ],
+   "groups": [
+    "G5 SJ.Assign"
+   ],
+   "processes": [
+    "SJ"
+   ],
+   "interleaving_or_failure": "concurrent pulls",
+   "source_anchors": [
+    "server_runner.py:309-335"
+   ],
+   "verified_at_pin": [],
+   "status": "unresolved (no consequence established)",
+   "crossing_state": "processingClients",
+   "boundaries": []
+  },
+  {
+   "id": "H47",
+   "phase1_refs": [
+    "analysis-report §7 secondary",
+    "brief LazyAggregator row"
+   ],
+   "description": "LazyAggregator returns accepted before underlying accept; timeout can still aggregate; reset/END_RUN do not join the worker",
+   "mechanisms": [
+    "SJ.Model LazyAggregator",
+    "SJ.Ctl aggregate"
+   ],
+   "groups": [
+    "G6 SJ.Model",
+    "G4 SJ.Ctl"
+   ],
+   "processes": [
+    "SJ"
+   ],
+   "interleaving_or_failure": "slow background accept",
+   "source_anchors": [
+    "lazy.py:109-188"
+   ],
+   "verified_at_pin": [],
+   "status": "intentional-policy (no drain-before-aggregate invariant)",
+   "crossing_state": "queued vs applied",
+   "boundaries": [
+    "B08"
+   ]
+  },
+  {
+   "id": "H49",
+   "phase1_refs": [
+    "#5550",
+    "trainer contracts",
+    "seed job handoff"
+   ],
+   "description": "External trainer bootstrap marker / process-group ownership gates Process CJ restart",
+   "mechanisms": [
+    "CJ.Trainer external cleanup retains bootstrap",
+    "CP.Exec can_restart"
+   ],
+   "groups": [
+    "P1 CJ.Trainer",
+    "G3 CP.Exec"
+   ],
+   "processes": [
+    "CJ",
+    "TP",
+    "CP"
+   ],
+   "interleaving_or_failure": "CJ dies while trainer group survives",
+   "source_anchors": [
+    "external_process_backend.py:810-818",
+    "process_launcher.py:60-120"
+   ],
+   "verified_at_pin": [],
+   "status": "contract-baseline (guard)",
+   "crossing_state": "bootstrapMarker, group alive",
+   "boundaries": [
+    "B18"
+   ]
+  },
+  {
+   "id": "H50",
+   "phase1_refs": [
+    "1.5 §3 task-worker decomposition",
+    "v1 Scenario 5"
+   ],
+   "description": "Worker physical attempt vs server assignment; task-owner settlement before CJ replacement; receipt-gated artifact release; replay fence outlives payload release",
+   "mechanisms": [
+    "W.Worker supervisor/artifacts",
+    "CP K8sTaskService",
+    "SJ.Assign receipt"
+   ],
+   "groups": [
+    "P3 W.Worker",
+    "G3 CP.Exec",
+    "G5 SJ.Assign"
+   ],
+   "processes": [
+    "CP",
+    "CJ",
+    "worker"
+   ],
+   "interleaving_or_failure": "CJ replacement / retry with saved result",
+   "source_anchors": [
+    "task_worker_executor.py:159-175",
+    "k8s_task_service.py:213-311",
+    "supervisor.py:155-205,380-489"
+   ],
+   "verified_at_pin": [],
+   "status": "contract-baseline (placeholder)",
+   "crossing_state": "physicalAttempt, receipt, taskOwnerSettled",
+   "boundaries": [
+    "B19"
+   ]
+  },
+  {
+   "id": "H51",
+   "phase1_refs": [
+    "Scenario 11",
+    "event.py contract"
+   ],
+   "description": "Synchronous event dispatch includes the emitter and swallows handler exceptions; callers inspect fatal state differently",
+   "mechanisms": [
+    "Events",
+    "all handlers"
+   ],
+   "groups": [
+    "I0 Events",
+    "P4 CJ.CCWF",
+    "G4 SJ.Ctl"
+   ],
+   "processes": [
+    "all"
+   ],
+   "interleaving_or_failure": "self-delivery, swallowed exception",
+   "source_anchors": [
+    "apis/utils/event.py:27-84"
+   ],
+   "verified_at_pin": [],
+   "status": "contract-baseline (EventFailurePropagation)",
+   "crossing_state": "event origin, EXCEPTIONS prop",
+   "boundaries": [
+    "B20"
+   ]
+  }
+ ],
+ "excluded_non_interaction": [
+  {
+   "id": "T-3/L-C3",
+   "reason": "Process launcher shlex-splits paths with spaces (job_launcher_utils.py:49-127; process_launcher.py:154-158): single mechanism (CP.Exec), test target, no cross-component interleaving"
+  },
+  {
+   "id": "CR-2/TP-R1",
+   "reason": "Client API docs vs global context cache: single component, no cross-job reuse established"
+  },
+  {
+   "id": "#5474/#5605",
+   "reason": "recipe SessionManager missing finally: user-side helper, not runtime interaction"
+  },
+  {
+   "id": "#5661/#5662",
+   "reason": "simulator fatal reason lost: simulator profile bypasses production admission; out of slice profile"
+  },
+  {
+   "id": "#5577, #5634, #5643",
+   "reason": "checkpoint retention design gap, config shadowing, multiprocess init: no concurrent cross-component interleaving in the job/fedavg/payload cut"
+  },
+  {
+   "id": "AuthorizedConfiguration (brief §5)",
+   "reason": "configuration-legality matrix (one ClientAPIExecutor, mode/lifetime/backend guards): encode as model constants/ASSUME per profile, not as an interleaving target"
+  },
+  {
+   "id": "H10 / T-1 in the matrix",
+   "reason": "StreamIdentityUniqueness needs a fine byte-stream Net variant below the message abstraction; test-first, no MC scenario row"
+  },
+  {
+   "id": "#3223",
+   "reason": "shallow task-data copy + filter idempotence: intentional filter-author contract (keep make_copy semantics in SJ.Assign filters)"
+  }
+ ],
+ "scenarios": [
+  {
+   "id": "S01",
+   "rank": 1,
+   "description": "Process CJ restart captures another job's GPU env",
+   "hazards": [
+    "H08"
+   ],
+   "fine_groups": [
+    "G3 CP.Exec"
+   ],
+   "coarse_ok_groups": [
+    "G2 CP.Res",
+    "G1 SP.Job (2 jobs)",
+    "G9 CJ.Runner (alive/READY/crash only)"
+   ],
+   "not_needed_groups": [
+    "SJ.*",
+    "PaySrc/PayRcv",
+    "trainer"
+   ],
+   "faults": [
+    "CJ crash with restartable rc (EXECUTION_ERROR/EXCEPTION/INFRA) after READY"
+   ],
+   "config": "2 jobs, max_jobs>=2, List/GPU RM+consumer, 2 GPU units, Process backend, no study env override, max_cj_restart_failures>=1",
+   "property": "ResourceUseMatchesAllocation",
+   "property_formula": "\\A c \\in Sites, j \\in Jobs, g \\in Gens: launch[c][j][g].state = \"alive\" => launch[c][j][g].env = Devices(alloc[c][j])   (explicit study env override excluded by config)",
+   "phase1_refs": [
+    "MC-8/L-C5",
+    "v1 MC-1"
+   ],
+   "source_anchors": [
+    "scheduler_cmds.py:117-131",
+    "client_executor.py:722-758",
+    "process_launcher.py:128-158"
+   ],
+   "status": "candidate-MC",
+   "plausibility": "high",
+   "depth": "3 groups, CP + 3 CJ gens, 1 fault",
+   "missing_hooks": [
+    "K01",
+    "K02",
+    "K21"
+   ]
+  },
+  {
+   "id": "S03",
+   "rank": 2,
+   "description": "SAG publishes partially mutated accumulator after accept raised",
+   "hazards": [
+    "H04",
+    "H45"
+   ],
+   "fine_groups": [
+    "G4 SJ.Ctl (SAG policy)"
+   ],
+   "coarse_ok_groups": [
+    "G6 SJ.Model (must expose partialFailed; FINE for zoom-in to per-key lazy I/O)",
+    "G5 SJ.Assign (callback raise -> ERROR, wait returns)",
+    "G8 SJ.PayRcv (disk-offload lazy refs)",
+    "G9 CJ.Runner",
+    "job groups"
+   ],
+   "not_needed_groups": [
+    "trainer"
+   ],
+   "faults": [
+    "lazy tensor read I/O failure after shape preflight, after >=1 key mutated"
+   ],
+   "config": "SAG + InTimeAccumulateWeightedAggregator + enable_tensor_disk_offload, 2 sites, >=2 keys; FedAvg run as negative control",
+   "property": "FailedContributionIsolation",
+   "property_formula": "\\A g: (published[g] \\/ saved[g]) => \\A a \\in published[g].provenance: contrib[a] # \"partialFailed\"   (equivalently: published[g] => ~published[g].poisoned)",
+   "phase1_refs": [
+    "MC-4/WF-C2",
+    "v1 MC-4"
+   ],
+   "source_anchors": [
+    "weighted_aggregation_helper.py:192-264",
+    "wf_comm_server.py:657-672",
+    "scatter_and_gather.py:285-337"
+   ],
+   "status": "candidate-MC",
+   "plausibility": "medium-high",
+   "depth": "4 groups (1 fine), SJ only, 1 fault",
+   "missing_hooks": [
+    "K08",
+    "K09",
+    "K10",
+    "K13"
+   ]
+  },
+  {
+   "id": "S02",
+   "rank": 3,
+   "description": "In-process sender tail clears successor input",
+   "hazards": [
+    "H02"
+   ],
+   "fine_groups": [
+    "P1 CJ.Trainer (in-process)",
+    "G9 CJ.Runner"
+   ],
+   "coarse_ok_groups": [
+    "G5 SJ.Assign (next assignment after receipt)",
+    "G4 SJ.Ctl (rounds>=2)",
+    "G7/G8 Pay* (or bypass)",
+    "G1-G3 job"
+   ],
+   "not_needed_groups": [
+    "SJ.Model detail"
+   ],
+   "faults": [
+    "none (trainer thread may pause between publish and clear)"
+   ],
+   "config": "resident job lifetime, in-process, clear_cache=True, 2 rounds, 1 site suffices",
+   "property": "SuccessorInputPreserved",
+   "property_formula": "\\A c \\in Sites: inSlot[c].gen \\notin trainerReceived[c] => inSlot[c].params = \"present\"   + liveness \\A c,k: delivered(c,k) ~> (submitted(c,k) \\/ runAbort)",
+   "phase1_refs": [
+    "MC-2/TP-C"
+   ],
+   "source_anchors": [
+    "client/in_process/api.py:212-227,311-331",
+    "in_process_backend.py:206-219,324-330"
+   ],
+   "status": "candidate-MC",
+   "plausibility": "high",
+   "depth": "2 fine groups, 2 CJ threads + SJ round trip, 0 faults",
+   "missing_hooks": [
+    "K07",
+    "K15"
+   ]
+  },
+  {
+   "id": "S04",
+   "rank": 4,
+   "description": "Attach transfer completion inferred as canonical acceptance",
+   "hazards": [
+    "H01"
+   ],
+   "fine_groups": [
+    "P2 TP.Trainer (attach session)",
+    "P1 CJ.Trainer (attach backend)",
+    "G8 CJ.PayRcv (eager decode, confirm-before-dispatch)"
+   ],
+   "coarse_ok_groups": [
+    "G7 TP.PaySrc (waiter outcome)",
+    "G9 CJ.Runner (timeout/END_RUN)",
+    "SJ.*"
+   ],
+   "not_needed_groups": [
+    "job groups"
+   ],
+   "faults": [
+    "CJ result_wait_timeout or END_RUN close between confirm and handler",
+    "drop RESULT_READY reply on both attempts",
+    "RESULT_STATUS -> UNKNOWN",
+    "drop ABORT"
+   ],
+   "config": "Attach, downloadable result, finite result_wait_timeout",
+   "property": "SendSuccessRequiresAuthority",
+   "property_formula": "\\A r \\in Results: tpSend[r] = \"success\" => canonical[TaskOf(r)].resultId = r",
+   "phase1_refs": [
+    "MC-1/TP-A",
+    "v1 MC-2"
+   ],
+   "source_anchors": [
+    "attach_session.py:441-459",
+    "cell.py:96-142",
+    "cell_backend.py:195-252"
+   ],
+   "status": "candidate-MC",
+   "plausibility": "medium (needs selective loss twice)",
+   "depth": "4 groups fine/coarse, TP+CJ, 3-4 faults",
+   "missing_hooks": [
+    "K05",
+    "K06",
+    "K11",
+    "K15"
+   ]
+  },
+  {
+   "id": "S08",
+   "rank": 5,
+   "description": "Old publish_results handler removes successor launch's transfer record",
+   "hazards": [
+    "H07",
+    "H35"
+   ],
+   "fine_groups": [
+    "G3 CP.Exec (K8s profile + ws-transfer handler split + restart)",
+    "G9 CJ.Runner (upload-at-exit, skip STOPPED)"
+   ],
+   "coarse_ok_groups": [
+    "P3 W.Worker (task owner settled)",
+    "I0 Net (request timeout, handler continues)",
+    "G2 CP.Res",
+    "G1 SP.Job"
+   ],
+   "not_needed_groups": [
+    "SJ.*",
+    "Pay* (bundle download abstract)"
+   ],
+   "faults": [
+    "old CJ fails after upload reached CP, or publish request times out (600 s) during extraction",
+    "STOPPED skipped/lost",
+    "retryable failure"
+   ],
+   "config": "K8s persistent resident (PVC) or K8s task; restart enabled",
+   "property": "NoStaleOwnerMutation",
+   "property_formula": "\\A c,j: wsRemoved[c][j] # None => wsRemoved[c][j].authGen = wsRemoved[c][j].recordGen   + liveness launched(j,g2) ~> (uploadOk(j,g2) \\/ aborted(j))",
+   "phase1_refs": [
+    "MC-7/L-C4"
+   ],
+   "source_anchors": [
+    "workspace_cell_transfer.py:429-475",
+    "k8s_launcher.py:715-742,1058-1059"
+   ],
+   "status": "candidate-MC",
+   "plausibility": "medium-low (slow-handler premise)",
+   "depth": "2 fine + 2 coarse, CP + 2 CJ gens, 2 faults",
+   "missing_hooks": [
+    "K02",
+    "K03",
+    "K04",
+    "K06",
+    "K16",
+    "K21"
+   ]
+  },
+  {
+   "id": "S10",
+   "rank": 6,
+   "description": "Source loss during SJ result decode: CJ crash mid-upload, or straggler at END_RUN, turns into SJ os._exit(1)",
+   "hazards": [
+    "H29",
+    "H30"
+   ],
+   "fine_groups": [
+    "G8 SJ.PayRcv (decode policy)",
+    "G9 CJ.Runner (submit timeout, END_RUN, teardown order)",
+    "G4 SJ.Ctl (END_RUN then readiness then local DS shutdown)"
+   ],
+   "coarse_ok_groups": [
+    "G7 CJ.PaySrc (shutdown clears refs -> INVALID_REQUEST)",
+    "G1 SP.Job (outcome precedence)",
+    "G3 CP.Exec (restart, H29)",
+    "G5 SJ.Assign"
+   ],
+   "not_needed_groups": [
+    "SJ.Model detail",
+    "trainer"
+   ],
+   "faults": [
+    "H30: none (END_RUN vs teardown race)",
+    "H29: CJ crash/kill during SJ pull"
+   ],
+   "config": "last round admits a straggler (SAG min_clients<n + grace, or ModelController min_responses/timeout); payload large enough that SJ pull is still running at END_RUN; >=2 sites",
+   "property": "OutcomeReflectsWorkflow (diagnostic)",
+   "property_formula": "~(wfDone /\\ savedGen > 0 /\\ ~abortLatch /\\ sjExitCause = \"decodeFatal\")   ; H29 variant: restartEligible(CJ) /\\ policyTolerates => ~(sjExitCause = \"decodeFatal\")",
+   "phase1_refs": [
+    "derived (H30)",
+    "shared notes cell.py policy (H29)"
+   ],
+   "source_anchors": [
+    "cell.py:118-135",
+    "download_service.py:1681-1707,2240-2270",
+    "server_runner.py:205-237",
+    "client_runner.py:796-821,1084-1089",
+    "communicator.py:617"
+   ],
+   "status": "derived-new (H30, unverified) / intentional-policy (H29)",
+   "plausibility": "medium (H30 race needs no fault; H29 certain once a CJ dies mid-pull)",
+   "depth": "3 fine + 4 coarse, SJ+CJ+CP+SP, 0-1 faults",
+   "missing_hooks": [
+    "K02",
+    "K05",
+    "K06",
+    "K08",
+    "K11",
+    "K12",
+    "K14"
+   ]
+  },
+  {
+   "id": "S05",
+   "rank": 7,
+   "description": "Swarm busy replacement self-delivers ABORT_TASK and permanently stops its controller",
+   "hazards": [
+    "H06",
+    "H51"
+   ],
+   "fine_groups": [
+    "P4 CJ.CCWF (trainer site)",
+    "I0 Events (self-delivery)"
+   ],
+   "coarse_ok_groups": [
+    "P4 peer aggregator",
+    "P1 CJ.Trainer (slow learn)",
+    "G4 SJ.Ctl (CCWF server timeouts)"
+   ],
+   "not_needed_groups": [
+    "Pay*",
+    "job"
+   ],
+   "faults": [
+    "none (slow prior learn; aggregator min/grace)"
+   ],
+   "config": "Swarm, allow_busy_task=True, >=3 sites",
+   "property": "TaskAbortDoesNotStopSuccessorWorkflow",
+   "property_formula": "[]((busyReplaced /\\ ~runAbort /\\ ~workflowEndReq) => ~askedToStop)   + liveness \\A r: acked(r) ~> (executed(r) \\/ rejected(r))",
+   "phase1_refs": [
+    "MC-6/WF-C4"
+   ],
+   "source_anchors": [
+    "client_ctl.py:201-205,431-457",
+    "swarm_client_ctl.py:583-599"
+   ],
+   "status": "candidate-MC (source-established)",
+   "plausibility": "high",
+   "depth": "2 groups, 2 CJ, 0 faults",
+   "missing_hooks": [
+    "K17",
+    "K18"
+   ]
+  },
+  {
+   "id": "S06",
+   "rank": 8,
+   "description": "Resend duplicates ClientTask and kills task monitor",
+   "hazards": [
+    "H11"
+   ],
+   "fine_groups": [
+    "G5 SJ.Assign"
+   ],
+   "coarse_ok_groups": [
+    "G4 SJ.Ctl (CSE: standing A->C, B->D)",
+    "G9 CJ.Runner (GET_TASK retry)",
+    "I0 Net"
+   ],
+   "not_needed_groups": [
+    "SJ.Model",
+    "Pay*",
+    "job"
+   ],
+   "faults": [
+    "drop/delay TASK_ASSIGNMENT reply to C"
+   ],
+   "config": "two standing tasks with disjoint targets; clientTasks as sequence",
+   "property": "OneAssignmentRecordPerIdentity",
+   "property_formula": "\\A t, x: Cardinality({i \\in DOMAIN clientTasks[t] : clientTasks[t][i] = x}) <= 1 /\\ (runActive => monitorAlive)   + liveness (standing(t) /\\ allResponded(t)) ~> retired(t)",
+   "phase1_refs": [
+    "T-2/WF-C1"
+   ],
+   "source_anchors": [
+    "wf_comm_server.py:238-280,371-375,1255-1264"
+   ],
+   "status": "candidate-test (model-checkable)",
+   "plausibility": "high",
+   "depth": "1 fine group, SJ + 2 CJ, 1 fault",
+   "missing_hooks": [
+    "K06",
+    "K07",
+    "K08"
+   ]
+  },
+  {
+   "id": "S07",
+   "rank": 9,
+   "description": "Swarm all-reply closure before last accept",
+   "hazards": [
+    "H05"
+   ],
+   "fine_groups": [
+    "P4 CJ.CCWF (aggregator site: gather/is_done/monitor)"
+   ],
+   "coarse_ok_groups": [
+    "G6 CJ.Model (accept lock)",
+    "peer trainers"
+   ],
+   "not_needed_groups": [
+    "SJ.*",
+    "Pay*",
+    "job"
+   ],
+   "faults": [
+    "delay inside BEFORE_CONTRIBUTION_ACCEPT handler"
+   ],
+   "config": "all-required, learn_task_timeout=None, >=1 other contribution",
+   "property": "GatherClosureAfterRequiredConsumption",
+   "property_formula": "\\A rd: frozen[rd] /\\ closeCause[rd] = \"allReplied\" => \\A t \\in Required: acceptDone[rd][t]",
+   "phase1_refs": [
+    "MC-5/WF-C3",
+    "v1 MC-3"
+   ],
+   "source_anchors": [
+    "swarm_client_ctl.py:192-229,263-287,643-669"
+   ],
+   "status": "candidate-MC",
+   "plausibility": "medium",
+   "depth": "1-2 groups, 1 CJ + peers, scheduling only",
+   "missing_hooks": [
+    "K17",
+    "K18"
+   ]
+  },
+  {
+   "id": "S09",
+   "rank": 10,
+   "description": "Stale source monitor stops reused trainer",
+   "hazards": [
+    "H03"
+   ],
+   "fine_groups": [
+    "P1 CJ.Trainer (external launch_once: monitor/stop/accept)",
+    "P2 TP.Trainer (heartbeat/disconnect)"
+   ],
+   "coarse_ok_groups": [
+    "G7 TP.PaySrc (settle -> source-live cleared)",
+    "G9 CJ.Runner (next task)",
+    "SJ.*"
+   ],
+   "not_needed_groups": [
+    "job"
+   ],
+   "faults": [
+    "heartbeat silence > timeout or disconnect > grace, then recovery"
+   ],
+   "config": "external_process launch_once=True, lazy source result",
+   "property": "StopRequiresCurrentOwner",
+   "property_formula": "stopCause # None /\\ stopCause.kind = \"monitor\" => stopCause.task = stopCause.ownerTaskAtStop /\\ stopCause.sourceLiveAtStop",
+   "phase1_refs": [
+    "MC-3/TP-D"
+   ],
+   "source_anchors": [
+    "external_process_backend.py:1239-1294"
+   ],
+   "status": "candidate-MC",
+   "plausibility": "medium-low",
+   "depth": "2 fine groups, CJ+TP, 1 fault",
+   "missing_hooks": [
+    "K06",
+    "K15",
+    "K21"
+   ]
+  },
+  {
+   "id": "S11",
+   "rank": 11,
+   "description": "Delayed CANCEL fails a new tx that reused the ref id",
+   "hazards": [
+    "H09"
+   ],
+   "fine_groups": [
+    "G7 PaySrc"
+   ],
+   "coarse_ok_groups": [
+    "G8 PayRcv (emits CANCEL)",
+    "I0 Net (delay)"
+   ],
+   "not_needed_groups": [
+    "all others (custom ObjectDownloader caller)"
+   ],
+   "faults": [
+    "delay CANCEL past old tx retirement (TTL/delete)"
+   ],
+   "config": "explicit sequential ref-id reuse; 2 tx; same receiver",
+   "property": "CancellationGenerationAssociation",
+   "property_formula": "\\A x, r: failedByCancel[x][r] => \\E m \\in cancelsSent: m.receiver = r /\\ m.txAtSend = x",
+   "phase1_refs": [
+    "MC-9/TP-E"
+   ],
+   "source_anchors": [
+    "download_service.py:1824-1855,1398-1400"
+   ],
+   "status": "candidate-MC",
+   "plausibility": "low-medium (API-specific)",
+   "depth": "1 fine group, 2 procs, 1 fault",
+   "missing_hooks": [
+    "K06",
+    "K11"
+   ]
+  },
+  {
+   "id": "S12",
+   "rank": 12,
+   "description": "Submission timeout/retry vs in-progress claim/callback; tx per attempt",
+   "hazards": [
+    "H31"
+   ],
+   "fine_groups": [
+    "G5 SJ.Assign (check/claim/finish, TASK_CHECK)",
+    "G9 CJ.Runner (submit loop)"
+   ],
+   "coarse_ok_groups": [
+    "G7 CJ.PaySrc (tx per try)",
+    "G8 SJ.PayRcv",
+    "G4 SJ.Ctl FedAvg"
+   ],
+   "not_needed_groups": [
+    "job detail"
+   ],
+   "faults": [
+    "submit local timeout while SJ downloads/claims",
+    "lost RESULT_RECEIPT",
+    "duplicate envelope"
+   ],
+   "config": "slice FedAvg profile + retries",
+   "property": "ApplicationReceiptAtMostOnce + AbandonedTxSettles",
+   "property_formula": "\\A a \\in FencedAttempts: cbRuns[a] <= 1   ; \\A x: abandoned(x) ~> (txs[x].state = \"settled\" \\/ shutdown(Owner(x)))   ; submitted(a) ~> receiptKnown(a)",
+   "phase1_refs": [
+    "Scenario 3 retries",
+    "1.5 network contract"
+   ],
+   "source_anchors": [
+    "client_runner.py:656-721",
+    "wf_comm_server.py:417-672"
+   ],
+   "status": "contract-baseline",
+   "plausibility": "high (baseline)",
+   "depth": "2 fine + 3 coarse, CJ+SJ, 2-3 faults",
+   "missing_hooks": [
+    "K06",
+    "K11",
+    "K14"
+   ]
+  },
+  {
+   "id": "S13",
+   "rank": 13,
+   "description": "Overlapping ModelController tasks share error-tolerance context",
+   "hazards": [
+    "H18"
+   ],
+   "fine_groups": [
+    "G4 SJ.Ctl (BaseModelController)"
+   ],
+   "coarse_ok_groups": [
+    "G5 SJ.Assign (2 standing tasks)",
+    "G9 CJ.Runner (error rc)"
+   ],
+   "not_needed_groups": [
+    "Pay*",
+    "job"
+   ],
+   "faults": [
+    "client returns error rc for task A"
+   ],
+   "config": "nonblocking send A (3 targets, min 2) then B (1 target, min 1); ignore_result_error dynamic",
+   "property": "PolicyAssociation",
+   "property_formula": "[](panic /\\ panicCause = <<\"error\", t>> => QuorumUnreachable(t))",
+   "phase1_refs": [
+    "v1 TV-1"
+   ],
+   "source_anchors": [
+    "base_model_controller.py:161-165,342-375"
+   ],
+   "status": "candidate-test (v1)",
+   "plausibility": "high (test-level)",
+   "depth": "1 fine group, SJ + 3 CJ",
+   "missing_hooks": [
+    "K07",
+    "K08"
+   ]
+  },
+  {
+   "id": "S14",
+   "rank": 14,
+   "description": "Sampled FedAvg + tensor stream waits for unselected site",
+   "hazards": [
+    "H14"
+   ],
+   "fine_groups": [
+    "G5 SJ.Assign (get-task path + task-data hook + processing_tasks)",
+    "tensor plugin (SJ/CJ sub-module)"
+   ],
+   "coarse_ok_groups": [
+    "G4 SJ.Ctl (sampling)",
+    "G9 CJ.Runner"
+   ],
+   "not_needed_groups": [
+    "SJ.Model",
+    "Pay*",
+    "job"
+   ],
+   "faults": [
+    "none"
+   ],
+   "config": "FedAvgRecipe min_clients=1, 2 connected sites, tensor streaming enabled",
+   "property": "SelectedDeliveryCanProgress (liveness)",
+   "property_formula": "Healthy => \\A t, c \\in Selected(t): requested(c,t) ~> delivered(c,t)",
+   "phase1_refs": [
+    "T-5/WF-C5"
+   ],
+   "source_anchors": [
+    "tensor_stream/server.py:172-174,239-270"
+   ],
+   "status": "candidate-test",
+   "plausibility": "high (configuration bug; test-first)",
+   "depth": "2 groups, SJ + 2 CJ",
+   "missing_hooks": [
+    "K08",
+    "K19"
+   ]
+  },
+  {
+   "id": "S15",
+   "rank": 15,
+   "description": "Known accepted-handle loss / delete-failure terminalization frees live execution",
+   "hazards": [
+    "H19",
+    "H20"
+   ],
+   "fine_groups": [
+    "G3 CP.Exec (launch exception unwind; K8s terminate)"
+   ],
+   "coarse_ok_groups": [
+    "G2 CP.Res",
+    "G1 SP.Job (reuse)"
+   ],
+   "not_needed_groups": [
+    "SJ.*",
+    "Pay*"
+   ],
+   "faults": [
+    "backend launch exception after JOB_HANDLE_CALLBACK",
+    "K8s delete failure"
+   ],
+   "config": "K8s/Docker profile, 2 jobs for reuse",
+   "property": "PhysicalReleaseBeforeReuse (diagnostic)",
+   "property_formula": "\\A c,j: freeCalls[c][j] > 0 => \\A g: launch[c][j][g].state \\in {\"exited\",\"settled\"}   (known violations #5559/#5561 expected)",
+   "phase1_refs": [
+    "#5559/#5561",
+    "L-C1/L-C2"
+   ],
+   "source_anchors": [
+    "client_executor.py:358-365",
+    "k8s_launcher.py:409-436"
+   ],
+   "status": "known-open (canary)",
+   "plausibility": "known",
+   "depth": "1 fine group",
+   "missing_hooks": [
+    "K01",
+    "K04"
+   ]
+  },
+  {
+   "id": "S16",
+   "rank": 16,
+   "description": "Waiter-thread start failure frees allocation while child lives",
+   "hazards": [
+    "H21"
+   ],
+   "fine_groups": [
+    "G3 CP.Exec"
+   ],
+   "coarse_ok_groups": [
+    "G2 CP.Res"
+   ],
+   "not_needed_groups": [
+    "others"
+   ],
+   "faults": [
+    "thread start failure"
+   ],
+   "config": "any",
+   "property": "NoFreeWhileInUse",
+   "property_formula": "\\A c,j: freeCalls[c][j] > 0 => \\A g: launch[c][j][g].state # \"alive\"",
+   "phase1_refs": [
+    "seed job MC-2"
+   ],
+   "source_anchors": [
+    "client_executor.py:345-371"
+   ],
+   "status": "historical-lineage",
+   "plausibility": "low",
+   "depth": "1 fine group",
+   "missing_hooks": [
+    "K02"
+   ]
+  },
+  {
+   "id": "S17",
+   "rank": 17,
+   "description": "Delayed RUNNING after terminal (known accepted); pre-run abort guard (fixed)",
+   "hazards": [
+    "H22",
+    "H23"
+   ],
+   "fine_groups": [
+    "G1 SP.Job"
+   ],
+   "coarse_ok_groups": [
+    "G4 SJ.Ctl (fast exit)"
+   ],
+   "not_needed_groups": [
+    "CP*",
+    "Pay*"
+   ],
+   "faults": [
+    "admin abort",
+    "fast SJ exit"
+   ],
+   "config": "any",
+   "property": "TerminalStatusStable (diagnostic)",
+   "property_formula": "[][terminal[j] => jobStatus'[j] = jobStatus[j]]_vars   (known violation #5301 expected)",
+   "phase1_refs": [
+    "#5301",
+    "#5300"
+   ],
+   "source_anchors": [
+    "job_runner.py:687-824"
+   ],
+   "status": "known-accepted / fixed-baseline",
+   "plausibility": "known",
+   "depth": "1 fine group",
+   "missing_hooks": [
+    "K05",
+    "K20"
+   ]
+  },
+  {
+   "id": "S18",
+   "rank": 18,
+   "description": "Attach settlement ACK vs listener close",
+   "hazards": [
+    "H24"
+   ],
+   "fine_groups": [
+    "P2 TP.Trainer",
+    "P1 CJ.Trainer (attach finalize)"
+   ],
+   "coarse_ok_groups": [
+    "G7 TP.PaySrc"
+   ],
+   "not_needed_groups": [
+    "SJ.*",
+    "job"
+   ],
+   "faults": [
+    "SHUTDOWN concurrent with settlement"
+   ],
+   "config": "Attach shared-file route",
+   "property": "SettlementBeforeRouteClose (liveness)",
+   "property_formula": "resultAccepted(r) ~> (settledAck(r) \\/ trainerExited)  within bounded retries; known #5467 expected",
+   "phase1_refs": [
+    "#5467"
+   ],
+   "source_anchors": [
+    "client/cell/api.py:580-622"
+   ],
+   "status": "known-open",
+   "plausibility": "known",
+   "depth": "2 groups",
+   "missing_hooks": [
+    "K15"
+   ]
+  },
+  {
+   "id": "S19",
+   "rank": 19,
+   "description": "Payload-internal canaries: EOF-after-cancel progress (known), settlement once (fixed), receiver contract (fixed)",
+   "hazards": [
+    "H25",
+    "H26",
+    "H27"
+   ],
+   "fine_groups": [
+    "G7 PaySrc",
+    "G8 PayRcv (pipelined)"
+   ],
+   "coarse_ok_groups": [
+    "I0 Net"
+   ],
+   "not_needed_groups": [
+    "others"
+   ],
+   "faults": [
+    "cancel concurrent with admitted EOF",
+    "post-enqueue submit failure"
+   ],
+   "config": "seed profiles",
+   "property": "ProgressAgreesWithOutcome (diagnostic)",
+   "property_formula": "txs[x].outcome = \"FAILED\" => progress[x] # \"COMPLETED\"   (known S1 violation expected)",
+   "phase1_refs": [
+    "payload seed S1",
+    "#5292",
+    "#5291"
+   ],
+   "source_anchors": [
+    "seeds/payload/spec/output/MC_hunt_s1_progress_bfs.states.json"
+   ],
+   "status": "known / fixed-baseline",
+   "plausibility": "known",
+   "depth": "2 groups",
+   "missing_hooks": [
+    "K11"
+   ]
+  },
+  {
+   "id": "S20",
+   "rank": 20,
+   "description": "Learner init flag latched after failed initialize",
+   "hazards": [
+    "H13"
+   ],
+   "fine_groups": [
+    "P1 CJ.Trainer (learner executor)"
+   ],
+   "coarse_ok_groups": [
+    "G9 CJ.Runner",
+    "G4 SJ.Ctl (SAG ignore_result_error=True)"
+   ],
+   "not_needed_groups": [
+    "Pay*",
+    "job"
+   ],
+   "faults": [
+    "transient initialize exception"
+   ],
+   "config": "resident learner, 2 sites",
+   "property": "NoExecuteAfterFailedInit",
+   "property_formula": "[](executing(c) => initOk[c] \\/ initRetrying[c])",
+   "phase1_refs": [
+    "T-4/TP-R3"
+   ],
+   "source_anchors": [
+    "learner_executor.py:80-82"
+   ],
+   "status": "candidate-test",
+   "plausibility": "medium (test-first)",
+   "depth": "1 fine group",
+   "missing_hooks": [
+    "K08",
+    "K15"
+   ]
+  },
+  {
+   "id": "S21",
+   "rank": 21,
+   "description": "Concurrent AUX DO_TASK and pull-loop execute on one in-process backend",
+   "hazards": [
+    "H15"
+   ],
+   "fine_groups": [
+    "G9 CJ.Runner (AUX)",
+    "P1 CJ.Trainer (in-process)"
+   ],
+   "coarse_ok_groups": [
+    "G4 SJ.Ctl (TaskController DO_TASK)"
+   ],
+   "not_needed_groups": [
+    "Pay*",
+    "job"
+   ],
+   "faults": [
+    "none"
+   ],
+   "config": "custom controller issuing DO_TASK concurrently (supported-ness unresolved)",
+   "property": "ResultSlotAssociation",
+   "property_formula": "\\A c: resultSlot[c] # None => resultSlot[c].task = currentExecute[c].task",
+   "phase1_refs": [
+    "CR-1/TP-B"
+   ],
+   "source_anchors": [
+    "client_runner.py:1091-1097"
+   ],
+   "status": "review-only",
+   "plausibility": "unresolved",
+   "depth": "2 groups",
+   "missing_hooks": [
+    "K15"
+   ]
+  },
+  {
+   "id": "S22",
+   "rank": 22,
+   "description": "Lifecycle contract baseline: lost START reply, lost OUTCOME + grace, TTL expiry, stale READY/STOPPED, abort during restart, bootstrap-marker restart gate",
+   "hazards": [
+    "H32",
+    "H33",
+    "H34",
+    "H35",
+    "H36",
+    "H49"
+   ],
+   "fine_groups": [
+    "G1 SP.Job",
+    "G3 CP.Exec"
+   ],
+   "coarse_ok_groups": [
+    "G2 CP.Res",
+    "G9 CJ.Runner",
+    "P1 CJ.Trainer (marker)"
+   ],
+   "not_needed_groups": [
+    "SJ.Model",
+    "Pay*"
+   ],
+   "faults": [
+    "drop START reply",
+    "drop OUTCOME",
+    "drop/delay STOPPED/READY",
+    "ABORT during restart",
+    "CJ crash"
+   ],
+   "config": "Process profile, 2 sites",
+   "property": "OutcomePrecedenceAndPolicy + StaleNotificationFenced + AbortBlocksRestart + ReservationOwnership",
+   "property_formula": "terminal[j] => (pendingOutcomes[j] = {} \\/ graceExpired[j] \\/ abortLatch[j]) ; status update by m => m.launchId \\in {None, curLaunch[c][j]} ; abortReq[c][j] => no gen spawned after abort ; token -> at most one live allocation",
+   "phase1_refs": [
+    "lifecycle contracts",
+    "brief §5 properties"
+   ],
+   "source_anchors": [
+    "job_runner.py:338-636",
+    "client_executor.py:345-841"
+   ],
+   "status": "contract-baseline",
+   "plausibility": "baseline",
+   "depth": "2 fine + 3 coarse",
+   "missing_hooks": [
+    "K02",
+    "K03",
+    "K05",
+    "K06",
+    "K20"
+   ]
+  },
+  {
+   "id": "S23",
+   "rank": 23,
+   "description": "Workflow switch, mark-only cancel, completion-before-task_done vs admitted callbacks and late results",
+   "hazards": [
+    "H37"
+   ],
+   "fine_groups": [
+    "G5 SJ.Assign",
+    "G4 SJ.Ctl"
+   ],
+   "coarse_ok_groups": [
+    "G9 CJ.Runner",
+    "G8 SJ.PayRcv"
+   ],
+   "not_needed_groups": [
+    "job"
+   ],
+   "faults": [
+    "late result",
+    "cancel during callback"
+   ],
+   "config": "2 workflows",
+   "property": "WorkflowAdmissionIdentity + FencedReceiptAtMostOnce",
+   "property_formula": "claimed(a) => a.workflow = currentWf ; \\A a fenced: cbRuns[a] + lateHookRuns[a] <= 1",
+   "phase1_refs": [
+    "Scenario 3",
+    "fedavg seed S4/U2"
+   ],
+   "source_anchors": [
+    "server_runner.py:131-184",
+    "wf_comm_server.py:963,1013-1046,1353-1367"
+   ],
+   "status": "contract-baseline",
+   "plausibility": "baseline",
+   "depth": "2 fine groups",
+   "missing_hooks": [
+    "K07",
+    "K09"
+   ]
+  },
+  {
+   "id": "S24",
+   "rank": 24,
+   "description": "Local backing lifetime and persistence stages after transfer",
+   "hazards": [
+    "H38",
+    "H39",
+    "H47"
+   ],
+   "fine_groups": [
+    "G6 SJ.Model"
+   ],
+   "coarse_ok_groups": [
+    "G8 SJ.PayRcv (disk refs)",
+    "G4 SJ.Ctl"
+   ],
+   "not_needed_groups": [
+    "CP*",
+    "trainer"
+   ],
+   "faults": [
+    "I/O failure before/after replace",
+    "cleanup while lazy ref read"
+   ],
+   "config": "disk offload / DiskFedAvg / PT vs NP persistor",
+   "property": "LocalReferenceLifetime + SaveOutcomeHonest",
+   "property_formula": "materialized(ref) => readGen(ref) = backingGen(ref) ; saveFailed(g) /\\ artifactReplaced(g) => recorded(g) (no assumption that exception means no artifact)",
+   "phase1_refs": [
+    "Scenario 6/10"
+   ],
+   "source_anchors": [
+    "file_model_persistor.py:308-363",
+    "disk_fedavg_components.py:194-300"
+   ],
+   "status": "contract-baseline",
+   "plausibility": "baseline",
+   "depth": "1 fine group",
+   "missing_hooks": [
+    "K10",
+    "K13"
+   ]
+  }
+ ],
+ "missing_hooks": [
+  {
+   "id": "K01",
+   "hook": "Jobs >= 2 sharing one CP (RM pool, consumer env, scheduler capacity reuse)",
+   "needed_by": [
+    "S01",
+    "S15"
+   ],
+   "slice_now": "one job",
+   "design_note": "parameterize job id everywhere; SP.Job admits sequentially"
+  },
+  {
+   "id": "K02",
+   "hook": "CJ crash / abnormal exit with rc classes; restart eligibility; physical launch generations with launchId",
+   "needed_by": [
+    "S01",
+    "S08",
+    "S10",
+    "S16",
+    "S22"
+   ],
+   "slice_now": "launch-1 hard-coded; exit only after StopClientRunner",
+   "design_note": "gens as sequence per (c,j); old-gen messages stay in Net"
+  },
+  {
+   "id": "K03",
+   "hook": "STOPPED notification message (best-effort, skippable via TaskExecutionInterrupted)",
+   "needed_by": [
+    "S08",
+    "S22"
+   ],
+   "slice_now": "absent (only local runnerStopped)",
+   "design_note": "add STOPPED kind to VSNetworkV1 job-control channel"
+  },
+  {
+   "id": "K04",
+   "hook": "Backend profile parameter (Process / Docker / K8s-persistent / K8s-task) with per-profile can_restart and settlement predicates; K8s workspace transfer record + publish_results handler",
+   "needed_by": [
+    "S08",
+    "S15"
+   ],
+   "slice_now": "Process only",
+   "design_note": "profile constant selects predicate operators in CP.Exec variants"
+  },
+  {
+   "id": "K05",
+   "hook": "Abort paths: admin abort, run abort, task abort; END_RUN as droppable/delayable message; abort latch blocks restart",
+   "needed_by": [
+    "S04",
+    "S10",
+    "S17",
+    "S22"
+   ],
+   "slice_now": "END_RUN only after WorkflowDone, no abort",
+   "design_note": "abortIntent on SP.Job port; END_RUN arrival independent of result waiter (D15)"
+  },
+  {
+   "id": "K06",
+   "hook": "Net fault toggles per message kind: drop, delay/reorder, duplicate, caller-local timeout with remote continuation, late reply dropped",
+   "needed_by": [
+    "S04",
+    "S06",
+    "S08",
+    "S09",
+    "S10",
+    "S11",
+    "S12",
+    "S22"
+   ],
+   "slice_now": "delivery is reliable; no drop/timeout",
+   "design_note": "toggle set + per-kind budget counters in MC wrapper"
+  },
+  {
+   "id": "K07",
+   "hook": "Rounds >= 2, multiple standing tasks, ClientTask SEQUENCE, resend path, retired cache, >= 2 workflows",
+   "needed_by": [
+    "S02",
+    "S06",
+    "S13",
+    "S23"
+   ],
+   "slice_now": "one round, one task, assignment record per site",
+   "design_note": "clientTasks as Seq; task ids independent of round"
+  },
+  {
+   "id": "K08",
+   "hook": "Controller policy parameter (FedAvg all/sampled, SAG, BaseModelController dynamic errors, CSE, CCWF server) and selected targets vs registered clients",
+   "needed_by": [
+    "S03",
+    "S06",
+    "S10",
+    "S13",
+    "S14",
+    "S20"
+   ],
+   "slice_now": "all-selected FedAvg only",
+   "design_note": "policy constant selects SJ.Ctl variant module"
+  },
+  {
+   "id": "K09",
+   "hook": "Callback frames: exception -> Task ERROR, completion before task_done, mark-only cancel, wait_for_task",
+   "needed_by": [
+    "S03",
+    "S23"
+   ],
+   "slice_now": "callback always succeeds",
+   "design_note": "cbFrame on SJ.Assign port"
+  },
+  {
+   "id": "K10",
+   "hook": "Model outcomes: accept {accepted, safeRejected, partialFailed}, aggregate provenance/poisoned, save {ok, failBeforeReplace, failAfterReplace}",
+   "needed_by": [
+    "S03",
+    "S24"
+   ],
+   "slice_now": "accept/save always succeed",
+   "design_note": "SJ.Model coarse must already expose these"
+  },
+  {
+   "id": "K11",
+   "hook": "Payload multiplicity and failure: >= 2 tx per source (per try/round), ref-id mode {UUID, explicit reuse}, CANCEL, FAILED confirm, TTL/budget expiry, shutdown -> waiter None + refs cleared, legacy EOF mode, tombstones",
+   "needed_by": [
+    "S04",
+    "S10",
+    "S11",
+    "S12",
+    "S19"
+   ],
+   "slice_now": "one tx per site, success path only",
+   "design_note": "key tx by (process, generation); refTable separate from txs"
+  },
+  {
+   "id": "K12",
+   "hook": "Receiver decode-outcome classification: local DownloadCancelled -> SERVICE_UNAVAILABLE vs other -> SJ os._exit(1) for SUBMIT_UPDATE",
+   "needed_by": [
+    "S10"
+   ],
+   "slice_now": "decode always succeeds",
+   "design_note": "sjExitCause on SJ.PayRcv port feeding SP.Job outcome"
+  },
+  {
+   "id": "K13",
+   "hook": "Object forms: eager value, pass-through LazyDownloadRef, disk-offload lazy ref with backingGen; offload-root cleanup",
+   "needed_by": [
+    "S03",
+    "S24"
+   ],
+   "slice_now": "eager CPU array",
+   "design_note": "object record {form, backingGen, owner}"
+  },
+  {
+   "id": "K14",
+   "hook": "Submission retry: submit timeout, TASK_CHECK loop, new msg_root + tx per try, RECEIVED/TASK_CLOSED/RETRY",
+   "needed_by": [
+    "S10",
+    "S12"
+   ],
+   "slice_now": "single submit, single receipt",
+   "design_note": "submitAttempt[a] on CJ.Runner port"
+  },
+  {
+   "id": "K15",
+   "hook": "Trainer modes: in-process inSlot/resultSlot generations + trainer PC (publish -> return -> clear) + DataBus; external launch_once session/monitor/heartbeat/source-live; Attach RESULT_READY/REJECTED/STATUS, canonical attempt, result_wait_timeout; bootstrap marker; learner init",
+   "needed_by": [
+    "S02",
+    "S04",
+    "S09",
+    "S18",
+    "S20",
+    "S21"
+   ],
+   "slice_now": "InProcessTrainerPublish + BuildSubmission atomic, no slots",
+   "design_note": "CJ.Trainer coarse must keep the trainer tail as a separate step"
+  },
+  {
+   "id": "K16",
+   "hook": "Task worker: physical vs server attempt, task-owner settlement, replay fence, receipt-gated release",
+   "needed_by": [
+    "S08"
+   ],
+   "slice_now": "absent",
+   "design_note": "W.Worker placeholder module with coarse settle/receipt"
+  },
+  {
+   "id": "K17",
+   "hook": "Event dispatch: synchronous, emitter included, exceptions swallowed",
+   "needed_by": [
+    "S05",
+    "S07"
+   ],
+   "slice_now": "absent",
+   "design_note": "Events helper operator, not a group"
+  },
+  {
+   "id": "K18",
+   "hook": "Client-side workflow placement (CCWF/Swarm): controller + aggregator in CJ, AUX peer messages, learn thread, gather monitor",
+   "needed_by": [
+    "S05",
+    "S07"
+   ],
+   "slice_now": "server-side FedAvg only",
+   "design_note": "CJ.CCWF placeholder + CJ.Model instance"
+  },
+  {
+   "id": "K19",
+   "hook": "Tensor-stream plugin barrier (task-data hook in get-task path)",
+   "needed_by": [
+    "S14"
+   ],
+   "slice_now": "absent",
+   "design_note": "optional sub-module of SJ.Assign/CJ.Runner"
+  },
+  {
+   "id": "K20",
+   "hook": "SP completion policy: outcome grace expiry, non-strict start narrowing, archive retry/latch, non-CAS metadata",
+   "needed_by": [
+    "S17",
+    "S22"
+   ],
+   "slice_now": "FinalizeJob requires all outcomes seen",
+   "design_note": "graceExpired as explicit nondeterministic event"
+  },
+  {
+   "id": "K21",
+   "hook": "Snapshot-then-act splits: env snapshot at spawn, authorize-then-remove (ws transfer), monitor snapshot-then-stop",
+   "needed_by": [
+    "S01",
+    "S08",
+    "S09"
+   ],
+   "slice_now": "atomic actions",
+   "design_note": "explicit local snapshot variables on the owning group's internal state"
+  }
+ ]
+}

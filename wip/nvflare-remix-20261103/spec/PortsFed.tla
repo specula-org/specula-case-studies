@@ -1,0 +1,64 @@
+------------------------------ MODULE PortsFed ------------------------------
+\* Port shapes, message kinds and faults of the FEDAVG/task component groups
+\* (TaskCJ, CommSJ, WfSJ). Owned by the fedavg component; others only read.
+\* Message protocol (all variants use identical keys and bodies):
+\*   GET_TASK         CJ(c)->SJ  id <<JobId,c,l,p>>     body [launch, poll]
+\*   TASK_ASSIGNMENT  SJ->CJ(c)  id = GET_TASK id       body [status ASSIGNED|TRY_AGAIN, assignment, input]
+\*   TASK_CHECK       CJ(c)->SJ  id <<JobId,c,l,k,n>>   body [assignment, try]
+\*   TASK_CHECK_REPLY SJ->CJ(c)  id = TASK_CHECK id     body RETRY|RECEIVED|TASK_CLOSED
+\*   RESULT_ENVELOPE  CJ(c)->SJ  id <<JobId,c,l,k,n>>   body [assignment, refs, rc]
+\*   RESULT_RECEIPT   SJ->CJ(c)  id = RESULT_ENVELOPE id  body RECEIVED|TASK_CLOSED|RETRY
+\*   END_RUN          SJ->CJ(c)  id <<JobId,c>>         body None
+\* (l = CJ launch, p = poll number, k = task number within the launch,
+\*  n = submission try; the server attempt is assignment.attempt = round.)
+\* CTRL/COMM blocking call: CommSJ posts pCommSJ.call (APP_CALL), WfSJ runs the
+\* result callback and posts pWfSJ.ret (APP_RETURN); CommSJ then continues.
+EXTENDS Consts
+FedKinds == {"GET_TASK", "TASK_ASSIGNMENT", "TASK_CHECK", "TASK_CHECK_REPLY",
+             "RESULT_ENVELOPE", "RESULT_RECEIPT", "END_RUN"}
+\* sjCrash: SJ process crash.          taskTimeout: server task timeout (monitor TIMEOUT).
+\* submitTimeout: CJ local get-task / task-check / submit_task_result timeouts.
+\* prepFail: before_task_sent_cb, broadcast deepcopy or outbound filter failure.
+\* cbFail: conversion / weighted-helper / metric failure inside the result callback.
+\* cancel: direct mark-only cancel_task.  deadClient: dead-job reports + heartbeat.
+\* minClients: bcast min_responses < targets (task may exit OK with stragglers).
+\* resultWaitTimeout: in-process executor result_wait_timeout.
+FedFaults == {"sjCrash", "taskTimeout", "submitTimeout", "prepFail", "cbFail", "cancel",
+              "deadClient", "minClients", "resultWaitTimeout"}
+\* FedAvg rounds = the attempt bound (mkmc.py --attempt N). Round r uses server
+\* attempt r, result transaction Tx(c, l, r) and ref Ref(c, l, r).
+Rounds == MaxAttempt
+\* Per-launch bounds on GET_TASK polls and on submission tries (finite instances).
+FedLossy == {"netLoss", "submitTimeout"} \cap Faults /= {}
+\* Poll budget: one successful GET_TASK per round plus one TRY_AGAIN per round
+\* (the gap before the next round is scheduled); the real client polls without
+\* bound. With only Rounds polls, a single TRY_AGAIN exhausted the budget and the
+\* generic deadlock check reported a model-bound hang (blind2, 03:10).
+FedMaxPoll == 2 * Rounds + (IF FedLossy \/ "prepFail" \in Faults THEN 1 ELSE 0)
+FedMaxTry == 1 + (IF FedLossy \/ {"pullTimeout", "txTimeout", "taskTimeout"} \cap Faults /= {}
+                  THEN 1 ELSE 0)
+\* Global model generation broadcast with round r's task.
+TaskInput(a) == <<"global", a.attempt - 1>>
+\* Port fields are those read by another group or by Props; everything else is private.
+\* pTaskCJ: input / trainerSignal (Trainer), submission (PaySrc). The receipt of
+\* the current submission (incl. "aborted" on END_RUN, H30) is TaskCJ_F-private.
+TaskCJPortInit == [c \in Sites |-> [l \in Launches |->
+                  [input |-> None, trainerSignal |-> "none", submission |-> None]]]
+\* round: latest scheduled task round (0 = none); standing: that task is standing;
+\* call: None or [site, round, kind live|unknown, key, assignment, value, rc, metricKind];
+\* cancelled: last round whose CANCEL_ALL(ERROR) was applied; finalized:
+\* communicator.finalize_run done (after current_wf was unset); monitorCrashed:
+\* the task monitor thread (_monitor_tasks) died of an exception, so no task
+\* is retired, timed out or checked for dead clients any more.
+CommSJPortInit == [round |-> 0, envelopes |-> [c \in Sites |-> None],
+                   claimed |-> {}, finished |-> {}, standing |-> FALSE,
+                   call |-> None, cancelled |-> 0, panic |-> FALSE, finalized |-> FALSE,
+                   monitorCrashed |-> FALSE]
+\* scheduled: last round whose SCHEDULE was requested; ret: None or [site, round];
+\* returned: control_flow return outcome; done: runner status "done" (END_RUN phase);
+\* dsShutdown: SJ-local DownloadService.shutdown() done (after END_RUN + readiness).
+WfSJPortInit == [open |-> FALSE, scheduled |-> 0, accepted |-> {},
+                 aggregate |-> None, saved |-> FALSE, cancelAll |-> 0,
+                 ret |-> None, panic |-> FALSE, returned |-> "none",
+                 done |-> FALSE, dsShutdown |-> FALSE, sj |-> "none"]
+=============================================================================
