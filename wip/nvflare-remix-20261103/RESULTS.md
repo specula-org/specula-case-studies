@@ -295,3 +295,15 @@
 | T2 | 网络中断后几个 client 同时超时又重连。`remove_dead_clients` 先列出死 client，再逐个 logout；处理一个死 client 时，`fail_run` 会向各方发 abort（数秒），这时另一个 client 重新登录，旧 token 被弹出，`remove_client` 返回 None，`notify_dead_client(None)` 抛 AttributeError（`fed_server.py:309-321, 1114`），`client_cleanup` 没有异常处理 | `t2_repro.py`：真实的 `ClientManager.authenticate` 和 FederatedServer 的 cleanup、logout、notify 路径；job runner 是 stub，`fail_run` 耗时 2 秒，代表 abort 往返。3/3 次复现 | 之后死掉的 client 永远不会被移除 |
 
 另外注意到：`remove_dead_clients` 遍历的是 ClientManager 内部的 dict，没有加锁；`notify_dead_client` 也直接遍历 `run_processes`。并发注册或 job 退出时，两处都可能抛 "dictionary changed size during iteration"。这两处没有单独复现。
+
+**进程重启排查**（也都在真实代码上确认了，上游没有相关 issue）：
+
+| 线索 | 现象 | 复现方式 | 后果 |
+|---|---|---|---|
+| R1 | SP 重启时的恢复函数 `update_abnormal_finished_jobs`、`update_unfinished_jobs`（`job_runner.py:852-883`）在整个代码树里都没有调用者，GitHub 上的 main 也一样 | `r1_repro.py`：存储里留着崩溃前写下的 RUNNING；新启动的 JobRunner 照常运行；管理命令走真实的 `JobCommandModule` | 被打断的 job 永远停在 RUNNING：`abort_job` 回答 "is not running"，`delete_job` 回答 "is running, could not be deleted"，结果也下载不了。对照组的 DISPATCHED 还能 abort |
+| R2 | CP 重启后重新登录会拿到新 token，旧 token 被静默移除（`client_manager.py:330-339`）；`_sync_client_jobs`（`fed_server.py:1013-1084`）只按 job 启动时的参与者 token 匹配，所以对不上，SJ 永远收不到 dead-job 通知 | `r2_repro.py`：真实的 `ClientManager.authenticate` 和 `_sync_client_jobs`。对照组（CP 不重启、CJ 退出）每次心跳都会通知；CP 重启后通知 0 次 | SJ 一直在等这个 client 的结果，而 FedAvg 的 task 默认没有超时，job 卡住，只能用管理命令手动处理 |
+
+**trace validation**（DESIGN §6，这一轮把工具修好了）：
+- 修了两处：一是静默步上限从 10 提到 120，细变体两个可观测事件之间最多有 100 步左右的内部步；二是允许一步对应 3 个观测事件，因为 `ServerRunnerEndRun` 在同一步里置 done 并广播两条 END_RUN，真实代码也是一次 aux broadcast。
+- 结果：真实 POC trace（120 步，其中 68 个端口事件）在全细组合上被接受。BFS 会因为静默步的交错爆炸而跑不完，所以接受是用随机模拟找到的一条完整匹配。全粗组合和两种交替组合也都接受。
+- 负例：把 `SendStart` 挪到 `ServerLaunch` 之前，全粗组合在 BFS 下穷尽拒绝。

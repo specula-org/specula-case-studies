@@ -626,6 +626,19 @@ JobExecutorRestartException(s) ==
               !.restartFailed[s] = TRUE]
     /\ UNCHANGED <<net, pJobCP>>
 
+\* ---- CP process crash and restart (fault cpCrash, round 6). The new CP has
+\* no run_processes, reservations, allocations or env; its CJs die with it
+\* (Ports CJAlive, monitor_parent_process); its heartbeat no longer lists the
+\* job (HEARTBEAT phase 3). Handled message keys stay handled.
+CPCrashRestart(s) ==
+    /\ "cpCrash" \in Faults /\ ~pJobCP[s].cpRestarted
+    /\ \E k \in jobCP_f.handled[s] : k[1] = "START_JOB"
+    /\ jobCP_f' = [jobCP_f EXCEPT !.client[s] = [u \in Tokens |-> EmptyClient],
+                     !.rm[s] = InitValue.rm[s], !.resourceEnv[s] = <<>>,
+                     !.startReply[s] = "none", !.restartFailed[s] = FALSE, !.hb[s] = 3]
+    /\ pJobCP' = [pJobCP EXCEPT ![s].cpRestarted = TRUE, ![s].allocated = FALSE]
+    /\ net' = Send(net, HB(s, 3))
+
 Next ==
     \/ \E s \in Sites, k \in DOMAIN net :
         CheckResourceProcessorReserve(s, k)
@@ -673,6 +686,7 @@ Next ==
         \/ JobExecutorRestartClaim(s)
         \/ JobExecutorRestartContinue(s)
         \/ JobExecutorRestartException(s)
+        \/ CPCrashRestart(s)
     \/ \E s \in Sites, rc \in {"ok", "generic", "failed", "aborted"} :
         JobExecutorObserveExitCode(s, rc)
     \/ \E s \in Sites, safe \in BOOLEAN :

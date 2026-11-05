@@ -50,11 +50,15 @@ CJFatal(c, l) == Flag(pTaskCJ[c][l], "fatal") \/ Flag(pPaySrc[c][l], "fatal")
 \* pJobCP[c].killed is the parent's kill REQUEST (SIGKILL/terminate issued). The
 \* child dies only when RunCJ takes its DieOfKill step (no fairness: a kill may
 \* never land, e.g. terminate of a non-owned group, process_launcher.py:60-93).
+\* A CJ dies with its parent: monitor_parent_process (worker_process.py:124,
+\* app/utils.py:45) ends the job process when the CP is gone (cpCrash restart).
+CPRestarted(c) == Flag(pJobCP[c], "cpRestarted")
 CJAlive(c, l) == /\ l \in Launches /\ CurLaunch(c) >= l
-                 /\ pRunCJ[c][l].exit = "none" /\ ~CJFatal(c, l)
+                 /\ pRunCJ[c][l].exit = "none" /\ ~CJFatal(c, l) /\ ~CPRestarted(c)
 \* Exit status the parent observes for launch l (meaningful once ~CJAlive).
 CJExitCode(c, l) == IF pRunCJ[c][l].exit /= "none" THEN pRunCJ[c][l].exit
-                    ELSE IF CJFatal(c, l) THEN "crash" ELSE "none"
+                    ELSE IF CJFatal(c, l) \/ (CPRestarted(c) /\ l \in Launches /\ CurLaunch(c) >= l)
+                         THEN "crash" ELSE "none"
 \* A launched child that is no longer alive: peers may observe it as a
 \* transport failure (connection lost / no route), at any later time.
 CJGone(c, l) == l \in Launches /\ CurLaunch(c) >= l /\ ~CJAlive(c, l)
@@ -68,8 +72,11 @@ SJFatal == \/ \E c \in Sites : Flag(pPayRcv[c], "fatal")
 \* terminate, local Process backend): a kill of the SJ lands; the SP's view
 \* (pJobSP.sjKilled) and the SJ's liveness must agree (blind sweep artifact fix).
 SJKilled == Has(pJobSP, "sjKilled") /\ pJobSP.sjKilled = TRUE
+\* The SJ dies with its parent (runner_process.py:126 monitor_parent_process)
+\* when the SP crashes (spCrash restart).
+SPRestarted == Has(pJobSP, "spRestarted") /\ pJobSP.spRestarted = TRUE
 SJAlive == /\ pJobSP.sjLaunched /\ pWfSJ.sj \notin {"exited", "crashed"} /\ ~SJFatal
-           /\ ~SJKilled
+           /\ ~SJKilled /\ ~SPRestarted
 \* SJ exit status as seen by SP: "none" while alive or not launched.
 \* "error": the SJ exited normally but reported execution_error. Every SJ panic
 \* (CommSJ dead-client policy, workflow exception, strict error mode) is a
@@ -80,7 +87,7 @@ SJAlive == /\ pJobSP.sjLaunched /\ pWfSJ.sj \notin {"exited", "crashed"} /\ ~SJF
 \* (bfs3 lead: without it a panicked run was classified COMPLETED.)
 SJPanicked == pCommSJ.panic \/ pWfSJ.panic
 SJExitCode == IF ~pJobSP.sjLaunched \/ SJAlive THEN "none"
-              ELSE IF SJFatal \/ pWfSJ.sj = "crashed" \/ SJKilled THEN "crashed"
+              ELSE IF SJFatal \/ pWfSJ.sj = "crashed" \/ SJKilled \/ SPRestarted THEN "crashed"
               ELSE IF SJPanicked THEN "error" ELSE "exited"
 SJGone == pJobSP.sjLaunched /\ ~SJAlive
 PeerFailureSJ == SJGone \/ ("transportFail" \in Faults /\ SJAlive)

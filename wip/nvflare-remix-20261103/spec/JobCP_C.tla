@@ -189,6 +189,15 @@ SendHeartbeat(c, ph) ==
     /\ net' = Send(net, Msg("HEARTBEAT", CP(c), SP, <<JobId, c, ph>>, ph))
     /\ UNCHANGED pJobCP
 
+\* CP process crash and restart (fault cpCrash): the new CP keeps nothing but
+\* the handled keys; its CJs die with it; the heartbeat drops the job (phase 3).
+CPCrashRestart(c) ==
+    /\ "cpCrash" \in Faults /\ ~pJobCP[c].cpRestarted
+    /\ \E k \in P(c).handled : k[1] = "START_JOB"
+    /\ jobCP_c' = [jobCP_c EXCEPT ![c] = [InitValue[c] EXCEPT !.handled = P(c).handled, !.hb = 3]]
+    /\ pJobCP' = [pJobCP EXCEPT ![c].cpRestarted = TRUE, ![c].allocated = FALSE]
+    /\ net' = Send(net, Msg("HEARTBEAT", CP(c), SP, <<JobId, c, 3>>, 3))
+
 Next ==
     \/ \E c \in Sites, k \in DOMAIN net :
         RecvCheck(c, k) \/ RecvCancel(c, k) \/ RecvDeploy(c, k) \/ RecvStart(c, k)
@@ -196,5 +205,6 @@ Next ==
     \/ \E c \in Sites : Expire(c) \/ ReturnedError(c) \/ Spawn(c) \/ Rollback(c)
         \/ StartReplyOk(c) \/ Kill(c) \/ ObserveExit(c) \/ RestartClaim(c)
         \/ Relaunch(c) \/ RestartFail(c) \/ ReportOutcome(c) \/ FreeAllocation(c)
+        \/ CPCrashRestart(c)
     \/ \E c \in Sites, ph \in {2, 3} : SendHeartbeat(c, ph)
 =============================================================================

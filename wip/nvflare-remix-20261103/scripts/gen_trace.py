@@ -95,7 +95,7 @@ def main():
     ap.add_argument("--run", action="store_true"); ap.add_argument("--timeout", type=int, default=600)
     ap.add_argument("--workers", type=int, default=16)
     ap.add_argument("--drop", default="", help="extra observed actions to treat as unobserved")
-    ap.add_argument("--silent", type=int, default=10, help="max consecutive silent steps")
+    ap.add_argument("--silent", type=int, default=120, help="max consecutive silent steps (fine variants need ~100 between two observed events)")
     a = ap.parse_args()
     global SILENT
     SILENT = a.silent
@@ -132,9 +132,10 @@ def main():
          "TInit == Init /\\ tpos = 1 /\\ sil = 0",
          "Match(p, d) == CASE d = 0 -> ~AnyObs",
          "                 [] d = 1 -> p <= Len(TR) /\\ Ev(TR[p]) /\\ ~(p + 1 <= Len(TR) /\\ Ev(TR[p+1]))",
-         "                 [] d = 2 -> p + 1 <= Len(TR) /\\ Ev(TR[p]) /\\ Ev(TR[p+1])",
-         "\\* sil counts consecutive silent steps (bounded by CONSTRAINT SilentBound)",
-         "TNext == \\E p \\in {tpos}, d \\in {0, 1, 2}, q \\in {sil} : tpos' = p + d /\\ sil' = (IF d = 0 THEN q + 1 ELSE 0) /\\ (",
+         "                 [] d = 2 -> p + 1 <= Len(TR) /\\ Ev(TR[p]) /\\ Ev(TR[p+1]) /\\ ~(p + 2 <= Len(TR) /\\ Ev(TR[p+2]))",
+         "                 [] d = 3 -> p + 2 <= Len(TR) /\\ Ev(TR[p]) /\\ Ev(TR[p+1]) /\\ Ev(TR[p+2])",
+         "\\* sil counts consecutive silent steps (bounded by CONSTRAINT SilentBound); one step may produce up to 3 consecutive observed events (e.g. WorkflowDone + the END_RUN broadcast)",
+         "TNext == \\E p \\in {tpos}, d \\in {0, 1, 2, 3}, q \\in {sil} : tpos' = p + d /\\ sil' = (IF d = 0 THEN q + 1 ELSE 0) /\\ (",
          "    \\/ " + "\n    \\/ ".join(f"({st} /\\ Match(p, d))" for st in mix_steps()) + ")",
          "TraceNotAccepted == tpos <= Len(TR)",
          f"SilentBound == sil <= {SILENT}",

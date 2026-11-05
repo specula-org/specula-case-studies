@@ -187,13 +187,23 @@ Delete ==
     /\ "deleteJob" \in Faults /\ ~pJobSP.deleted /\ pJobSP.status = "SUBMITTED"
     /\ \/ /\ pJobSP' = [pJobSP EXCEPT !.deleted = TRUE]
           /\ UNCHANGED jobSP_c
-       \/ /\ S.stage \in {"init", "check"}
+       \/ /\ S.stage \in {"init", "check", "blocked"}
           /\ pJobSP' = [pJobSP EXCEPT !.deleted = TRUE, !.schedulerCrashed = TRUE]
           /\ jobSP_c' = [S EXCEPT !.stage = "crashed"]
     /\ UNCHANGED net
 
+\* SP process crash and restart (fault spCrash): only the job store survives;
+\* no startup recovery (R1); the SJ dies with its parent (Ports SJAlive).
+SPCrashRestart ==
+    /\ "spCrash" \in Faults /\ ~pJobSP.spRestarted
+    /\ pJobSP.status \in {"DISPATCHED", "RUNNING"}
+    /\ jobSP_c' = [InitValue EXCEPT !.handled = S.handled, !.aborts = S.aborts, !.stage = "idle"]
+    /\ pJobSP' = [pJobSP EXCEPT !.spRestarted = TRUE, !.completionCrashed = FALSE,
+                                !.startDropped = {}, !.schedulerCrashed = FALSE, !.deleted = FALSE]
+    /\ UNCHANGED net
+
 DeletedCrash ==
-    /\ pJobSP.deleted /\ ~pJobSP.schedulerCrashed /\ S.stage \in {"init", "check"}
+    /\ pJobSP.deleted /\ ~pJobSP.schedulerCrashed /\ S.stage \in {"init", "check", "blocked"}
     /\ pJobSP' = [pJobSP EXCEPT !.schedulerCrashed = TRUE]
     /\ jobSP_c' = [S EXCEPT !.stage = "crashed"]
     /\ UNCHANGED net
@@ -353,7 +363,7 @@ Next ==
     \/ ObserveSJExit \/ Terminate \/ RemoveAfterTerminate
     \/ AbortRead \/ AbortRunningSend \/ AbortRunningNoSJ \/ MarkAborted
     \/ SelectCompletion \/ OutcomeGraceExpired \/ Classify \/ PublishTerminal \/ RemoveCompleted
-    \/ RemoveCompletedMissing \/ Delete \/ DeletedCrash
+    \/ RemoveCompletedMissing \/ Delete \/ DeletedCrash \/ SPCrashRestart
     \/ \E c \in Sites : HeartbeatStop(c) \/ ResolveMissingOutcome(c)
     \/ \E c \in Sites, k \in DOMAIN net : RecvOutcome(c, k)
 =============================================================================

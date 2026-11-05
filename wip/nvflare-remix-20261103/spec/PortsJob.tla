@@ -51,7 +51,7 @@ CJTeardownTimingOK(pWfSJx, sjGone) == pWfSJx.dsShutdown \/ sjGone
 JobKinds == JobSPKinds \cup JobCPKinds \cup RunCJKinds
 JobFaults == {"slowSJTeardown", "slowAdminStop", "abortCmdError", "cjCrash", "abort", "outcomeReportFail", "deployError", "launchError",
               "storeError", "rpcTimeout", "outcomeTimeout", "archiveError",
-              "admissionError", "resExpiry", "deleteJob"}
+              "admissionError", "resExpiry", "deleteJob", "spCrash", "cpCrash"}
 JobStatuses == {"SUBMITTED", "DISPATCHED", "RUNNING", "ABORTED", "COMPLETED",
                 "FAILED", "FAILED_TO_RUN", "CANT_SCHEDULE"}
 JobTerminalStatuses == {"ABORTED", "COMPLETED", "FAILED", "FAILED_TO_RUN", "CANT_SCHEDULE"}
@@ -67,19 +67,20 @@ TerminalClass(st) == IF st = "COMPLETED" THEN "FINISHED" ELSE "ABORTED_OR_FAILED
 \* by the waiter; job_runner.py:396-411); their outcome is not awaited and a
 \* later OUTCOME from them is dropped (fed_server.py:943-945).
 \* schedulerCrashed: the JobRunner.run scheduling loop died of an exception (T1);
-\* deleted: the job was removed from the job store by an admin delete_job.
+\* deleted: the job was removed from the job store by an admin delete_job;
+\* spRestarted: the SP process crashed and restarted (fault spCrash).
 JobSPPortInit == [sjLaunched |-> FALSE, sjKilled |-> FALSE, startSent |-> {},
                   abortSent |-> {}, outcomes |-> [c \in Sites |-> "none"],
                   terminal |-> "none", status |-> "SUBMITTED", outcomeSeen |-> {},
                   completionCrashed |-> FALSE, startDropped |-> {},
-                  schedulerCrashed |-> FALSE, deleted |-> FALSE]
+                  schedulerCrashed |-> FALSE, deleted |-> FALSE, spRestarted |-> FALSE]
 \* launch: current CJ launch generation (0 = none); killed: launches CP
 \* terminated; exitSeen[l]: exit status CP's waiter observed for launch l
 \* ("ok"|"crash"|"killed"); freed: resource releases; reported: outcome the CP
 \* tried to report ("none"|"ok"|"failed"|"aborted").
 JobCPPortInit == [c \in Sites |-> [launch |-> 0, killed |-> {},
                   exitSeen |-> [l \in Launches |-> "none"], freed |-> 0,
-                  allocated |-> FALSE, reported |-> "none"]]
+                  allocated |-> FALSE, reported |-> "none", cpRestarted |-> FALSE]]
 \* state: "none" -> "initialized" (init_run) -> "running" (main loop) ->
 \*        "stopping" (left the loop: run_abort_signal) -> "exited";
 \* ready: main loop started (after on_ready); abort: run_abort_signal

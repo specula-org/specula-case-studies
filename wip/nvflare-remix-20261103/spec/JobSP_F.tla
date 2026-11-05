@@ -68,7 +68,7 @@ InitValue ==
      rpc |-> [s \in Sites |-> [t \in Tokens |-> EmptyReplies]],
      handled |-> {}, adminAborts |-> 0, admissionErrors |-> 0, ms |-> {},
      sjKilled |-> FALSE, startSent |-> {}, abortSent |-> {},
-     outcomes |-> [s \in Sites |-> "none"], terminal |-> "none"]
+     outcomes |-> [s \in Sites |-> "none"], terminal |-> "none", spRestarted |-> FALSE]
 Init == jobSP_f = InitValue
 
 CurrentJob == scheduler.current
@@ -87,7 +87,8 @@ PortOf(f) == [sjLaunched |-> f.jobs[JobId].serverSpawned, sjKilled |-> f.sjKille
               startDropped |-> IF "startEval" \in f.ms
                                THEN f.jobs[JobId].deployed \ f.jobs[JobId].active ELSE {},
               schedulerCrashed |-> f.scheduler.pc = "crashed",
-              deleted |-> f.jobs[JobId].deleted]
+              deleted |-> f.jobs[JobId].deleted,
+              spRestarted |-> f.spRestarted]
 \* terminal records the class of a newly written terminal job status.
 Fin(n) == [n EXCEPT !.terminal =
              IF n.jobs[JobId].status \in JobTerminalStatuses
@@ -130,6 +131,7 @@ BlockedDone == "exceeded" \in SeqSet(scheduler.history[J]) /\ J \notin scheduler
 \* running_jobs registration); coarse stages are a function of them.
 AbsStage ==
     IF FPc = "crashed" THEN "crashed"
+    ELSE IF "spRestart" \in jobSP_f.ms THEN "idle"
     ELSE IF FPc = "failStop" THEN "failStop"
     ELSE IF FPc = "failStopWait" THEN "failCancel"
     ELSE IF FPc = "failCancelSend" THEN (IF "failStop" \in jobSP_f.ms THEN "failCancel" ELSE "failStop")
@@ -152,7 +154,7 @@ AbsC == [handled |-> {k \in jobSP_f.handled : k[1] = "OUTCOME"},
          terminated |-> JJ.serverTerminated, running |-> JJ.running,
          pending |-> IF Setup THEN JJ.deployed ELSE JJ.pending,
          \* active sites after the START reply evaluation (coarse StartEval)
-         active |-> IF "startEval" \in jobSP_f.ms THEN JJ.active ELSE Sites,
+         active |-> IF "startEval" \in jobSP_f.ms /\ "spRestart" \notin jobSP_f.ms THEN JJ.active ELSE Sites,
          outcomeKey |-> JJ.outcomeKey \/ Setup,
          failed |-> JJ.serverFailed, sAborted |-> JJ.serverAborted,
          runAborted |-> JJ.runAborted,
@@ -1131,6 +1133,29 @@ JobRunnerFailureStatusDeleted ==
        /\ pJobSP' = PortOf(Fin(n))
     /\ UNCHANGED <<net>>
 
+\* ---- SP process crash and restart (fault spCrash, round 6). The new SP
+\* process starts with empty run_processes / running_jobs / pending outcomes and
+\* a fresh scheduler; only the job store survives. Its SJ dies with it (Ports
+\* SJAlive). No startup recovery runs: JobRunner.update_abnormal_finished_jobs /
+\* update_unfinished_jobs (job_runner.py:852-883) have no caller (R1). Messages
+\* already handled stay handled (in-flight requests die with the connections).
+SPCrashRestart ==
+    LET j == JobId IN
+    /\ "spCrash" \in Faults /\ ~jobSP_f.spRestarted
+    /\ jobs[j].status \in {"DISPATCHED", "RUNNING"}
+    /\ LET n == [InitValue EXCEPT
+                   !.jobs = [InitValue.jobs EXCEPT ![j].status = jobs[j].status,
+                                                   ![j].serverSpawned = jobs[j].serverSpawned],
+                   !.handled = jobSP_f.handled, !.adminAborts = jobSP_f.adminAborts,
+                   !.admissionErrors = jobSP_f.admissionErrors,
+                   !.ms = jobSP_f.ms \cup {"spRestart"}, !.sjKilled = jobSP_f.sjKilled,
+                   !.startSent = jobSP_f.startSent, !.abortSent = jobSP_f.abortSent,
+                   !.outcomes = jobSP_f.outcomes, !.terminal = jobSP_f.terminal,
+                   !.spRestarted = TRUE] IN
+       /\ jobSP_f' = n
+       /\ pJobSP' = PortOf(n)
+    /\ UNCHANGED <<net>>
+
 Next ==
     \/ DefaultJobSchedulerBeginPass
     \/ DefaultJobSchedulerEndPass
@@ -1191,6 +1216,7 @@ Next ==
     \/ JobRunnerRemoveCompleted
     \/ JobRunnerRemoveCompletedMissing
     \/ AdminDeleteJob \/ JobRunnerScanDeleted \/ JobRunnerDeletedInTry \/ JobRunnerFailureStatusDeleted
+    \/ SPCrashRestart
     \/ DefaultJobSchedulerJobAbortedOnCompletion
     \/ DefaultJobSchedulerJobCompleted
     \/ DefaultJobSchedulerPersistFailed

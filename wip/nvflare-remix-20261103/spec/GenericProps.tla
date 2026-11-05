@@ -26,6 +26,11 @@ GGenerical == GTerminalStable /\ GStatusStable /\ GOutcomeStable /\ GExitStable
 GCompletionThreadAlive == ~pJobSP.completionCrashed
 GTaskMonitorAlive == ~pCommSJ.monitorCrashed
 GSchedulerThreadAlive == ~pJobSP.schedulerCrashed
+\* after an SP restart, once no process of the job is left, the stored status
+\* must not still claim the job is dispatched or running (R1)
+JobProcessesGone == ~SJAlive /\ \A c \in Sites, l \in Launches : ~CJAlive(c, l)
+GNoStaleStatusAfterRestart == pJobSP.spRestarted /\ JobProcessesGone =>
+                                 pJobSP.status /= "RUNNING"   \* a stale DISPATCHED can still be aborted
 
 \* ---------------- G2 a FINISHED job is consistent with what happened
 \* no process of a finished job died abnormally in its final incarnation
@@ -144,5 +149,15 @@ GFinishedNoAbnormalExitK2 == Finished =>
     /\ ~SJFatal /\ SJExitCode /= "crashed"
     /\ \A c \in Sites : Started(c) /\ Kept(c) /\ CurLaunch(c) > 0 =>
          CJExitCode(c, CurLaunch(c)) \in {"none", "ok"} \/ pJobCP[c].reported = "ok"
-KnownStuck == KS02 \/ KH21 \/ KH19R \/ KH30 \/ KH11 \/ KC1B
+\* K12 T1 / T1-b (REPRODUCED, checks/confirm/t1_repro.py, t1b_repro.py): the
+\* scheduling loop died after a queued job was deleted
+KT1 == pJobSP.schedulerCrashed
+\* K13 R2 (REPRODUCED at the server-logic level, checks/confirm/r2_repro.py): a
+\* restarted CP's new token matches no job participant, the SJ is never told
+\* that this client's job died, and its task waits (hang)
+KR2 == \E c \in Sites : pJobCP[c].cpRestarted
+\* K14 R1 (REPRODUCED, checks/confirm/r1_repro.py): no startup recovery after an
+\* SP restart; checked by GNoStaleStatusAfterRestart, filtered in hunts
+KR1 == pJobSP.spRestarted
+KnownStuck == KS02 \/ KH21 \/ KH19R \/ KH30 \/ KH11 \/ KC1B \/ KT1 \/ KR2 \/ KR1
 =============================================================================
