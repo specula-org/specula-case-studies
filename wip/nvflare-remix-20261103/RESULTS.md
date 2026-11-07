@@ -506,6 +506,7 @@
   - 重构前后 576 个步骤的定价完全一致。
   - hunt8b 中 4 个穷尽完成的检查点 BFS 原样重跑，状态数逐个相同：err p5 266,874，status p5 393,274，status p4 528,926，tail p5 484,648。
   - 全细、全粗 TV 仍接受真实 POC trace（71 秒、18 秒）。
+  - JobSP 细到粗精化在时序模块化后补跑：开 multiJob 900 秒跑到 266 万状态、不开 600 秒跑到 161 万状态，都没有违例（跑满预算，有界）；错误映射的负控按预期失败（`BadStep`，4 层）。
 
 **自然时序复现与影响评估（11-07）**（`notes/repro-natural-A.md`、`notes/repro-natural-B.md`、`notes/impact-assessment.md`）：
 - 没有任何一项升到"无强制"。把触发事件放在窗口附近随机的试验，仍算"以时序巧合为条件"。
