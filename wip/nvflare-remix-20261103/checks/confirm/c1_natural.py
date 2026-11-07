@@ -25,7 +25,9 @@ usage:
   c1_natural.py measure                      real-code latencies
   c1_natural.py run <scenario> <n> [par]     n trials of a scenario, par processes (default 7)
   c1_natural.py trial <scenario> <seed>      one trial (internal), prints one JSON line
-scenarios: control fastfail sdk slow sdk_alive slow_alive persistent fixed:<D seconds>
+scenarios: control fastfail sdk slow sdk_alive slow_alive persistent persistent_early fixed:<D seconds>
+           stall:<D seconds> (RUNNING write delayed by D, then succeeds: the #5301 path)
+           silentabort:<D seconds> (as fixed:, but the completion thread's ABORT waits its 2 s timeout)
 """
 import contextlib, json, logging, os, random, shutil, subprocess, sys, tempfile, threading, time, types, uuid
 from unittest.mock import MagicMock
@@ -59,7 +61,7 @@ def scenario_params(name, rng):
     """t_start: start_client_job latency; sj: SJ exit time after spawn (None = long job); d: RUNNING
     write time-to-failure (None = no fault)."""
     sj_fast = rng.uniform(1.0, 1.5)          # imports (~0.8 s measured) + config error, before any cell
-    slow_start = 5.0                          # START_JOB reply slower than SJ exit + 2 s reap wait
+    slow_start = rng.uniform(4.5, 6.5)        # START_JOB reply slower than SJ exit + 2 s reap wait
     fast_start = rng.uniform(0.1, 0.5)        # CP spawns the CJ and replies
     if name == "control":
         return dict(t_start=slow_start, sj=sj_fast, d=None)
@@ -70,10 +72,16 @@ def scenario_params(name, rng):
         return dict(t_start=slow_start if name == "sdk" else fast_start, sj=sj_fast, d=d)
     if name in ("slow", "slow_alive"):        # stands for timeouts of many seconds (soft NFS, SDK read timeout)
         return dict(t_start=slow_start if name == "slow" else fast_start, sj=sj_fast, d=rng.uniform(5.0, 15.0))
-    if name == "persistent":
+    if name == "persistent":                  # store read-only from the client-start phase on
         return dict(t_start=slow_start, sj=sj_fast, d="readonly")
+    if name == "persistent_early":            # store read-only from the deploy phase on
+        return dict(t_start=slow_start, sj=sj_fast, d="readonly_early")
     if name.startswith("fixed:"):
         return dict(t_start=slow_start, sj=sj_fast, d=float(name.split(":", 1)[1]))
+    if name.startswith("silentabort:"):       # fixed D; a client does not answer ABORT -> 2.0 s timeout (460)
+        return dict(t_start=slow_start, sj=sj_fast, d=float(name.split(":", 1)[1]), abort_rtt=2.0)
+    if name.startswith("stall:"):             # #5301: RUNNING write delayed, then succeeds (no failure)
+        return dict(t_start=slow_start, sj=sj_fast, d=["stall", float(name.split(":", 1)[1])])
     raise SystemExit(f"unknown scenario {name}")
 
 
@@ -92,6 +100,8 @@ class Store(FilesystemStorage):
                 time.sleep(self.fault_d)
                 self.history.append((threading.current_thread().name, "RUNNING-write-failed", time.monotonic()))
                 raise StorageException("failed to write content: [Errno 5] Input/output error")
+            if isinstance(self.fault_d, list):
+                time.sleep(self.fault_d[1])
         try:
             super().update_meta(uri, meta, replace)
         except Exception as e:
@@ -134,18 +144,18 @@ def trial(name, seed):
     jm = SimpleJobDefManager(uri_root="jobs", job_store_id="job_store")
     ws = Workspace(os.path.join(work, "ws"))
     eng = MagicMock(spec=ServerEngineSpec)
-    eng.get_component.side_effect = lambda n: {"job_store": store, SystemComponents.JOB_MANAGER: jm}.get(n)
+    eng.get_component = lambda n: {"job_store": store, SystemComponents.JOB_MANAGER: jm}.get(n)
     eng.server = MagicMock()
     eng.server.server_state = HotState()
     client = Client("site-1", "tok-1")
-    eng.get_clients.return_value = [client]
+    eng.get_clients = lambda: [client]
     eng.client_manager = types.SimpleNamespace(clients={"tok-1": client})
-    eng.validate_targets.side_effect = lambda names: ([client], [])
-    eng.get_job_clients.side_effect = lambda sites: {"tok-1": client}
-    eng.get_workspace.return_value = ws
+    eng.validate_targets = lambda names: ([client], [])
+    eng.get_job_clients = lambda sites: {"tok-1": client}
+    eng.get_workspace = lambda: ws
     eng.run_processes, eng.exception_run_processes, eng.lock = {}, {}, threading.Lock()
     mgr = FLContextManager(engine=eng, identity_name="server")
-    eng.new_context.side_effect = mgr.new_context
+    eng.new_context = mgr.new_context
     marks, procs = {}, []
     reaper = types.SimpleNamespace(run_processes=eng.run_processes, exception_run_processes=eng.exception_run_processes,
                                    lock=eng.lock, logger=logging.getLogger("sj"), engine_info=types.SimpleNamespace())
@@ -156,7 +166,8 @@ def trial(name, seed):
 
     eng.server.admin_server = types.SimpleNamespace(
         timeout=10.0, sai=types.SimpleNamespace(new_context=lambda: contextlib.nullcontext(None)),
-        send_requests=lambda reqs, ctx, timeout_secs=2.0, optional=False: rpc(0.02, 0.3))   # abort RTT
+        send_requests=lambda reqs, ctx, timeout_secs=2.0, optional=False:
+        rpc(p["abort_rtt"], p["abort_rtt"]) if "abort_rtt" in p else rpc(0.02, 0.3))   # abort RTT
 
     def start_app_on_server(fl_ctx, job, job_clients, snapshot=None):
         sleep_for = p["sj"] if p["sj"] is not None else 3600
@@ -185,11 +196,11 @@ def trial(name, seed):
                 pr.terminate()
         return ""
 
-    eng.start_app_on_server.side_effect = start_app_on_server
-    eng.start_client_job.side_effect = start_client_job
-    eng.abort_app_on_server.side_effect = abort_app_on_server
-    eng.cancel_client_resources.side_effect = lambda *a, **k: rpc(0.02, 0.3)
-    eng.remove_exception_process.side_effect = lambda jid: eng.exception_run_processes.pop(jid, None)
+    eng.start_app_on_server = start_app_on_server
+    eng.start_client_job = start_client_job
+    eng.abort_app_on_server = abort_app_on_server
+    eng.cancel_client_resources = lambda *a, **k: rpc(0.02, 0.3)
+    eng.remove_exception_process = lambda jid: eng.exception_run_processes.pop(jid, None)
 
     class Scheduler:
         given = set()
@@ -206,7 +217,12 @@ def trial(name, seed):
 
     runner = JobRunner(workspace_root=ws.root)
     runner.scheduler = Scheduler()
-    runner._deploy_job = lambda job, sites, fl_ctx: (time.sleep(0.2), (job.job_id, []))[1]
+    def deploy(job, sites, fl_ctx):
+        time.sleep(rng.uniform(0.1, 1.5))
+        if p["d"] == "readonly_early":
+            os.chmod(os.path.join(store.root_dir, "jobs", job.job_id), 0o555)
+        return job.job_id, []
+    runner._deploy_job = deploy
     real_gfs = runner._get_finished_job_status
 
     def gfs(engine, job, fl_ctx):                    # timestamp only, then the real method
@@ -247,10 +263,13 @@ def trial(name, seed):
     c1a = bool(terminal_by_completion and failed_by_runner and terminal_by_completion[0][2] < failed_by_runner[-1][2])
     c1b = any(c[1] == "KeyError" for c in crashes if c[0] != "job_runner")
     sched_dead = not t.is_alive() and any(c[0] == "job_runner" for c in crashes)
+    running_by_runner = [h for h in hist if h[0] == "job_runner" and h[1] == RUNNING]
+    late_running = bool(terminal_by_completion and running_by_runner and final == RUNNING
+                        and terminal_by_completion[0][2] < running_by_runner[-1][2])
     rel = lambda k: None if k not in marks or store.t_running is None else round(marks[k] - store.t_running, 4)
     out = dict(scenario=name, seed=seed, d=p["d"], t_start=round(p["t_start"], 3), sj_exit=p["sj"],
                sj_reaped_rel768=rel("sj_reaped"), pickup_rel768=rel("pickup"), final=final, history=hist,
-               crashes=crashes, C1A=c1a, C1B=c1b, sched_dead=sched_dead)
+               crashes=crashes, C1A=c1a, C1B=c1b, sched_dead=sched_dead, late_running=late_running)
     os.chdir(TMP)
     with contextlib.suppress(Exception):
         os.chmod(os.path.join(store.root_dir, "jobs", jid), 0o755)
@@ -275,13 +294,14 @@ def run(name, n, par):
             if line:
                 results.append(json.loads(line[-1]))
     k = lambda f: sum(1 for r in results if r[f])
-    benign = sum(1 for r in results if not (r["C1A"] or r["C1B"] or r["sched_dead"]))
+    benign = sum(1 for r in results if not (r["C1A"] or r["C1B"] or r["sched_dead"] or r["late_running"]))
     finals = {}
     for r in results:
         finals[r["final"]] = finals.get(r["final"], 0) + 1
     pick = sorted(r["pickup_rel768"] for r in results if r["pickup_rel768"] is not None)
     print(f"scenario={name} trials={len(results)} C1-A={k('C1A')} C1-B={k('C1B')} "
-          f"scheduler_dead={k('sched_dead')} benign={benign} final_status={finals}")
+          f"scheduler_dead={k('sched_dead')} late_RUNNING_over_terminal(#5301)={k('late_running')} benign={benign} "
+          f"final_status={finals}")
     if pick:
         print(f"  completion pickup after line 768: n={len(pick)} min={pick[0]:.3f}s "
               f"median={pick[len(pick) // 2]:.3f}s max={pick[-1]:.3f}s")
