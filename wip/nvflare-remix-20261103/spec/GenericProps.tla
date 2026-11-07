@@ -22,6 +22,17 @@ GExitStable     == [][\A c \in Sites, l \in Launches : pRunCJ[c][l].exit /= "non
                         pRunCJ'[c][l].exit = pRunCJ[c][l].exit]_portVars
 GGenerical == GTerminalStable /\ GStatusStable /\ GOutcomeStable /\ GExitStable
 
+\* ---------------- G1c promise-derived (v9): a decided or deleted job is never started
+\* An accepted pre-run abort wins over startup ("Once claimed, abort returns busy until
+\* startup finishes", job_runner.py:724-733, #5305); a FAILED_TO_RUN decision likewise.
+\* GStatusStable only keeps the status; this also forbids a later SJ launch or START.
+GNoStartAfterEarlyTerminal == [][(Terminal /\ ~pJobSP.sjLaunched) =>
+                                   (~pJobSP'.sjLaunched /\ pJobSP'.startSent = pJobSP.startSent)]_portVars
+\* delete_job accepts a SUBMITTED job (job_cmds.py:518); the runner re-checks after
+\* deployment (job_runner.py:726-733). A deleted job never gets an SJ or a START.
+GNoStartAfterDelete == [][pJobSP.deleted =>
+                            ((pJobSP'.sjLaunched => pJobSP.sjLaunched) /\ pJobSP'.startSent = pJobSP.startSent)]_portVars
+
 \* ---------------- G1b server worker threads do not die of exceptions
 GCompletionThreadAlive == ~pJobSP.completionCrashed
 GTaskMonitorAlive == ~pCommSJ.monitorCrashed

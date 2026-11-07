@@ -25,4 +25,21 @@ OnlyAssignmentLoss == \A k \in DOMAIN net : net[k].lost => net[k].msg.kind = "TA
 \* notified to its receivers (or with no live source)
 LTrainerStopOwner == Grain["Trainer"] /= "X" \/
     \A c \in Sites, l \in Launches : trainer_x[c][l].victim = 0 \/ trainer_x[c][l].victim \in trainer_x[c][l].notices
+\* ---- v9 SP shutdown (JobSP_F): what fl_shutdown -> stop_all_jobs promises
+\* every job still in run_processes when the shutdown finishes was stopped by it
+LShutdownStopsAll == jobSP_f.shut.pc = "done" =>
+    \A k \in DOMAIN jobSP_f.jobs : jobSP_f.jobs[k].serverRegistered => k \in jobSP_f.shut.stopped
+\* SYSTEM_END is fired on every shutdown (resource managers stop their threads)
+LSystemEndOnShutdown == jobSP_f.shut.pc = "done" => jobSP_f.shut.sysEnd
+\* no SJ is launched once the shutdown has begun
+LNoSpawnAfterShutdown == [][jobSP_f.shut.pc /= "none" =>
+    \A k \in DOMAIN jobSP_f.jobs : jobSP_f'.jobs[k].serverSpawned => jobSP_f.jobs[k].serverSpawned]_jobSP_f
+\* the same with the known S4 excluded: only the job the scheduling pass was already
+\* handling when the shutdown began may still be launched (ask_to_stop is read at the loop top)
+LNoSpawnAfterShutdownK == [][jobSP_f.shut.pc /= "none" =>
+    \A k \in DOMAIN jobSP_f.jobs : (jobSP_f'.jobs[k].serverSpawned /\ ~jobSP_f.jobs[k].serverSpawned)
+                                    => k = jobSP_f.shut.passJob]_jobSP_f
+\* the jobs listed in run_processes when the shutdown began were all stopped (S1 breaks it)
+LShutdownStopsAllK == jobSP_f.shut.pc = "done" => jobSP_f.shut.snap \subseteq jobSP_f.shut.stopped
+
 =========================================================================

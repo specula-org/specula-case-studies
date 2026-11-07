@@ -15,10 +15,14 @@ T1Holds(sjDsShutdown, sjGone) == sjDsShutdown \/ sjGone
 T2Holds(adminStopping) == ~adminStopping
 \* #3 T3: no new download after the SJ's DS shutdown (late envelope). Escape slowEnvelope.
 T3Holds(sjDsShutdown) == ~sjDsShutdown
+\* #18 T5: an SP shutdown's stop_all_runs loop finishes before a stopped job's SJ exits
+\* (each iteration is milliseconds while the clients reply). Escape slowShutdownAbort: a
+\* registered client does not reply, so each abort_client_run waits its 2 s timeout.
+T5Holds(shutdownLoop) == ~shutdownLoop
 \* #17 T4: no 30 s clock tick between the workflow's return and finalize_run. Escape slowFinalize.
 T4Holds(wfReturned) == wfReturned = "none"
 
-TimingGuardEscapes == {"slowSJTeardown", "slowAdminStop", "slowEnvelope", "slowFinalize"}
+TimingGuardEscapes == {"slowSJTeardown", "slowAdminStop", "slowEnvelope", "slowFinalize", "slowShutdownAbort"}
 \* escape events: actions gated by the fault itself (statically priced)
 TimingEventEscapes == {"statusLost", "monitorStale", "jobExitRace"}
 =============================================================================

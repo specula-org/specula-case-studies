@@ -27,15 +27,16 @@
 | H03（REPRODUCED，强制抢占；自然 0/71,584） | 过期 monitor 停掉正在服务 task B 的 launch_once trainer，B 没有失效通知 | 2.9+；external_process + `launch_once` + 惰性结果 | 很低 | 低 | F-K | 无；main 未变 | 10（暂不单独提） |
 | H01（REPRODUCED，桩传输 + 注入回复丢失） | Attach `send()` 报成功，但 CJ 已拒绝该结果；server 本来就把这一轮记失败 | 2.9+；Attach；两次 RESULT_REJECTED 回复都丢 | 很低 | 低 | 状态查询返回 REJECTED | 无；main 未变 | 暂不提 |
 | S1（REPRODUCED，桩 SJ + 桩传输，时序由场景设定） | `shutdown server`/`restart server` 中途抛 RuntimeError：后面的 job 不被停止，SYSTEM_END 不触发，调度器不停；错误留在 executor future 里无日志；restart 时孤儿 SJ + R1 | 2.8/2.9/main；≥2 个运行中的 job，且有一个已注册但不回复的 client（每个 job 的 abort 等满 2 s） | 中 | 中 | `list(engine.run_processes.keys())` 快照（1 行） | 无；main 未变 | 第一批末尾或并入 T2+T3 的加固 issue |
+| S4（REPRODUCED，部署桩 2 s；模型先找到） | 关机/重启时正在部署的 job 在 `stop_all_runs` 之后仍被启动并记为 RUNNING；SP 退出后它的 SJ、CJ 成为孤儿，restart 后落入 R1 | 2.8/2.9/main；关机命令恰在调度器部署某个 job 的那几秒里 | 中 | 中 | `_start_run` 前复查 `ask_to_stop`，或关机与启动认领互斥 | 无；main 未变 | 与 S1 合成一个关机路径 issue |
 | N1（MODEL-ONLY） | 非严格 START 下，回复超时但实际启动的 site 的失败 OUTCOME 被丢弃，job 可能 COMPLETED | 默认非严格模式；START 回复晚于 20 s | 低 | 低 | 保留该 site 的 pending outcome | 无；main 未变 | 不提 |
 
 ## 按根因计数
 
 | 口径 | 个数 | 是哪些 |
 |---|---:|---|
-| 在真实代码上复现 | 15 | C1-A、C1-B、H08、H11、T1、T1-b、T2、T3、R1、R2、L13、H03、N2、H01、S1 |
+| 在真实代码上复现 | 16 | C1-A、C1-B、H08、H11、T1、T1-b、T2、T3、R1、R2、L13、H03、N2、H01、S1、S4 |
 | 其中无强制调度、无注入 | 5 | H08、H11、T1、R1、R2 |
-| 其中靠强制调度、耗时桩、注入故障或以时序巧合为条件 | 10 | C1-A、C1-B、T1-b、T2、T3、L13、H03、N2、H01、S1 |
+| 其中靠强制调度、耗时桩、注入故障或以时序巧合为条件 | 11 | C1-A、C1-B、T1-b、T2、T3、L13、H03、N2、H01、S1、S4 |
 | 只有静态代码确认 | 0 | —（H01 已在 11-07 复现） |
 | 只有模型反例 | 1 | N1 |
 | 本次只读代码新看到、未执行（不计数） | 2 | T1 的 715 行路径；R1 的"abort 后立即 shutdown"路径 |

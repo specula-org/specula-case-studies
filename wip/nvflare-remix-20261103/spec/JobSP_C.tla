@@ -25,7 +25,7 @@ InitValue == [handled |-> {}, stage |-> "init",
               pending |-> {}, active |-> Sites, outcomeKey |-> FALSE, failed |-> FALSE,
               sAborted |-> FALSE, runAborted |-> FALSE,
               completion |-> "idle", finish |-> "COMPLETED",
-              adminPC |-> "idle", aborts |-> 0]
+              adminPC |-> "idle", aborts |-> 0, shut |-> "none", shutStopped |-> FALSE]
 Init == jobSP_c = InitValue
 
 S == jobSP_c
@@ -276,6 +276,25 @@ MarkAborted ==
     /\ jobSP_c' = [S EXCEPT !.runAborted = @ \/ S.running, !.adminPC = "idle"]
     /\ UNCHANGED <<pJobSP, net>>
 
+\* ---------------- SP shutdown / restart (fault spShutdown, v9): stop_all_runs. Coarse
+\* abstracts the loop: it may stop this job (abort to the clients if the SJ is
+\* registered, mark aborted) or end without it (RuntimeError or the job not listed).
+ShutStart ==
+    /\ "spShutdown" \in Faults /\ S.shut = "none" /\ ~pJobSP.spRestarted
+    /\ jobSP_c' = [S EXCEPT !.shut = "loop"]
+    /\ UNCHANGED <<pJobSP, net>>
+ShutStop ==
+    /\ S.shut = "loop" /\ ~S.shutStopped
+    /\ jobSP_c' = [S EXCEPT !.shutStopped = TRUE, !.runAborted = @ \/ S.running]
+    /\ \/ /\ S.registered
+          /\ net' = CmdAllS("ABORT_JOB", Sites, "shutdown")
+          /\ pJobSP' = Stops(Sites)
+       \/ UNCHANGED <<pJobSP, net>>
+ShutDone ==
+    /\ S.shut = "loop"
+    /\ jobSP_c' = [S EXCEPT !.shut = "done"]
+    /\ UNCHANGED <<pJobSP, net>>
+
 \* ---------------- client outcome receipt (fed_server / fail_run)
 RecvOutcome(c, k) ==
     /\ InInbox(k, SP, "OUTCOME") /\ M(k).from = CP(c) /\ k \notin S.handled
@@ -393,6 +412,7 @@ Next ==
     \/ OtherLaunch \/ OtherExit \/ OtherComplete \/ OtherDelete
     \/ ObserveSJExit \/ ObserveSJExitStatusLost \/ Terminate \/ RemoveAfterTerminate
     \/ AbortRead \/ AbortRunningSend \/ AbortRunningNoSJ \/ MarkAborted
+    \/ ShutStart \/ ShutStop \/ ShutDone
     \/ SelectCompletion \/ OutcomeGraceExpired \/ Classify \/ PublishTerminal \/ RemoveCompleted
     \/ RemoveCompletedMissing \/ Delete \/ DeletedCrash \/ SPCrashRestart
     \/ \E c \in Sites : HeartbeatStop(c) \/ ResolveMissingOutcome(c)

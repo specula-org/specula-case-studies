@@ -51,7 +51,8 @@ RunCJKinds == {"STARTED", "READY", "STOPPED"}
 JobKinds == JobSPKinds \cup JobCPKinds \cup RunCJKinds
 JobFaults == {"slowSJTeardown", "slowAdminStop", "statusLost", "abortCmdError", "cjCrash", "abort", "outcomeReportFail", "deployError", "launchError",
               "storeError", "rpcTimeout", "outcomeTimeout", "archiveError",
-              "admissionError", "resExpiry", "deleteJob", "spCrash", "cpCrash"}
+              "admissionError", "resExpiry", "deleteJob", "spCrash", "cpCrash",
+              "spShutdown", "slowShutdownAbort"}
 JobStatuses == {"SUBMITTED", "DISPATCHED", "RUNNING", "ABORTED", "COMPLETED",
                 "FAILED", "FAILED_TO_RUN", "CANT_SCHEDULE"}
 JobTerminalStatuses == {"ABORTED", "COMPLETED", "FAILED", "FAILED_TO_RUN", "CANT_SCHEDULE"}

@@ -563,15 +563,24 @@
 - 范围：main、2.9、2.8 都有同一循环和清理线程。上游没有相关 issue。
 - 与 T3 同族（遍历 `run_processes` 不取快照），但根因位置和后果不同，按根因单独计。修法是 `for job_id in list(engine.run_processes.keys())`。
 
+**SP 关机进入模型**（`spShutdown` 故障，时序前提 T5 / 逃逸 `slowShutdownAbort`；细 JobSP 的 `ShutdownStart/StopJob/IterError/End`，粗 JobSP 的 `ShutStart/ShutStop/ShutDone`；性质 `LShutdownStopsAll(K)`、`LSystemEndOnShutdown`、`LNoSpawnAfterShutdown(K)`，以及 A 组 `GNoStartAfterEarlyTerminal`、`GNoStartAfterDelete`）：
+- 回归：打开 `spShutdown` 后，全细、全粗 TV 仍接受真实 POC trace（95 秒、20 秒）；精化负控按预期失败（`BadStep`，3 层）。
+- **S4（模型先找到，随后在真实代码上复现；REPRODUCED，部署桩 2 秒，触发时刻自然；`checks/confirm/s4_repro.py`）：** 冒烟 BFS 在第 9–10 层就报出 `LNoSpawnAfterShutdown`，不开 `slowShutdownAbort` 也一样。路径是：调度器开始一轮 → 关机开始（`run_processes` 为空，循环立即结束并置 `ask_to_stop`）→ 这一轮继续部署并启动 J2。
+  - 代码：`ask_to_stop` 只在循环顶部读（`job_runner.py:494, 695`），进行中的一轮会继续 `_deploy_job` → `_start_run`；`BaseServer.fl_shutdown` 随后最多等 30 秒 client 离开（`fed_server.py:343-354`）。
+  - 实测：关机时正在部署的 job 在 `stop_all_runs` 返回 2.01 秒后被启动，状态 RUNNING；对照组（关机之后才提交）不会启动。
+  - 后果：这个 job 的 SJ 和 CJ 在 SP 退出后成为孤儿；如果是 restart，就落进 R1，永远停在 RUNNING。
+  - 范围：2.8、2.9、main 的调度循环结构相同；上游没有相关 issue（#5561/#5559 是 launcher 后端关闭时的进程归属，不是同一问题）。
+  - 和 S1 根因不同：S1 是遍历不取快照；S4 是调度中的 job 不在关机的覆盖范围内。修法是在 `_start_run` 前复查 `ask_to_stop`，或者让关机与调度的启动认领互斥。
+
 **按根因汇总（截至 11-07 第九轮）：**
 
 | 口径 | 个数 | 是哪些 |
 |---|---:|---|
-| 在真实代码上复现 | 15 | C1-A、C1-B、H08、H11、T1、T1-b、T2、T3、R1、R2、L13、H03、N2、H01、S1 |
+| 在真实代码上复现 | 16 | C1-A、C1-B、H08、H11、T1、T1-b、T2、T3、R1、R2、L13、H03、N2、H01、S1、S4 |
 | 其中不需要强制调度或注入 | 5 | H08、H11、T1、R1、R2 |
-| 其中靠强制调度、桩、注入故障或以时序巧合为条件 | 10 | 加上 S1 |
-| 有模型反例且盲跑能找回 | 13 | S1、H01 还不在模型里 |
-| 新于上游 | 14（或 15） | 都没有提交 |
-| 新于 Phase 1 | 11 | 加上 S1 |
+| 其中靠强制调度、桩、注入故障或以时序巧合为条件 | 11 | 加上 S1、S4 |
+| 有模型反例 | 14 | 加上 S4（由模型先找到）；S1 的模型反例待 h9B，H01 不在模型里 |
+| 新于上游 | 15（或 16） | 都没有提交 |
+| 新于 Phase 1 | 12 | 加上 S1、S4 |
 | 只有静态代码确认 | 2 | S2、S3（新线索，影响低或依赖时序） |
 | 只有模型反例 | 1 | N1 |

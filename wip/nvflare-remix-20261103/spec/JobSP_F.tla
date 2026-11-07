@@ -71,7 +71,10 @@ InitValue ==
      rpc |-> [s \in Sites |-> [t \in Tokens |-> EmptyReplies]],
      handled |-> {}, adminAborts |-> 0, admissionErrors |-> 0, ms |-> {},
      sjKilled |-> FALSE, startSent |-> {}, abortSent |-> {},
-     outcomes |-> [s \in Sites |-> "none"], terminal |-> "none", spRestarted |-> FALSE]
+     outcomes |-> [s \in Sites |-> "none"], terminal |-> "none", spRestarted |-> FALSE,
+     \* v9 SP shutdown/restart (fault spShutdown): stop_all_runs over run_processes
+     shut |-> [pc |-> "none", snap |-> {}, size |-> 0, left |-> {}, stopped |-> {},
+               err |-> FALSE, sysEnd |-> FALSE, askStop |-> FALSE, passJob |-> "none"]]
 Init == jobSP_f = InitValue
 
 CurrentJob == scheduler.current
@@ -116,6 +119,9 @@ CmdAll(kind, ss) == SendAll(net, {Cmd(kind, s) : s \in ss})
 \* ABORT_JOB (seed Stop: five senders) and CANCEL_RESOURCES carry the sender
 \* path in the id; each path sends at most once per job attempt.
 CmdAllS(kind, ss, src) == SendAll(net, {Msg(kind, SP, CP(s), <<JobId, s, src>>, None) : s \in ss})
+\* v9: engine.run_processes keys (an entry is popped when serverRegistered falls)
+RunProcs == {k \in Jobs : jobSP_f.jobs[k].serverRegistered}
+ShutLoop == jobSP_f.shut.pc = "loop"
 \* HEARTBEAT_STOP repeats with heartbeats; seq 2 only matters under loss.
 HBStopKey(s, n) == MsgKey("HEARTBEAT_STOP", SP, CP(s), <<JobId, s, n>>)
 HBStopFree(s) == HBStopKey(s, 1) \notin DOMAIN net
@@ -183,18 +189,21 @@ AbsC == [handled |-> {k \in jobSP_f.handled : k[1] = "OUTCOME"},
          adminPC |-> CASE JJ.adminPC = "read" -> IF JJ.adminRead \in Terminal THEN "idle" ELSE "read"
                        [] JJ.adminPC \in {"stopWait", "markAborted"} -> "stop"
                        [] OTHER -> "idle",
-         aborts |-> jobSP_f.adminAborts]
+         aborts |-> jobSP_f.adminAborts,
+         shut |-> IF jobSP_f.shut.pc = "none" THEN "none" ELSE IF ShutLoop THEN "loop" ELSE "done",
+         shutStopped |-> JobId \in jobSP_f.shut.stopped]
 AbsCInit == [handled |-> {}, stage |-> "init",
              registered |-> FALSE, terminated |-> FALSE, running |-> FALSE,
              pending |-> {}, active |-> Sites, outcomeKey |-> FALSE, failed |-> FALSE,
              sAborted |-> FALSE, runAborted |-> FALSE,
              completion |-> "idle", finish |-> "COMPLETED",
-             adminPC |-> "idle", aborts |-> 0]
+             adminPC |-> "idle", aborts |-> 0, shut |-> "none", shutStopped |-> FALSE]
 
 
 \* app_common/job_schedulers/job_scheduler.py:368-375; private/fed/server/job_runner.py:695-712
 DefaultJobSchedulerBeginPass ==
     /\ scheduler.pc = "idle"
+    /\ ~jobSP_f.shut.askStop   \* v9: job_runner.py:694 while not self.ask_to_stop
     /\ Cardinality(scheduler.scheduled) < MaxJobs
     \* A pass with no SUBMITTED job (BeginPass, EndPass, ReturnPass) only cycles
     \* the scheduler pc back to "idle": the pending sets are empty at "idle", and
@@ -690,6 +699,7 @@ ServerEngineReceiveFailureOutcome(s, k) ==
 \* private/fed/server/server_engine.py:204-235  [X5: SJ return code recorded with the run_processes pop]
 ServerEngineObserveExit ==
     LET j == JobId IN
+    /\ TimingOK(Faults, "slowShutdownAbort", T5Holds(ShutLoop))
     /\ jobs[j].serverWaiter
     /\ jobs[j].serverRegistered
     /\ SJDown
@@ -705,6 +715,7 @@ ServerEngineObserveExit ==
 \* popped and the late message finds no run_processes entry: not a failure.
 ServerEngineObserveExitStatusLost ==
     LET j == JobId IN
+    /\ TimingOK(Faults, "slowShutdownAbort", T5Holds(ShutLoop))
     /\ "statusLost" \in Faults
     /\ jobs[j].serverWaiter
     /\ jobs[j].serverRegistered
@@ -729,6 +740,7 @@ ServerEngineTerminateAfterGrace ==
 \* private/fed/server/server_engine.py:409-410
 ServerEngineRemoveAfterTerminate ==
     LET j == JobId IN
+    /\ TimingOK(Faults, "slowShutdownAbort", T5Holds(ShutLoop))
     /\ jobs[j].serverTerminated
     /\ LET n == [jobSP_f EXCEPT !.jobs = [jobs EXCEPT ![j].serverRegistered = FALSE]] IN
        /\ jobSP_f' = Fin(n)
@@ -1196,6 +1208,53 @@ SPCrashRestart ==
        /\ pJobSP' = PortOf(n)
     /\ UNCHANGED <<net>>
 
+\* ---- SP shutdown / restart (fault spShutdown, v9). shutdown_server and restart_server
+\* (server_engine.py:417-440) run server_shutdown in the engine executor (1129-1140):
+\* fl_shutdown -> stop_all_jobs -> JobRunner.stop_all_runs (fed_server.py:1251-1255,
+\* job_runner.py:944-951), which iterates engine.run_processes.keys() without a snapshot.
+\* Python checks the dict size at every next(): a pop since the loop began raises
+\* RuntimeError, which skips the remaining jobs, ask_to_stop, SYSTEM_END and the base
+\* shutdown; the executor future keeps the exception (no log). Pops during the loop
+\* need timing escape T5 (slowShutdownAbort). The restart itself is spCrash's SPCrashRestart.
+ShutdownStart ==
+    /\ "spShutdown" \in Faults /\ jobSP_f.shut.pc = "none" /\ ~jobSP_f.spRestarted
+    /\ LET rp == RunProcs
+           n == [jobSP_f EXCEPT !.shut = [@ EXCEPT !.pc = "loop", !.snap = rp,
+                                                    !.size = Cardinality(rp), !.left = rp,
+                                                    !.passJob = IF scheduler.pc /= "idle" THEN scheduler.current ELSE "none"]] IN
+       /\ jobSP_f' = Fin(n)
+       /\ pJobSP' = PortOf(Fin(n))
+    /\ UNCHANGED <<net>>
+\* next() after the dict changed size
+ShutdownIterError ==
+    /\ ShutLoop /\ Cardinality(RunProcs) /= jobSP_f.shut.size
+    /\ LET n == [jobSP_f EXCEPT !.shut = [@ EXCEPT !.pc = "done", !.err = TRUE]] IN
+       /\ jobSP_f' = Fin(n)
+       /\ pJobSP' = PortOf(Fin(n))
+    /\ UNCHANGED <<net>>
+\* job_runner.py:888-890, 425-445: stop_run = _stop_run (abort to the job's clients and
+\* to its SJ, whose cleanup thread terminates it after the graceful wait: serverStop)
+\* + mark_run_aborted. A job already gone from run_processes is only marked.
+ShutdownStopJob(j) ==
+    /\ ShutLoop /\ j \in jobSP_f.shut.left /\ Cardinality(RunProcs) = jobSP_f.shut.size
+    /\ LET reg == jobs[j].serverRegistered
+           send == reg /\ j = JobId
+           n == [jobSP_f EXCEPT !.jobs = [jobs EXCEPT ![j].serverStop = @ \/ reg,
+                                                    ![j].runAborted = @ \/ jobs[j].running],
+                 !.abortSent = IF send THEN @ \cup jobs[j].deployed ELSE @,
+                 !.shut = [@ EXCEPT !.left = @ \ {j}, !.stopped = @ \cup {j}]] IN
+       /\ jobSP_f' = Fin(n)
+       /\ pJobSP' = PortOf(Fin(n))
+       /\ net' = IF send THEN CmdAllS("ABORT_JOB", jobs[j].deployed, "shutdown") ELSE net
+ShutdownStopJobAny == \E j \in Jobs : ShutdownStopJob(j)
+\* the loop ends: ask_to_stop, then SYSTEM_END and the base shutdown
+ShutdownEnd ==
+    /\ ShutLoop /\ jobSP_f.shut.left = {} /\ Cardinality(RunProcs) = jobSP_f.shut.size
+    /\ LET n == [jobSP_f EXCEPT !.shut = [@ EXCEPT !.pc = "done", !.askStop = TRUE, !.sysEnd = TRUE]] IN
+       /\ jobSP_f' = Fin(n)
+       /\ pJobSP' = PortOf(Fin(n))
+    /\ UNCHANGED <<net>>
+
 AdminDeleteJobAny == \E j \in Jobs : AdminDeleteJob(j)
 JobRunnerScanDeletedAny == \E j \in Jobs : JobRunnerScanDeleted(j)
 
@@ -1222,6 +1281,7 @@ J2LaunchDeleted ==
     /\ UNCHANGED <<net>>
 J2Exit ==
     /\ "multiJob" \in Profile /\ jobs[J2].running /\ jobs[J2].serverRegistered
+    /\ TimingOK(Faults, "slowShutdownAbort", T5Holds(ShutLoop))
     /\ LET n == [jobSP_f EXCEPT !.jobs = [jobs EXCEPT ![J2].serverRegistered = FALSE]] IN
        /\ jobSP_f' = Fin(n)
        /\ pJobSP' = PortOf(Fin(n))
@@ -1239,6 +1299,7 @@ J2Complete ==
 
 Next ==
     \/ DefaultJobSchedulerBeginPass
+    \/ ShutdownStart \/ ShutdownIterError \/ ShutdownStopJobAny \/ ShutdownEnd
     \/ DefaultJobSchedulerEndPass
     \/ DefaultJobSchedulerSkipBackoff
     \/ DefaultJobSchedulerBackoffElapsed
