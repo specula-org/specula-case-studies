@@ -452,7 +452,7 @@ ClockAdvance ==
     \* stop_controller + finalize_run end the task monitor within seconds, so no
     \* 30 s tick (and no 60 s dead-client grace) elapses in between, unless the
     \* finalization is slow or a grace expiry lands in that window (slowFinalize).
-    /\ pWfSJ.returned = "none" \/ "slowFinalize" \in Faults
+    /\ TimingOK(Faults, "slowFinalize", T4Holds(pWfSJ.returned))
     /\ SJAlive /\ ~P.finalized
     /\ \/ \E t \in Tasks : S.task[t].scheduled /\ S.task[t].age = 0
        \/ \E c \in Sites : S.dead[c].reported /\ S.dead[c].age < 2

@@ -69,7 +69,7 @@ Stop(c, l) ==
 \* streamer shutdown, DownloadService.shutdown (clears this CJ's refs).
 ShutdownDS(c, l) ==
     /\ CJAlive(c, l) /\ pRunCJ[c][l].state = "stopping" /\ ~pRunCJ[c][l].dsDown
-    /\ "slowSJTeardown" \in Faults \/ CJTeardownTimingOK(pWfSJ, SJGone)   \* timing T1
+    /\ TimingOK(Faults, "slowSJTeardown", T1Holds(pWfSJ.dsShutdown, SJGone))   \* timing T1
     /\ pRunCJ' = [pRunCJ EXCEPT ![c][l].dsDown = TRUE]
     /\ UNCHANGED <<runCJ_c, net>>
 

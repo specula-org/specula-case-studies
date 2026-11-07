@@ -33,8 +33,11 @@ ROOT = Path(__file__).resolve().parents[1]
 SPEC = Path(os.environ.get("MIX_SPEC") or ROOT / "spec")
 
 FAULT1 = re.compile(r'"(\w+)"\s*\\in\s*Faults')
+# timing guards (spec/Timing.tla): TimingOK(Faults, "escape", holds) widens an
+# action by the escape; seen for dynamic pricing only (not a static gate)
+TIMINGOK = re.compile(r'TimingOK\(\s*Faults\s*,\s*"(\w+)"')
 FAULTSET = re.compile(r'(?:Faults\s*\\cap\s*\{([^}]*)\}|\{([^}]*)\}\s*\\cap\s*Faults)\s*/=\s*\{\}')
-PORT_MODULES = ["Consts", "PortsJob", "PortsFed", "PortsPay", "PortsTrn", "Ports"]
+PORT_MODULES = ["Consts", "Timing", "PortsJob", "PortsFed", "PortsPay", "PortsTrn", "PortsReg", "Ports"]
 
 
 def bodies(text):
@@ -51,7 +54,7 @@ def bodies(text):
 
 
 def fault_names(text):
-    names = set(FAULT1.findall(text))
+    names = set(FAULT1.findall(text)) | set(TIMINGOK.findall(text))
     for m in FAULTSET.finditer(text):
         names |= set(re.findall(r'"(\w+)"', m.group(1) or m.group(2)))
     return names

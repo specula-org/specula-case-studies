@@ -242,7 +242,7 @@ SourceDownloadRegister(si, a, p) ==
     LET st == payRcv_f[si][a] IN
     /\ SJAlive /\ ~SJShutdownPending /\ pCommSJ.envelopes[si] /= None
     /\ pCommSJ.envelopes[si].assignment.attempt = a /\ pPayRcv[si].rx[a].want = None
-    /\ "slowEnvelope" \in Faults \/ ~Flag(pWfSJ, "dsShutdown")   \* timing T3 (PortsPay)
+    /\ TimingOK(Faults, "slowEnvelope", T3Holds(Flag(pWfSJ, "dsShutdown")))   \* timing T3 (Timing)
     /\ (p \notin st.sourceStarted)
     /\ (st.consumer[p] = "new")
     /\ payRcv_f' = [payRcv_f EXCEPT ![si][a] = [st EXCEPT

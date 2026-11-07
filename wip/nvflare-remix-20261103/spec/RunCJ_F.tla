@@ -111,7 +111,7 @@ EndRunEvents(c, l) ==
 \* side; PaySrc applies it per transaction, the next step waits for the return).
 ShutdownDownloadService(c, l) ==
     /\ At(c, l, "events")
-    /\ "slowSJTeardown" \in Faults \/ CJTeardownTimingOK(pWfSJ, SJGone)   \* timing T1 (PortsJob)
+    /\ TimingOK(Faults, "slowSJTeardown", T1Holds(pWfSJ.dsShutdown, SJGone))   \* timing T1 (Timing)
     /\ pRunCJ' = [pRunCJ EXCEPT ![c][l].dsDown = TRUE]
     /\ Go(c, l, "dsDown")
     /\ UNCHANGED net

@@ -172,7 +172,7 @@ FinalizeRun ==
 
 Mature ==
     /\ ~commSJ_c.deadEarly /\ SJAlive /\ pReg.notified /= {}
-    /\ pWfSJ.returned = "none" \/ "slowFinalize" \in Faults
+    /\ TimingOK(Faults, "slowFinalize", T4Holds(pWfSJ.returned))
     /\ commSJ_c' = [commSJ_c EXCEPT !.deadEarly = TRUE]
     /\ UNCHANGED <<pCommSJ, net>>
 Unmature ==

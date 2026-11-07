@@ -5,7 +5,7 @@
 \* messages of kinds its group owns). Receiving is private (handled-key sets);
 \* the log is append-only except for NET-owned loss marks.
 \* Port shapes live in PortsJob / PortsFed / PortsPay (one per component).
-EXTENDS PortsJob, PortsFed, PortsPay, PortsTrn, PortsReg
+EXTENDS PortsJob, PortsFed, PortsPay, PortsTrn, PortsReg, Timing
 
 FaultNames == JobFaults \cup FedFaults \cup PayFaults \cup TrnFaults \cup RegFaults \cup {"netLoss", "transportFail"}
 ASSUME Faults \subseteq FaultNames

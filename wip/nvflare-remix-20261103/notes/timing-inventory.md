@@ -2,6 +2,11 @@
 
 The model has no time. Each row is a real time constant (pin c411a201), the ordering it decides, and how the model treats that ordering.
 
+The guards live in `spec/Timing.tla`:
+- rows #1, #2, #3 and #17 are `T1Holds`, `T2Holds`, `T3Holds` and `T4Holds`;
+- each is used as `TimingOK(Faults, "<escape>", T?Holds(...))`;
+- escape events and structural assumptions are listed there too.
+
 Treatments:
 - **guard**: a default-on timing assumption with a priced escape fault (T1–T3).
 - **priced**: a fault with a rarity weight.

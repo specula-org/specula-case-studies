@@ -717,7 +717,7 @@ ServerEngineObserveExitStatusLost ==
 \* private/fed/server/server_engine.py:386-408  [terminate kills a live SJ; timing T2 (PortsJob): the 10 s graceful wait starts when abort_app_on_server returns, so the admin thread's mark_run_aborted lands first]
 ServerEngineTerminateAfterGrace ==
     LET j == JobId IN
-    /\ "slowAdminStop" \in Faults \/ jobs[j].adminPC \notin {"stopWait", "markAborted"}
+    /\ TimingOK(Faults, "slowAdminStop", T2Holds(jobs[j].adminPC \in {"stopWait", "markAborted"}))
     /\ jobs[j].serverStop \/ jobs[j].adminPC="stopWait" \/ (scheduler.current=j /\ scheduler.pc="failStopWait")
     /\ jobs[j].serverSpawned
     /\ LET n == [jobSP_f EXCEPT !.jobs = [jobs EXCEPT ![j].serverTerminated = TRUE],

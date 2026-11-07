@@ -40,7 +40,7 @@ RunCJKinds == {"STARTED", "READY", "STOPPED"}
 \* client_runner.py:175,679,814-821). Untimed, the model would let the CJ win.
 \* Unless "slowSJTeardown" (end-run readiness held / slow SJ teardown) is enabled,
 \* a CJ's DS shutdown waits for the SJ's (or for the SJ to be gone).
-CJTeardownTimingOK(pWfSJx, sjGone) == pWfSJx.dsShutdown \/ sjGone
+\* (the guard is Timing!T1Holds, used as TimingOK(Faults, "slowSJTeardown", ...))
 \* Timing assumption T2 (source reading, checks/findings/ABORT_classified_completed.md):
 \* abort_app_on_server sends ABORT, starts the cleanup thread and returns at once
 \* (server_engine.py:355-382); stop_run then calls mark_run_aborted

@@ -228,8 +228,8 @@ ObserveSJExitStatusLost ==
 \* observed (run_processes pop) or on the 0 s abortCmdError path.
 Terminate ==
     /\ pJobSP.abortSent /= {} /\ pJobSP.sjLaunched
-    /\ \/ S.adminPC /= "stop" \/ ~S.registered
-       \/ Faults \cap {"slowAdminStop", "abortCmdError"} /= {}
+    /\ \/ TimingOK(Faults, "slowAdminStop", T2Holds(S.adminPC = "stop" /\ S.registered))
+       \/ "abortCmdError" \in Faults
     /\ jobSP_c' = [S EXCEPT !.terminated = TRUE]
     \* kill after the grace period, or terminate an SJ that is already gone
     \* (fine TerminateAfterExit needs ~registered). v5: the no-kill branch used

@@ -324,3 +324,16 @@ The dead-client report to the SJ used to be abstract: CommSJ's `WFCommReportDead
   - CommSJ_C has a private flag `deadEarly` (a report matured through the grace), maintained by `Mature`/`Unmature`. `PolicyPanic` requires it. After the return, `Mature` only fires with `slowFinalize`.
   - The abstraction is CommSJ_F's `AbsC.deadEarly == Matured`. Without T4, v8's relaxed coarse guard let a dead-client report that came after the workflow returned turn a completed job into FAILED.
 
+## 14. Timing module
+
+`spec/Timing.tla` (extended by `Ports`) holds the model's timing assumptions. Each one is a predicate with its source row in `notes/timing-inventory.md`.
+- **Guards.** Each guard site reads `TimingOK(Faults, "<escape>", T?Holds(...))`. TimingOK means: the escape fault is enabled, or the assumption holds.
+  - T1 is used in RunCJ_C/F, T2 in JobSP_C/F, T3 in PayRcv_C/F, T4 in CommSJ_C/F.
+  - The fault set is a parameter, so MixR's pricing instances substitute it. A zero-arity shared constant would keep the root value (DESIGN §11).
+  - `scripts/rarity.py` reads the escape name from the call (`TIMINGOK`), for dynamic pricing only.
+- **Escape events.** `statusLost`, `monitorStale` and `jobExitRace` stay as top-level `"x" \in Faults` gates, so they are still statically priced. `Timing` lists them.
+- **Equivalence of the refactor.**
+  - All 576 step costs are identical before and after.
+  - The hunt8b C runs that completed exhaustively were rerun unchanged and give the same distinct-state counts (RESULTS §14).
+  - Trace validation still accepts the POC trace.
+

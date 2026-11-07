@@ -49,7 +49,7 @@ FailCause(si, a) == OtherCause(si, a) \/ Flag(pWfSJ, "dsShutdown")
 Accept(si, a) ==
     /\ SJAlive /\ ~SJShutdownPending /\ pCommSJ.envelopes[si] /= None /\ pCommSJ.envelopes[si].assignment.attempt = a
     /\ Desc(si, a) = None
-    /\ "slowEnvelope" \in Faults \/ ~Flag(pWfSJ, "dsShutdown")   \* timing T3 (PortsPay)
+    /\ TimingOK(Faults, "slowEnvelope", T3Holds(Flag(pWfSJ, "dsShutdown")))   \* timing T3 (Timing)
     /\ pPayRcv' = RxUpd(si, a, [pPayRcv[si].rx[a] EXCEPT
                      !.want = CHOOSE d \in pCommSJ.envelopes[si].refs : TRUE, !.status = "pulling"])
     /\ UNCHANGED <<payRcv_c, net>>
