@@ -15,37 +15,40 @@
 | R2（REPRODUCED，无强制） | CP 重启后 SJ 永远收不到该 site 的 dead-job 通知；FedAvg task 默认无超时，job 卡在 RUNNING，只能手动 abort | 2.8/2.9/main；Process launcher；CP 在 `heart_beat_timeout`（provisioned 600 s）内重启；1 个 client 就够 | 高 | 高 | F-G（按 name 匹配或 re-login 时通知），独立 | 无相关 issue；main 未变 | 1 |
 | H08（REPRODUCED，无强制，真实子进程） | 自动重启的 CJ 用上另一个 job 的 GPU，自己的 GPU 闲置，另一个 job 被挤占或 OOM；无任何日志 | 只在 main（#5550 的自动恢复，未发布）；Process launcher + GPU RM/consumer；同一 site ≥2 个并发 GPU job | 中 | 高 | F-H，同时覆盖模型里的 START 交叠首启路径 | 无；违背 #5550 和设计文档"same resource reservation" | 2 |
 | R1（REPRODUCED，无强制） | SP 重启后崩溃前 RUNNING 的 job 永远 RUNNING，abort、delete、下载都不行 | 2.8/2.9/main（#4503 回归，2.7 正常）；任何部署；SP 非优雅退出 | 高 | 中 | F-F（启动时调一次 `update_unfinished_jobs`），独立 | 无；回归 | 3 |
-| T1-b（REPRODUCED，部署桩 2 s，无强制） | 调度线程退出，server 不再调度任何 job，直到重启 | 所有版本（2.9 失败点不同）；部署期间删除该 job（秒级窗口） | 中 | 高 | F-A，与 T1 和 715 行路径共用 | 无；main 未变 | 4 |
+| T1-b（REPRODUCED，部署桩 2 s，无强制） | 调度线程退出，server 不再调度任何 job，直到重启 | 所有版本（2.9 失败点不同）；部署期间删除该 job（窗口 0.5–2.2 s，慢 client 约 10 s）；同一根因的另一触发：job 存储持续写失败（磁盘满、只读），20/20 | 中 | 高 | F-A，与 T1 和 715 行路径共用 | 无；main 未变 | 4 |
 | T1（REPRODUCED，自然竞态） | 同 T1-b | 所有版本；删除排队中的 job 恰在 1 s 扫描读 meta 之间；窗口随排队数增长 | 低 | 高 | F-A | 无；main 未变 | 4（与 T1-b 合并） |
 | H11（REPRODUCED，无强制） | SJ 的 task monitor 线程 KeyError 退出；task 不再收尾、超时或做 dead-client 检查；CSE 无限等待 | 2.8/2.9/main；≥2 个同时挂着的 task（CSE 等）+ 一次 GET_TASK 重发 | 中 | 高 | 需根因修复；monitor 加 try/except 只保线程 | 无；main 未变 | 5 |
-| C1-B（REPRODUCED，强制 + 注入存储故障） | completion 线程 KeyError 退出，此后所有 job 不收尾、不归档；占满 `max_jobs` 后停止调度；重启后落入 R1 | 所有版本；RUNNING 写入先挂住再失败，期间 SJ 已退出 | 很低 | 高 | F-B 保线程；根因与 C1-A 同一处（F-C） | 无；同族 #5301 NOT_PLANNED | 6 |
+| C1-B（REPRODUCED，强制 + 注入存储故障） | completion 线程 KeyError 退出，此后所有 job 不收尾、不归档；占满 `max_jobs` 后停止调度；重启后落入 R1 | 所有版本；RUNNING 写入先挂住 ≥ 1 s 再失败，期间 SJ 已退出；默认部署（本地盘 + 进程 launcher）0/100，自写的慢失败存储 + K8s launcher 时几乎必然 | 很低 | 高 | F-B 保线程；根因与 C1-A 同一处（F-C） | 无；同族 #5301 NOT_PLANNED | 6 |
 | C1-A/A2（REPRODUCED，强制 + 注入存储故障） | 已发布的终态（EXECUTION_EXCEPTION，或 COMPLETED 且已归档）被改写成 FAILED_TO_RUN | 同上；2.9.1rc8 的 except 分支无条件写，更宽 | 很低 | 低 | F-C | #5301 同根因族（NOT_PLANNED, P3） | 6（附在 C1-B） |
-| L13（REPRODUCED，注入消息延迟或丢失） | system_panic 的 job（工作流异常、策略违规）被记为 FINISHED:COMPLETED | 所有版本；SJ→SP 那一条 fire-and-forget 状态消息在 SJ 退出后 >2 s 或丢失 | 低 | 中 | F-I（panic 时非零退出码） | 无；#5662 同类但只修 simulator/client 侧 | 7 |
-| T2（REPRODUCED，`fail_run` 桩 2 s，无强制） | `client_cleanup` 线程退出，此后死掉的 client 永不移除，SJ 收不到 dead-client 通知 | 所有版本（秒级窗口只在 2.9+）；≥2 个 client 同时失联，其中一个在处理期间重新登录 | 低 | 中 | F-D 保线程（同时覆盖 T3）；根因 1 行 None 检查 | 无；main 未变 | 8 |
-| T3（REPRODUCED，强制时序；自然 4/300） | 同 T2 | 所有版本；多 job；另一 job 的 SJ 恰在通知循环中退出 | 很低 | 中 | F-D；根因是快照遍历 | 无；main 未变 | 8（与 T2 合并） |
-| N2（REPRODUCED，时序由场景设定） | 已完成并保存的 job 在收尾窗口被判策略违规，记为 EXECUTION_EXCEPTION | 所有版本；`min_clients` = client 数或配了 required_sites；client 死亡恰在工作流返回前约 60 s | 低 | 低 | F-J | 无（#3671 根因不同）；main 未变 | 9（附在 L13） |
-| H03（REPRODUCED，强制抢占） | 过期 monitor 停掉正在服务 task B 的 launch_once trainer，B 没有失效通知 | 2.9+；external_process + `launch_once` + 惰性结果 | 很低 | 低 | F-K | 无；main 未变 | 10（暂不单独提） |
-| H01（STATIC） | Attach `send()` 报成功，但 CJ 已拒绝该结果；server 本来就把这一轮记失败 | 2.9+；Attach；两次 RESULT_REJECTED 回复都丢 | 很低 | 低 | 状态查询返回 REJECTED | 无；main 未变 | 不提 |
+| L13（REPRODUCED，注入消息延迟或丢失；自然 0/300） | system_panic 的 job（工作流异常、策略违规）被记为 FINISHED:COMPLETED | 所有版本；SJ→SP 那一条 fire-and-forget 状态消息在 SJ 退出后 >2 s 或丢失；实测处理延迟中位 3.6 ms | 很低 | 中 | F-I（panic 时非零退出码） | 无；#5662 同类但只修 simulator/client 侧 | 7 |
+| T2（REPRODUCED，时序巧合为条件，路径无桩） | `client_cleanup` 线程退出，此后死掉的 client 永不移除，SJ 收不到 dead-client 通知 | 所有版本；≥2 个 client 被判失联，其中一个宕机超过 600 s 的 CP 恰在清理循环里重新登录（或管理员 remove/disable）；窗口 0.15–3.3 ms；断网恢复的重连不触发 | 很低 | 中 | F-D 保线程（同时覆盖 T3）；根因 1 行 None 检查 | 无；main 未变 | 8 |
+| T3（REPRODUCED，强制时序；时序巧合为条件，窗口约 0.08 ms） | 同 T2 | 所有版本；多 job；另一 job 的 SJ 恰在通知循环中退出 | 很低 | 中 | F-D；根因是快照遍历 | 无；main 未变 | 8（与 T2 合并） |
+| N2（REPRODUCED，时序巧合为条件，收尾路径真实） | 已完成并保存的 job 在收尾窗口被判策略违规，记为 EXECUTION_EXCEPTION | 所有版本；`min_clients` = client 数或配了 required_sites；client 死亡恰在工作流返回前约 60 s；窗口 = `stop_controller` 耗时 + ≤ 0.2 s：标准 workflow 0.8 ms，非 torch job 在装了 torch 的 server 上 325 ms | 低 | 低 | F-J | 无（#3671 根因不同）；main 未变 | 9（附在 L13） |
+| H03（REPRODUCED，强制抢占；自然 0/71,584） | 过期 monitor 停掉正在服务 task B 的 launch_once trainer，B 没有失效通知 | 2.9+；external_process + `launch_once` + 惰性结果 | 很低 | 低 | F-K | 无；main 未变 | 10（暂不单独提） |
+| H01（REPRODUCED，桩传输 + 注入回复丢失） | Attach `send()` 报成功，但 CJ 已拒绝该结果；server 本来就把这一轮记失败 | 2.9+；Attach；两次 RESULT_REJECTED 回复都丢 | 很低 | 低 | 状态查询返回 REJECTED | 无；main 未变 | 暂不提 |
 | N1（MODEL-ONLY） | 非严格 START 下，回复超时但实际启动的 site 的失败 OUTCOME 被丢弃，job 可能 COMPLETED | 默认非严格模式；START 回复晚于 20 s | 低 | 低 | 保留该 site 的 pending outcome | 无；main 未变 | 不提 |
 
 ## 按根因计数
 
 | 口径 | 个数 | 是哪些 |
 |---|---:|---|
-| 在真实代码上复现 | 13 | C1-A、C1-B、H08、H11、T1、T1-b、T2、T3、R1、R2、L13、H03、N2 |
+| 在真实代码上复现 | 14 | C1-A、C1-B、H08、H11、T1、T1-b、T2、T3、R1、R2、L13、H03、N2、H01 |
 | 其中无强制调度、无注入 | 5 | H08、H11、T1、R1、R2 |
-| 其中靠强制调度、耗时桩或注入故障 | 8 | C1-A、C1-B、T1-b、T2、T3、L13、H03、N2 |
-| 只有静态代码确认 | 1 | H01 |
+| 其中靠强制调度、耗时桩、注入故障或以时序巧合为条件 | 9 | C1-A、C1-B、T1-b、T2、T3、L13、H03、N2、H01 |
+| 只有静态代码确认 | 0 | —（H01 已在 11-07 复现） |
 | 只有模型反例 | 1 | N1 |
 | 本次只读代码新看到、未执行（不计数） | 2 | T1 的 715 行路径；R1 的"abort 后立即 shutdown"路径 |
+| 自然时序一轮顺带看到的新线索（不计数） | 2 | SFM 在 endpoint 挂上之前静默丢弃 DATA 帧（REPRODUCED，人为 GIL 负载 + 连接建立后 0.2 s 即发送，4/100；丢弃逻辑是 #5320 有意加的，是否算 bug 未定）；`Controller.set_communicator` 写 `task_check_period` 而 monitor 读 `_task_check_period`（STATIC，影响很小） |
 
-已复现的 13 个按严重度：high 6 个（R2、H08、T1、T1-b、H11、C1-B），medium 4 个（R1、L13、T2、T3），low 3 个（C1-A、N2、H03）。按可能性：高 2 个（R1、R2），中 3 个（H08、T1-b、H11），低 4 个（T1、L13、T2、N2），很低 4 个（C1-A、C1-B、T3、H03）。H01、N1 不计入这两组。
+已复现的 14 个按严重度：high 6 个（R2、H08、T1、T1-b、H11、C1-B），medium 4 个（R1、L13、T2、T3），low 4 个（C1-A、N2、H03、H01）。按可能性：高 2 个（R1、R2），中 3 个（H08、T1-b、H11），低 2 个（T1、N2），很低 7 个（C1-A、C1-B、T2、T3、L13、H03、H01）。N1 不计入这两组。
+
+持续写失败让调度线程退出不另计：失败点和 T1-b 在 2.9.1rc8 上的失败点相同，都是 except 分支里 `set_status(FAILED_TO_RUN)` 再抛一次、`run()` 没有兜底，F-A 一并覆盖。
 
 ## 上游与版本复核
 
 - 任务给的 main 是 `e17c1edf6`；写这份文档时 main 已到 `5c54edda`（2026-11-07 00:21 UTC，比 pin 多 26 个提交）。逐个文件比对 blob：`job_runner.py`、`job_def_manager.py`、`filesystem_storage.py`、`job_cmds.py`、`client_manager.py`、`server_engine.py`、`server_runner.py`、`server_app_runner.py`、`training_cmds.py`、`job_scheduler.py`、`wf_comm_server.py`、`task_manager.py`、`bcast_manager.py`、`cse_server_ctl.py`、`gpu_resource_consumer.py`、`process_launcher.py`、`client_executor.py`、`scheduler_cmds.py`、`external_process_backend.py`、`cell_backend.py`、`attach_backend.py`、`attach_session.py` 都与 pin 相同。
 - `fed_server.py` 有两处改动：#5672 和 #5708，都在 53–644 行的调用方身份校验（`_resolve_client_fqcn_for_auth`、`_listen_command` 入口）。UPDATE_RUN_STATUS 分支只多了"非 SJ 调用方拒绝"，丢弃逻辑不变；`client_cleanup`、`remove_dead_clients`、`notify_dead_client`、`_sync_client_jobs`、outcome 处理都没变。`cross_site_model_eval.py` 的改动（#5706）只是保存路径限制，与 H11 无关。结论：所有已复现的问题在最新 main 上都还在。
-- 发布线（2.8 分支、`2.9.1rc8`）：H11、T1、T2（日志行解引用）、T3、R2、L13、N2、C1 的 completion 线程 `del` 在 2.8 和 2.9 上都有；C1-A 在 2.9.1rc8 上更宽；T1-b 在 2.9.1rc8 上以不同的失败点存在（静态阅读）；H03、H01 从 2.9 开始；T2 的秒级窗口从 2.9 开始；R1 从 2.8 开始（回归）；H08 只在 main。
+- 发布线（2.8 分支、`2.9.1rc8`）：H11、T1、T2（日志行解引用）、T3、R2、L13、N2、C1 的 completion 线程 `del` 在 2.8 和 2.9 上都有；C1-A 在 2.9.1rc8 上更宽；T1-b 在 2.9.1rc8 上以不同的失败点存在（静态阅读）；H03、H01 从 2.9 开始；T2 在 2.9 起多了 `_resolve_missing_client_outcome` 一段，但实测窗口仍是毫秒级；R1 从 2.8 开始（回归）；H08 只在 main。
 - 检索过的关键词（issue 和 PR）：FAILED_TO_RUN、`_job_complete_process`、completion thread、running_jobs KeyError、CUDA_VISIBLE_DEVICES、GPUResourceConsumer、resend_task、`_client_task_map`、get_jobs_to_schedule、`_check_job_status`、remove_dead_clients、notify_dead_client、client_cleanup、dictionary changed size、update_unfinished_jobs、update_abnormal_finished_jobs、ABANDONED、`_sync_client_jobs`、re-login、UPDATE_RUN_STATUS、execution_error、`_monitor_accepted_result_source`、`_resolve_ambiguous_result`、RESULT_REJECTED、deployment policy violation、dead client grace、strict_start_job_reply_check 等。除下面各节写到的，没有重复或相关的 issue。
 - 维护者的态度（#5300 中 pcnudde 的回复、#5301 的关闭理由）：只在复现需要人为时序、且没有证明自然发生或现实故障时，才会定为 P3 不修；也说过"有些问题真实但实践中不会发生，或后果轻到不值得冒修复的风险"。这决定了下面的提交顺序：先提无强制复现、后果重的。
 
@@ -89,15 +92,15 @@
 
 ### T1-b：部署期间删除 job，调度线程退出
 
-证据：REPRODUCED（`checks/confirm/t1b_repro.py`：真实 `JobRunner.run()` 及 except 分支、真实 SimpleJobDefManager 和 FilesystemStorage；部署用耗时 2 秒的桩，期间做一次真实删除；不强制调度；2/2）。MC：BFS 23 步找到。
+证据：REPRODUCED（`checks/confirm/t1b_repro.py`：真实 `JobRunner.run()` 及 except 分支、真实 SimpleJobDefManager 和 FilesystemStorage；部署用耗时 2 秒的桩，期间做一次真实删除；不强制调度；2/2）。自然时序（`checks/confirm/t1b_natural.py`，删除时刻随机）：窗口内删除必中，不是微秒级竞争；窗口 0.5–2.2 s（client 正常回复），有一个 client 不回 DEPLOY 时约 10 s；脚本式删除（提交后 0–2 s）11/30，人工删除（中位 8 s）快部署下 0/40、慢 client 下 20/30。同一根因的另一触发（`c1_natural.py`）：job 目录只读，真实 EACCES，DISPATCHED 或 RUNNING 写失败后 except 分支的 FAILED_TO_RUN 写入也失败，20/20 调度线程退出，job 停在 DISPATCHED 或 SUBMITTED；故障时刻由 harness 设定。MC：BFS 23 步找到。
 
 1. 后果：部署期间 job 仍是 SUBMITTED，`delete_job` 允许删除（`job_cmds.py:518` 只拒绝 DISPATCHED 和 RUNNING）。部署完成后，try 里的 `_check_job_status`（`job_runner.py:727`）对已删除的 job 拿到 None，`.meta` 抛 AttributeError（`job_runner.py:827-829`）；except 分支在 793–796 行再调一次 `_check_job_status`，抛同样的异常，没有处理，`run()` 退出。此后 server 不再调度任何 job，直到重启；已经在跑的 job 由 completion 线程照常收尾；这个 job 在各 client 上的资源预留也不会被取消。谁看到：所有用户，之后提交的 job 永远 SUBMITTED；SP 只有一条未捕获线程异常（`AttributeError: 'NoneType' object has no attribute 'meta'`，NVFlare 没有装 `threading.excepthook`，由 Python 默认 hook 打到 stderr），没有其他报错，`check_status` 看起来正常。
 2. 范围：所有部署（simulator 不走 JobRunner）；FilesystemStorage 是唯一自带的后端，其他后端只要 `get_job` 对已删除 job 返回 None 也一样；1 个 job 就够；窗口是整个部署过程（向所有 client 发 deploy，RPC 超时 10 s，custom code 大或 client 多时更长）。2.9.1rc8 上同一窗口也存在，失败点不同：部署后 `set_status(DISPATCHED)` 对已删除的对象抛 StorageException，except 分支里的 `set_status(FAILED_TO_RUN)` 再抛一次（静态阅读，未执行）。持续到 SP 重启。
-3. 可能性：中。"刚提交就发现提错了，马上删掉"是普通的用户操作，用户看到的状态仍是 SUBMITTED，窗口是秒级，不需要时序配合。
+3. 可能性：中。"刚提交就发现提错了，马上删掉"是普通的用户操作，用户看到的状态仍是 SUBMITTED，窗口是秒级，不需要时序配合。磁盘满或只读重挂载这类持续性存储故障每次都会触发，比 C1 现实得多。
 4. 严重度：高。一次普通的删除让整个 server 静默停止调度，波及所有用户；恢复要重启 SP，而重启又会把正在跑的 job 变成 R1 僵尸。
 5. 修复（与 T1 共用 F-A）：`_check_job_status` 遇到 None 时返回 True，即"不在期望状态"，调用方跳过这个 job；`run()` 的循环体每轮包一层 `try/except Exception`（记日志后 continue）；except 分支里的写状态也要容忍 job 已不存在。
 6. 上游：无相关 issue；main 未变。
-7. 建议：与 T1 合成一个 issue，以 T1-b 为主场景，优先级 4。
+7. 建议：与 T1 合成一个 issue，以 T1-b 为主场景，附上持续写失败的触发（真实 OS 故障，正好回应维护者对 #5301 要的"现实的存储故障"），优先级 4。
 
 ### T1：扫描与删除竞态，调度线程退出
 
@@ -127,11 +130,11 @@
 
 ### C1-B：completion 线程 KeyError 退出
 
-证据：REPRODUCED，强制调度 + 在 RUNNING 写入注入 EIO（`checks/confirm/c1_repro.py` 场景 B，连跑 3 次结果相同）。MC 盲跑 4 次找回线程退出；跨 job 后果在给 J2 退出定价后也能盲跑找回。
+证据：REPRODUCED，强制调度 + 在 RUNNING 写入注入 EIO（`checks/confirm/c1_repro.py` 场景 B，连跑 3 次结果相同）。不强制调度、只注入存储故障（`checks/confirm/c1_natural.py`）：C1 落在 completion 线程收尾的那一段，约占窗口的 F/1 s（F 是收尾耗时），client 正常回复 abort 时 2–17%，client 不回复、abort 等满 2 s 时 20/20。MC 盲跑 4 次找回线程退出；跨 job 后果在给 J2 退出定价后也能盲跑找回。
 
 1. 后果：`JobRunner.run` 先把 job 放进 `running_jobs`，再写 RUNNING（`job_runner.py:767-769`）。写入抛异常时，except 分支删掉 `running_jobs[job_id]`（772–775）；如果 completion 线程此前已经接手这个 job（SJ 已退出）并正在收尾，它随后执行没有保护的 `del self.running_jobs[job_id]`（583 行），抛 KeyError，整个 completion 线程退出。此后 server 上所有 job，包括完全无故障的，都不会再被收尾：不写终态、不归档 workspace、不发 JOB_COMPLETED。调度器的 `scheduled_jobs` 不再减少，占满 `max_jobs` 后不再调度新 job；`abort_job` 只设 `run_aborted`，状态永远不变。重启 SP 后这些 RUNNING 又落进 R1。谁看到：所有用户；SP stderr 一条 `_job_complete_process` 线程的 KeyError traceback。
 2. 范围：所有版本（2.8、2.9 有同一行）；任何部署。需要 RUNNING 那次写 job store 先挂住再失败（例如 NFS 或网络存储的瞬时故障），挂住期间 SJ 已经退出、completion 线程已经接手，而且 completion 线程自己的终态写入在 except 分支删除之后成功（存储已恢复）。持续到 SP 重启。
-3. 可能性：很低。需要注入级的存储故障，并且与 SJ 早退在时间上重叠；本地盘写满时写入会立即失败，窗口只有毫秒级。
+3. 可能性：很低。默认部署（本地盘 `FilesystemStorage` + 进程 launcher）下基本为 0：RUNNING 写入时 SJ 还活着（`start_client_job` 0.1–0.5 s 返回，配置错误的 SJ 最早约 3 s 才被回收），本地盘写失败中位 0.18 ms，fastfail 组 0/100；本地盘的典型故障是持续性的，触发的是 T1-b 而不是 C1。只有 RUNNING 请求以 ≥ 1 s 的耗时失败（带重试的对象存储式 `StorageSpec`，代码树里没有，只能是用户自写）且 SJ 在失败前已被回收（fail-fast SJ + K8s launcher，server 最多等 20 s）时才几乎必然：sdk 组 96/100，D 扫描与 min(1, D/1 s) 吻合。
 4. 严重度：高。一旦触发，server 级的收尾和调度同时丧失。
 5. 修复：583 行改成 `self.running_jobs.pop(job_id, None)`，completion 线程的循环体包 try/except（F-B，1–3 行，只保线程）。根因与 C1-A 是同一处所有权问题（F-C）：except 分支在 `self.lock` 下发现 completion 线程已经接手（`job_id in self._finished_job_states`）时，不删 `running_jobs`，也不写 FAILED_TO_RUN。
 6. 上游：无相关 issue；同族 #5301（迟到的 RUNNING 覆盖终态，我们提的）2026-09-15 以 NOT_PLANNED 关闭，维护者定为 P3，理由是复现需要人为时序，也没有证明存在能让终态抢先的存储故障。C1 正是"存储故障 + 时序"，但仍然需要时序配合。main 未变。
@@ -155,7 +158,7 @@
 
 1. 后果：SJ 在 `system_panic`（工作流抛异常 `server_runner.py:157`、部署策略违规等）之后以退出码 0 退出，执行出错只靠 `server_app_runner.py:90` finally 里一条 fire-and-forget 的 UPDATE_RUN_STATUS 传递（`server_engine.py:874-885`）。SP 在进程退出后最多等 2 s（`server_engine.py:204-235`），然后从 run_processes 里弹出这个 job；晚到的消息找不到条目，被丢弃（`fed_server.py:595-605`）；`_classify_finished_job_status(None)` 给出 FINISHED_COMPLETED。谁看到：数据科学家看到失败的 job 显示 COMPLETED，可能直接使用产物；只有翻 SJ 日志才能看到 "Aborting current RUN due to FATAL_SYSTEM_ERROR"。
 2. 范围：所有版本（2.8、2.9 相同）；任何部署；1 个 job。需要 SJ→SP 的本地连接在那一刻慢或丢消息：SJ 发完立刻 shutdown，fire-and-forget 没有确认也没有重试；SP 繁忙时的处理延迟也会触发。记录永久错误。
-3. 可能性：低。前提是 job 本身已经 panic，再叠加本地消息晚于 2 s 或丢失。自然丢失率没有测。
+3. 可能性：很低。前提是 job 本身已经 panic，再叠加本地消息晚于 2 s 或丢失。自然时序（`checks/confirm/l13_natural.py`，真实 cell 传输、真实 SJ 进程）：空闲 SP 200/200 正确，处理延迟中位 3.6 ms，余量至少 2.0 s；SP 加 4 个忙线程 100/100 正确，最大延迟 1.4 s。需要 SP 停顿超过 2 s，或连接在结束时断开、刚重连。
 4. 严重度：中。失败被静默报成成功，下游可能用到错误或不完整的模型。
 5. 修复：SJ 在 FATAL_SYSTEM_ERROR 时以非零退出码退出（`server_app_runner.py` 的 finally 或 runner_process 入口），让分类走可靠的返回码；或者把 UPDATE_RUN_STATUS 改成带回复、可重试的请求，SJ 收到确认后再退出。
 6. 上游：无直接相关的 issue；#5662（2026-11-05 合并）修的是 simulator 里 client 因 FATAL_SYSTEM_ERROR 停止时报告失败，属于同类问题的 simulator/client 侧，server 侧这条路径没变。main 上 UPDATE_RUN_STATUS 分支只多了 #5708 的调用方身份检查。
@@ -163,23 +166,23 @@
 
 ### T2：重新登录与 logout 循环交错，`client_cleanup` 线程退出
 
-证据：REPRODUCED，不强制，用 2 s 的 `fail_run` 桩代表 abort 往返（`checks/confirm/t2_repro.py`，3/3）。MC：带预算的 BFS 11 步找到；盲跑模拟命中不稳（3 次 900 s 里 1 次）。
+证据：REPRODUCED。`checks/confirm/t2_repro.py` 用 2 s 的 `fail_run` 桩代表 abort 往返（3/3），这个桩不符合真实代码（见第 1 点）。`checks/confirm/t2_natural.py` 去掉了桩，登录、logout、notify、`fail_run` 和到 SJ 子进程的 TCP 传输都是真实的，B 的重新登录时刻在扫描前后 ±X 内均匀随机：9/600（窗口 0.15 ms）、21/600（3 个 job，0.35 ms）、33/400（前面有 10 个过期 token，3.3 ms）。触发事件被放在窗口附近，所以仍属"以时序巧合为条件"一档。MC：带预算的 BFS 11 步找到；盲跑模拟命中不稳（3 次 900 s 里 1 次）。
 
-1. 后果：`remove_dead_clients`（`fed_server.py:309-321`）先列出失联的 token，再逐个 logout。处理一个死 client 时，如果走到 `_resolve_missing_client_outcome` → `fail_run`（那个 site 的 outcome 还 pending 且 SJ 已退出时，向各方发 abort，耗时数秒），另一个已经列进名单的 client 在这期间重新登录，旧 token 被弹出，`remove_client` 返回 None，`notify_dead_client(None)` 在 1114 行解引用 `client.name`，抛 AttributeError。`client_cleanup`（290–304）没有异常处理，线程退出。此后失联的 client 永不移除：admin 看到的 client 列表里一直有它；SJ 收不到 dead-client 通知，job 等一个已死的 site，默认无 task 超时就挂起；调度器按陈旧名单向死 client 部署。谁看到：运维（`check_status` 里死 client 一直在），以及之后受影响的 job 的用户；SP stderr 一条 AttributeError traceback。
-2. 范围：所有版本都有这个解引用（2.8 在 `remove_dead_clients` 的日志行，2.9 起在 `notify_dead_client`）；秒级窗口只在 2.9+，因为 2.8 没有 `_resolve_missing_client_outcome`，2.8 上窗口是微秒级。条件：≥2 个 client 在同一个 5 s 清理周期里同时超过 `heart_beat_timeout`（例如同时断网），其中一个在另一个的处理期间重新登录；重新登录只在 CP 重启或 server 会话变化时发生。持续到 SP 重启。
-3. 可能性：低。需要关联的多点失联，再加 CP 重启恰好落在秒级的处理窗口内。
+1. 后果：`remove_dead_clients`（`fed_server.py:309-321`）先列出失联的 token，再逐个 logout。处理一个死 client 时，如果走到 `_resolve_missing_client_outcome` → `fail_run`（只在那个 site 的 outcome 还 pending 且 SJ 已不在 `run_processes` 时才走到，`fed_server.py:1095-1103`；此时 `_stop_run` 取不到 run process，什么也不发，`job_runner.py:433-434`，实测 0.03 ms），另一个已经列进名单的 client 恰在这期间重新登录，旧 token 被弹出，`remove_client` 返回 None，`notify_dead_client(None)` 在 1114 行解引用 `client.name`，抛 AttributeError。`client_cleanup`（290–304）没有异常处理，线程退出。此后失联的 client 永不移除：admin 看到的 client 列表里一直有它；SJ 收不到 dead-client 通知，job 等一个已死的 site，默认无 task 超时就挂起；调度器按陈旧名单向死 client 部署。谁看到：运维（`check_status` 里死 client 一直在），以及之后受影响的 job 的用户；SP stderr 一条 AttributeError traceback。
+2. 范围：所有版本都有这个解引用（2.8 在 `remove_dead_clients` 的日志行，2.9 起在 `notify_dead_client`）；窗口在所有版本上都是亚毫秒到毫秒级（2.9 起多了 `_resolve_missing_client_outcome` 一段，也很快）。条件：≥2 个 client 在同一个 5 s 清理周期里同时超过 `heart_beat_timeout`，其中一个恰在另一个的处理期间重新登录。断网恢复后的重连不会触发：CP 继续用旧 token 发心跳，被按同一 token 重新激活（`client_manager.py:376-417`）。现实的触发是宕机超过 600 s 的 CP 重启，或管理员此时 remove/disable。持续到 SP 重启。
+3. 可能性：很低。每次"宕机超过 600 s 的 CP 重启"约 1e-7–1e-5；最不利的情形（前面积压多个过期 token）约 3e-5–6e-4。
 4. 严重度：中。server 级的失联检测丧失，但后果是潜伏的，要等之后有 client 死掉才体现为 job 挂起。
 5. 修复：`remove_dead_clients` 和 `logout_client` 里 `if client is None: continue`（根因，1 行）；`client_cleanup` 循环包 try/except（F-D，同时保住 T3 和未复现的"遍历活字典"变体）。
 6. 上游：无相关 issue；main 上这段未变。
-7. 建议：第二批，与 T3 合成一个 issue，优先级 8。
+7. 建议：第二批，与 T3 合成一个 issue，优先级 8。自然可能性可以忽略，能打动维护者的只有后果和 1 行修复。
 
 ### T3：遍历 `run_processes` 时另一个 job 退出
 
-证据：REPRODUCED，强制时序（`checks/confirm/t3_repro.py`：锁内 poll 停 50 ms 必现）；自然时序下 job B 在通知前后 ±10 ms 内均匀退出，300 次里 4 次触发。MC：盲跑深度 11 找回，D 轨 4 秒命中。
+证据：REPRODUCED，强制时序（`checks/confirm/t3_repro.py`：锁内 poll 停 50 ms 必现）；自然时序下 job B 在通知前后 ±10 ms 内均匀退出，300 次里 4 次触发。`checks/confirm/t3_natural.py`（job B 的 SJ 是真实子进程，用真实 `wait_for_complete` 观察退出）：1 个 job 15/1900（窗口约 0.08 ms），3 个 job 45/1900（约 0.24 ms）；SP 里加 4 个 CPU 忙线程时遍历拉长到中位 62 ms。默认 launcher 的 `poll()` 很快，K8s/Docker handle 在 `wait()` 返回时已缓存终态，`t3_repro.py` 里"锁内停 50 ms"没有现实对应。MC：盲跑深度 11 找回，D 轨 4 秒命中。
 
 1. 后果：同 T2。根因：`notify_dead_client`（`fed_server.py:1118`）不拿 `engine.lock` 就遍历 `engine.run_processes`，循环体里的 `notify_dead_job` → `send_command_to_child_runner_process` 要拿这把锁（`server_engine.py:887-911`）；另一个 job 的 SJ 退出时，`wait_for_complete` 在锁内 pop 掉一项（`server_engine.py:219-234`），继续迭代时抛 `RuntimeError: dictionary changed size during iteration`。
 2. 范围：所有版本（2.8 有同一循环）；多 job 并发；死 client 参与了某个 job，同时另一个 job 恰好结束。持续到 SP 重启。
-3. 可能性：很低。死 client 处理本身就少（600 s 超时），再叠加毫秒级窗口（在 ±10 ms 内退出时约 1.3%）。
+3. 可能性：很低。死 client 处理本身就少（600 s 超时），再叠加亚毫秒窗口：空闲 SP 上每个 dead-client 事件约 1e-6（按每分钟 1 次 SJ 启停算），SP 长期 GIL 饱和时上界约 1e-3。
 4. 严重度：中（同 T2）。
 5. 修复：先在 `engine.lock` 下拷一份 `list(self.engine.run_processes.items())` 再遍历（不能整个循环持锁，因为循环体要拿同一把锁）；`remove_dead_clients` 也遍历 `list(...)` 快照；外层用 F-D。
 6. 上游：无；main 未变。
@@ -187,11 +190,11 @@
 
 ### N2：收尾窗口里宽限期到期，完成的 job 被判失败
 
-证据：REPRODUCED，时序由场景设定（`checks/confirm/n2_repro.py`：真实 `process_dead_client_report`、`_monitor_tasks`、`_check_dead_clients`、`_job_policy_violated`、`finalize_run`；dead-job 报告的时间往前拨 59.5 s，`stop_controller` 用 1 s 的桩；对照组不 panic）。panic 之后记为 EXECUTION_EXCEPTION 的链路由 `l13_repro.py` 的对照组确认。MC：v8 的 C 轨报出，加时序前提 T4 后只在 `slowFinalize` 逃逸下出现。
+证据：REPRODUCED，时序由场景设定（`checks/confirm/n2_repro.py`：真实 `process_dead_client_report`、`_monitor_tasks`、`_check_dead_clients`、`_job_policy_violated`、`finalize_run`；dead-job 报告的时间往前拨 59.5 s，`stop_controller` 用 1 s 的桩；对照组不 panic）。panic 之后记为 EXECUTION_EXCEPTION 的链路由 `l13_repro.py` 的对照组确认。`checks/confirm/n2_natural.py` 用真实的 `ServerRunner._execute_run` 整个收尾路径（engine 和 `control_flow` 是桩，宽限期压缩到 1 s 只缩短试验），到期时刻在返回前后 ±A 内均匀随机：没装 torch 2/1200（窗口 0.8 ms），装了 torch 65/200（325 ms），`stop_controller` 1 s 时 950 ms。MC：v8 的 C 轨报出，加时序前提 T4 后只在 `slowFinalize` 逃逸下出现。
 
 1. 后果：`_monitor_tasks` 要到 `finalize_run` 置 `_all_done` 才停（`wf_comm_server.py:1201-1213, 1046`），而 ServerRunner 在 `control_flow` 返回后先 `stop_controller` 再 `finalize_run`（`server_runner.py:171-172`），这段时间里仍在做 60 s 宽限期的 dead-client 判定（1179–1199）和部署策略检查（1369–1404）。一个在工作流返回前约 60 s 死掉的 client 恰好在收尾窗口里到期，task monitor 调 `system_panic("Aborting job due to deployment policy violation")`，已经正常完成并保存的 job 记为 `FINISHED:EXECUTION_EXCEPTION`。谁看到：数据科学家看到失败状态，但结果和模型都在；SJ 日志在 "finalizing" 之后出现策略违规。
-2. 范围：所有版本。需要 `min_clients` 等于 client 数（recipe 常见写法；FedJob 默认 1 时只有 required_sites 里的 site 死亡或全部 client 死亡才算违规），或者配了 required_sites；client 死亡报告要落在"返回前 60 s"起、长度等于收尾耗时（秒级）的区间里。记录永久错误。
-3. 可能性：低。job 最后一分钟恰好有 client 死亡，且宽限期到期与收尾窗口重叠。
+2. 范围：所有版本。需要 `min_clients` 等于 client 数（recipe 常见写法；FedJob 默认 1 时只有 required_sites 里的 site 死亡或全部 client 死亡才算违规），或者配了 required_sites；client 死亡报告要落在"返回前 60 s"起、长度等于收尾窗口的区间里。`finalize_run` 持有 `_controller_lock`，monitor 的 `check_tasks` 也要这把锁，所以窗口约等于 `stop_controller` 的耗时加最多一个 0.2 s 的 tick；`finalize_run` 里 import 了 torch（`wf_comm_server.py:153`），非 torch 的 job 在装了 torch 的 server 上首次收尾要 0.9–1.2 s。记录永久错误。
+3. 可能性：低。job 最后一分钟恰好有 client 死亡，且宽限期到期与收尾窗口重叠。以"返回前最后 60 s 内有 dead-job 报告"为条件：标准 workflow 1.4e-5，非 torch job + 装 torch 的 server 5.4e-3，`stop_controller` 1 s 时 1.6e-2。
 4. 严重度：低。成功的 job 被报失败，产物完整，可以人工核对；影响是误报和可能的重跑。
 5. 修复：ServerRunner 在 `stop_controller` 之前告诉 communicator 工作流已经返回，`_monitor_tasks` 此后不再做策略 panic（1–3 行）。L13 的退出码修复不覆盖 N2：panic 照样发生，状态照样是 EXECUTION_EXCEPTION。
 6. 上游：无相关 issue；#3671 是通信错误导致的 job 失败，根因不同。main 未变。
@@ -199,11 +202,11 @@
 
 ### H03：过期的 source monitor 停掉服务下一个 task 的 trainer
 
-证据：REPRODUCED，强制抢占（`checks/confirm/h03_repro.py`：桩让 `peer_silent_for` 在返回旧值之前切换 source 身份）。MC：Trainer_X 变体深度 66 找到，需要 `monitorStale` 逃逸。
+证据：REPRODUCED，强制抢占（`checks/confirm/h03_repro.py`：桩让 `peer_silent_for` 在返回旧值之前切换 source 身份）。自然时序（`checks/confirm/h03_natural.py`）：monitor 读静默到复查之间的间隙中位 0.7 µs，有忙线程争 GIL 时均值 6.1 µs；71,584 次试验 0 次命中（95% 上界 8.3e-5），强制对齐的正向对照能判出 H03。MC：Trainer_X 变体深度 66 找到，需要 `monitorStale` 逃逸。
 
 1. 后果：launch_once 的外部 trainer 在服务 task B 时被 task A 的过期 monitor 停掉，而且不发 B 的 source 失效通知；B 的接收方只能等自己的下载超时，之后这一轮或这个 job 失败。谁看到：数据科学家看到 B 这一轮失败或 job 失败；CJ 日志里出现针对 A 的 "heartbeat timed out"，被停的却是 B 的 trainer。
 2. 范围：2.9+；Client API `external_process` + `launch_once=True` + 惰性（可下载）结果。需要 monitor 先读到"心跳超时"或"断连超过宽限"，紧接着 A 结算、B 被接受，都落在 `external_process_backend.py:1239-1283` 两次检查之间的微秒窗口里。
-3. 可能性：很低。先要有真实的心跳停顿超过超时，再叠加微秒窗口。
+3. 可能性：很低。先要有真实的心跳停顿超过超时，再叠加微秒窗口；每个"trainer 静默超过 30 s、并在下一个轮询周期内结算 A"的事件里约 1.5e-6–1.2e-5，实际上可视为不会自然发生。
 4. 严重度：低。后果可见（失败，而不是错误结果），受 B 自身超时约束。
 5. 修复：`_monitor_accepted_result_source` 只在 `_fail_accepted_result_source` 确认身份仍是 A 时才调 `_stop_trainer`（让它返回"是否认领成功"，或在 `_result_failure_lock` 内复核后再停）。
 6. 上游：无；main 未变。
@@ -211,7 +214,7 @@
 
 ### H01：Attach 模式把"传输完成"当成"已接受"
 
-证据：STATIC（只读代码，未执行复现）。
+证据：REPRODUCED，桩传输 + 注入回复丢失（`checks/confirm/h01_repro.py`：真实的 `CellClientAPI.send`、`AttachTrainerSession.publish_result` / `_resolve_ambiguous_result`、CJ 的 `_handle_result_ready` / `_handle_result_status` 和 `TransferWaiter`；桩是 cell 传输、lazy 结果的 FOBS 编解码和 task 关闭）。对照：task 开着时被接受；task 已关且拒收回复送达时 `send()` 报 rejected；结果小、没有 lazy 下载时两次回复丢失 `send()` 也报错。H01：CJ 下载完成后 task 关闭，两次 RESULT_REJECTED 回复都丢，状态查询都是 UNKNOWN，CJ 侧没有 authority，`send()` 正常返回。状态查询的回复丢不丢结果一样。
 
 1. 后果：CJ 在任务已关闭时回 RESULT_REJECTED，且不记录归属（`cell_backend.py:236-242`）；状态查询于是回 UNKNOWN（281–282）；TP 的 `_resolve_ambiguous_result`（`attach_session.py:441-467`）在 waiter 已 COMPLETED 时推断为已接受，`send()` 返回成功并清掉 trainer 侧数据。server 本来就把这一轮记为该 client 失败，影响只是 trainer 误以为发送成功。
 2. 范围：2.9+ Attach 模式；两次 RESULT_REJECTED 回复都丢失；任务已经因超时或 END_RUN 关闭。
@@ -219,7 +222,7 @@
 4. 严重度：低。
 5. 修复：CJ 记录被拒绝的 result_id，状态查询返回 REJECTED；或者 TP 在状态为 UNKNOWN 时不从传输完成推断接受。
 6. 上游：无；main 未变。
-7. 建议：不提（只有静态证据，后果轻）。
+7. 建议：暂不提（后果轻；需要 CJ→trainer 方向连续丢两个回复，而下载方向正常）。
 
 ### N1：非严格 START 下丢弃迟到 site 的失败 OUTCOME
 
@@ -237,7 +240,7 @@
 
 | 修复 | 位置 | 覆盖 | 不覆盖 |
 |---|---|---|---|
-| F-A | `job_runner.py::run` 循环体 try/except；`_check_job_status` 对 None 安全；`job_def_manager.py::_scan` 跳过不存在的对象 | T1、T1-b、715 行路径（线程存活和根因都覆盖） | C1-B（另一个线程） |
+| F-A | `job_runner.py::run` 循环体 try/except；`_check_job_status` 对 None 安全；`job_def_manager.py::_scan` 跳过不存在的对象 | T1、T1-b、715 行路径、持续写失败触发（线程存活和根因都覆盖） | C1-B（另一个线程） |
 | F-B | `_job_complete_process`：583 行 `pop(job_id, None)`，循环体 try/except | C1-B 的线程退出 | C1-A 的状态覆盖 |
 | F-C | `run()` except 分支：completion 线程已接手时不删 `running_jobs`、不写 FAILED_TO_RUN；或 `set_status` 拒绝终态→其他 | C1-A、A2、C1-B 的触发源；做到 `set_status` 时连 #5301 一起 | — |
 | F-D | `client_cleanup` 循环 try/except | T2、T3、遍历活字典的变体（只保线程） | 根因：T2 的 None 检查，T3 的快照遍历 |
@@ -258,20 +261,33 @@
 1. R2：CP 重启后 SJ 收不到 dead-job 通知，job 无限挂起。
 2. H08：自动恢复的 CJ 用上另一个 job 的 GPU。说明只在 main、违反 #5550 的承诺，赶在 2.10 之前。
 3. R1：SP 重启后 RUNNING 的 job 无法清理。写成 #4503 的回归，附 2.7 的对照和一行修复。
-4. T1-b + T1：删除 job 让调度线程退出。主场景用 T1-b（部署期间删除，秒级窗口），T1 附自然竞态的实测命中率；715 行路径作为同一修复覆盖的第三个入口，注明只读代码。
+4. T1-b + T1：删除 job 让调度线程退出。主场景用 T1-b（部署期间删除，秒级窗口），附持续写失败（真实 EACCES，20/20）的触发；T1 附自然竞态的实测命中率；715 行路径作为同一修复覆盖的另一个入口，注明只读代码。
 5. H11：重发路径重复登记 ClientTask，task monitor 退出，CSE 挂起。
 
 第二批（需要注入或时序巧合；按维护者对 #5301 的态度，合并成少量 issue，强调后果和修复成本）：
 6. C1-B（附 C1-A）：completion 线程 KeyError 退出；写明需要存储故障，修复一行。
 7. L13（附 N2）：SJ 收尾时的状态判定，失败报成功、成功报失败。
-8. T2 + T3：`client_cleanup` 线程会被两种竞态杀死。
+8. T2 + T3：`client_cleanup` 线程会被两种竞态杀死。两者的自然可能性都可以忽略，最适合并进下面的"加固"issue，不单独提。
 
 第二批也可以合成一个"后台线程与收尾状态加固"的 issue，附上面的共性说明，降低维护者的处理成本。
 
-暂不提：H03（很低，必要时附在别的 issue 里提一句）、H01（只有静态证据）、N1（只有模型反例）。
+暂不提：H03（自然时序 0/71,584，必要时附在别的 issue 里提一句）、H01（已复现但后果轻、需要连续丢两个回复）、N1（只有模型反例）。
 
 写 issue 时：每个 issue 标明证据等级（无强制 / 强制 / 注入），给出复现脚本和 main SHA（`5c54edda`），后果写用户能看到的现象，不写模型细节。
 
 ## 自然发生率
 
-截至定稿（08:50 后），`notes/repro-natural-A.md` 还不存在；`notes/repro-natural-B.md` 只是骨架，范围是 C1-A、C1-B、T1-b、H03，目前只写了 C1 的窗口分析（§1.1），测量、随机试验和结论都还是占位。§1.1 与本文一致：C1-B 只有 RUNNING 写入失败这一条路径（另一个删除入口 `remove_running_job` 只被没有调用者的 `pause_server_jobs` 调用）；配置错误的 SJ 不发 UPDATE_RUN_STATUS，`wait_for_complete` 一定等满 2 s 才 pop，这限定了 C1 需要的写入挂起时长。B 也明确写了本轮试验不会把 C1、T1-b 升到"无强制"一档。所以上面的可能性评级仍只依据代码里的默认常量和现有复现脚本（T1 的 300/20 排队实测、T3 的 ±10 ms 自然命中率）。自然测量结果出来后，最可能改变评级的是 T1（常见排队规模下的命中率）、T1-b、C1、T3、L13（本地状态消息的自然丢失或延迟）和 N2。
+来源：`notes/repro-natural-A.md`（T2、T3、L13、N2、H01）和 `notes/repro-natural-B.md`（C1-A、C1-B、T1-b、H03），2026-11-07。随机试验不在线程之间做事件对齐；凡是把触发事件放在窗口附近 ±X 内均匀随机、再从命中率反推窗口的，仍算"以时序巧合为条件"，不升到"无强制"。本轮没有任何一项升级。
+
+| 发现 | 自然条件下的窗口或命中率 | 对评级的影响 |
+|---|---|---|
+| T1-b | 部署窗口内删除必中；窗口 0.5–2.2 s，慢 client 约 10 s；脚本式删除 11/30，人工删除 0/40（快部署）或 20/30（慢 client）；持续写失败 20/20 | 维持"中"；多一个更现实的触发 |
+| C1-A / C1-B | 默认部署 0/100；RUNNING 请求以 ≥ 1 s 耗时失败且 SJ 已回收时 96/100；C1-B 占 2–17%，abort 等满 2 s 时 20/20 | 维持"很低"，触发条件收窄到自写存储 + K8s launcher |
+| T2 | 窗口 0.15–3.3 ms；每次长时间宕机的 CP 重启约 1e-7–1e-5 | 低 → 很低；原 2 s `fail_run` 桩不符合真实代码 |
+| T3 | 窗口约 0.08 ms（3 个 job 0.24 ms）；每个 dead-client 事件约 1e-6 | 维持"很低" |
+| L13 | 空闲 SP 0/200、忙 SP 0/100 误判；余量 ≥ 1.18 s | 低 → 很低 |
+| N2 | 窗口 0.8 ms（标准）/ 325 ms（非 torch job + 装 torch 的 server）/ 950 ms（`stop_controller` 1 s） | 维持"低" |
+| H03 | 0/71,584；每个前提事件约 1e-6–1e-5 | 维持"很低"，实际上不会自然发生 |
+| H01 | 未做自然试验；需要单方向连续丢两个回复 | STATIC → REPRODUCED（桩 + 注入），维持"很低" |
+
+对模型的提示：N2 的收尾窗口在标准 workflow 下是毫秒级，`slowFinalize`（收尾持续"几秒"）偏宽；T2 的现实触发是长时间宕机后的 CP 重启，与 Reg_F 里 GoStale 需要 `deadClient` 一致。
