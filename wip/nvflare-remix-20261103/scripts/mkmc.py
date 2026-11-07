@@ -17,7 +17,8 @@ PORT_INVS = ("ClaimNeedsMaterialized","MaterializedIsRegistered","AggregateIsAcc
 def build(name, grain=None, default="C", faults=(), sites=2, launch=1, attempt=1,
           inv=PORT_INVS, prop=(), symmetry=True, constraint=None,
           outdir=None, extends=("Mix", "Props"), extra_defs="", deadlock=False, rarity=None,
-          throttle=None, profile=(), known=False, fuse=False, init_states=None, action_constraint=None):
+          throttle=None, profile=(), known=False, fuse=False, init_states=None, action_constraint=None,
+          extra_stutter=()):
     """fuse (simulation, with throttle): each trace draws a phase (JobPhase.FusePhases)
     at its initial state; priced steps are refused before the job reaches it (unless no
     free step is enabled), and accepted with probability 1/T from then on.
@@ -117,6 +118,7 @@ def build(name, grain=None, default="C", faults=(), sites=2, launch=1, attempt=1
             tla[1] = "EXTENDS " + ", ".join(extends) + ", TLC"
         if rarity is None:
             tla.insert(-1, "GNext == Next \\/ ((DoneStutter \\/ ((AtBoundAny" + (" \\/ KnownStuck" if known else "")
+                       + "".join(f" \\/ {x}" for x in extra_stutter)
                        + ") /\\ UNCHANGED portVars)) /\\ UNCHANGED privVars)")
         else:
             ob = "OverBudget"
@@ -124,6 +126,7 @@ def build(name, grain=None, default="C", faults=(), sites=2, launch=1, attempt=1
                 tla.insert(-1, "OverBudgetF == ENABLED (FPriced /\\ rare' > RareBudget /\\ fuse' = fuse)")
                 ob = "OverBudgetF"
             tla.insert(-1, "GNext == RNext \\/ ((DoneStutter \\/ ((AtBoundAny \\/ " + ob + (" \\/ KnownStuck" if known else "")
+                       + "".join(f" \\/ {x}" for x in extra_stutter)
                        + ") /\\ UNCHANGED portVars)) /\\ UNCHANGED <<privVars, rare>>)")
         nxt = "GNext"
     if fuse:

@@ -43,5 +43,8 @@ LNoSpawnAfterShutdownK == [][jobSP_f.shut.pc /= "none" =>
 \* were stopped (S1 breaks it; jobs registered later are S4)
 LShutdownStopsAllK == jobSP_f.shut.pc = "done" =>
     \A k \in jobSP_f.shut.snap : jobSP_f.jobs[k].serverRegistered => k \in jobSP_f.shut.stopped
+\* the SP process has exited after its shutdown (server_shutdown's finally sets SHUTDOWN):
+\* a legitimate end for the deadlock check (v9)
+ShutdownExited == jobSP_f.shut.pc = "done"
 
 =========================================================================

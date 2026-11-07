@@ -22,7 +22,7 @@ import mkmc, run_mc  # noqa: E402
 
 BUILD_KEYS = ("grain", "faults", "sites", "launch", "attempt", "inv", "prop", "constraint",
               "extends", "deadlock", "rarity", "throttle", "profile", "symmetry", "default", "known",
-              "fuse", "init_states", "extra_defs", "action_constraint")
+              "fuse", "init_states", "extra_defs", "action_constraint", "extra_stutter")
 
 
 class Budget:
