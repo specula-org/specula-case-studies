@@ -799,6 +799,7 @@ JobRunnerMarkAborted ==
 \* private/fed/server/job_runner.py:494-527
 JobRunnerSelectCompletion ==
     LET j == JobId IN
+    /\ ~jobSP_f.shut.askStop   \* v9: job_runner.py:494 while not self.ask_to_stop
     /\ jobs[j].running
     /\ ~jobs[j].serverRegistered
     /\ jobs[j].completion = "idle"
@@ -1225,9 +1226,10 @@ ShutdownStart ==
        /\ jobSP_f' = Fin(n)
        /\ pJobSP' = PortOf(Fin(n))
     /\ UNCHANGED <<net>>
-\* next() after the dict changed size
+\* next() after the dict changed size; the first next() follows keys() at once, so a
+\* change can only be seen after at least one _stop_run (which takes time)
 ShutdownIterError ==
-    /\ ShutLoop /\ Cardinality(RunProcs) /= jobSP_f.shut.size
+    /\ ShutLoop /\ jobSP_f.shut.stopped /= {} /\ Cardinality(RunProcs) /= jobSP_f.shut.size
     /\ LET n == [jobSP_f EXCEPT !.shut = [@ EXCEPT !.pc = "done", !.err = TRUE]] IN
        /\ jobSP_f' = Fin(n)
        /\ pJobSP' = PortOf(Fin(n))
@@ -1288,6 +1290,7 @@ J2Exit ==
     /\ UNCHANGED <<net>>
 J2Complete ==
     /\ "multiJob" \in Profile /\ jobs[J2].running /\ ~jobs[J2].serverRegistered
+    /\ ~jobSP_f.shut.askStop
     /\ jobs[J2].completion = "idle" /\ CompletionThreadAlive
     /\ jobs[JobId].completion \in {"idle", "done"}
     /\ LET n == [jobSP_f EXCEPT !.jobs = [jobs EXCEPT ![J2].status = "COMPLETED", ![J2].running = FALSE,

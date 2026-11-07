@@ -39,7 +39,9 @@ LNoSpawnAfterShutdown == [][jobSP_f.shut.pc /= "none" =>
 LNoSpawnAfterShutdownK == [][jobSP_f.shut.pc /= "none" =>
     \A k \in DOMAIN jobSP_f.jobs : (jobSP_f'.jobs[k].serverSpawned /\ ~jobSP_f.jobs[k].serverSpawned)
                                     => k = jobSP_f.shut.passJob]_jobSP_f
-\* the jobs listed in run_processes when the shutdown began were all stopped (S1 breaks it)
-LShutdownStopsAllK == jobSP_f.shut.pc = "done" => jobSP_f.shut.snap \subseteq jobSP_f.shut.stopped
+\* the jobs listed in run_processes when the shutdown began and still there at its end
+\* were stopped (S1 breaks it; jobs registered later are S4)
+LShutdownStopsAllK == jobSP_f.shut.pc = "done" =>
+    \A k \in jobSP_f.shut.snap : jobSP_f.jobs[k].serverRegistered => k \in jobSP_f.shut.stopped
 
 =========================================================================
