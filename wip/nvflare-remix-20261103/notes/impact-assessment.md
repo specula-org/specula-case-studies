@@ -26,15 +26,16 @@
 | N2（REPRODUCED，时序巧合为条件，收尾路径真实） | 已完成并保存的 job 在收尾窗口被判策略违规，记为 EXECUTION_EXCEPTION | 所有版本；`min_clients` = client 数或配了 required_sites；client 死亡恰在工作流返回前约 60 s；窗口 = `stop_controller` 耗时 + ≤ 0.2 s：标准 workflow 0.8 ms，非 torch job 在装了 torch 的 server 上 325 ms | 低 | 低 | F-J | 无（#3671 根因不同）；main 未变 | 9（附在 L13） |
 | H03（REPRODUCED，强制抢占；自然 0/71,584） | 过期 monitor 停掉正在服务 task B 的 launch_once trainer，B 没有失效通知 | 2.9+；external_process + `launch_once` + 惰性结果 | 很低 | 低 | F-K | 无；main 未变 | 10（暂不单独提） |
 | H01（REPRODUCED，桩传输 + 注入回复丢失） | Attach `send()` 报成功，但 CJ 已拒绝该结果；server 本来就把这一轮记失败 | 2.9+；Attach；两次 RESULT_REJECTED 回复都丢 | 很低 | 低 | 状态查询返回 REJECTED | 无；main 未变 | 暂不提 |
+| S1（REPRODUCED，桩 SJ + 桩传输，时序由场景设定） | `shutdown server`/`restart server` 中途抛 RuntimeError：后面的 job 不被停止，SYSTEM_END 不触发，调度器不停；错误留在 executor future 里无日志；restart 时孤儿 SJ + R1 | 2.8/2.9/main；≥2 个运行中的 job，且有一个已注册但不回复的 client（每个 job 的 abort 等满 2 s） | 中 | 中 | `list(engine.run_processes.keys())` 快照（1 行） | 无；main 未变 | 第一批末尾或并入 T2+T3 的加固 issue |
 | N1（MODEL-ONLY） | 非严格 START 下，回复超时但实际启动的 site 的失败 OUTCOME 被丢弃，job 可能 COMPLETED | 默认非严格模式；START 回复晚于 20 s | 低 | 低 | 保留该 site 的 pending outcome | 无；main 未变 | 不提 |
 
 ## 按根因计数
 
 | 口径 | 个数 | 是哪些 |
 |---|---:|---|
-| 在真实代码上复现 | 14 | C1-A、C1-B、H08、H11、T1、T1-b、T2、T3、R1、R2、L13、H03、N2、H01 |
+| 在真实代码上复现 | 15 | C1-A、C1-B、H08、H11、T1、T1-b、T2、T3、R1、R2、L13、H03、N2、H01、S1 |
 | 其中无强制调度、无注入 | 5 | H08、H11、T1、R1、R2 |
-| 其中靠强制调度、耗时桩、注入故障或以时序巧合为条件 | 9 | C1-A、C1-B、T1-b、T2、T3、L13、H03、N2、H01 |
+| 其中靠强制调度、耗时桩、注入故障或以时序巧合为条件 | 10 | C1-A、C1-B、T1-b、T2、T3、L13、H03、N2、H01、S1 |
 | 只有静态代码确认 | 0 | —（H01 已在 11-07 复现） |
 | 只有模型反例 | 1 | N1 |
 | 本次只读代码新看到、未执行（不计数） | 2 | T1 的 715 行路径；R1 的"abort 后立即 shutdown"路径 |

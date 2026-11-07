@@ -534,3 +534,44 @@
 | Phase 1 候选、第一次确认 | 4 | H08、H11、H03、H01 |
 | 只有模型反例 | 1 | N1 |
 | 只有静态代码确认 | 0 | — |
+
+## 15. 第九轮（11-07）：失败语义扫描、SP 关机路径（S1）
+
+**失败语义扫描**（只读 pin `c411a201`；server、client、task_worker、apis/impl、client_api 执行器、资源管理器、job launcher）：
+- 扫了 55 处：不带保护的 `del`/`pop`、对共享字典的遍历、`get_job(...)` 后的链式取值、后台线程的循环体。
+- 已知的 C1-B（583）、H11（1264）、T3（1118）、T1（727/793）都在命中里。
+- 其余大多有锁、存在性检查或每轮的 try（CP 心跳）。
+- 新候选三个：
+  - S1（`job_runner.py:946`）；
+  - S2：`abort_before_start` 对已删除 job 取 `.meta`（821 行），只让那次 abort 命令失败；
+  - S3：资源预留 30 秒过期，部署加启动更久时 START 分配失败。
+  - S2、S3 只有静态证据。
+
+**S1 在真实代码上复现**（REPRODUCED，桩 SJ 和桩传输，SJ 退出时刻由场景设定；`checks/confirm/s1_repro.py`）：
+- 背景：`shutdown server` 和 `restart server` 在有 job 运行时都允许。两者都在 engine 的 executor 里调用 `server_shutdown` → `FederatedServer.fl_shutdown` → `stop_all_jobs` → `JobRunner.stop_all_runs`。
+- 根因：`stop_all_runs` 遍历 `engine.run_processes.keys()` 时不取快照（946 行）。而每停一个 job，`abort_app_on_server` 都另起线程等它退出后弹出条目（`server_engine.py:394-410`），`wait_for_complete` 也会弹出（204-237）。
+- 触发：某个 client 仍在注册表里但不回复（比如刚死、还没到 600 秒心跳超时），每个 job 的 `abort_client_run` 都要等满 2 秒。前一个 job 的 SJ 在循环结束前退出，下一次迭代就抛 `RuntimeError: dictionary changed size during iteration`。
+- 后果：
+  - 后面的 job 不会被停止；
+  - `SYSTEM_END` 不触发，基类的关机流程不执行，`ask_to_stop` 不置位；
+  - 异常留在 executor 的 future 里，没有任何日志。
+  - 如果是 restart，没被停止的 job 会成为旧 SP 的孤儿进程，新 SP 又不做启动恢复（R1）。
+- 实测：
+  - 3 个 job：对照组（client 都回复）全部停止，`SYSTEM_END` 触发。
+  - S1：停完第 2 个后抛错，第 3 个 job 的 SJ 一直在运行。
+  - 扫 SJ 退出时间（收到 abort 后 0.3/1.5/3.0 秒）：只要前面某个 SJ 在循环结束前退出就触发；只有 2 个 job 且 3.0 秒才退出时不触发。
+- 范围：main、2.9、2.8 都有同一循环和清理线程。上游没有相关 issue。
+- 与 T3 同族（遍历 `run_processes` 不取快照），但根因位置和后果不同，按根因单独计。修法是 `for job_id in list(engine.run_processes.keys())`。
+
+**按根因汇总（截至 11-07 第九轮）：**
+
+| 口径 | 个数 | 是哪些 |
+|---|---:|---|
+| 在真实代码上复现 | 15 | C1-A、C1-B、H08、H11、T1、T1-b、T2、T3、R1、R2、L13、H03、N2、H01、S1 |
+| 其中不需要强制调度或注入 | 5 | H08、H11、T1、R1、R2 |
+| 其中靠强制调度、桩、注入故障或以时序巧合为条件 | 10 | 加上 S1 |
+| 有模型反例且盲跑能找回 | 13 | S1、H01 还不在模型里 |
+| 新于上游 | 14（或 15） | 都没有提交 |
+| 新于 Phase 1 | 11 | 加上 S1 |
+| 只有静态代码确认 | 2 | S2、S3（新线索，影响低或依赖时序） |
+| 只有模型反例 | 1 | N1 |
