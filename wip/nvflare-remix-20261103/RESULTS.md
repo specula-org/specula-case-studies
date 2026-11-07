@@ -307,3 +307,192 @@
 - 修了两处：一是静默步上限从 10 提到 120，细变体两个可观测事件之间最多有 100 步左右的内部步；二是允许一步对应 3 个观测事件，因为 `ServerRunnerEndRun` 在同一步里置 done 并广播两条 END_RUN，真实代码也是一次 aux broadcast。
 - 结果：真实 POC trace（120 步，其中 68 个端口事件）在全细组合上被接受。BFS 会因为静默步的交错爆炸而跑不完，所以接受是用随机模拟找到的一条完整匹配。全粗组合和两种交替组合也都接受。
 - 负例：把 `SendStart` 挪到 `ServerLaunch` 之前，全粗组合在 BFS 下穷尽拒绝。
+
+**hunt6**（11-05 17:20 至 11-06 00:29，墙钟 7 小时 9 分，155 个 run，75.1 run·小时；没有 worker 异常，结束后没有残留进程）：
+
+| 跑法 | run 数 | 跑满预算 | 违例 | 规模 |
+|---|---:|---:|---:|---|
+| S 11 个故障族，降频深 simulation，已知发现全部过滤 | 120 | 120 | 0 | 135,154 条 trace，3.20 亿状态 |
+| L 3-site 实例（simulation） | 12 | 12 | 0 | 9,499 条 trace，4,008 万状态 |
+| D 盲跑重新发现 T1、R1、R2 | 8 | 0 | 8 | 156 条 trace |
+| B rarity BFS（K=1、K=2） | 15 | 15 | 0 | 9,389 万 distinct |
+
+- D 的 8 个 run 都找到了要找的问题：T1 4 次、R1 2 次、R2 2 次（R2 表现为 deadlock）。我核对了 R2 的两条 trace，机制一致：CP 重启，CJ 随之退出，SJ 那一轮的 task 一直挂着，没有任何 dead-client 通知，job 停在 RUNNING。
+- 把已知发现过滤掉之后，S、L、B 三类共 147 个 run 没有报出任何新违例。这两轮的新 bug 都是先做代码排查（线程异常退出、进程重启），再补进模型的。
+- **更正（§12）：** 当时我据此判断"盲跑已接近饱和"，这个结论不成立。事后测量表明，hunt6 的搜索基本没有到达 job 的运行和收尾阶段：T=20 的模拟大多在 RUNNING 之前就因故障结束，BFS 也没到 job 结束的深度。所以 0 个新违例只说明启动阶段没有问题。
+
+## 12. 第七轮（11-06）：状态空间诊断、v7 搜索改造、hunt7
+
+**诊断**（`.build/x7/`；导出 hunt6 原配置的模拟 trace，每组 64 条，逐条看 job 何时进 RUNNING、何时进终态；另跑无故障 BFS 求最短路径）：
+
+| 问题 | 测量 | 原因 |
+|---|---|---|
+| 节流 T=20 下 job 活不到 RUNNING | 细 JobSP 的族（allP、proc、restart、job）只有 0–15/64 条 trace 到 RUNNING；T=200 时是 43–53/64 | 节流按步抽签（每步 1/T），而 abort、delete、CHECK 超时、丢包几乎每一步都可用；稀有度权重是按"发生一次"定价的，所以长时间可用的故障被大量过度采样 |
+| BFS 到不了 job 结束 | 无故障最短路径：到 RUNNING 14/20/39/53 步（全粗 1 site/2 site、全细 1 site/2 site）；到终态全粗 1 site 69 步，其余超过 58–129 步还没到。hunt6 B 轨停在 30–60 层 | 启动阶段很小（全粗 1 site 前 47 层只有 4,095 个状态）；宽度爆炸在 RUNNING 之后，每层约 ×1.4 |
+| RUNNING 之后的宽度爆炸 | 新状态主要来自收尾阶段各组件的关闭顺序、任务轮询、SJ 工作流启动的一串内部步骤 | TLC 没有偏序规约，独立的内部步骤每种顺序都是新状态；网络是只增不减的消息历史，路径不同的状态永远不会合并 |
+| 细 JobSP 的调度器空转 | 58–93% 的模拟步数在 job 终态之后，其中 99% 是 BeginPass/ReturnPass/EndPass；按墙钟只占 5–30% | job 结束后调度扫描还能无限转圈 |
+
+- TLC 模拟日志里的 `trace length mean` 不可信：tail 族实际 trace 中位 134 步，日志报 1435。
+- **定价漏洞（这一轮发现，"不现实的时序"的一个实例）：** client 端的 get-task 超时、task-check 超时、等回执超时，以及有损网络下多出的一次轮询，本该按 netLoss/submitTimeout 计价，实际都是免费的。
+  - 原因是 TLC 会预先计算共享模块里零参数的常量定义（`FedLossy`、`FedMaxPoll`、`FedMaxTry`），在 `INSTANCE ... WITH Faults <- NormalFaults` 的定价实例里仍沿用那个值，替换不生效。我用三个模块的最小例子确认了这一点（`.build/x7/toy`）。
+  - 后果：client 可以在回复到达前立刻超时、重新轮询，几次就用完轮询上限，trace 停在 AtBound。受影响的是含 netLoss/submitTimeout 的族（tail、net、cse、err、allP）的所有带节流或预算的 run，包括 hunt5、hunt6。
+  - 没有造成假反例；之前报告的 bug 和 N1 都不依赖这几步。
+  - 修法：三者改成以故障集为参数的算子（`FedLossyIn(Faults)` 等）。模型本身的行为不变，只影响定价。
+- 已知的三处时序前提 T1–T3 仍然有效：默认禁止，由 `slowSJTeardown`/`slowAdminStop`/`slowEnvelope` 放开并按最高权重计价。模型里没有时间这一根因还在。
+
+**v7 改动**（DESIGN §11；模型行为不变，只改搜索）：
+- **按阶段放行故障：** `spec/JobPhase.tla` 用端口定义 7 档进度。每条模拟 trace 开始时随机抽一档，到达之前拒绝计价步和只为驱动故障机制的免费步（如 30 秒时钟 tick），之后按 1/T 放行；每条 trace 的稀有度预算为 4。
+- **检查点 BFS：** `scripts/ckpt.py` 用同一组合、同一故障集、预算 0 模拟到某一档，取那个状态作为 BFS 初始状态。hunt7 为 11 个族各采了阶段 2–5 的检查点，每个 2 份。
+- **去掉调度器空转：** 没有 SUBMITTED job 时不开始扫描。
+- **TLC 线程栈加到 64 MB：** 去掉空转后，什么都不可用的状态上 TLC 要沿 532 个动作的 `\/` 链递归到底，默认栈会溢出。
+
+**验证：**
+- 按阶段放行（T=20，每组 48 条 trace）：到 RUNNING 的比例从 0–15/64 升到 27–33/48；终态之后的步数降到 2–15%。第一个故障的位置随抽到的阶段变化，例如 proc 全细 2 site 各档的中位数为 16、33、95、364、501、875 步。
+- 检查点 BFS：proc 族从阶段 3 出发，K=1，5 分钟 44 万状态无违例；R1 在 3 秒（深度 8）、R2 在 5 秒（深度 21）重新找到，机制与原来一致。
+- JobSP 细到粗精化复查跑满预算（586 万状态）无违例；全细组合上真实 POC trace 仍被接受（40 秒）。
+- hunt7 冒烟 31 个 run：28 个无违例，3 个盲跑重新发现（T1 ×2、R1）全部命中，没有 worker 异常。
+- 代价：按阶段放行后每一步更贵（tail 族每 worker 每秒 2.8 步，hunt6 的配置是 16.6 步），因为 trace 现在大部分时间处在多个组件同时活跃的阶段；全细 2 site 一个 job 要约 900 步才到 end-run。
+
+**hunt7**（11-06 05:49 至 10:25 UTC，墙钟 4 小时 36 分，130 个 run，35.9 run·小时；没有 worker 异常，结束后没有残留进程）：
+
+| 跑法 | run 数 | 违例 | 规模 |
+|---|---:|---:|---|
+| S 按阶段放行的深度模拟，11 个故障族，已知发现全部过滤 | 60 | 0 | 3,679 条 trace（每条走完整个 job），3,102 万状态（TLC 计数） |
+| L 3-site 实例 | 6 | 0 | 231 条 trace |
+| D 盲跑重新发现 | 8 | 8 | T1 ×4、R1 ×2、R2 ×2，新的搜索方式没有丢掉旧发现 |
+| C 检查点 BFS（阶段 2–5，K=1；6 个族加 K=2） | 56 | 0 | 7,029 万 distinct；从检查点往后 14–63 层；4 个穷尽 |
+
+- 穷尽的 4 个（在"从该阶段出发、最多 1 个故障"的范围内无违例）：tail 族 end-run（20.7 万状态）、job 族第 2 轮（1.2 万）、err 族 end-run（22.8 万）、del 族第 2 轮（93.0 万）。
+- 局限：2 site 全细的族（cse、allP）从检查点只往后走了 14–18 层；故障要很久以后才显现的后果（比如收尾时的 hang）只有 S 轨覆盖。
+- 结论：这次搜索真正到达了运行和收尾阶段，在当前模型能表达的范围里仍然没有新违例。和 hunt6 不同，这个"没有"现在有覆盖数据支撑，但仍是有界证据。
+- 我的一个操作失误：等待 hunt7 结束的循环用了 `pgrep -f`，匹配到了自己，所以 hunt7 在 10:25 结束后我过了约 4 小时才发现。结果本身不受影响。
+
+**同时做的代码排查**（只读源码，没有改 spec）：
+- **T3（REPRODUCED，强制时序；`checks/confirm/t3_repro.py`）：** `notify_dead_client`（`fed_server.py:1118`）遍历 `engine.run_processes` 时没有拿 `engine.lock`，而循环体里的 `send_command_to_child_runner_process` 要拿这把锁。另一个 job 的 SJ 退出时，`wait_for_complete`（`server_engine.py:219-234`）会在锁内 pop 掉一项；循环继续时抛 `RuntimeError: dictionary changed size during iteration`，`client_cleanup` 线程退出，之后死掉的 client 不再被移除。对照组正常；强制时序（锁内停 50 ms）必现；自然时序下 job B 在通知前后 ±10 ms 内退出，300 次里 4 次触发。§11 当时已注意到但没有复现。后果和 T2 相同，根因不同。
+- 其余 6 处遍历共享字典的地方（cellnet、job runner、task monitor 等）读写都在同一把锁下。
+- SJ 心跳早于登记导致误杀：排除，各 launcher 创建完进程或 pod 就返回。
+- **时序清单**（`notes/timing-inventory.md`，16 项，时序 spec 的底稿）：3 项带价逃逸的默认时序前提（T1–T3），8 项计价故障，2 项免费步，2 项模型里没有表达。
+- **L13（只有代码阅读）：** SJ 退出时 server 最多等 2 秒的 UPDATE_RUN_STATUS（`server_engine.py:204-235`），晚到或丢失时 `execution_error` 被丢弃（`fed_server.py:595-605`），SJ 以 0 退出的话 job 记为 COMPLETED；这两段还分别用 `FederatedServer.lock` 和 `engine.lock`。没有复现，模型里还没有表达。
+
+**按根因汇总**（截至第七轮）：
+
+| 口径 | 个数 | 是哪些 |
+|---|---:|---|
+| 在真实代码上复现 | 10 | C1-A、C1-B、H08、H11、T1、T1-b、T2、T3、R1、R2 |
+| 其中不需要强制调度 | 5 | H08、H11、T1、R1，R2（server 端逻辑层面） |
+| 其中靠强制时序或耗时的桩代码 | 5 | C1-A、C1-B、T1-b、T2、T3 |
+| 新于上游 | 9（或 10） | 都没有提交；C1-A 和我们的 #5301（NOT_PLANNED）缺的是同一个终态检查，按同一根因族算就是 9 |
+| 新于 Phase 1 | 8 | C1-A、C1-B、T1、T1-b、T2、T3、R1、R2 |
+| Phase 1 候选、第一次确认 | 2 | H08、H11 |
+| 只有模型反例 | 1 | N1 |
+| 只有代码阅读线索 | 1 | L13 |
+
+**L13 补进模型并在代码上复现**（第七轮后续）：
+- 代码级（`checks/confirm/l13_repro.py`；真实的 `FederatedServer._listen_command`、`ServerEngine.wait_for_complete`、`JobRunner._get_finished_job_status`；只有 SJ 进程句柄和消息投递时机是桩）：system_panic 之后 SJ 以 0 退出，执行出错只靠一条 fire-and-forget 的 UPDATE_RUN_STATUS 传递。对照组（消息 50 ms 到）记为 `FINISHED:EXECUTION_EXCEPTION`；消息在 SJ 退出 2.5 秒后才到、或丢失时，记为 `FINISHED:COMPLETED`。证据级别：REPRODUCED（注入消息延迟或丢失）。触发需要 SJ 到父进程的内部连接在那一刻出问题。
+- 模型：新故障 `statusLost`（权重 2，和其他时序逃逸同级），只作用于"panic 后以 0 退出"的情况；细、粗 JobSP 各加一个观察 SJ 退出的分支。新通用性质 `GFinishedNoPanic`（记为 COMPLETED 的 job 没有发生过 panic）。原来的 `GFinishedNoAbnormalExit` 只排除 `"crashed"`，抓不到这种情况；模型里"panic 一定被记录"的写法是 bfs3 时当作模型错误修掉的，现在看那是真实代码会出现的结果。
+- 检查：带 `statusLost` 的定向 BFS 找到违例（细 JobSP 50 层、粗 32 层，路径都是 CommSJ 策略 panic → SJ 退出 → 状态消息没到 → COMPLETED）；不带它的对照跑满 380 万状态无违例；JobSP 细到粗精化复查跑满 614 万状态无违例。
+- 按根因汇总更新为：在真实代码上复现 11 个（加 L13，属于"靠注入故障"一类）；新于上游 10（或 11）；新于 Phase 1 有 9 个。
+
+## 13. 第八轮（11-06）：补模型缺口——client 注册表与清理线程（Reg 组）
+
+- **新组 Reg**（DESIGN §12；`spec/Reg_C.tla`、`Reg_F.tla`、`PortsReg.tla`）：SP 上的 ClientManager 和 cleanup 线程。SJ 得知 client 死亡的两条真实路径都在模型里了：cleanup 线程登出失效 token 后通知；心跳同步发现 job 不在 client 上时通知。T2、T3、R2 从此是模型自己的行为，不再在模型之外。
+- **精化：** Reg 细到粗跑满 769 万状态无违例；负控按预期失败（9 层）。CommSJ 细到粗复查 123 万状态无违例；真实 POC trace 在全细组合上仍被接受（75 秒）。
+- **盲跑能找回：** T2（2 site，深度 12）；T3（排除 T2 后，深度 11）；R2（CP 重启，SJ 永远收不到通知，deadlock 深度 28）。对照组（只有 CJ 崩溃，心跳同步会通知 SJ）跑满 258 万状态没有卡住。hunt8 冒烟里 S 轨的盲跑模拟也自己找到了 T3。
+- **建模时抓到的一个时序假象：** 第一版允许"CP 重启让旧 token 失效"并且允许重新登录插在名单列出和第一次移除之间，于是 1 个 site 就能触发 T2。现实中 CP 几秒内就重新登录（远早于 60–600 秒的心跳超时），名单列出后第一个 token 是微秒内就处理的。改成原子步骤后，1 site 跑满 239 万状态不再出现，T2 需要两个失效 token，和真实复现条件一致。
+- 新计划 `plans/hunt8.py`（加 reg、status 两个族；T2、T3、L13 的盲跑回归放在 D 轨）。C 轨的检查点要重新采集（变量集合变了）。
+
+**第 3 项起步：Attach / external trainer 的代码核实**
+- **H03（Phase 1 排名第 10，第一次确认；REPRODUCED，强制调度；`checks/confirm/h03_repro.py`）：** `ExternalProcessBackend._monitor_accepted_result_source`（`external_process_backend.py:1239-1283`）先在锁内确认 source 仍是任务 A，再在锁外判断心跳超时或连接断开；判定后调用 `_fail_accepted_result_source(trainer, A)`（这里会重新核对身份，source 已换成 B 时返回 False），然后**无条件**调用 `_stop_trainer`。两步之间如果 A 完成结算、B 被接受，monitor 会停掉正在服务 B 的 trainer，而且不发 B 的 source 失效通知。对照组（服务 A 时真的失联）：发出 refA 的失效通知、job 判失败、trainer 停止。H03 场景：trainer 在服务 B 时被停，没有任何通知，B 的接收方只能等自己的超时。自然时序下窗口是微秒级。
+- **H01（Phase 1 排名第 4）：静态逻辑成立，未执行复现。** CJ 在解码确认之后、任务已关闭时回 RESULT_REJECTED 且不记录归属（`cell_backend.py:236-242`）；状态查询于是回 UNKNOWN（`cell_backend.py:281-282`）；TP 的 `_resolve_ambiguous_result`（`attach_session.py:441-467`）在 UNKNOWN 且 waiter 已 COMPLETED 时推断为已接受，`send()` 返回成功。需要两次 RESULT_REJECTED 回复都丢失；任务此时已关闭，server 本来就把这一轮记为失败，影响限于 trainer 误以为发送成功，所以优先级低。
+- **上游核对**（GitHub API，只读；main = `e17c1edf6`，2026-11-05）：`external_process_backend.py`、`cell_backend.py`、`server_engine.py`、`job_runner.py` 与 pin 完全相同。`fed_server.py` 有一处改动（#5672，`_listen_command` 入口加调用方身份校验），L13 的丢弃逻辑、T2/T3 的 cleanup 路径、R2 的 `_sync_client_jobs` 都没变。所有已复现的 bug 在最新 main 上仍然存在。
+
+**按根因汇总（截至第八轮）：**
+
+| 口径 | 个数 | 是哪些 |
+|---|---:|---|
+| 在真实代码上复现 | 12 | C1-A、C1-B、H08、H11、T1、T1-b、T2、T3、R1、R2、L13、H03 |
+| 其中不需要强制调度或注入 | 5 | H08、H11、T1、R1，R2（server 端逻辑层面） |
+| 其中靠强制调度、耗时的桩或注入故障 | 7 | C1-A、C1-B、T1-b、T2、T3、L13（注入消息延迟或丢失）、H03（强制调度） |
+| 新于上游 | 11（或 12） | 都没有提交，最新 main 上仍存在；C1-A 与 #5301 同根因族时为 11 |
+| 新于 Phase 1 | 9 | C1-A、C1-B、T1、T1-b、T2、T3、R1、R2、L13 |
+| Phase 1 候选、第一次确认 | 3 | H08、H11、H03 |
+| 只有模型反例 | 1 | N1 |
+| 只有静态代码确认 | 1 | H01 |
+
+## 14. 第八轮续：external trainer 建模（第 3 项）与第二个 job（2b）
+
+**第 3 项：Trainer_X**（DESIGN §13）
+- 新增 Trainer 组的第三个变体，表达外部 trainer 进程（launch_once）和 CJ 端的结果接受、accepted-source monitor。H03 的微秒窗口作为带价时序逃逸 `monitorStale`（权重 3）。
+- 精化 X→C 跑满 305 万状态无违例，负控按预期失败（26 层）。
+- **MC 自己找到 H03**（深度 66）：发布 A → monitor 读到"失联"后被抢占 → 恢复、A 结算 → B 发布 → monitor 停掉 trainer，B 没有失效通知；与 `h03_repro.py` 一致。对照（不开 `monitorStale`）跑满 102 万状态无违例。
+
+**2b：第二个只存在于 SP 内部的 job（profile `multiJob`）**
+- 备份：`.work/v8-pre-2b-20261106-1700`（改动前）。
+- 精化：JobSP 细到粗（开 multiJob）跑满 458 万状态无违例；不开 multiJob 的回归 210 万状态无违例。真实 POC trace 在全细组合上仍被接受（86 秒）。无故障的 multiJob 对照跑满 139 万状态，没有 deadlock。
+- **T1 的真实场景进入模型：** 删掉另一个排队中的 job（J2），调度线程退出，我们的 job 再也不会被调度（5 步，我们的 job 没被删）。
+- **C1-B 的跨 job 后果进入模型：** completion 线程在我们的 job 上因 KeyError 退出时，J2 还在运行，此后永远收不了尾（`c1_repro.py` 场景 B 里的 job2）。盲跑模拟能找到线程退出本身，但 J2 恰好还没结束的组合概率太低，600 秒内没碰到；加一个"我们的 job 结束前 J2 不退出"的定向约束后在 2,896 条 trace 内找到（81 步）。
+
+- 冒烟（`plans/hunt8.py`，加 multi 族，allP 开 multiJob；S/L/D 共 25 个 run）：22 个无违例，3 个是 D 轨的预期找回（T1 ×2、R1），没有 worker 异常。
+- **模型覆盖：** 12 个已复现的根因现在都有对应的模型行为。其中 11 个已确认 MC 能找回：C1-A、C1-B、H08、H11、T1、T2、T3、R1、R2、L13、H03。T1-b 有对应动作（`JobRunnerFailureStatusDeleted`），但没有单独确认盲跑能找回。
+
+**2b 收尾**（按目标核查暴露的问题并修掉）：
+- **trace validation 的读法：** 我们的 TV 把 `TraceNotAccepted == tpos <= Len(TR)` 设为不变式，它被违反表示游标越过了 trace 末尾，也就是接受。`gen_trace.py` 按这个打印 TRACE ACCEPTED。最终模型上：全细（模拟，103 秒）接受；全粗（模拟，11 秒）接受；把 `SendStart` 挪到 `ServerLaunch` 之前的负例在全粗上 BFS 穷尽拒绝（9 个状态）。全粗用 BFS 跑满 900 秒没走完，是没有结论，不是拒绝。
+- **C1-B 跨 job 后果原来只能靠定向约束到达：** 原因是 J2 的退出是免费步，随机模拟几乎总让 J2 先结束。现实中另一个训练 job 要跑几分钟到几小时，远长于本 job 启动失败的几秒，所以把 J2 的退出计价（`rarity.json`：`JobSP_F.J2Exit`、`JobSP_C.OtherExit` 权重 1）。之后不加约束的盲跑在 T=20 和 T=50 下都找到了（1,494 / 2,934 条 trace 内）：completion 线程已死、J2 仍在运行。
+- 这个后果在 deadlock 检查下看不到：其他组件还能走步，属于活锁。所以加了通用性质 `GOtherJobFinalizable`，含义是 completion 线程死后，未结束的 J2 再也到不了终态。hunt8 的 D 轨加了对应回归 `h8D_c1bmulti`。
+- **C 轨冒烟：** 为 hunt8 重新采集检查点（14 个族 × 4 个阶段，56/56）；完整冒烟 40 个 run（S 14、C 14、D 6、L 6）：36 个无违例，1 个穷尽，3 个是 D 轨的预期找回（T1 ×2、R1）；没有 worker 异常。D 轨的 T2、L13、C1B-multi 在 150 秒的冒烟时长内没命中，它们的定向 BFS 和模拟此前都已找到。
+- **正式时长的盲跑找回（补证）：**
+  - D 轨 900 秒：T3（4 秒）、T2（569 秒）、L13（673 秒）；重跑一轮也都找回。
+  - C1-B 的跨 job 后果（`GOtherJobFinalizable`）：开阶段门控时 900 秒找不到，因为它的故障发生在启动阶段，只有抽到阶段 0 或 1 的 trace 才可能触发。改为不开阶段门控、1800 秒、12 个 worker 后，753 秒内找回（1,318 条 trace）。hunt8 的这一项已按此设置。
+  - T1-b：用里程碑区分它和 T1 的扫描路径，判据是调度线程在部署开始以后才死。BFS 在 23 步内找到：部署前检查 → 删除 → 部署异常 → 失败分支 → `JobRunnerFailureStatusDeleted`。用 `ACTION_CONSTRAINT` 剪掉扫描路径的第一次尝试没有生效：TLC 在检查不变式时没有先套用这个约束，反例仍是 T1。
+- **模型覆盖更新：** 12 个已复现的根因现在都已确认 MC 能在模型里找回（T1-b 补上）。
+
+**hunt8 完整一轮**（11-06 19:30 至 11-07 01:02 UTC，墙钟 5 小时 31 分，162 个 run，43.9 run·小时；没有 worker 异常）：
+
+| 跑法 | run 数 | 违例 | 规模 |
+|---|---:|---:|---|
+| S 按阶段放行的深度模拟，14 个族（新增 reg、status、multi） | 76 | 0 | 4,148 条 trace，3,538 万状态（TLC 计数） |
+| L 3-site 实例 | 6 | 0 | 177 条 trace |
+| D 盲跑重新发现 | 12 | 10 | T1 ×4、R1 ×2、R2 ×2、T3、C1-B 跨 job；T2、L13 这一轮没命中（900 秒，此前两次正式时长重跑都命中） |
+| C 检查点 BFS（阶段 2–5，K=1/2） | 68 | 2 | 7,153 万 distinct；6 个穷尽 |
+
+- **C 轨的 2 个违例（`h8C_del_p5_k2`、`h8C_job_p5_k2`，`GDoneSavedCompletedK`）是 v8 引入的时序假象，已修。**
+  - 路径：工作流已正常返回并保存 → 管理员 abort → CJ 被杀 → 心跳同步通知 SJ 这个 client 死了 → 粗 CommSJ 策略 panic → job 记为 FAILED。
+  - 原因：v8 把粗 CommSJ 的策略 panic 放宽成"有 dead-client 报告就能 panic"；细 CommSJ 的 30 秒时钟在工作流返回后仍然免费，60 秒宽限期可以在收尾期间瞬间过完。真实代码里 `control_flow` 返回后，`stop_controller` + `finalize_run` 几秒内就结束 task monitor（`server_runner.py:153-172`），报告在返回之后才到的话，宽限期不可能在这之前到期。
+  - 修法（时序前提 T4，带价逃逸 `slowFinalize`，权重 2）：细 CommSJ 在工作流返回后不再走时钟 tick，除非打开 `slowFinalize`；粗 CommSJ 加私有标志 `deadEarly`（报告已过宽限期），策略 panic 改为只在 `deadEarly` 时发生，返回后只有 `slowFinalize` 才能置位。备份：`.work/v8-pre-T4-20261107-0104`。
+  - 复查：CommSJ 细到粗精化跑满 133 万状态无违例，负控失败；全细、全粗 TV 都接受（87 秒、22 秒）；hunt8 的检查点全部重采（56/56）。从新检查点重跑这两个配置，各跑满 120 万状态无违例；额外打开 `slowFinalize` 后 del 族重新出现同一违例（路径正是心跳同步 → `Mature` → 策略 panic），说明它只在这个时序巧合下成立。
+  - 对应的真实可能性：client 在工作流返回前最后几十秒内死掉，宽限期恰好在收尾的几秒内到期，已完成的 job 会因策略 panic 记为执行失败。需要时序巧合，作为 `slowFinalize` 逃逸留在模型里；没有复现。
+- 打开 `slowFinalize` 并把预算提到 4 时，job 族还报出 `GFinishedNoAbnormalExitK2`：收尾阶段 abort、发给 SJ 的 abort 命令出错（`abortCmdError`）→ 0 秒终止路径 → SJ 被杀 → job 记为 COMPLETED。这是第 4 轮起记录的已知线索 `ABORT_classified_completed`（依赖 T2 的逃逸），预算 4 才够同时用 abort 和 `abortCmdError`，与 2b、T4 无关。
+
+- **T4 修复后的完整冒烟**（S 14、C 14、D 6、L 6，共 40 个 run，C 轨用新检查点）：37 个无违例，3 个是 D 轨的预期找回（T1 ×2、R1）；没有 worker 异常。
+- **新增一条模型线索 N2（只有模型反例，未复现）：** client 在工作流返回前最后几十秒内死掉，60 秒宽限期恰好在收尾的几秒内到期，task monitor 判定违反作业策略并 panic，已完成并保存的 job 记为执行失败。依赖时序巧合，在模型里由 `slowFinalize` 逃逸表达。
+
+**收尾复核（最终模型，T4 修复之后）：**
+- **L13：** 定向 BFS 找到（细 JobSP 深度 50，全粗深度 32）。两次 900 秒 D 轨盲跑都找到（187 秒、297 秒）。
+- **T2：** 定向 BFS 找到（深度 12）。两次 900 秒 D 轨盲跑都没碰到（各约 75 条 trace）。原因是按 v8 修正后的时序，T2 要求两个 token 都失效，并且重新登录落在一次 logout 处理之内，几个带价事件要在同一条长 trace 里依次发生。hunt8 的 T2 回归因此改为带预算的 BFS（`h8D_t2_s2l1a1`，K=3）：3 秒、11 步找到（两个都失效 → 列出名单并登出第一个 → 另一个重新登录 → 处理下一个时线程退出）。
+- **N2 在真实代码上复现**（REPRODUCED，强制时序；`checks/confirm/n2_repro.py`）：真实的 `WFCommServer.process_dead_client_report`、`_monitor_tasks`、`_check_dead_clients`、`_job_policy_violated`、`finalize_run`；engine 和 `system_panic` 是桩，`stop_controller` 用 1 秒代替。site-2 的 dead-job 报告在工作流返回前 59.5 秒到达时，宽限期在收尾窗口内到期，task monitor 调用 `system_panic("Aborting job due to deployment policy violation")`；对照组（报告在返回时才到）没有 panic。之后 FATAL_SYSTEM_ERROR 变成 `execution_error`，job 记为 `FINISHED:EXECUTION_EXCEPTION`（这一段是 `l13_repro.py` 对照组已确认的链路）。根因：`control_flow` 返回后 task monitor 要到 `finalize_run` 才停，期间仍在执行部署策略检查。上游检索：没有相关 issue（#3671 是通信错误导致失败，根因不同）。
+
+**按根因汇总（截至第八轮收尾）：**
+
+| 口径 | 个数 | 是哪些 |
+|---|---:|---|
+| 在真实代码上复现 | 13 | C1-A、C1-B、H08、H11、T1、T1-b、T2、T3、R1、R2、L13、H03、N2 |
+| 其中不需要强制调度或注入 | 5 | H08、H11、T1、R1，R2（server 端逻辑层面） |
+| 其中靠强制调度、耗时的桩或注入故障 | 8 | C1-A、C1-B、T1-b、T2、T3、L13、H03、N2 |
+| 新于上游 | 12（或 13） | 都没有提交；C1-A 与 #5301 同根因族时为 12 |
+| 新于 Phase 1 | 10 | C1-A、C1-B、T1、T1-b、T2、T3、R1、R2、L13、N2 |
+| Phase 1 候选、第一次确认 | 3 | H08、H11、H03 |
+| 只有模型反例 | 1 | N1 |
+| 只有静态代码确认 | 1 | H01 |
+
+**修复后的完整一轮 hunt8b**（11-07 02:07 至 07:42 UTC，墙钟 5 小时 35 分，162 个 run，44.7 run·小时；用 T4 修复后的模型和重采的检查点；没有 worker 异常）：
+
+| 跑法 | run 数 | 违例 | 规模 |
+|---|---:|---:|---|
+| S 按阶段放行的深度模拟，14 个族 | 76 | 0 | 4,353 条 trace，3,732 万状态（TLC 计数） |
+| L 3-site 实例 | 6 | 0 | 209 条 trace |
+| C 检查点 BFS（阶段 2–5，K=1/2） | 68 | 0 | 9,202 万 distinct；4 个穷尽 |
+| D 盲跑重新发现 | 12 | 11 | L13 在这一轮的模拟里没命中（900 秒，263 条 trace） |
+
+- L13 和 T2 的模拟回归命中率不稳：T2 在 3 次 900 秒运行里命中 1 次，L13 在 5 次里命中 3 次。两者都改为带预算的 BFS（T2：K=3；L13：K=4，JobSP 细、其余粗），结果是确定性的。
+- **按最终计划重跑整个 D 轨**（`plans/hunt8_Dfinal.py`，12 个 run）：**12/12 全部找回**。T1 ×4、R1 ×2、R2 ×2（deadlock）、T2（BFS，4 秒）、T3、L13（BFS，499 秒）、C1-B 跨 job（593 秒）。
+- 结论：修复后，S、L、C 三个轨道没有任何新违例；D 轨对已知问题的回归全部通过。

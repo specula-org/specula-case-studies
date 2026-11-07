@@ -38,6 +38,19 @@ GFinishedNoAbnormalExit == Finished =>
     /\ ~SJFatal /\ SJExitCode /= "crashed"
     /\ \A c \in Sites : Started(c) /\ CurLaunch(c) > 0 =>
          CJExitCode(c, CurLaunch(c)) \in {"none", "ok"}
+\* v8 multiJob: the other job J2 can still be finalized. Only the single
+\* completion thread finalizes a job; once it died (C1-B) a J2 that is queued,
+\* running or exited never reaches a terminal status (a livelock, not a deadlock)
+GOtherJobFinalizable == ~(pJobSP.completionCrashed /\ pJobSP.other \in {"queued", "running", "exited"})
+\* the SP's client cleanup thread is alive (v8, T2/T3): otherwise dead clients
+\* are never removed and no SJ is told about them again
+GCleanupThreadAlive == pReg.cleanupCrashed = "no"
+\* the same, with the known T2 death (re-login during the logout loop) excluded
+GCleanupThreadAliveK == pReg.cleanupCrashed \in {"no", "relogin"}
+\* a job reported COMPLETED had no fatal error in its server run (v7, L13)
+GFinishedNoPanic == Finished => ~SJPanicked
+\* the same with the known L13 escape (statusLost) excluded, for hunts
+GFinishedNoPanicK8 == "statusLost" \notin Faults => GFinishedNoPanic
 \* a finished job leaves no running client job process behind
 GFinishedNoLiveChild == Finished => \A c \in Sites : LiveLaunches(c) = {}
 \* a terminal job has no running server job process. Excluded: FAILED_TO_RUN,
@@ -76,7 +89,9 @@ GenericSafety ==
 \* a non-terminal state without any enabled step is a hang; terminal states
 \* are given an explicit stutter so that they do not count as deadlocks.
 \* a deleted job is over as well (it will never run)
-DoneStutter == (Terminal \/ pJobSP.deleted) /\ UNCHANGED portVars
+\* v8 multiJob: not done while the SP-only job J2 still has to run or be finalized
+DoneStutter == (Terminal \/ pJobSP.deleted) /\ pJobSP.other \notin {"queued", "running", "exited"}
+               /\ UNCHANGED portVars
 
 \* ---------------- K: known findings filtered out of bug hunts (plans/hunt4.py)
 \* so that a run does not stop at them; anything else of the same kind is
@@ -159,5 +174,8 @@ KR2 == \E c \in Sites : pJobCP[c].cpRestarted
 \* K14 R1 (REPRODUCED, checks/confirm/r1_repro.py): no startup recovery after an
 \* SP restart; checked by GNoStaleStatusAfterRestart, filtered in hunts
 KR1 == pJobSP.spRestarted
-KnownStuck == KS02 \/ KH21 \/ KH19R \/ KH30 \/ KH11 \/ KC1B \/ KT1 \/ KR2 \/ KR1
+\* K15 T2 / T3 (REPRODUCED, t2_repro.py, t3_repro.py): the cleanup thread died,
+\* so dead clients are never logged out and their jobs' SJs never told (v8)
+KT23 == pReg.cleanupCrashed /= "no"
+KnownStuck == KS02 \/ KH21 \/ KH19R \/ KH30 \/ KH11 \/ KC1B \/ KT1 \/ KR2 \/ KR1 \/ KT23
 =============================================================================

@@ -17,8 +17,10 @@ VARIABLE commSJ_c
 
 \* called: <<round, site>> pairs whose APP_CALL was dispatched;
 \* ckey[c]: id of the envelope whose claim succeeded in the current round.
-Init == commSJ_c = [called |-> {}, ckey |-> [c \in Sites |-> None]]
-InitValue == [called |-> {}, ckey |-> [c \in Sites |-> None]]
+\* deadEarly (v8): a dead-client report has matured through the 60 s grace;
+\* after the workflow returned only with slowFinalize (timing T4, CommSJ_F)
+Init == commSJ_c = [deadEarly |-> FALSE, called |-> {}, ckey |-> [c \in Sites |-> None]]
+InitValue == [deadEarly |-> FALSE, called |-> {}, ckey |-> [c \in Sites |-> None]]
 
 P == pCommSJ
 Aborted == pCommSJ.panic \/ pWfSJ.panic
@@ -33,7 +35,8 @@ Replied(kind, k) == MsgKey(kind, SJ, M(k).from, M(k).id) \in DOMAIN net
 \* Receiver attempt of site c for round a (PayRcv port, one per (site, round)).
 Rx(c, a) == pPayRcv[c].rx[a]
 Materialized(c, a, refs) == Rx(c, a).status = "materialized" /\ Rx(c, a).want \in refs
-RetireFaults == {"cancel", "prepFail", "taskTimeout", "minClients", "deadClient"} \cap Faults /= {}
+RetireFaults == ({"cancel", "prepFail", "taskTimeout", "minClients", "deadClient"} \cap Faults /= {})
+                \/ pReg.notified /= {}     \* v8: dead-client reports come from Reg
 NonLiveFaults == {"cancel", "prepFail"} \cap Faults /= {} \/ P.cancelled = Cur
 
 ScheduleTask ==
@@ -158,7 +161,7 @@ CancelAllAck ==
     /\ UNCHANGED <<commSJ_c, net>>
 
 PolicyPanic ==
-    /\ SJAlive /\ "deadClient" \in Faults /\ ~P.panic /\ ~P.finalized /\ ~P.monitorCrashed
+    /\ SJAlive /\ commSJ_c.deadEarly /\ ~P.panic /\ ~P.finalized /\ ~P.monitorCrashed
     /\ pCommSJ' = [pCommSJ EXCEPT !.panic = TRUE]
     /\ UNCHANGED <<commSJ_c, net>>
 
@@ -167,7 +170,18 @@ FinalizeRun ==
     /\ pCommSJ' = [pCommSJ EXCEPT !.finalized = TRUE, !.standing = FALSE]
     /\ UNCHANGED <<commSJ_c, net>>
 
+Mature ==
+    /\ ~commSJ_c.deadEarly /\ SJAlive /\ pReg.notified /= {}
+    /\ pWfSJ.returned = "none" \/ "slowFinalize" \in Faults
+    /\ commSJ_c' = [commSJ_c EXCEPT !.deadEarly = TRUE]
+    /\ UNCHANGED <<pCommSJ, net>>
+Unmature ==
+    /\ commSJ_c.deadEarly
+    /\ commSJ_c' = [commSJ_c EXCEPT !.deadEarly = FALSE]
+    /\ UNCHANGED <<pCommSJ, net>>
+
 Next ==
+    \/ Mature \/ Unmature
     \/ ScheduleTask \/ Retire \/ CancelAllAck \/ PolicyPanic \/ FinalizeRun
     \/ \E c \in Sites : Dispatch(c) \/ Complete(c)
     \/ \E c \in Sites, k \in DOMAIN net :

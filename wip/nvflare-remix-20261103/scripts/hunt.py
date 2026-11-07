@@ -21,7 +21,8 @@ sys.path.insert(0, str(ROOT / "scripts"))
 import mkmc, run_mc  # noqa: E402
 
 BUILD_KEYS = ("grain", "faults", "sites", "launch", "attempt", "inv", "prop", "constraint",
-              "extends", "deadlock", "rarity", "throttle", "profile", "symmetry", "default", "known")
+              "extends", "deadlock", "rarity", "throttle", "profile", "symmetry", "default", "known",
+              "fuse", "init_states")
 
 
 class Budget:
@@ -94,7 +95,7 @@ def main():
         r["free_gb_after"] = round(shutil.disk_usage(ROOT).free / 2**30)
         r.pop("cfg", None)
         r.update({k: p[k] for k in ("grain", "faults", "sites", "launch", "attempt", "profile",
-                                    "rarity", "throttle", "mode", "family", "track") if k in p})
+                                    "rarity", "throttle", "mode", "family", "track", "fuse", "ckpt") if k in p})
         return r
 
     todo = [p for p in plan if p["name"] not in done]

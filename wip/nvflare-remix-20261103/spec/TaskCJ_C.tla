@@ -7,7 +7,7 @@
 \* Over-approximates TaskCJ_F on pTaskCJ + GET_TASK / TASK_CHECK / RESULT_ENVELOPE:
 \* reply / receipt consumption, local timeouts and the END_RUN reaction are
 \* port-invisible in the fine variant and are not modeled here; a submission
-\* may be retried (up to FedMaxTry) regardless of replies, and the next GET_TASK
+\* may be retried (up to FedMaxTryIn(Faults)) regardless of replies, and the next GET_TASK
 \* may follow as soon as a final reply for the current task exists in net.
 \* Writes: taskCJ_c, pTaskCJ, net (sender CJ(c)).
 \* Anchors: client_runner.py:245-277,585-789,1084-1089; in_process_backend.py:152-260.
@@ -45,13 +45,13 @@ FinalReply(c, l) ==
 
 \* Finite-instance hook for the generic deadlock check (see TaskCJ_F).
 AtBound == \E c \in Sites, l \in Launches :
-    \/ Running(c, l) /\ (T(c, l).asg = None \/ FinalReply(c, l)) /\ Polls(c, l) >= FedMaxPoll
+    \/ Running(c, l) /\ (T(c, l).asg = None \/ FinalReply(c, l)) /\ Polls(c, l) >= FedMaxPollIn(Faults)
     \* TASK_CHECK retries exhausted (the real client retries without bound)
-    \/ Running(c, l) /\ T(c, l).asg /= None /\ ~FinalReply(c, l) /\ Tries(c, l) >= FedMaxTry
+    \/ Running(c, l) /\ T(c, l).asg /= None /\ ~FinalReply(c, l) /\ Tries(c, l) >= FedMaxTryIn(Faults)
 
 RequestTask(c, l) ==
     /\ Running(c, l) /\ (T(c, l).asg = None \/ FinalReply(c, l))
-    /\ Polls(c, l) < FedMaxPoll
+    /\ Polls(c, l) < FedMaxPollIn(Faults)
     /\ LET p == Polls(c, l) + 1 IN
        net' = Send(net, Msg("GET_TASK", CJ(c), SJ, <<JobId, c, l, p>>, [launch |-> l, poll |-> p]))
     /\ UNCHANGED <<taskCJ_c, pTaskCJ>>
@@ -97,7 +97,7 @@ FirstCheck(c, l) ==
     /\ UNCHANGED pTaskCJ
 
 RetryCheck(c, l) ==
-    /\ Running(c, l) /\ Tries(c, l) >= 1 /\ Tries(c, l) < FedMaxTry
+    /\ Running(c, l) /\ Tries(c, l) >= 1 /\ Tries(c, l) < FedMaxTryIn(Faults)
     /\ net' = Send(net, Msg("TASK_CHECK", CJ(c), SJ, SubmitId(c, l, Tries(c, l) + 1),
                  [assignment |-> T(c, l).asg, try |-> Tries(c, l) + 1]))
     /\ UNCHANGED <<taskCJ_c, pTaskCJ>>

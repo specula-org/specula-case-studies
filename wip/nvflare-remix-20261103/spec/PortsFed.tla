@@ -24,19 +24,24 @@ FedKinds == {"GET_TASK", "TASK_ASSIGNMENT", "TASK_CHECK", "TASK_CHECK_REPLY",
 \* minClients: bcast min_responses < targets (task may exit OK with stragglers).
 \* resultWaitTimeout: in-process executor result_wait_timeout.
 FedFaults == {"sjCrash", "taskTimeout", "submitTimeout", "prepFail", "cbFail", "cancel",
-              "deadClient", "minClients", "resultWaitTimeout"}
+              "deadClient", "minClients", "resultWaitTimeout", "slowFinalize"}
 \* FedAvg rounds = the attempt bound (mkmc.py --attempt N). Round r uses server
 \* attempt r, result transaction Tx(c, l, r) and ref Ref(c, l, r).
 Rounds == MaxAttempt
 \* Per-launch bounds on GET_TASK polls and on submission tries (finite instances).
-FedLossy == {"netLoss", "submitTimeout"} \cap Faults /= {}
+\* These bounds take the fault set as a parameter (call them with Faults). TLC
+\* precomputes zero-arity constant-level definitions of modules the root also
+\* extends and reuses that value inside an INSTANCE ... WITH Faults <- ..., so a
+\* zero-arity FedLossy ignored the substitution in MixR's G_V__N pricing instances
+\* and the TaskCJ timeouts it gates were priced free (v7; .build/x7/toy).
+FedLossyIn(fs) == {"netLoss", "submitTimeout"} \cap fs /= {}
 \* Poll budget: one successful GET_TASK per round plus one TRY_AGAIN per round
 \* (the gap before the next round is scheduled); the real client polls without
 \* bound. With only Rounds polls, a single TRY_AGAIN exhausted the budget and the
 \* generic deadlock check reported a model-bound hang (blind2, 03:10).
-FedMaxPoll == 2 * Rounds + (IF FedLossy \/ "prepFail" \in Faults THEN 1 ELSE 0)
-FedMaxTry == 1 + (IF FedLossy \/ {"pullTimeout", "txTimeout", "taskTimeout"} \cap Faults /= {}
-                  THEN 1 ELSE 0)
+FedMaxPollIn(fs) == 2 * Rounds + (IF FedLossyIn(fs) \/ "prepFail" \in fs THEN 1 ELSE 0)
+FedMaxTryIn(fs) == 1 + (IF FedLossyIn(fs) \/ {"pullTimeout", "txTimeout", "taskTimeout"} \cap fs /= {}
+                        THEN 1 ELSE 0)
 \* Global model generation broadcast with round r's task.
 TaskInput(a) == <<"global", a.attempt - 1>>
 \* Port fields are those read by another group or by Props; everything else is private.

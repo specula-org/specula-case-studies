@@ -49,7 +49,7 @@ CJTeardownTimingOK(pWfSJx, sjGone) == pWfSJx.dsShutdown \/ sjGone
 \* "slowAdminStop" is enabled, the graceful terminate waits for the admin stop
 \* thread to finish (the 0 s path is the separate fault abortCmdError).
 JobKinds == JobSPKinds \cup JobCPKinds \cup RunCJKinds
-JobFaults == {"slowSJTeardown", "slowAdminStop", "abortCmdError", "cjCrash", "abort", "outcomeReportFail", "deployError", "launchError",
+JobFaults == {"slowSJTeardown", "slowAdminStop", "statusLost", "abortCmdError", "cjCrash", "abort", "outcomeReportFail", "deployError", "launchError",
               "storeError", "rpcTimeout", "outcomeTimeout", "archiveError",
               "admissionError", "resExpiry", "deleteJob", "spCrash", "cpCrash"}
 JobStatuses == {"SUBMITTED", "DISPATCHED", "RUNNING", "ABORTED", "COMPLETED",
@@ -73,7 +73,10 @@ JobSPPortInit == [sjLaunched |-> FALSE, sjKilled |-> FALSE, startSent |-> {},
                   abortSent |-> {}, outcomes |-> [c \in Sites |-> "none"],
                   terminal |-> "none", status |-> "SUBMITTED", outcomeSeen |-> {},
                   completionCrashed |-> FALSE, startDropped |-> {},
-                  schedulerCrashed |-> FALSE, deleted |-> FALSE, spRestarted |-> FALSE]
+                  schedulerCrashed |-> FALSE, deleted |-> FALSE, spRestarted |-> FALSE,
+                  \* v8 (profile multiJob): summary of a second job J2 that lives only in
+                  \* the SP ("none" | "queued" | "running" | "exited" | "done" | "deleted" | "stale")
+                  other |-> IF "multiJob" \in Profile THEN "queued" ELSE "none"]
 \* launch: current CJ launch generation (0 = none); killed: launches CP
 \* terminated; exitSeen[l]: exit status CP's waiter observed for launch l
 \* ("ok"|"crash"|"killed"); freed: resource releases; reported: outcome the CP

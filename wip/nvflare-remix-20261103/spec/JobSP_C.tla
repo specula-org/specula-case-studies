@@ -199,7 +199,8 @@ SPCrashRestart ==
     /\ pJobSP.status \in {"DISPATCHED", "RUNNING"}
     /\ jobSP_c' = [InitValue EXCEPT !.handled = S.handled, !.aborts = S.aborts, !.stage = "idle"]
     /\ pJobSP' = [pJobSP EXCEPT !.spRestarted = TRUE, !.completionCrashed = FALSE,
-                                !.startDropped = {}, !.schedulerCrashed = FALSE, !.deleted = FALSE]
+                                !.startDropped = {}, !.schedulerCrashed = FALSE, !.deleted = FALSE,
+                                !.other = IF @ \in {"running", "exited"} THEN "stale" ELSE @]
     /\ UNCHANGED net
 
 DeletedCrash ==
@@ -212,6 +213,13 @@ DeletedCrash ==
 ObserveSJExit ==
     /\ S.registered /\ SJDown
     /\ jobSP_c' = [S EXCEPT !.registered = FALSE, !.failed = @ \/ SJCrashed]
+    /\ UNCHANGED <<pJobSP, net>>
+\* L13 (statusLost): a panicked SJ's exit (code 0) observed without its status
+\* message: not recorded as a failure.
+ObserveSJExitStatusLost ==
+    /\ "statusLost" \in Faults
+    /\ S.registered /\ SJDown /\ ~pJobSP.sjKilled /\ SJExitCode = "error"
+    /\ jobSP_c' = [S EXCEPT !.registered = FALSE]
     /\ UNCHANGED <<pJobSP, net>>
 
 \* abort_app_on_server after a stop request (abort, startup failure, fail_run):
@@ -357,10 +365,33 @@ RemoveCompletedMissing ==
     /\ pJobSP' = [pJobSP EXCEPT !.completionCrashed = TRUE]
     /\ UNCHANGED net
 
+\* ---- J2 (profile multiJob), v8: the second SP-only job, port summary only
+OtherLaunch ==
+    /\ pJobSP.other = "queued" /\ ~pJobSP.schedulerCrashed
+    /\ pJobSP' = [pJobSP EXCEPT !.other = "running"]
+    /\ UNCHANGED <<jobSP_c, net>>
+OtherExit ==
+    /\ pJobSP.other = "running"
+    /\ pJobSP' = [pJobSP EXCEPT !.other = "exited"]
+    /\ UNCHANGED <<jobSP_c, net>>
+OtherComplete ==
+    /\ pJobSP.other = "exited" /\ ~pJobSP.completionCrashed
+    /\ pJobSP' = [pJobSP EXCEPT !.other = "done"]
+    /\ UNCHANGED <<jobSP_c, net>>
+OtherDelete ==
+    /\ "deleteJob" \in Faults /\ pJobSP.other = "queued"
+    /\ \/ /\ pJobSP' = [pJobSP EXCEPT !.other = "deleted"]
+          /\ UNCHANGED jobSP_c
+       \/ /\ ~pJobSP.schedulerCrashed
+          /\ pJobSP' = [pJobSP EXCEPT !.other = "deleted", !.schedulerCrashed = TRUE]
+          /\ jobSP_c' = [S EXCEPT !.stage = "crashed"]
+    /\ UNCHANGED net
+
 Next ==
     \/ SendCheck \/ AdmitCancel \/ Blocked \/ DeploySend \/ WriteDispatched \/ Spawn
     \/ SendStart \/ RegisterRunning \/ StartEval \/ FilterPending \/ WriteRunning \/ Fail \/ FailStop \/ FailCancel \/ FailStatus
-    \/ ObserveSJExit \/ Terminate \/ RemoveAfterTerminate
+    \/ OtherLaunch \/ OtherExit \/ OtherComplete \/ OtherDelete
+    \/ ObserveSJExit \/ ObserveSJExitStatusLost \/ Terminate \/ RemoveAfterTerminate
     \/ AbortRead \/ AbortRunningSend \/ AbortRunningNoSJ \/ MarkAborted
     \/ SelectCompletion \/ OutcomeGraceExpired \/ Classify \/ PublishTerminal \/ RemoveCompleted
     \/ RemoveCompletedMissing \/ Delete \/ DeletedCrash \/ SPCrashRestart

@@ -59,10 +59,12 @@ InitValue == [
 Init == commSJ_f = InitValue
 
 \* Abstraction to CommSJ_C's private state.
-AbsC == [called |-> commSJ_f.dispatched,
+\* a dead-client report has matured (disconnected, or aged through the grace)
+Matured == \E c \in Sites : commSJ_f.dead[c].reported /\ (commSJ_f.dead[c].disconnected \/ commSJ_f.dead[c].age >= 2)
+AbsC == [deadEarly |-> Matured, called |-> commSJ_f.dispatched,
          ckey |-> [c \in Sites |-> IF pCommSJ.round \in 1..Rounds
                                    THEN commSJ_f.ct[pCommSJ.round][c].ckey ELSE None]]
-AbsCInit == [called |-> {}, ckey |-> [c \in Sites |-> None]]
+AbsCInit == [deadEarly |-> FALSE, called |-> {}, ckey |-> [c \in Sites |-> None]]
 
 S == commSJ_f
 P == pCommSJ
@@ -421,19 +423,21 @@ WFCommDropSubmission ==
              !.finished = IF LiveMap(id) /\ IsCur(id) THEN @ \cup {id[2]} ELSE @]
 
 \* ================================================================ dead clients
-\* wf_comm_server.py:191-202,82-85 (fault deadClient; one report per site; the
-\* report follows a peer failure of the CJ as seen through SP, Ports!PeerFailureCJ)
+\* wf_comm_server.py:191-202,82-85 (one report per site): HANDLE_DEAD_JOB from the
+\* SP for this job's participant token (generation 1), sent by the cleanup
+\* thread's notify_dead_client or by the heartbeat job sync (Reg, v8; a stale
+\* token of a live CJ gives a false suspicion)
 WFCommReportDeadClient(c) ==
-    /\ "deadClient" \in Faults /\ SJAlive /\ WfOpen /\ S.mon.pc /= "dead"
+    /\ SJAlive /\ WfOpen /\ S.mon.pc /= "dead"
     /\ ~S.dead[c].reported /\ S.dead[c].serial < MaxDeadReports
-    /\ \E l \in Launches : PeerFailureCJ(c, l)     \* SP dead-job report (real or false suspicion)
+    /\ <<c, 1>> \in pReg.notified
     /\ commSJ_f' = [commSJ_f EXCEPT !.dead[c] = [reported |-> TRUE, age |-> 0,
                        disconnected |-> FALSE, serial |-> S.dead[c].serial+1]]
     /\ UNCHANGED <<pCommSJ, net>>
 
 \* server_runner.py:614-629; wf_comm_server.py:1405-1414 (heartbeat input)
 WFCommClientIsActive(c) ==
-    /\ "deadClient" \in Faults /\ SJAlive /\ WfOpen /\ RunnerLockFree /\ S.mon.pc /= "dead"
+    /\ SJAlive /\ WfOpen /\ RunnerLockFree /\ S.mon.pc /= "dead"
     /\ S.dead[c].reported /\ \E l \in Launches : CJAlive(c, l)   \* JOB_HEART_BEAT from a live CJ
     /\ commSJ_f' = [commSJ_f EXCEPT !.dead[c] = Cleared(c)]
     /\ UNCHANGED <<pCommSJ, net>>
@@ -442,7 +446,13 @@ WFCommClientIsActive(c) ==
 \* report age 0..2). Seed ENV action; enabled only when a clock-driven
 \* mechanism is in the fault profile.
 ClockAdvance ==
-    /\ {"deadClient", "taskTimeout", "minClients"} \cap Faults /= {}
+    /\ \/ {"deadClient", "taskTimeout", "minClients"} \cap Faults /= {}
+       \/ \E c \in Sites : S.dead[c].reported
+    \* Timing T4 (v8; server_runner.py:153-172): after control_flow returns,
+    \* stop_controller + finalize_run end the task monitor within seconds, so no
+    \* 30 s tick (and no 60 s dead-client grace) elapses in between, unless the
+    \* finalization is slow or a grace expiry lands in that window (slowFinalize).
+    /\ pWfSJ.returned = "none" \/ "slowFinalize" \in Faults
     /\ SJAlive /\ ~P.finalized
     /\ \/ \E t \in Tasks : S.task[t].scheduled /\ S.task[t].age = 0
        \/ \E c \in Sites : S.dead[c].reported /\ S.dead[c].age < 2

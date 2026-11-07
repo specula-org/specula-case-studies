@@ -23,14 +23,17 @@ EXTENDS Ports
 VARIABLE jobSP_f
 
 \* ---- slice profile of the seed constants (JobRefinement.tla) ----
-Jobs == {JobId}
-JobOrder == <<JobId>>
+J2 == "J2"
+\* v8 (profile multiJob): a second job J2 private to the SP; its client side
+\* (check/deploy/start RPCs) is abstracted into one launch step
+Jobs == IF "multiJob" \in Profile THEN {JobId, J2} ELSE {JobId}
+JobOrder == IF "multiJob" \in Profile THEN <<J2, JobId>> ELSE <<JobId>>
 T0 == <<JobId, 1>>
 Tokens == {T0}
 RequiredSites == Sites
 MinSites == Cardinality(Sites)
 StrictStart == "nonStrictStart" \notin Profile
-MaxJobs == 1
+MaxJobs == IF "multiJob" \in Profile THEN 2 ELSE 1
 MaxScheduleCount == 1
 MinScheduleInterval == 1
 MaxScheduleInterval == 1
@@ -72,10 +75,23 @@ InitValue ==
 Init == jobSP_f = InitValue
 
 CurrentJob == scheduler.current
+\* a queued job (a deleted J2 is gone from the store listing; our job keeps the
+\* seed's deleted-but-listed handling)
+Queued(j) == jobs[j].status = "SUBMITTED" /\ (j = JobId \/ ~jobs[j].deleted)
 CurrentToken == <<CurrentJob,scheduler.issued[CurrentJob]>>
 Policy(ss) == /\ Cardinality(ss) >= MinSites /\ RequiredSites \subseteq ss
 ReplySites(t,k,r) == {s \in Sites : rpc[s][t][k] = r}
 WaitDone(t,k,ss) == \A s \in ss : rpc[s][t][k] \notin {"idle","waiting"}
+
+OtherSummary(f) ==
+    IF "multiJob" \notin Profile THEN "none"
+    ELSE LET o == f.jobs[J2] IN
+         IF o.deleted THEN "deleted"
+         ELSE IF o.status \in JobTerminalStatuses THEN "done"
+         ELSE IF o.running /\ o.serverRegistered THEN "running"
+         ELSE IF o.running THEN "exited"
+         ELSE IF o.status = "SUBMITTED" THEN "queued"
+         ELSE "stale"
 
 \* ---- port re-encodings ----
 PortOf(f) == [sjLaunched |-> f.jobs[JobId].serverSpawned, sjKilled |-> f.sjKilled,
@@ -88,7 +104,8 @@ PortOf(f) == [sjLaunched |-> f.jobs[JobId].serverSpawned, sjKilled |-> f.sjKille
                                THEN f.jobs[JobId].deployed \ f.jobs[JobId].active ELSE {},
               schedulerCrashed |-> f.scheduler.pc = "crashed",
               deleted |-> f.jobs[JobId].deleted,
-              spRestarted |-> f.spRestarted]
+              spRestarted |-> f.spRestarted,
+              other |-> OtherSummary(f)]
 \* terminal records the class of a newly written terminal job status.
 Fin(n) == [n EXCEPT !.terminal =
              IF n.jobs[JobId].status \in JobTerminalStatuses
@@ -179,7 +196,13 @@ AbsCInit == [handled |-> {}, stage |-> "init",
 DefaultJobSchedulerBeginPass ==
     /\ scheduler.pc = "idle"
     /\ Cardinality(scheduler.scheduled) < MaxJobs
-    /\ LET n == [jobSP_f EXCEPT !.scheduler = [scheduler EXCEPT !.pc = "scan", !.candidates = SelectSeq(JobOrder,LAMBDA j : jobs[j].status = "SUBMITTED")]] IN
+    \* A pass with no SUBMITTED job (BeginPass, EndPass, ReturnPass) only cycles
+    \* the scheduler pc back to "idle": the pending sets are empty at "idle", and
+    \* returnTo is rewritten before ReturnPass reads it. Omitting it loses only
+    \* private steps, and the cycle kept simulation traces running for hundreds of
+    \* steps after the job ended (v7).
+    /\ SelectSeq(JobOrder, LAMBDA j : Queued(j)) # <<>>
+    /\ LET n == [jobSP_f EXCEPT !.scheduler = [scheduler EXCEPT !.pc = "scan", !.candidates = SelectSeq(JobOrder, LAMBDA j : Queued(j))]] IN
        /\ jobSP_f' = Fin(n)
        /\ pJobSP' = PortOf(Fin(n))
     /\ UNCHANGED <<net>>
@@ -237,7 +260,7 @@ DefaultJobSchedulerTryJob ==
 
 \* private/fed/server/server_engine.py:1011-1025
 ServerEngineCheckClientResources ==
-    /\ scheduler.pc = "sendCheck"
+    /\ scheduler.pc = "sendCheck" /\ CurrentJob = JobId
     /\ LET n == [jobSP_f EXCEPT !.rpc = [s \in Sites |-> [rpc[s] EXCEPT ![CurrentToken].check = "waiting"]],
                  !.scheduler = [scheduler EXCEPT !.pc = "checkWait"],
                  !.ms = @ \cup {"check"}] IN
@@ -675,6 +698,22 @@ ServerEngineObserveExit ==
        /\ pJobSP' = PortOf(Fin(n))
     /\ UNCHANGED <<net>>
 
+\* server_engine.py:204-235, fed_server.py:595-605 (L13, fault statusLost): after a
+\* system panic the SJ exits with 0 and only its one fire_and_forget
+\* UPDATE_RUN_STATUS{execution_error} carries the error. If it is not handled
+\* within the 2 s wait after the exit, the return code (0) is recorded, the job is
+\* popped and the late message finds no run_processes entry: not a failure.
+ServerEngineObserveExitStatusLost ==
+    LET j == JobId IN
+    /\ "statusLost" \in Faults
+    /\ jobs[j].serverWaiter
+    /\ jobs[j].serverRegistered
+    /\ SJDown /\ ~pJobSP.sjKilled /\ SJExitCode = "error"
+    /\ LET n == [jobSP_f EXCEPT !.jobs = [jobs EXCEPT ![j].serverRegistered = FALSE]] IN
+       /\ jobSP_f' = Fin(n)
+       /\ pJobSP' = PortOf(Fin(n))
+    /\ UNCHANGED <<net>>
+
 \* private/fed/server/server_engine.py:386-408  [terminate kills a live SJ; timing T2 (PortsJob): the 10 s graceful wait starts when abort_app_on_server returns, so the admin thread's mark_run_aborted lands first]
 ServerEngineTerminateAfterGrace ==
     LET j == JobId IN
@@ -1091,8 +1130,7 @@ JobCommandAbortStarting ==
 \* ---- admin delete_job (fault deleteJob) and the scheduling loop (thread audit T1)
 \* job_cmds.py:509-537: refused only for DISPATCHED/RUNNING, so a queued job, or
 \* one being deployed (still SUBMITTED), can be deleted (store object removed).
-AdminDeleteJob ==
-    LET j == JobId IN
+AdminDeleteJob(j) ==
     /\ "deleteJob" \in Faults
     /\ ~jobs[j].deleted /\ jobs[j].status = "SUBMITTED"
     /\ LET n == [jobSP_f EXCEPT !.jobs = [jobs EXCEPT ![j].deleted = TRUE]] IN
@@ -1102,8 +1140,7 @@ AdminDeleteJob ==
 
 \* job_def_manager.py:517-531, job_runner.py:703: the delete lands between the
 \* scan's listing and its meta read; StorageException outside the try (T1).
-JobRunnerScanDeleted ==
-    LET j == JobId IN
+JobRunnerScanDeleted(j) ==
     /\ "deleteJob" \in Faults
     /\ scheduler.pc = "idle" /\ Cardinality(scheduler.scheduled) < MaxJobs
     /\ ~jobs[j].deleted /\ jobs[j].status = "SUBMITTED"
@@ -1144,8 +1181,11 @@ SPCrashRestart ==
     /\ "spCrash" \in Faults /\ ~jobSP_f.spRestarted
     /\ jobs[j].status \in {"DISPATCHED", "RUNNING"}
     /\ LET n == [InitValue EXCEPT
-                   !.jobs = [InitValue.jobs EXCEPT ![j].status = jobs[j].status,
-                                                   ![j].serverSpawned = jobs[j].serverSpawned],
+                   !.jobs = [k \in Jobs |-> IF k = j
+                               THEN [InitValue.jobs[k] EXCEPT !.status = jobs[k].status,
+                                                              !.serverSpawned = jobs[k].serverSpawned]
+                               ELSE [InitValue.jobs[k] EXCEPT !.status = jobs[k].status,
+                                                              !.deleted = jobs[k].deleted]],
                    !.handled = jobSP_f.handled, !.adminAborts = jobSP_f.adminAborts,
                    !.admissionErrors = jobSP_f.admissionErrors,
                    !.ms = jobSP_f.ms \cup {"spRestart"}, !.sjKilled = jobSP_f.sjKilled,
@@ -1154,6 +1194,47 @@ SPCrashRestart ==
                    !.spRestarted = TRUE] IN
        /\ jobSP_f' = n
        /\ pJobSP' = PortOf(n)
+    /\ UNCHANGED <<net>>
+
+AdminDeleteJobAny == \E j \in Jobs : AdminDeleteJob(j)
+JobRunnerScanDeletedAny == \E j \in Jobs : JobRunnerScanDeleted(j)
+
+\* ---- J2 (profile multiJob), v8: deploy + start abstracted into one step
+\* (its clients are not modeled); its SJ runs until it exits; the single
+\* completion thread (job_runner.py:494-589) finalizes it only while the thread
+\* is alive and not busy with this job's completion.
+CompletionThreadAlive == \A j \in Jobs : jobs[j].completion /= "crashed"
+J2Launch ==
+    /\ scheduler.pc = "sendCheck" /\ CurrentJob = J2 /\ ~jobs[J2].deleted
+    /\ LET n == [jobSP_f EXCEPT !.jobs = [jobs EXCEPT ![J2].status = "RUNNING", ![J2].running = TRUE,
+                                                    ![J2].serverSpawned = TRUE, ![J2].serverRegistered = TRUE,
+                                                    ![J2].serverWaiter = TRUE],
+                 !.scheduler = [scheduler EXCEPT !.pc = "idle", !.scheduled = @ \cup {J2}]] IN
+       /\ jobSP_f' = Fin(n)
+       /\ pJobSP' = PortOf(Fin(n))
+    /\ UNCHANGED <<net>>
+\* J2 deleted after the listing: the try block's store access fails, the job is skipped
+J2LaunchDeleted ==
+    /\ scheduler.pc = "sendCheck" /\ CurrentJob = J2 /\ jobs[J2].deleted
+    /\ LET n == [jobSP_f EXCEPT !.scheduler = [scheduler EXCEPT !.pc = "idle"]] IN
+       /\ jobSP_f' = Fin(n)
+       /\ pJobSP' = PortOf(Fin(n))
+    /\ UNCHANGED <<net>>
+J2Exit ==
+    /\ "multiJob" \in Profile /\ jobs[J2].running /\ jobs[J2].serverRegistered
+    /\ LET n == [jobSP_f EXCEPT !.jobs = [jobs EXCEPT ![J2].serverRegistered = FALSE]] IN
+       /\ jobSP_f' = Fin(n)
+       /\ pJobSP' = PortOf(Fin(n))
+    /\ UNCHANGED <<net>>
+J2Complete ==
+    /\ "multiJob" \in Profile /\ jobs[J2].running /\ ~jobs[J2].serverRegistered
+    /\ jobs[J2].completion = "idle" /\ CompletionThreadAlive
+    /\ jobs[JobId].completion \in {"idle", "done"}
+    /\ LET n == [jobSP_f EXCEPT !.jobs = [jobs EXCEPT ![J2].status = "COMPLETED", ![J2].running = FALSE,
+                                                    ![J2].completion = "done"],
+                 !.scheduler = [scheduler EXCEPT !.scheduled = @ \ {J2}]] IN
+       /\ jobSP_f' = Fin(n)
+       /\ pJobSP' = PortOf(Fin(n))
     /\ UNCHANGED <<net>>
 
 Next ==
@@ -1196,6 +1277,7 @@ Next ==
     \/ JobRunnerFailureStatus
     \/ DefaultJobSchedulerJobAbortedOnStartFailure
     \/ ServerEngineObserveExit
+    \/ ServerEngineObserveExitStatusLost
     \/ ServerEngineTerminateAfterGrace
     \/ ServerEngineRemoveAfterTerminate
     \/ JobCommandAbortRead
@@ -1215,8 +1297,9 @@ Next ==
     \/ JobRunnerTerminalStoreException
     \/ JobRunnerRemoveCompleted
     \/ JobRunnerRemoveCompletedMissing
-    \/ AdminDeleteJob \/ JobRunnerScanDeleted \/ JobRunnerDeletedInTry \/ JobRunnerFailureStatusDeleted
+    \/ AdminDeleteJobAny \/ JobRunnerScanDeletedAny \/ JobRunnerDeletedInTry \/ JobRunnerFailureStatusDeleted
     \/ SPCrashRestart
+    \/ J2Launch \/ J2LaunchDeleted \/ J2Exit \/ J2Complete
     \/ DefaultJobSchedulerJobAbortedOnCompletion
     \/ DefaultJobSchedulerJobCompleted
     \/ DefaultJobSchedulerPersistFailed

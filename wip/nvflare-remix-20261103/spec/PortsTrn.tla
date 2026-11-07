@@ -10,7 +10,9 @@
 \*   stopped   : the trainer loop has exited (abort/stop/closed observed)
 EXTENDS Consts
 \* trainerError: the user training code raises (thread ends without send()).
-TrnFaults == {"trainerError"}
+\* tpSilent / monitorStale: external trainer (Trainer_X) heartbeat timeout, and the
+\* accepted-source monitor preempted between its check and its decision (H03).
+TrnFaults == {"trainerError", "tpSilent", "monitorStale"}
 TrainerPortInit == [c \in Sites |-> [l \in Launches |->
                      [slot |-> 0, received |-> 0, published |-> None, stopped |-> FALSE]]]
 =============================================================================

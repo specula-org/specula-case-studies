@@ -30,7 +30,7 @@ ASSUME MaxLaunch \in Nat \ {0} /\ MaxAttempt \in Nat \ {0}
 \*                controlled CSE server controller, ccwf/cse_server_ctl.py:
 \*                186-200); the model's round task stands for that group. Not
 \*                symmetric in Sites (the order is fixed): no symmetry reduction.
-ProfileSwitches == {"lossBudget3", "wfTolerant", "nonStrictStart", "otherJob", "errResilient", "cseTasks"}
+ProfileSwitches == {"lossBudget3", "wfTolerant", "nonStrictStart", "otherJob", "errResilient", "cseTasks", "multiJob"}
 ASSUME Profile \subseteq ProfileSwitches
 
 Launches == 1..MaxLaunch

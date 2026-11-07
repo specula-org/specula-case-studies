@@ -33,7 +33,7 @@ T(c, l) == taskCJ_f[c][l]
 Pt(c, l) == pTaskCJ[c][l]
 Tr(c, l) == pTrainer[c][l]
 Running(c, l) == CJAlive(c, l) /\ pRunCJ[c][l].ready /\ pRunCJ[c][l].state = "running"
-Lossy == FedLossy
+Lossy == FedLossyIn(Faults)
 SubmitId(c, l, n) == <<JobId, c, l, T(c, l).task, n>>
 PubSeq(c, l) == IF Tr(c, l).published = None THEN 0 ELSE Tr(c, l).published.seq
 Active(c, l) == T(c, l).phase \in {"result", "check", "send", "wait", "retry"}
@@ -51,16 +51,16 @@ AbsCInit == [c \in Sites |-> [l \in Launches |->
 \* The real client polls without bound, so such a state is "bounded out".
 AtBound == \E c \in Sites, l \in Launches :
     \/ /\ Running(c, l) /\ ~T(c, l).endRun /\ T(c, l).phase \in {"idle", "done"}
-       /\ ~T(c, l).pollWait /\ T(c, l).poll >= FedMaxPoll
+       /\ ~T(c, l).pollWait /\ T(c, l).poll >= FedMaxPollIn(Faults)
     \* the real _send_task_result retries TASK_CHECK without bound
-    \* (client_runner.py:656-678); the model stops at FedMaxTry tries
-    \/ /\ Running(c, l) /\ ~T(c, l).endRun /\ T(c, l).phase = "retry" /\ T(c, l).try >= FedMaxTry
+    \* (client_runner.py:656-678); the model stops at FedMaxTryIn(Faults) tries
+    \/ /\ Running(c, l) /\ ~T(c, l).endRun /\ T(c, l).phase = "retry" /\ T(c, l).try >= FedMaxTryIn(Faults)
 
 \* ---------------------------------------------------------------- pull loop
 \* client_runner.py:613-617: get_task_assignment (GET_TASK), only when idle.
 ClientGetTask(c, l) ==
     /\ Running(c, l) /\ ~T(c, l).endRun /\ T(c, l).phase \in {"idle", "done"}
-    /\ ~T(c, l).pollWait /\ T(c, l).poll < FedMaxPoll
+    /\ ~T(c, l).pollWait /\ T(c, l).poll < FedMaxPollIn(Faults)
     /\ LET p == T(c, l).poll + 1 IN
        /\ net' = Send(net, Msg("GET_TASK", CJ(c), SJ, <<JobId, c, l, p>>, [launch |-> l, poll |-> p]))
        /\ taskCJ_f' = [taskCJ_f EXCEPT ![c][l].poll = p, ![c][l].pollWait = TRUE]
@@ -227,7 +227,7 @@ ClientLoseDispatchAck(c, l) ==
 
 \* client_runner.py:656-678 (seed ClientRetryResult): next try, TASK_CHECK n+1.
 ClientRetryResult(c, l) ==
-    /\ Running(c, l) /\ T(c, l).phase = "retry" /\ ~T(c, l).endRun /\ T(c, l).try < FedMaxTry
+    /\ Running(c, l) /\ T(c, l).phase = "retry" /\ ~T(c, l).endRun /\ T(c, l).try < FedMaxTryIn(Faults)
     /\ taskCJ_f' = Upd(c, l, [T(c, l) EXCEPT !.phase = "check", !.try = @ + 1])
     /\ net' = Send(net, Msg("TASK_CHECK", CJ(c), SJ, SubmitId(c, l, T(c, l).try + 1),
                  [assignment |-> T(c, l).asg, try |-> T(c, l).try + 1]))

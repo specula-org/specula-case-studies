@@ -46,6 +46,13 @@ Error(c, l) ==
     /\ pTrainer' = [pTrainer EXCEPT ![c][l].stopped = TRUE]
     /\ UNCHANGED trainer_c
 
+\* External trainer (Trainer_X, fault tpSilent): the backend's accepted-source
+\* monitor stops the trainer process after a heartbeat timeout.
+ExtStop(c, l) ==
+    /\ "tpSilent" \in Faults /\ CJAlive(c, l) /\ ~P(c, l).stopped
+    /\ pTrainer' = [pTrainer EXCEPT ![c][l].stopped = TRUE]
+    /\ UNCHANGED trainer_c
+
 Next == \E c \in Sites, l \in Launches :
-    Callback(c, l) \/ Publish(c, l) \/ ClearCache(c, l) \/ Stop(c, l) \/ Error(c, l)
+    Callback(c, l) \/ Publish(c, l) \/ ClearCache(c, l) \/ Stop(c, l) \/ Error(c, l) \/ ExtStop(c, l)
 =============================================================================

@@ -6,7 +6,9 @@ set -euo pipefail
 W="$(cd "$(dirname "$0")/.." && pwd)"
 export TMPDIR="$W/.tmp"; mkdir -p "$TMPDIR"
 JAR="$W/lib/tla2tools.jar"
-JOPTS=(-Djava.io.tmpdir="$TMPDIR" -XX:-UsePerfData -XX:+UseParallelGC -DTLA-Library="${MIX_BUILD:+$MIX_BUILD:}${MIX_SPEC:-$W/spec}")
+# -Xss: with no step enabled, ENABLED/next-state over the 532-way binary \/ chain of
+# (R)Next recurses to its end; the default worker stack overflows (v7)
+JOPTS=(-Djava.io.tmpdir="$TMPDIR" -XX:-UsePerfData -XX:+UseParallelGC -Xss${TLC_XSS:-64m} -DTLA-Library="${MIX_BUILD:+$MIX_BUILD:}${MIX_SPEC:-$W/spec}")
 mode="$1"; shift
 case "$mode" in
   sany)

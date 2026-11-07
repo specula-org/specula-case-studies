@@ -241,3 +241,86 @@ From the gap list of the round-4 review (`.tmp/discuss/gap.md` §5). Each item b
   - Explicit ref reuse (H09): API-specific; default UUID refs exclude it.
   - SAG (H04): the partial accumulator is SJ-internal, and the helper documents that it does not roll back; a direct code check is cheaper.
   - Attach / external trainer, client sampling, SP/CP process restart, full multi-job: not done in v5.
+
+## 10. v6: thread deaths, admin delete, process restart, trace validation
+
+- **Thread-death audit.** Every long-running SP, SJ, CP and CJ thread was checked for calls outside an exception handler (RESULTS §11). Thread deaths that matter across components are modeled as death, with a port flag and a generic property:
+  - completion thread (`completionCrashed`, C1-B);
+  - task monitor (`monitorCrashed`, H11);
+  - scheduling loop (`schedulerCrashed`, T1).
+
+  The client cleanup thread (T2) is not modeled, because client registration is not in the slice.
+- **Admin delete** (fault `deleteJob`). `delete_job` refuses only DISPATCHED/RUNNING jobs, so a queued job, or one still being deployed, can be deleted.
+  - Fine JobSP: `AdminDeleteJob`; `JobRunnerScanDeleted` (the delete lands inside the scheduling scan); `CheckSubmitted` on a deleted job; `JobRunnerDeletedInTry` (store access inside the try raises); `JobRunnerFailureStatusDeleted` (the except branch's own status check raises and the loop dies).
+  - Coarse JobSP: `Delete`, `DeletedCrash`, plus deleted as a `Fail` reason and in `FailStatus`.
+  - A deleted job counts as done for the deadlock check (`DoneStutter`).
+- **Process restart** (faults `spCrash`, `cpCrash`; Ports `SPRestarted` / `CPRestarted`). The child process dies with its parent (`monitor_parent_process`).
+  - The restarted SP keeps only the job store. It runs no startup recovery (R1), and its scheduler idles forever, so R1 shows as the invariant `GNoStaleStatusAfterRestart`, not as a deadlock.
+  - The restarted CP keeps nothing but handled keys. Its heartbeat drops the job (phase 3), and the SJ is never told (R2), so R2 shows as a hang.
+  - Rule: `cpCrash` and `spCrash` come with `rpcTimeout`. A dead peer makes the real admin request time out or fail; without the timeout fault the model's waiter would wait forever.
+- **Trace validation** (§6): silent bound 120, up to 3 observed events per step; acceptance by simulation; the real POC trace is accepted on all-fine, all-coarse and two alternating mixes, and a reordered trace is rejected exhaustively on all-coarse.
+- **Not done in v6:** Attach / external-process trainer (about 3000 lines across the external process, cell and attach backends plus the client cell API; it needs a new trainer group).
+
+## 11. v7: search that reaches the running and teardown phases
+
+The round-6 coverage probe (RESULTS §12; `.build/x7/`) found that hunt6 rarely searched past job start. With throttle T=20, faults that are enabled at almost every step (admin abort, delete, CHECK timeout, message loss) ended the job before RUNNING in most traces: in the fine-JobSP families, 0–15 of 64 traces reached RUNNING. The BFS runs stopped at depth 30–60, and a fault-free job needs 69 steps (all-coarse, 1 site) to more than 129 steps (all-fine) to reach a terminal status. v7 changes the search, not the model's behaviors.
+
+- **Phase-gated fault throttle** (`mkmc --fuse`, simulation). `spec/JobPhase.tla` defines job progress on the ports only, so it means the same in every mix:
+  - 0 submitted, 1 dispatched, 2 RUNNING, 3 first client result accepted, 4 round 2 scheduled, 5 end-run, 6 terminal or deleted.
+  - Each trace draws `fuse ∈ FusePhases` at its initial state. Priced steps are refused until `JobPhase >= fuse`, unless no free step is enabled, and are accepted with probability 1/T after that. This only prunes, so every trace is still a behavior.
+  - The throttle's and the over-budget test's ENABLED also fix `fuse' = fuse`, so each ENABLED search determines the whole successor state.
+- **Checkpoint BFS** (`scripts/ckpt.py`, `mkmc init_states`).
+  - A checkpoint is the first state of a trace at which `JobPhase` reaches a level. It is found by simulating the same mix, faults and profile with budget 0, so the prefix is a cost-0 behavior of the BFS's own spec.
+  - Free steps that only drive a fault mechanism (`rarity.json` actions priced 0, e.g. the CommSJ clock tick) are pruned from the prefix. Taken early, they lead to a state whose only way on is a priced step, such as a forced task timeout.
+  - The BFS starts from the disjunction of the checkpoints, with `rare = 0` and no symmetry. A counterexample is the stored prefix (`checks/ckpt/<key>/p<phase>_<i>.trace`) followed by the BFS trace.
+- **No idle scheduler passes** (JobSP_F `DefaultJobSchedulerBeginPass`). A pass needs a SUBMITTED job. A pass with no candidate only cycles the scheduler pc back to `idle`, so dropping it loses only private steps. Before v7 that cycle was 58–93% of the simulation steps in fine-JobSP families.
+- **TLC stack.** With no step enabled, evaluating `(R)Next` (a 532-way binary `\/` chain) or ENABLED over it recurses to the end of the chain. Before v7 the idle scheduler cycle was always enabled and hid this. `scripts/tlc.sh` now passes `-Xss64m` (override with `TLC_XSS`).
+- **L13 (v7, after hunt7).** New fault `statusLost` (weight 2). After a system panic the SJ exits with 0, and only its one fire_and_forget UPDATE_RUN_STATUS carries the error. If that message is handled more than 2 s after the exit, the job is classified as COMPLETED.
+  - Fine JobSP: `ServerEngineObserveExitStatusLost`. Coarse JobSP: `ObserveSJExitStatusLost`. Both apply only when `SJExitCode = "error"` and the SJ was not killed.
+  - New generic property `GFinishedNoPanic == Finished => ~SJPanicked`.
+
+## 12. v8: client registry and cleanup thread (group Reg)
+
+The dead-client report to the SJ used to be abstract: CommSJ's `WFCommReportDeadClient` fired on `PeerFailureCJ` under fault `deadClient`. Group Reg now models the real chain (`notes/reg-impl.md`), so T2, T3 and R2 are behaviors of the model.
+- **Port `pReg`:**
+  - `tok[c]`: token generation; a re-login adds 1, and the job's participants hold generation 1.
+  - `reg[c]`, `stale[c]`.
+  - `notified`: the <<site, generation>> pairs for which HANDLE_DEAD_JOB reached this job's SJ.
+  - `cleanupCrashed`: "no", "relogin" (T2) or "jobExit" (T3).
+- **Paths to `notified`:**
+  - the cleanup thread's `notify_dead_client`, for a stale token that it logs out;
+  - the heartbeat job sync, when the participant token is alive but no longer lists the job (its CJ is gone).
+
+  A restarted CP's new token matches neither path, which is R2.
+- **Timing.** Re-login pops the old token silently, and a CP restart alone never makes a token stale: the restart takes seconds, against a heart_beat_timeout of 60–600 s. In Reg_F the cleanup pass lists the stale tokens and logs out the first in one step, and each notification is followed at once by the next removal. A re-login therefore lands only while a logout is being processed (seconds each), and T2 needs two stale tokens. An earlier version let a re-login land in the microsecond gaps; the first R2 check exposed that as a 1-site T2.
+- **T3.** New fault `jobExitRace` (weight 3; measured window about 0.3 ms) with profile `otherJob`: another job's SJ exits while `notify_dead_client` iterates.
+- **Consumers.**
+  - CommSJ_F's dead report requires `<<c, 1>> \in pReg.notified` and no longer needs `deadClient`.
+  - The CommSJ_F clock tick also runs while a dead report is pending.
+  - In CommSJ_C, `RetireFaults` and `PolicyPanic` also allow `pReg.notified /= {}`.
+- **Properties.**
+  - `GCleanupThreadAlive`.
+  - `GCleanupThreadAliveK`, which excludes T2.
+  - Known-stuck signature `KT23`.
+  - `GFinishedNoPanicK8`, which excludes the L13 escape.
+
+## 13. v8: external trainer (Trainer_X) and a second SP-only job (multiJob)
+
+- **Trainer_X** (`spec/Trainer_X.tla`, a third variant of group Trainer, same port `pTrainer`). It models an external trainer process with `launch_once` and the CJ's ExternalProcessBackend acceptance and accepted-result-source monitor.
+  - **Process and loop.** The process is launched once and serves the CJ's tasks. The trainer script loop is Trainer_F's. RESULT_READY accepted makes the result the session's live source for its task generation and starts a monitor thread. RESULT_SOURCE_SETTLED clears the source.
+  - **Fault `tpSilent`** (w=1): heartbeats stop and may resume.
+  - **Monitor iteration.** By default one iteration is atomic. Fault `monitorStale` (w=3) splits the identity check from the decision; that is the H03 window, measured as microseconds.
+  - **Stop.** `_fail_accepted_result_source` notifies only if the source still is the monitored task, and `_stop_trainer` is unconditional.
+  - **Fine-local property** `PropsLocal!LTrainerStopOwner`: a trainer is stopped only for a live source whose failure was notified.
+  - **Coarse.** Trainer_C gains `ExtStop` (stopped under tpSilent). Refinement X→C passed with a 3.0M-state budget stop, and the negative check fails.
+- **Profile `multiJob`** (JobSP).
+  - **J2 in fine JobSP.** A second job J2 exists only in the fine JobSP: `Jobs = {JobId, "J2"}`, scan order J2 first, `MaxJobs = 2`. J2's check/deploy/start is one step, `J2Launch`, from `sendCheck`; our job's RPC chain requires `CurrentJob = JobId`. `J2Exit` is J2's SJ exiting. `J2Complete` runs only while the single completion thread is alive (`CompletionThreadAlive`) and not busy with our job.
+  - **Delete paths.** Admin delete and the scan-time delete crash (T1) apply to both jobs. A deleted J2 is gone from the store listing.
+  - **SP restart.** J2 keeps its store status and deletion; a running J2 becomes "stale".
+  - **Port summary** `pJobSP.other` ∈ none | queued | running | exited | done | deleted | stale. Coarse JobSP drives it with `OtherLaunch`, `OtherExit`, `OtherComplete` and `OtherDelete`. `OtherDelete`'s crash branch sets `schedulerCrashed` and stage "crashed" from any stage.
+  - **`DoneStutter`** does not count a terminal job as done while J2 is queued, running or exited, so a J2 that can never be finalized shows as a hang.
+- **Timing T4 (after hunt8).** After `control_flow` returns, `stop_controller` + `finalize_run` end the task monitor within seconds (`server_runner.py:153-172`), so no 30 s tick and no 60 s dead-client grace elapses in between.
+  - CommSJ_F's `ClockAdvance` requires `pWfSJ.returned = "none"` unless `slowFinalize` is enabled (w=2).
+  - CommSJ_C has a private flag `deadEarly` (a report matured through the grace), maintained by `Mature`/`Unmature`. `PolicyPanic` requires it. After the return, `Mature` only fires with `slowFinalize`.
+  - The abstraction is CommSJ_F's `AbsC.deadEarly == Matured`. Without T4, v8's relaxed coarse guard let a dead-client report that came after the workflow returned turn a completed job into FAILED.
+

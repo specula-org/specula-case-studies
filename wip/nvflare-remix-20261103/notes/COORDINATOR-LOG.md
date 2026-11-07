@@ -191,3 +191,33 @@ Open: a TLC cast error when evaluating NoSJDeathAfterWorkflowDone (via SJFatal/F
   - the coarse JobSP Terminate no-kill branch applied to a live SJ.
 - Smoke runs also found one lead, N1: under the non-strict start policy, a site whose START reply timed out has its failure OUTCOME dropped, and the job can finish COMPLETED. H32 class. It is now filtered by K11.
 - A JobSP refinement check caught my first non-strict coarse encoding. It merged the reply evaluation with the pending filter, but the code has a window between them where an OUTCOME is still handled as pending. The coarse side now uses two steps.
+
+## 2026-11-05 round 6: thread audit, restart, trace validation, hunt6
+
+- Thread-death audit of the long-running SP/SJ/CP/CJ threads. Three new findings, reproduced on the pin:
+  - T1: the scheduling loop dies when a queued job is deleted during the 1 s scan. Natural race, about 2.6% per delete with 300 queued jobs.
+  - T1-b: same death when a job is deleted while being deployed (deterministic).
+  - T2: client_cleanup dies when a dead client re-registers during the logout loop.
+- Process-restart review. Two findings:
+  - R1: the SP's startup recovery helpers have no caller, so an interrupted RUNNING job can be neither aborted nor deleted.
+  - R2: a restarted CP's new token matches no job participant, so the SJ is never told that the client's job died. Confirmed at the server-logic level.
+  - Upstream: no related issues; the relevant files on main match the pin.
+- Model v6 (DESIGN §10):
+  - `deleteJob`: fine and coarse JobSP, `GSchedulerThreadAlive`.
+  - `spCrash` / `cpCrash`: fate sharing in Ports, `GNoStaleStatusAfterRestart`.
+  - K filters K12–K14.
+- Refinement after each change, all budget-stopped with no violation (negatives FAIL):
+  - JobSP: 8.6M / 2.7M (deleteJob), 8.0M (spCrash).
+  - JobCP: 4.3M / 3.4M (cpCrash).
+  - The first deleteJob encoding missed the "blocked" stage; caught by the check.
+- Probe findings:
+  - cpCrash without rpcTimeout deadlocks: a model-bound wait. Rule: process death comes with rpcTimeout.
+  - The restarted SP's idle scheduler never deadlocks, so R1 needs an invariant.
+- Trace validation:
+  - Silent bound 120; up to 3 events per step (END_RUN broadcast).
+  - The real POC trace is accepted (simulation) on all-fine, all-coarse and two mixes.
+  - A reordered trace is rejected exhaustively.
+- hunt6:
+  - Launched 17:20 UTC: 155 runs (S 120, L 12 three-site, D 8, B 15), planned ≤ 8 h.
+  - Smoke: 20 runs clean; D rediscovered T1 and R1 in seconds.
+- Not done: Attach / external-process trainer (scope).

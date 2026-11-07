@@ -19,4 +19,10 @@ LNoCrashAfterDeploy == GrainHas("JobSP", "F") =>
 \* ---- directed reachability (CONSTRAINT), not for blind hunts
 \* only TASK_ASSIGNMENT replies are lost (H11 needs a GET_TASK retry)
 OnlyAssignmentLoss == \A k \in DOMAIN net : net[k].lost => net[k].msg.kind = "TASK_ASSIGNMENT"
-=============================================================================
+
+\* H03 (Phase 1 rank 10; REPRODUCED with a forced schedule, checks/confirm/h03_repro.py):
+\* an external trainer is stopped only for a live source whose failure was
+\* notified to its receivers (or with no live source)
+LTrainerStopOwner == Grain["Trainer"] /= "X" \/
+    \A c \in Sites, l \in Launches : trainer_x[c][l].victim = 0 \/ trainer_x[c][l].victim \in trainer_x[c][l].notices
+=========================================================================
