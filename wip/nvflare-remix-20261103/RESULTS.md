@@ -507,6 +507,8 @@
   - hunt8b 中 4 个穷尽完成的检查点 BFS 原样重跑，状态数逐个相同：err p5 266,874，status p5 393,274，status p4 528,926，tail p5 484,648。
   - 全细、全粗 TV 仍接受真实 POC trace（71 秒、18 秒）。
   - JobSP 细到粗精化在时序模块化后补跑：开 multiJob 900 秒跑到 266 万状态、不开 600 秒跑到 161 万状态，都没有违例（跑满预算，有界）；错误映射的负控按预期失败（`BadStep`，4 层）。
+  - multiJob 冒烟和跨 job 回归在时序模块化后补跑（`plans/hunt8_post_timing.py`，`h8post`，8 个 run）：S 轨 3 个、C 轨 2 个（阶段 2、5 的检查点 BFS，159 万、96 万状态）都没有违例；D 轨 T1 在 del、job 族各 9 秒内找回；C1-B 跨 job 那一项 1800 秒没找回（4,489 条 trace；此前 3 次分别在 929、1,318、2,565 条 trace 内命中）。
+  - 为确认这次没找回不是重构造成的，把 h8Dfinal 保存的 93 个状态的反例放到当前 spec 上逐步重放（`.build/x7/replay_ttrace.py`）：93 步都是当前 `GNext` 的合法转移，最后一个状态仍违反 `GOtherJobFinalizable`。结论：这条路径没有被改坏，这次没命中是模拟的随机性。用同一种子比较前后两版的模拟不可行：TLC 按字符串首次出现的顺序排序，重构移动了 `"dsShutdown"` 等字符串，枚举顺序随之改变。
 
 **自然时序复现与影响评估（11-07）**（`notes/repro-natural-A.md`、`notes/repro-natural-B.md`、`notes/impact-assessment.md`）：
 - 没有任何一项升到"无强制"。把触发事件放在窗口附近随机的试验，仍算"以时序巧合为条件"。
