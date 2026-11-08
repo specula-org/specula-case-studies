@@ -337,3 +337,34 @@ The dead-client report to the SJ used to be abstract: CommSJ's `WFCommReportDead
   - The hunt8b C runs that completed exhaustively were rerun unchanged and give the same distinct-state counts (RESULTS §14).
   - Trace validation still accepts the POC trace.
 
+
+## 15. v10: task worker (group Worker, profile taskMode)
+
+Profile `taskMode` means the client app uses `execution_lifetime: "task"` on the Kubernetes task backend. `TaskWorkerExecutor` then runs every assignment in a fresh worker Pod. Without the profile, every taskMode branch is disabled and the port `pWorker` is the constant 0, so non-taskMode mixes behave as before.
+
+- **Port `pWorker[c]`** (`spec/PortsWrk.tla`):
+  - `out[l]`: the executor's return for task number `gen` of launch `l` (result fresh/saved/recovered, error, aborted, interrupted).
+  - Worker Pod states, PVC records per physical attempt `w = <<l, a>>` (attempt ID = sha256(launch ID, server attempt)), the committed checkpoint manifest `ckpt` with its history `committed`, and the CP task owner per launch.
+  - `att[w]`: the CP view of attempt `w`.
+- **Worker_F**:
+  - CJ side: the `execute()` order (ending/abort, `_completed_attempts`, `recover_checkpoint_result`, then `supervisor.run`: identity fence, staging, launch, wait, settlement, read result / failure / `TaskExecutionInterrupted`, checkpoint commit under the commit guard) and receipt-gated payload release.
+  - CP side: the per-launch `_Job` owner. It admits at most one unsettled attempt; launch is idempotent; cancel of an unknown identity leaves a fence; it supports close and release, and its thread exits once every attempt has settled.
+  - The worker Pod.
+  - The CJ↔CP control channel is private (request/reply sets). Its loss is the fault `ctrlLoss`.
+- **Worker_C** has no private state. Every outcome is constrained only by port-visible evidence.
+- **Wiring**:
+  - `TaskCJ_F/C` take the result from `pWorker.out` instead of the Trainer.
+  - END_RUN latches `pTaskCJ.abort`; the final receipt is published as `pTaskCJ.receipt`; `TaskExecutionInterrupted` sets `pTaskCJ.fatal` (the CJ dies, and CP may replace it).
+  - `JobCP_F`'s restart check needs the old launch's task owner to be done (`can_restart`).
+  - `WfSJ` records `errored` (a live non-OK result reached the callback).
+  - The Trainer is off in taskMode.
+- **Faults**: workerCrash, workerFail, taskStageFail, ctrlLoss, settleTimeout, taskDeadline (`rarity.json`).
+- **Assumptions**:
+  - The app writes a checkpoint on every assignment, so every fresh OK result commits the manifest.
+  - CP restart adoption is unsupported (design), so CP steps stop after `cpCrash`.
+  - `system_panic` after an unconfirmed settlement is not modeled. The fenced supervisor answers later assignments with errors.
+  - L5 (deadlines from the worker's monotonic clock) is a value bug and is not modeled.
+- **Trace validation** is group-level (`checks/trace/worker/`):
+  - `tv_worker_test.py` runs the real executor, supervisor, store and worker process through upstream's process harness, and logs port events.
+  - The stand-in for the Kubernetes backend is the test `ProcessTaskLauncher`, with K8s retryable-exit semantics mirrored. CP and Pod steps are silent.
+  - `gen_tv_worker.py` replays each trace against Worker_F with a trace-driven environment.

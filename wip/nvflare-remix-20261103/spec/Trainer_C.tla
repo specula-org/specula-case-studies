@@ -53,6 +53,6 @@ ExtStop(c, l) ==
     /\ pTrainer' = [pTrainer EXCEPT ![c][l].stopped = TRUE]
     /\ UNCHANGED trainer_c
 
-Next == \E c \in Sites, l \in Launches :
+Next == \E c \in Sites, l \in TrnLaunches :
     Callback(c, l) \/ Publish(c, l) \/ ClearCache(c, l) \/ Stop(c, l) \/ Error(c, l) \/ ExtStop(c, l)
 =============================================================================

@@ -47,8 +47,15 @@ TaskInput(a) == <<"global", a.attempt - 1>>
 \* Port fields are those read by another group or by Props; everything else is private.
 \* pTaskCJ: input / trainerSignal (Trainer), submission (PaySrc). The receipt of
 \* the current submission (incl. "aborted" on END_RUN, H30) is TaskCJ_F-private.
+\* taskMode (v10) adds abort (run_abort_signal latched at END_RUN; the task
+\* abort_signal is its child), receipt ([gen, body] of the final RECEIVED /
+\* TASK_CLOSED reply, AFTER_SEND_TASK_RESULT -> _record_receipt) and fatal
+\* (TaskExecutionInterrupted ends the CJ with a nonzero exit).
 TaskCJPortInit == [c \in Sites |-> [l \in Launches |->
-                  [input |-> None, trainerSignal |-> "none", submission |-> None]]]
+                  IF TaskMode
+                  THEN [input |-> None, trainerSignal |-> "none", submission |-> None,
+                        abort |-> FALSE, receipt |-> None, fatal |-> FALSE]
+                  ELSE [input |-> None, trainerSignal |-> "none", submission |-> None]]]
 \* round: latest scheduled task round (0 = none); standing: that task is standing;
 \* call: None or [site, round, kind live|unknown, key, assignment, value, rc, metricKind];
 \* cancelled: last round whose CANCEL_ALL(ERROR) was applied; finalized:
@@ -62,8 +69,13 @@ CommSJPortInit == [round |-> 0, envelopes |-> [c \in Sites |-> None],
 \* scheduled: last round whose SCHEDULE was requested; ret: None or [site, round];
 \* returned: control_flow return outcome; done: runner status "done" (END_RUN phase);
 \* dsShutdown: SJ-local DownloadService.shutdown() done (after END_RUN + readiness).
-WfSJPortInit == [open |-> FALSE, scheduled |-> 0, accepted |-> {},
+\* errored (taskMode, v10): <<round, site>> pairs whose live result reached the
+\* result callback with a non-OK return code (base_model_controller.py:262-284).
+WfSJPortBase == [open |-> FALSE, scheduled |-> 0, accepted |-> {},
                  aggregate |-> None, saved |-> FALSE, cancelAll |-> 0,
                  ret |-> None, panic |-> FALSE, returned |-> "none",
                  done |-> FALSE, dsShutdown |-> FALSE, sj |-> "none"]
+WfSJPortInit == IF TaskMode THEN [f \in DOMAIN WfSJPortBase \cup {"errored"} |->
+                                    IF f = "errored" THEN {} ELSE WfSJPortBase[f]]
+                ELSE WfSJPortBase
 =============================================================================

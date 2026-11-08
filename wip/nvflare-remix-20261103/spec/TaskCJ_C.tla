@@ -11,6 +11,8 @@
 \* may follow as soon as a final reply for the current task exists in net.
 \* Writes: taskCJ_c, pTaskCJ, net (sender CJ(c)).
 \* Anchors: client_runner.py:245-277,585-789,1084-1089; in_process_backend.py:152-260.
+\* taskMode (v10): results come from pWorker[c].out[l]; abort / receipt / fatal
+\* port fields as in TaskCJ_F.
 EXTENDS Ports
 VARIABLE taskCJ_c
 
@@ -30,6 +32,9 @@ SentForTask(kind, c, l) == {k \in Sent(kind, c, l) : net[k].msg.id[4] = T(c, l).
 Tries(c, l) == Cardinality(SentForTask("TASK_CHECK", c, l))
 Polls(c, l) == Cardinality(Sent("GET_TASK", c, l))
 SubmitId(c, l, n) == <<JobId, c, l, T(c, l).task, n>>
+\* taskMode: the worker outcome of the current task (None if stale or absent).
+WorkerOut(c, l) == IF pWorker[c].out[l] /= None /\ pWorker[c].out[l].gen = T(c, l).task
+                   THEN pWorker[c].out[l] ELSE None
 \* The readiness check of try n was answered RETRY (the fine variant uploads only then).
 RetryAnswered(c, l, n) ==
     LET k == MsgKey("TASK_CHECK_REPLY", SJ, CJ(c), SubmitId(c, l, n))
@@ -88,13 +93,42 @@ SignalTrainer(c, l) ==
 FirstCheck(c, l) ==
     /\ CJAlive(c, l) /\ T(c, l).asg /= None /\ Tries(c, l) = 0
     /\ \E rc \in {"OK", "EXECUTION_EXCEPTION"} :
-         /\ rc = "OK" => pTrainer[c][l].published /= None
-         /\ rc /= "OK" => "resultWaitTimeout" \in Faults \/ pTrainer[c][l].stopped
+         /\ ~TaskMode =>
+              /\ rc = "OK" => pTrainer[c][l].published /= None
+              /\ rc /= "OK" => "resultWaitTimeout" \in Faults \/ pTrainer[c][l].stopped
+         /\ TaskMode =>
+              /\ WorkerOut(c, l) /= None
+              /\ rc = "OK" => WorkerOut(c, l).kind = "result"
+              /\ rc /= "OK" => WorkerOut(c, l).kind \in {"error", "aborted"}
          /\ taskCJ_c' = [taskCJ_c EXCEPT ![c][l].result =
-               [rc |-> rc, value |-> IF rc = "OK" THEN pTrainer[c][l].published.value ELSE None]]
+               [rc |-> rc, value |-> IF rc /= "OK" THEN None
+                                     ELSE IF TaskMode THEN <<"result", c, T(c, l).task>>
+                                     ELSE pTrainer[c][l].published.value]]
     /\ net' = Send(net, Msg("TASK_CHECK", CJ(c), SJ, SubmitId(c, l, 1),
                  [assignment |-> T(c, l).asg, try |-> 1]))
     /\ UNCHANGED pTaskCJ
+
+\* TaskExecutionInterrupted: the CJ exits nonzero (no reply).
+WorkerInterrupted(c, l) ==
+    /\ TaskMode /\ CJAlive(c, l) /\ T(c, l).asg /= None /\ Tries(c, l) = 0
+    /\ WorkerOut(c, l) /= None /\ WorkerOut(c, l).kind = "interrupted"
+    /\ pTaskCJ' = [pTaskCJ EXCEPT ![c][l].fatal = TRUE]
+    /\ UNCHANGED <<taskCJ_c, net>>
+\* END_RUN latches run_abort_signal.
+LatchAbort(c, l) ==
+    /\ TaskMode /\ CJAlive(c, l) /\ EndRunTo(c) /\ ~Pt(c, l).abort
+    /\ pTaskCJ' = [pTaskCJ EXCEPT ![c][l].abort = TRUE]
+    /\ UNCHANGED <<taskCJ_c, net>>
+\* The final RECEIVED / TASK_CLOSED reply of the current task (AFTER_SEND_TASK_RESULT).
+RecordReceipt(c, l) ==
+    /\ TaskMode /\ CJAlive(c, l) /\ T(c, l).asg /= None
+    /\ Pt(c, l).receipt = None \/ Pt(c, l).receipt.gen < T(c, l).task
+    /\ \E k \in DOMAIN net :
+         /\ net[k].msg.kind \in {"RESULT_RECEIPT", "TASK_CHECK_REPLY"} /\ net[k].msg.to = CJ(c)
+         /\ net[k].msg.id[3] = l /\ net[k].msg.id[4] = T(c, l).task
+         /\ net[k].msg.body \in {"RECEIVED", "TASK_CLOSED"}
+         /\ pTaskCJ' = [pTaskCJ EXCEPT ![c][l].receipt = [gen |-> T(c, l).task, body |-> net[k].msg.body]]
+    /\ UNCHANGED <<taskCJ_c, net>>
 
 RetryCheck(c, l) ==
     /\ Running(c, l) /\ Tries(c, l) >= 1 /\ Tries(c, l) < FedMaxTryIn(Faults)
@@ -131,5 +165,6 @@ SendEnvelope(c, l) ==
 Next == \E c \in Sites, l \in Launches :
     \/ RequestTask(c, l) \/ PublishInput(c, l) \/ SignalTrainer(c, l) \/ FirstCheck(c, l)
     \/ RetryCheck(c, l) \/ Serialize(c, l) \/ SendEnvelope(c, l)
+    \/ WorkerInterrupted(c, l) \/ LatchAbort(c, l) \/ RecordReceipt(c, l)
     \/ \E k \in DOMAIN net : RecvAssignment(c, l, k)
 =============================================================================

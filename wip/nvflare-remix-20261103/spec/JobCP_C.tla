@@ -135,6 +135,8 @@ RestartClaim(c) ==
     LET l == CurLaunch(c) IN
     /\ l > 0 /\ l < MaxLaunch /\ pJobCP[c].exitSeen[l] = "crash"
     /\ ~P(c).abortReq /\ ~P(c).relaunching /\ pJobCP[c].reported = "none"
+    \* taskMode: can_restart needs the CP task owner of launch l done (JobCP_F)
+    /\ IF TaskMode THEN pWorker[c].owner[l] = "done" ELSE TRUE
     /\ jobCP_c' = [jobCP_c EXCEPT ![c].relaunching = TRUE]
     /\ UNCHANGED <<pJobCP, net>>
 

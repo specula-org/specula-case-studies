@@ -255,7 +255,10 @@ BaseAcceptTrainResult ==
        /\ wfSJ_f' = [wfSJ_f EXCEPT !.app.pc = IF bad THEN "decision" ELSE "convert",
              !.aggr.failedClients = IF bad /\ ErrorMode = "dynamic"
                                     THEN @ \cup {CurId[2]} ELSE @]
-       /\ pWfSJ' = [pWfSJ EXCEPT !.panic = @ \/ (bad /\ ErrorMode /= "resilient")]
+       /\ pWfSJ' = IF TaskMode
+                   THEN [pWfSJ EXCEPT !.panic = @ \/ (bad /\ ErrorMode /= "resilient"),
+                                      !.errored = IF bad THEN @ \cup {CurId} ELSE @]
+                   ELSE [pWfSJ EXCEPT !.panic = @ \/ (bad /\ ErrorMode /= "resilient")]
     /\ UNCHANGED net
 
 \* base_model_controller.py:283-295

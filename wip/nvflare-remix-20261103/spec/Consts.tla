@@ -30,8 +30,12 @@ ASSUME MaxLaunch \in Nat \ {0} /\ MaxAttempt \in Nat \ {0}
 \*                controlled CSE server controller, ccwf/cse_server_ctl.py:
 \*                186-200); the model's round task stands for that group. Not
 \*                symmetric in Sites (the order is fixed): no symmetry reduction.
-ProfileSwitches == {"lossBudget3", "wfTolerant", "nonStrictStart", "otherJob", "errResilient", "cseTasks", "multiJob"}
+\*   taskMode     (v10) the client app uses execution_lifetime "task" on the
+\*                Kubernetes task backend: TaskWorkerExecutor runs every
+\*                assignment in a fresh worker Pod (Worker group, PortsWrk)
+ProfileSwitches == {"lossBudget3", "wfTolerant", "nonStrictStart", "otherJob", "errResilient", "cseTasks", "multiJob", "taskMode"}
 ASSUME Profile \subseteq ProfileSwitches
+TaskMode == "taskMode" \in Profile
 
 Launches == 1..MaxLaunch
 Attempts == 1..MaxAttempt

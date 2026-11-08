@@ -605,3 +605,24 @@
 | 新于 Phase 1 | 12 | 加上 S1、S4 |
 | 只有静态代码确认 | 2 | S2、S3（新线索，影响低或依赖时序） |
 | 只有模型反例 | 1 | N1 |
+
+## 16. 第十轮（11-08）：task worker 子系统
+
+task worker 在 Phase 1 和前九轮里都不在范围内（`DESIGN.md:159`、H50）。代码约 2,800 行，10/12–10/30 由 7 个 PR 合入，11-03 之后上游没有再改过这些文件（GitHub API 复核），pin `c411a201` 就是最新版本。失败语义表和线索核实在 `notes/task-worker-audit.md`。
+
+### 16.1 失败语义排查与 L5
+
+单点失败基本都有显式防护：每个边界要么重试，要么 fence 后 fail-stop。四条弱线索都不计：L1 launch 回复丢失直接让本轮失败，属设计取舍；L2 abort_task 路径是死代码；L3 重发被 `finish_submission` 挡住；L4 驱逐后拿不到退出码，需要集群才能确认。
+
+**L5（新，REPRODUCED）：CJ 用 worker 节点的单调时钟判超时。** worker 把自己的 `time.monotonic()` 写进进度标记（`client_api_task_runner.py:39-42`）。CJ 的 `result_wait_deadline`（62-77 行）用这些值算绝对截止时间，`TaskSupervisor._wait`（`supervisor.py:348-361`）再减去 CJ 自己的 `time.monotonic()`。单调时钟从各自节点开机算起，worker Pod 和 CJ Pod 不在同一节点时，这个差值没有意义。设计文档推荐 CPU CJ 加 GPU worker，二者通常不在同一节点。
+
+| 场景 | 对照（偏移 0） | worker 时钟偏移后 |
+|---|---|---|
+| A：默认 `finalization_timeout` 30 s，send 之后还有 2 s 收尾 | 2.7 s 成功 | worker 节点晚开机 1000 s：0.7 s 就判超时，健康任务被取消 |
+| B：`finalization_timeout=1s`，send 之后还有 4 s 收尾 | 1.7 s 判超时（应有行为） | worker 节点早开机 1000 s：4.7 s 成功，1 s 上限从未生效 |
+
+- 复现：`bash checks/confirm/l5_monotonic_repro.sh`（11-08 08:15 重跑，4 个用例全部通过）。
+- 真实代码：`TaskWorkerExecutor`、`TaskSupervisor`、`FileTaskArtifactStore`、worker 进程（`task_worker_process` → `run_worker` → Client API task runner）、指标会话、真实 Client API 脚本。
+- 替代物：上游测试用的 `ProcessTaskLauncher` 代替 K8s 后端；`checks/confirm/timens_exec.py` 用 Linux time namespace 平移 worker 的 `CLOCK_MONOTONIC`，代表"worker 在另一个开机时间不同的节点上"。
+- 证据档位：不需要强制调度、桩或故障注入，结果是确定的；环境条件靠模拟。由读代码发现，模型不含时间值，没有模型反例。
+- 上游：没有相关 issue 或 PR；#5616、#5500 都不涉及时钟。修复方向：worker 只写持续时间，或者 CJ 在第一次读到标记时用自己的时钟记下观测时刻。

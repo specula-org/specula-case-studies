@@ -5,9 +5,9 @@
 \* messages of kinds its group owns). Receiving is private (handled-key sets);
 \* the log is append-only except for NET-owned loss marks.
 \* Port shapes live in PortsJob / PortsFed / PortsPay (one per component).
-EXTENDS PortsJob, PortsFed, PortsPay, PortsTrn, PortsReg, Timing
+EXTENDS PortsJob, PortsFed, PortsPay, PortsTrn, PortsReg, PortsWrk, Timing
 
-FaultNames == JobFaults \cup FedFaults \cup PayFaults \cup TrnFaults \cup RegFaults \cup {"netLoss", "transportFail"}
+FaultNames == JobFaults \cup FedFaults \cup PayFaults \cup TrnFaults \cup RegFaults \cup WrkFaults \cup {"netLoss", "transportFail"}
 ASSUME Faults \subseteq FaultNames
 Kinds == JobKinds \cup FedKinds \cup PayKinds
 
@@ -21,8 +21,8 @@ Kinds == JobKinds \cup FedKinds \cup PayKinds
 \* pCommSJ    : SJ WFComm/server runner observable state
 \* pWfSJ      : SJ controller/workflow + SJ process lifecycle
 \* pTrainer   : CJ in-process trainer thread / Client API object
-VARIABLES net, pJobSP, pJobCP, pRunCJ, pTaskCJ, pPaySrc, pPayRcv, pCommSJ, pWfSJ, pTrainer, pReg
-portVars == <<net, pJobSP, pJobCP, pRunCJ, pTaskCJ, pPaySrc, pPayRcv, pCommSJ, pWfSJ, pTrainer, pReg>>
+VARIABLES net, pJobSP, pJobCP, pRunCJ, pTaskCJ, pPaySrc, pPayRcv, pCommSJ, pWfSJ, pTrainer, pReg, pWorker
+portVars == <<net, pJobSP, pJobCP, pRunCJ, pTaskCJ, pPaySrc, pPayRcv, pCommSJ, pWfSJ, pTrainer, pReg, pWorker>>
 
 \* Inbox view: a not-lost message of a kind addressed to p.
 Inbox(p, kind) == {k \in DOMAIN net : net[k].msg.to = p /\ net[k].msg.kind = kind /\ ~net[k].lost}
@@ -37,6 +37,7 @@ PortsInit == /\ net = [k \in {} |-> None]
              /\ pCommSJ = CommSJPortInit /\ pWfSJ = WfSJPortInit
              /\ pTrainer = TrainerPortInit
              /\ pReg = RegPortInit
+             /\ pWorker = WorkerPortInit
 
 \* OS-level process facts (the only allowed cross-process reads besides net).
 \* Any group of a process may kill its process (e.g. os._exit) by setting a

@@ -33,6 +33,50 @@ GNoStartAfterEarlyTerminal == [][(Terminal /\ ~pJobSP.sjLaunched) =>
 GNoStartAfterDelete == [][pJobSP.deleted =>
                             ((pJobSP'.sjLaunched => pJobSP.sjLaunched) /\ pJobSP'.startSent = pJobSP.startSent)]_portVars
 
+\* ---------------- GW (v10, profile taskMode): task worker end-to-end promises
+\* (task_worker_lifecycle.md "One assignment from delivery to cleanup",
+\* client_job_recovery.md). All are vacuous outside taskMode.
+\* W1: once a server assignment's checkpoint is committed, no worker is admitted
+\* for it again, by this CJ or a replacement (recovery adopts the saved result,
+\* task_worker_executor.py:239-244; "It does not rerun compute").
+GWNoRecomputeAfterCommit == [][TaskMode => \A c \in Sites, w \in WAttempts :
+        (w[2] \in pWorker[c].committed /\ pWorker[c].att[w] = "none") => pWorker'[c].att[w] /= "created"]_portVars
+\* W2a: at most one unsettled task attempt per site, across CJ launches
+\* ("The Kubernetes CP also admits at most one unsettled attempt per job").
+GWOneUnsettled == TaskMode => \A c \in Sites :
+        Cardinality({w \in WAttempts : pWorker[c].att[w] \in {"created", "deleting"}}) <= 1
+\* W2b: no worker of an earlier launch is still running once a replacement CJ
+\* exists ("CJ recovery after all prior executions stop"; can_restart). A CP
+\* restart is excluded: adoption is unsupported by design.
+GWNoOldLaunchPod == TaskMode => \A c \in Sites, w \in WAttempts :
+        (PodLive(pWorker[c].pod[w]) /\ ~CPRestarted(c)) => w[1] = CurLaunch(c)
+\* W3a: no dead end: while the server still waits for site c's result of the
+\* current round, the CJ never refuses that assignment because its identity is
+\* fenced ("alreadyOwned") or its saved result was released ("missingSaved")
+\* (supervisor.py:245-246, 415-428). A refusal of an assignment the server has
+\* already claimed is harmless (the duplicate is dropped, wf_comm_server.py:479-486).
+ServerWaits(c, a) == pCommSJ.round = a /\ pCommSJ.standing /\ c \notin pCommSJ.claimed
+OutAsg(c, l) == IF pTaskCJ[c][l].input /= None /\ pTaskCJ[c][l].input.gen = pWorker[c].out[l].gen
+                THEN pTaskCJ[c][l].input.assignment.attempt ELSE 0
+GWNoDeadEnd == TaskMode => \A c \in Sites, l \in Launches :
+        (pWorker[c].out[l] /= None /\ pWorker[c].out[l].reason \in {"alreadyOwned", "missingSaved"})
+            => ~ServerWaits(c, OutAsg(c, l))
+\* W3b: a result whose checkpoint was committed never reaches the server's
+\* result callback as an error for that round.
+GWCommittedNotErrored == TaskMode => \A c \in Sites, a \in Attempts :
+        a \in pWorker[c].committed => <<a, c>> \notin pWfSJ.errored
+\* W4 (written, not hunted): cancellation precedes publication. TaskCJ_F sends
+\* RESULT_ENVELOPE only while ~endRun and Worker_F commits only while ~abort; the
+\* property restates those two local guards (tautological, RESULTS 16.2).
+GWNoCommitAfterAbort == [][TaskMode => \A c \in Sites :
+        (pWorker'[c].ckpt /= pWorker[c].ckpt) =>
+            \E l \in Launches : pWorker'[c].ckpt.w[1] = l /\ ~pTaskCJ[c][l].abort]_portVars
+\* W6: checkpoint continuity: the committed manifest never moves back to an
+\* earlier server assignment (one slot per job/executor/task name).
+GWCkptMonotone == [][TaskMode => \A c \in Sites :
+        (pWorker[c].ckpt /= None /\ pWorker'[c].ckpt /= pWorker[c].ckpt) =>
+            pWorker'[c].ckpt.asg >= pWorker[c].ckpt.asg]_portVars
+
 \* ---------------- G1b server worker threads do not die of exceptions
 GCompletionThreadAlive == ~pJobSP.completionCrashed
 GTaskMonitorAlive == ~pCommSJ.monitorCrashed

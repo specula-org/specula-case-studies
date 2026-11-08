@@ -589,9 +589,15 @@ JobExecutorObserveExitCode(s, rc) ==
     /\ UNCHANGED <<net>>
 
 \* private/fed/client/client_executor.py:722-733; app_common/job_launcher/process_launcher.py:80-118
+\* taskMode (v10): K8sJobHandle.can_restart (app_opt/job_launcher/k8s_launcher.py:
+\* 718-740) is TRUE only once the CJ Pod shutdown is confirmed and the CP task
+\* owner thread has exited (every task attempt of that launch settled); a
+\* cleanup timeout returns FALSE.
 ProcessHandleCheckRestart(s, safe) ==
     LET t == T0 IN
     /\ client[s][t].cleanup="restartDecision"
+    \* IF, not \/: TLC explores both disjuncts of an action, and pWorker is 0 outside taskMode
+    /\ IF TaskMode /\ safe THEN pWorker[s].owner[client[s][t].generation] = "done" ELSE TRUE
     /\ client[s][t].retryable
     /\ LeafSite
     /\ MaxRestartFailures>0

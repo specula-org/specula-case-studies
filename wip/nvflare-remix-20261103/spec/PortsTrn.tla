@@ -13,6 +13,8 @@ EXTENDS Consts
 \* tpSilent / monitorStale: external trainer (Trainer_X) heartbeat timeout, and the
 \* accepted-source monitor preempted between its check and its decision (H03).
 TrnFaults == {"trainerError", "tpSilent", "monitorStale"}
+\* taskMode (v10): no in-process trainer; Trainer variants quantify over this.
+TrnLaunches == IF TaskMode THEN {} ELSE Launches
 TrainerPortInit == [c \in Sites |-> [l \in Launches |->
                      [slot |-> 0, received |-> 0, published |-> None, stopped |-> FALSE]]]
 =============================================================================

@@ -87,7 +87,7 @@ ClearCache(c, l) ==
     /\ pTrainer' = [pTrainer EXCEPT ![c][l].slot = 0]
     /\ trainer_f' = [trainer_f EXCEPT ![c][l].pc = "waiting", ![c][l].receiveCalled = FALSE]
 
-Next == \E c \in Sites, l \in Launches :
+Next == \E c \in Sites, l \in TrnLaunches :
     \/ Start(c, l) \/ Callback(c, l) \/ SignalCallback(c, l) \/ Receive(c, l)
     \/ ExitLoop(c, l) \/ Train(c, l) \/ TrainError(c, l) \/ Publish(c, l) \/ ClearCache(c, l)
 =============================================================================

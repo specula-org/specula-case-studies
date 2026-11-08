@@ -57,7 +57,15 @@ Accept(c) ==
 \* Strict error mode: a non-OK return code panics the runner.
 Panic ==
     /\ SJAlive /\ Call /= None /\ Call.kind = "live" /\ Call.rc /= "OK" /\ ~pWfSJ.panic
-    /\ pWfSJ' = [pWfSJ EXCEPT !.panic = TRUE]
+    /\ pWfSJ' = IF TaskMode THEN [pWfSJ EXCEPT !.panic = TRUE, !.errored = @ \cup {<<Call.round, Call.site>>}]
+                ELSE [pWfSJ EXCEPT !.panic = TRUE]
+    /\ UNCHANGED <<wfSJ_c, net>>
+
+\* taskMode: a live non-OK result reached the callback (pWfSJ.errored).
+RecordError ==
+    /\ TaskMode /\ SJAlive /\ Call /= None /\ Call.kind = "live" /\ Call.rc /= "OK"
+    /\ <<Call.round, Call.site>> \notin pWfSJ.errored
+    /\ pWfSJ' = [pWfSJ EXCEPT !.errored = @ \cup {<<Call.round, Call.site>>}]
     /\ UNCHANGED <<wfSJ_c, net>>
 
 \* APP_RETURN after the unknown hook or a rejection (bad rc, callback failure,
@@ -133,7 +141,7 @@ Crash ==
     /\ pWfSJ' = [pWfSJ EXCEPT !.sj = "crashed"]
     /\ UNCHANGED <<wfSJ_c, net>>
 
-Next == \/ Open \/ StartRound \/ Schedule \/ Panic \/ CancelAll \/ CloseRound
+Next == \/ Open \/ StartRound \/ Schedule \/ Panic \/ RecordError \/ CancelAll \/ CloseRound
         \/ RaiseReturn \/ Aggregate \/ Save \/ EndRun \/ DSShutdown \/ Exit \/ Crash
         \/ \E c \in Sites : Count(c) \/ Accept(c) \/ Return(c)
 =============================================================================

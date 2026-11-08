@@ -47,4 +47,8 @@ LShutdownStopsAllK == jobSP_f.shut.pc = "done" =>
 \* a legitimate end for the deadlock check (v9)
 ShutdownExited == jobSP_f.shut.pc = "done"
 
+\* W5 (v10, taskMode, WfSJ = F): the server's result callback / unknown-result
+\* hook runs at most once per (round, site), across CJ replacement and saved or
+\* recovered resubmission (WfSJ_F group-local invariants, seed base.tla).
+LWAtMostOnce == WfSJ_F!AtMostOneConsumer /\ WfSJ_F!FencedReceiptAtMostOnce
 =========================================================================

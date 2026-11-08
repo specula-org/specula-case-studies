@@ -145,7 +145,7 @@ MonDecide(c, l) ==
       /\ trainer_x' = Upd(c, l, [StopAfter(T(c, l), m.g) EXCEPT !.mon = T(c, l).mon \ {m}])
       /\ pTrainer' = [pTrainer EXCEPT ![c][l].stopped = TRUE]
 
-Next == \E c \in Sites, l \in Launches :
+Next == \E c \in Sites, l \in TrnLaunches :
     \/ Start(c, l) \/ Callback(c, l) \/ SignalCallback(c, l) \/ Receive(c, l)
     \/ ExitLoop(c, l) \/ Train(c, l) \/ TrainError(c, l) \/ Publish(c, l) \/ Settle(c, l)
     \/ ClearCache(c, l) \/ GoSilent(c, l) \/ Resume(c, l) \/ MonIter(c, l)
