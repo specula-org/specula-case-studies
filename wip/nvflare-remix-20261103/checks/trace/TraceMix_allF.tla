@@ -120,6 +120,9 @@ Step_JobSP_C_AbortRead == (/\ Grain["JobSP"] = "C" /\ "JobSP" \notin DOMAIN Site
 Step_JobSP_C_AbortRunningSend == (/\ Grain["JobSP"] = "C" /\ "JobSP" \notin DOMAIN SiteGrain /\ JobSP_C!AbortRunningSend /\ UNCHANGED <<pJobCP, pRunCJ, pTaskCJ, pPaySrc, pPayRcv, pCommSJ, pWfSJ, pTrainer, pReg, jobSP_f, jobCP_c, jobCP_f, runCJ_c, runCJ_f, taskCJ_c, taskCJ_f, trainer_c, trainer_f, trainer_x, paySrc_c, paySrc_f, payRcv_c, payRcv_f, commSJ_c, commSJ_f, wfSJ_c, wfSJ_f, reg_c, reg_f, net_r, net_l>> /\ Assert(NetOK("JobSP"), "net discipline: Step_JobSP_C_AbortRunningSend"))
 Step_JobSP_C_AbortRunningNoSJ == (/\ Grain["JobSP"] = "C" /\ "JobSP" \notin DOMAIN SiteGrain /\ JobSP_C!AbortRunningNoSJ /\ UNCHANGED <<pJobCP, pRunCJ, pTaskCJ, pPaySrc, pPayRcv, pCommSJ, pWfSJ, pTrainer, pReg, jobSP_f, jobCP_c, jobCP_f, runCJ_c, runCJ_f, taskCJ_c, taskCJ_f, trainer_c, trainer_f, trainer_x, paySrc_c, paySrc_f, payRcv_c, payRcv_f, commSJ_c, commSJ_f, wfSJ_c, wfSJ_f, reg_c, reg_f, net_r, net_l>> /\ Assert(NetOK("JobSP"), "net discipline: Step_JobSP_C_AbortRunningNoSJ"))
 Step_JobSP_C_MarkAborted == (/\ Grain["JobSP"] = "C" /\ "JobSP" \notin DOMAIN SiteGrain /\ JobSP_C!MarkAborted /\ UNCHANGED <<pJobCP, pRunCJ, pTaskCJ, pPaySrc, pPayRcv, pCommSJ, pWfSJ, pTrainer, pReg, jobSP_f, jobCP_c, jobCP_f, runCJ_c, runCJ_f, taskCJ_c, taskCJ_f, trainer_c, trainer_f, trainer_x, paySrc_c, paySrc_f, payRcv_c, payRcv_f, commSJ_c, commSJ_f, wfSJ_c, wfSJ_f, reg_c, reg_f, net_r, net_l>> /\ Assert(NetOK("JobSP"), "net discipline: Step_JobSP_C_MarkAborted"))
+Step_JobSP_C_ShutStart == (/\ Grain["JobSP"] = "C" /\ "JobSP" \notin DOMAIN SiteGrain /\ JobSP_C!ShutStart /\ UNCHANGED <<pJobCP, pRunCJ, pTaskCJ, pPaySrc, pPayRcv, pCommSJ, pWfSJ, pTrainer, pReg, jobSP_f, jobCP_c, jobCP_f, runCJ_c, runCJ_f, taskCJ_c, taskCJ_f, trainer_c, trainer_f, trainer_x, paySrc_c, paySrc_f, payRcv_c, payRcv_f, commSJ_c, commSJ_f, wfSJ_c, wfSJ_f, reg_c, reg_f, net_r, net_l>> /\ Assert(NetOK("JobSP"), "net discipline: Step_JobSP_C_ShutStart"))
+Step_JobSP_C_ShutStop == (/\ Grain["JobSP"] = "C" /\ "JobSP" \notin DOMAIN SiteGrain /\ JobSP_C!ShutStop /\ UNCHANGED <<pJobCP, pRunCJ, pTaskCJ, pPaySrc, pPayRcv, pCommSJ, pWfSJ, pTrainer, pReg, jobSP_f, jobCP_c, jobCP_f, runCJ_c, runCJ_f, taskCJ_c, taskCJ_f, trainer_c, trainer_f, trainer_x, paySrc_c, paySrc_f, payRcv_c, payRcv_f, commSJ_c, commSJ_f, wfSJ_c, wfSJ_f, reg_c, reg_f, net_r, net_l>> /\ Assert(NetOK("JobSP"), "net discipline: Step_JobSP_C_ShutStop"))
+Step_JobSP_C_ShutDone == (/\ Grain["JobSP"] = "C" /\ "JobSP" \notin DOMAIN SiteGrain /\ JobSP_C!ShutDone /\ UNCHANGED <<pJobCP, pRunCJ, pTaskCJ, pPaySrc, pPayRcv, pCommSJ, pWfSJ, pTrainer, pReg, jobSP_f, jobCP_c, jobCP_f, runCJ_c, runCJ_f, taskCJ_c, taskCJ_f, trainer_c, trainer_f, trainer_x, paySrc_c, paySrc_f, payRcv_c, payRcv_f, commSJ_c, commSJ_f, wfSJ_c, wfSJ_f, reg_c, reg_f, net_r, net_l>> /\ Assert(NetOK("JobSP"), "net discipline: Step_JobSP_C_ShutDone"))
 Step_JobSP_C_SelectCompletion == (/\ Grain["JobSP"] = "C" /\ "JobSP" \notin DOMAIN SiteGrain /\ JobSP_C!SelectCompletion /\ UNCHANGED <<pJobCP, pRunCJ, pTaskCJ, pPaySrc, pPayRcv, pCommSJ, pWfSJ, pTrainer, pReg, jobSP_f, jobCP_c, jobCP_f, runCJ_c, runCJ_f, taskCJ_c, taskCJ_f, trainer_c, trainer_f, trainer_x, paySrc_c, paySrc_f, payRcv_c, payRcv_f, commSJ_c, commSJ_f, wfSJ_c, wfSJ_f, reg_c, reg_f, net_r, net_l>> /\ Assert(NetOK("JobSP"), "net discipline: Step_JobSP_C_SelectCompletion"))
 Step_JobSP_C_OutcomeGraceExpired == (/\ Grain["JobSP"] = "C" /\ "JobSP" \notin DOMAIN SiteGrain /\ JobSP_C!OutcomeGraceExpired /\ UNCHANGED <<pJobCP, pRunCJ, pTaskCJ, pPaySrc, pPayRcv, pCommSJ, pWfSJ, pTrainer, pReg, jobSP_f, jobCP_c, jobCP_f, runCJ_c, runCJ_f, taskCJ_c, taskCJ_f, trainer_c, trainer_f, trainer_x, paySrc_c, paySrc_f, payRcv_c, payRcv_f, commSJ_c, commSJ_f, wfSJ_c, wfSJ_f, reg_c, reg_f, net_r, net_l>> /\ Assert(NetOK("JobSP"), "net discipline: Step_JobSP_C_OutcomeGraceExpired"))
 Step_JobSP_C_Classify == (/\ Grain["JobSP"] = "C" /\ "JobSP" \notin DOMAIN SiteGrain /\ JobSP_C!Classify /\ UNCHANGED <<pJobCP, pRunCJ, pTaskCJ, pPaySrc, pPayRcv, pCommSJ, pWfSJ, pTrainer, pReg, jobSP_f, jobCP_c, jobCP_f, runCJ_c, runCJ_f, taskCJ_c, taskCJ_f, trainer_c, trainer_f, trainer_x, paySrc_c, paySrc_f, payRcv_c, payRcv_f, commSJ_c, commSJ_f, wfSJ_c, wfSJ_f, reg_c, reg_f, net_r, net_l>> /\ Assert(NetOK("JobSP"), "net discipline: Step_JobSP_C_Classify"))
@@ -133,6 +136,10 @@ Step_JobSP_C_HeartbeatStop == \E c \in Sites : (/\ Grain["JobSP"] = "C" /\ "JobS
 Step_JobSP_C_ResolveMissingOutcome == \E c \in Sites : (/\ Grain["JobSP"] = "C" /\ "JobSP" \notin DOMAIN SiteGrain /\ JobSP_C!ResolveMissingOutcome(c) /\ UNCHANGED <<pJobCP, pRunCJ, pTaskCJ, pPaySrc, pPayRcv, pCommSJ, pWfSJ, pTrainer, pReg, jobSP_f, jobCP_c, jobCP_f, runCJ_c, runCJ_f, taskCJ_c, taskCJ_f, trainer_c, trainer_f, trainer_x, paySrc_c, paySrc_f, payRcv_c, payRcv_f, commSJ_c, commSJ_f, wfSJ_c, wfSJ_f, reg_c, reg_f, net_r, net_l>> /\ Assert(NetOK("JobSP"), "net discipline: Step_JobSP_C_ResolveMissingOutcome"))
 Step_JobSP_C_RecvOutcome == \E c \in Sites, k \in DOMAIN net : (/\ Grain["JobSP"] = "C" /\ "JobSP" \notin DOMAIN SiteGrain /\ JobSP_C!RecvOutcome(c, k) /\ UNCHANGED <<pJobCP, pRunCJ, pTaskCJ, pPaySrc, pPayRcv, pCommSJ, pWfSJ, pTrainer, pReg, jobSP_f, jobCP_c, jobCP_f, runCJ_c, runCJ_f, taskCJ_c, taskCJ_f, trainer_c, trainer_f, trainer_x, paySrc_c, paySrc_f, payRcv_c, payRcv_f, commSJ_c, commSJ_f, wfSJ_c, wfSJ_f, reg_c, reg_f, net_r, net_l>> /\ Assert(NetOK("JobSP"), "net discipline: Step_JobSP_C_RecvOutcome"))
 Step_JobSP_F_DefaultJobSchedulerBeginPass == (/\ Grain["JobSP"] = "F" /\ "JobSP" \notin DOMAIN SiteGrain /\ JobSP_F!DefaultJobSchedulerBeginPass /\ UNCHANGED <<pJobCP, pRunCJ, pTaskCJ, pPaySrc, pPayRcv, pCommSJ, pWfSJ, pTrainer, pReg, jobSP_c, jobCP_c, jobCP_f, runCJ_c, runCJ_f, taskCJ_c, taskCJ_f, trainer_c, trainer_f, trainer_x, paySrc_c, paySrc_f, payRcv_c, payRcv_f, commSJ_c, commSJ_f, wfSJ_c, wfSJ_f, reg_c, reg_f, net_r, net_l>> /\ Assert(NetOK("JobSP"), "net discipline: Step_JobSP_F_DefaultJobSchedulerBeginPass"))
+Step_JobSP_F_ShutdownStart == (/\ Grain["JobSP"] = "F" /\ "JobSP" \notin DOMAIN SiteGrain /\ JobSP_F!ShutdownStart /\ UNCHANGED <<pJobCP, pRunCJ, pTaskCJ, pPaySrc, pPayRcv, pCommSJ, pWfSJ, pTrainer, pReg, jobSP_c, jobCP_c, jobCP_f, runCJ_c, runCJ_f, taskCJ_c, taskCJ_f, trainer_c, trainer_f, trainer_x, paySrc_c, paySrc_f, payRcv_c, payRcv_f, commSJ_c, commSJ_f, wfSJ_c, wfSJ_f, reg_c, reg_f, net_r, net_l>> /\ Assert(NetOK("JobSP"), "net discipline: Step_JobSP_F_ShutdownStart"))
+Step_JobSP_F_ShutdownIterError == (/\ Grain["JobSP"] = "F" /\ "JobSP" \notin DOMAIN SiteGrain /\ JobSP_F!ShutdownIterError /\ UNCHANGED <<pJobCP, pRunCJ, pTaskCJ, pPaySrc, pPayRcv, pCommSJ, pWfSJ, pTrainer, pReg, jobSP_c, jobCP_c, jobCP_f, runCJ_c, runCJ_f, taskCJ_c, taskCJ_f, trainer_c, trainer_f, trainer_x, paySrc_c, paySrc_f, payRcv_c, payRcv_f, commSJ_c, commSJ_f, wfSJ_c, wfSJ_f, reg_c, reg_f, net_r, net_l>> /\ Assert(NetOK("JobSP"), "net discipline: Step_JobSP_F_ShutdownIterError"))
+Step_JobSP_F_ShutdownStopJobAny == (/\ Grain["JobSP"] = "F" /\ "JobSP" \notin DOMAIN SiteGrain /\ JobSP_F!ShutdownStopJobAny /\ UNCHANGED <<pJobCP, pRunCJ, pTaskCJ, pPaySrc, pPayRcv, pCommSJ, pWfSJ, pTrainer, pReg, jobSP_c, jobCP_c, jobCP_f, runCJ_c, runCJ_f, taskCJ_c, taskCJ_f, trainer_c, trainer_f, trainer_x, paySrc_c, paySrc_f, payRcv_c, payRcv_f, commSJ_c, commSJ_f, wfSJ_c, wfSJ_f, reg_c, reg_f, net_r, net_l>> /\ Assert(NetOK("JobSP"), "net discipline: Step_JobSP_F_ShutdownStopJobAny"))
+Step_JobSP_F_ShutdownEnd == (/\ Grain["JobSP"] = "F" /\ "JobSP" \notin DOMAIN SiteGrain /\ JobSP_F!ShutdownEnd /\ UNCHANGED <<pJobCP, pRunCJ, pTaskCJ, pPaySrc, pPayRcv, pCommSJ, pWfSJ, pTrainer, pReg, jobSP_c, jobCP_c, jobCP_f, runCJ_c, runCJ_f, taskCJ_c, taskCJ_f, trainer_c, trainer_f, trainer_x, paySrc_c, paySrc_f, payRcv_c, payRcv_f, commSJ_c, commSJ_f, wfSJ_c, wfSJ_f, reg_c, reg_f, net_r, net_l>> /\ Assert(NetOK("JobSP"), "net discipline: Step_JobSP_F_ShutdownEnd"))
 Step_JobSP_F_DefaultJobSchedulerEndPass == (/\ Grain["JobSP"] = "F" /\ "JobSP" \notin DOMAIN SiteGrain /\ JobSP_F!DefaultJobSchedulerEndPass /\ UNCHANGED <<pJobCP, pRunCJ, pTaskCJ, pPaySrc, pPayRcv, pCommSJ, pWfSJ, pTrainer, pReg, jobSP_c, jobCP_c, jobCP_f, runCJ_c, runCJ_f, taskCJ_c, taskCJ_f, trainer_c, trainer_f, trainer_x, paySrc_c, paySrc_f, payRcv_c, payRcv_f, commSJ_c, commSJ_f, wfSJ_c, wfSJ_f, reg_c, reg_f, net_r, net_l>> /\ Assert(NetOK("JobSP"), "net discipline: Step_JobSP_F_DefaultJobSchedulerEndPass"))
 Step_JobSP_F_DefaultJobSchedulerSkipBackoff == (/\ Grain["JobSP"] = "F" /\ "JobSP" \notin DOMAIN SiteGrain /\ JobSP_F!DefaultJobSchedulerSkipBackoff /\ UNCHANGED <<pJobCP, pRunCJ, pTaskCJ, pPaySrc, pPayRcv, pCommSJ, pWfSJ, pTrainer, pReg, jobSP_c, jobCP_c, jobCP_f, runCJ_c, runCJ_f, taskCJ_c, taskCJ_f, trainer_c, trainer_f, trainer_x, paySrc_c, paySrc_f, payRcv_c, payRcv_f, commSJ_c, commSJ_f, wfSJ_c, wfSJ_f, reg_c, reg_f, net_r, net_l>> /\ Assert(NetOK("JobSP"), "net discipline: Step_JobSP_F_DefaultJobSchedulerSkipBackoff"))
 Step_JobSP_F_DefaultJobSchedulerBackoffElapsed == (/\ Grain["JobSP"] = "F" /\ "JobSP" \notin DOMAIN SiteGrain /\ JobSP_F!DefaultJobSchedulerBackoffElapsed /\ UNCHANGED <<pJobCP, pRunCJ, pTaskCJ, pPaySrc, pPayRcv, pCommSJ, pWfSJ, pTrainer, pReg, jobSP_c, jobCP_c, jobCP_f, runCJ_c, runCJ_f, taskCJ_c, taskCJ_f, trainer_c, trainer_f, trainer_x, paySrc_c, paySrc_f, payRcv_c, payRcv_f, commSJ_c, commSJ_f, wfSJ_c, wfSJ_f, reg_c, reg_f, net_r, net_l>> /\ Assert(NetOK("JobSP"), "net discipline: Step_JobSP_F_DefaultJobSchedulerBackoffElapsed"))
@@ -697,6 +704,9 @@ Next == Step_JobSP_C_SendCheck
     \/ Step_JobSP_C_AbortRunningSend
     \/ Step_JobSP_C_AbortRunningNoSJ
     \/ Step_JobSP_C_MarkAborted
+    \/ Step_JobSP_C_ShutStart
+    \/ Step_JobSP_C_ShutStop
+    \/ Step_JobSP_C_ShutDone
     \/ Step_JobSP_C_SelectCompletion
     \/ Step_JobSP_C_OutcomeGraceExpired
     \/ Step_JobSP_C_Classify
@@ -710,6 +720,10 @@ Next == Step_JobSP_C_SendCheck
     \/ Step_JobSP_C_ResolveMissingOutcome
     \/ Step_JobSP_C_RecvOutcome
     \/ Step_JobSP_F_DefaultJobSchedulerBeginPass
+    \/ Step_JobSP_F_ShutdownStart
+    \/ Step_JobSP_F_ShutdownIterError
+    \/ Step_JobSP_F_ShutdownStopJobAny
+    \/ Step_JobSP_F_ShutdownEnd
     \/ Step_JobSP_F_DefaultJobSchedulerEndPass
     \/ Step_JobSP_F_DefaultJobSchedulerSkipBackoff
     \/ Step_JobSP_F_DefaultJobSchedulerBackoffElapsed
@@ -1413,6 +1427,9 @@ TNext == \E p \in {tpos}, d \in {0, 1, 2, 3}, q \in {sil} : tpos' = p + d /\ sil
     \/ (Step_JobSP_C_AbortRunningSend /\ Match(p, d))
     \/ (Step_JobSP_C_AbortRunningNoSJ /\ Match(p, d))
     \/ (Step_JobSP_C_MarkAborted /\ Match(p, d))
+    \/ (Step_JobSP_C_ShutStart /\ Match(p, d))
+    \/ (Step_JobSP_C_ShutStop /\ Match(p, d))
+    \/ (Step_JobSP_C_ShutDone /\ Match(p, d))
     \/ (Step_JobSP_C_SelectCompletion /\ Match(p, d))
     \/ (Step_JobSP_C_OutcomeGraceExpired /\ Match(p, d))
     \/ (Step_JobSP_C_Classify /\ Match(p, d))
@@ -1426,6 +1443,10 @@ TNext == \E p \in {tpos}, d \in {0, 1, 2, 3}, q \in {sil} : tpos' = p + d /\ sil
     \/ (Step_JobSP_C_ResolveMissingOutcome /\ Match(p, d))
     \/ (Step_JobSP_C_RecvOutcome /\ Match(p, d))
     \/ (Step_JobSP_F_DefaultJobSchedulerBeginPass /\ Match(p, d))
+    \/ (Step_JobSP_F_ShutdownStart /\ Match(p, d))
+    \/ (Step_JobSP_F_ShutdownIterError /\ Match(p, d))
+    \/ (Step_JobSP_F_ShutdownStopJobAny /\ Match(p, d))
+    \/ (Step_JobSP_F_ShutdownEnd /\ Match(p, d))
     \/ (Step_JobSP_F_DefaultJobSchedulerEndPass /\ Match(p, d))
     \/ (Step_JobSP_F_DefaultJobSchedulerSkipBackoff /\ Match(p, d))
     \/ (Step_JobSP_F_DefaultJobSchedulerBackoffElapsed /\ Match(p, d))
