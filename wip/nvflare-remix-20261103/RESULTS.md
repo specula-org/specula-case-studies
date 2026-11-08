@@ -626,3 +626,102 @@ task worker 在 Phase 1 和前九轮里都不在范围内（`DESIGN.md:159`、H5
 - 替代物：上游测试用的 `ProcessTaskLauncher` 代替 K8s 后端；`checks/confirm/timens_exec.py` 用 Linux time namespace 平移 worker 的 `CLOCK_MONOTONIC`，代表"worker 在另一个开机时间不同的节点上"。
 - 证据档位：不需要强制调度、桩或故障注入，结果是确定的；环境条件靠模拟。由读代码发现，模型不含时间值，没有模型反例。
 - 上游：没有相关 issue 或 PR；#5616、#5500 都不涉及时钟。修复方向：worker 只写持续时间，或者 CJ 在第一次读到标记时用自己的时钟记下观测时刻。
+
+### 16.2 性质 W1–W6
+
+都写在 `spec/GenericProps.tla`（端口级）和 `spec/PropsLocal.tla`（W5），taskMode 之外不起作用。
+
+| 编号 | TLA+ | 说的是什么 | 处理 |
+|---|---|---|---|
+| W1 | `GWNoRecomputeAfterCommit` | 某个分派的 checkpoint 一旦提交，这个 CJ 或接替它的 CJ 都不再为它启动 worker | 搜索 |
+| W2a | `GWOneUnsettled` | 每个 site 任意时刻最多一个没停稳的 attempt（跨 launch） | 搜索 |
+| W2b | `GWNoOldLaunchPod` | 已经有接替的 CJ 时，旧 launch 的 worker 不再运行（CP 重启除外，设计上不支持接管） | 搜索 |
+| W3a | `GWNoDeadEnd` | 服务器还在等这个 site 本轮的结果时，CJ 不会因为身份已被 fence 或保存的结果已释放而拒绝这个分派 | 搜索 |
+| W3b | `GWCommittedNotErrored` | 已提交 checkpoint 的结果，不会以错误的形式到达服务器的结果回调 | 搜索 |
+| W4 | `GWNoCommitAfterAbort` | 取消之后不再提交 | 剔除：等于 `TaskCJ_F` 的 `~endRun` 发送条件和 `Worker_F` 的 `~abort` 提交条件，必然成立 |
+| W5 | `LWAtMostOnce` | 服务器的结果回调和 unknown-result 钩子，对每个（轮，site）最多执行一次，跨 CJ 替换和保存结果的重发 | 搜索（WfSJ = F） |
+| W6 | `GWCkptMonotone` | 已提交的 checkpoint 清单不会退回到更早的分派 | 搜索 |
+
+W3a 的第一版没有限定"服务器还在等"，不带故障的 BFS 第 72 层就违反了：粗粒度 CommSJ 可以随时重发已完成的分派，CJ 回一个 missingSaved 错误。真实服务器在 `finish_submission` 之后不会再重发（L3），重复结果也会被丢掉，所以按服务器视角收紧了条件。
+
+### 16.3 模型、精化、TV 与回归
+
+- **模型**：DESIGN §15。新增 `Worker_F`（370 行）、`Worker_C`（173 行）、`PortsWrk`，接入 `TaskCJ_F/C`、`JobCP_F/C`（`can_restart` 门）、`WfSJ_F/C`（`errored`）。建模前备份：`.work/v10-pre-worker-20261108-034353`。
+- **改动中修掉的问题**：
+  1. TV 发现：abort 在 worker 停稳之后才被看到时，模型把原因记成 "none"，真实代码是 "abort"（`supervisor.py:284-286`）。
+  2. 回归发现：`JobCP` 的重启门写成 `~TaskMode \/ …`，TLC 会展开动作里的两个析取分支，非 taskMode 时 `pWorker` 是 0，求值报错。改成 `IF`，语义不变。
+- **精化（细 → 粗，1 site，2 次 launch，taskMode）**：
+
+| 检查 | 故障 | 状态数 | 结果 |
+|---|---|---:|---|
+| Worker F→C（修正 1 之后重跑） | 8 个 W 故障 + cjCrash + abort | 405 万 | 无违例（时限停止） |
+| Worker F→C（修正 1 之前） | 同上 / workerCrash、cjCrash、ctrlLoss | 475 万 / 423 万 | 无违例（时限停止） |
+| Worker 负控（只允许原地不动的"粗"版本） | 8 个 W 故障 + cjCrash + abort | 151（修正后）、174 | 按预期报 BadStep |
+| TaskCJ F→C | 8 个 W 故障 + cjCrash + abort | 474 万 | 无违例（时限停止） |
+| JobCP F→C | 同上 | 255 万 | 无违例（时限停止） |
+| WfSJ F→C | 同上 | 342 万 | 无违例（时限停止） |
+
+- **TV**（`checks/trace/worker/`，`tv_results.json`）：用上游测试里的 process harness 跑真实的 `TaskWorkerExecutor`、`TaskSupervisor`、`FileTaskArtifactStore`、worker 进程和 Client API 脚本，记录端口事件，再对 `Worker_F` 重放。K8s 后端换成测试用的 `ProcessTaskLauncher`，并按 `K8sTaskHandle._status` 把非零退出标成可重试；CP 和 Pod 的步骤不可见（silent）。
+
+| trace | 场景 | 结果 |
+|---|---|---|
+| fresh_receipt | 新算结果、提交 checkpoint、RECEIVED 后释放 | 接受 |
+| resend | 同一 CJ 内重发：已保存结果、新分派、再重发旧分派 | 接受 |
+| recovery | launch 1 提交后丢失，launch 2 从 checkpoint 清单恢复结果 | 接受 |
+| worker_fail | 脚本在 send 前失败，failure.json | 接受 |
+| worker_crash | worker 非零退出且没有记录，TaskExecutionInterrupted | 接受 |
+| abort_running | worker 运行中取消 | 接受 |
+| abort_before_commit | 停稳后、提交前取消 | 接受（修正 1 之后） |
+| abort_first | 开始前就已取消 | 接受 |
+| neg_nockpt | 新算结果但不提交 checkpoint | 拒绝（应拒绝） |
+| neg_samelaunch_recover | 同一 launch 内走"恢复" | 拒绝（应拒绝） |
+| neg_resend_recompute | 重发时重新计算 | 拒绝（应拒绝） |
+
+- **冒烟**：taskMode 不带故障的 BFS 140 万状态（时限停止）和死锁检查模拟 2,037 条 trace 都没有违例。
+- **回归（非 taskMode，`h10reg2`，28 个运行）**：
+  - D 组：之前的 12 个已知 bug 全部重新找到，另外 L13 的模拟版本也找到。T2 的模拟版本 900 秒内没找到（它的命中率一向只有 1/3 左右，BFS 版本已经找到）。
+  - S 组：每个族一个运行，14 个族都没有违例。
+
+### 16.4 搜索（taskMode，第一轮）与覆盖
+
+细粒度：JobSP、JobCP、RunCJ、TaskCJ、Worker、CommSJ、WfSJ；其余粗粒度。1 site 或 2 site，2 次 launch，2 轮。性质为 hunt8 的基础不变式加上 W1、W2a、W2b、W3a、W3b、W5、W6。
+
+| 计划 | 内容 | 结果 |
+|---|---|---|
+| `h10W`（10 个运行） | 4 个族（rec：workerCrash+cjCrash；ctl：ctrlLoss、settleTimeout、taskDeadline、taskStageFail；fail：workerFail+abort；net：netLoss、submitTimeout、workerCrash）各 1 个 BFS（从 Init 出发，K=2，JobPhase ≤ 5，30 分钟）和 1 个 2-site 模拟；另有全故障模拟（1/2 site） | 都没有违例。BFS 228 万–489 万状态（共 1,361 万）；模拟 648 条 trace |
+| `h10W2` 模拟 | 5 个族的 1-site 融合模拟，各 30 分钟 | 都没有违例，共 1,195 条 trace |
+| `h10C`（12 个运行） | 从作业中段 checkpoint 出发的 BFS：4 个族 × 阶段 2/3/4（RUNNING、第 1 轮已接受、第 2 轮已调度），K=2，20 分钟 | 都没有违例，69 万–117 万状态（共 1,054 万） |
+
+可达性见证（违反 = 走到了这条路径）：
+
+| 路径 | 模拟 | BFS（从 Init） | BFS（从 checkpoint） |
+|---|---|---|---|
+| 结果在回执后释放 | 8 秒 | 第 103 层 | — |
+| 停稳无法确认，fence | 8 秒 | 第 57 层 | — |
+| 第 2 轮提交 checkpoint | 31 秒 | 900 秒内没到 | 600 秒内没到 |
+| worker 起过之后 CJ 重启 | 71 秒 | 900 秒内没到 | 第 10 层（阶段 3）、第 21 层（阶段 2） |
+| 接替的 CJ 从 checkpoint 清单恢复结果 | 137 秒 | 900 秒内没到 | 600 秒内没到 |
+| 同一 CJ 内重发已保存的结果 | 1,640 条 trace 没到 | 65 万状态没到 | — |
+
+- 恢复路径（W1、W3 最关心的地方）只有模拟覆盖，BFS 在时限内都走不到；W2 的重启门在 checkpoint BFS 里有覆盖。
+- "同一 CJ 内重发已保存的结果"在细粒度服务器下走不到：服务器只在没收到结果时才重发（L3）。这与读代码的结论一致，上游单测是直接调两次 `execute` 才走到这条路径。
+- **变异检查**（`.build/x10/mutants.py`，模型副本 `.tmp/mut/`）：
+  - 去掉"从 checkpoint 恢复"（m2）：盲模拟 40 秒（38 条 trace）报出 W1 `GWNoRecomputeAfterCommit`。另外从真实见证 trace 恢复前 6 步的状态出发做 BFS，第 13 层报出；未变异的模型从同一状态出发不报。
+  - 去掉 `can_restart` 的 task owner 门（m1）：盲模拟 364 秒（306 条 trace）报出 W2b `GWNoOldLaunchPod`。
+  - 两个变异第一次只用 4 个 worker 各跑 900 秒（86/96 条 trace），都没报出来。说明这类路径需要几百条 trace 才能碰上，trace 数是这一轮覆盖的主要瓶颈。
+- **结论（有界负结果）**：在上述有界范围内，W1、W2、W3、W5、W6 都没有反例。这不是证明：BFS 都是跑到时限停的，恢复路径只有模拟覆盖。按 goal 的停止条件，第一轮全部干净即停止。
+
+### 16.5 按根因汇总（截至 11-08 第十轮）
+
+| 口径 | 个数 | 是哪些 |
+|---|---:|---|
+| 在真实代码上复现 | 17 | 第九轮的 16 个，加上 L5 |
+| 其中不需要强制调度或注入 | 6 | H08、H11、T1、R1、R2，加上 L5（环境条件用 time namespace 模拟，后端换成上游测试 launcher） |
+| 其中靠强制调度、桩、注入故障或以时序巧合为条件 | 11 | 同第九轮 |
+| 有模型反例且搜索能找回 | 15 | 同第九轮；L5 是时间值的 bug，模型不含时间值 |
+| 新于上游 | 16（或 17） | 加上 L5；都没有提交 |
+| 新于 Phase 1 | 13 | 加上 L5（task worker 不在 Phase 1 范围内） |
+| 只有静态代码确认 | 3 | S2、S3，加上 L6（停稳慢于 `settlement_timeout` 时已完成的结果被丢掉，需要集群时序确认） |
+| 只有模型反例 | 1 | N1 |
+
+这一轮模型检查没有找到新根因；L5 和 L6 都来自读代码。模型和性质的价值在于：给 task worker 子系统写出了 6 条端到端性质，有 TV 和精化检查作支撑，变异检查证明它们能抓到对应的 bug 类，在有界范围内没有发现反例。

@@ -60,6 +60,10 @@ worker 在 `_mark_progress`（`client_api_task_runner.py:39-42`）把 `time.mono
 
 证据等级：REPRODUCED，无强制调度、无耗时桩；环境条件（节点开机时间不同）用 time namespace 模拟，后端换成测试 launcher。上游：无相关 issue/PR（搜 "monotonic" 只有 #5653/#5656 的 conditional_wait，无关）；main 未变。修复方向：worker 只写持续时间，或 CJ 在第一次读到标记时用自己的时钟记下观测时刻。
 
+### L6（11-08 下午补充，只有静态证据，不计数）：停稳慢于 `settlement_timeout` 时，已经完成的结果被丢掉
+
+`TaskSupervisor._wait`（`supervisor.py:362-375`）看到 TERMINAL 后最多等 `settlement_timeout`（默认 10 s，`task_execution_policy.py:102`）。超时就 `_cancel`，取消在 `cleanup_timeout`（默认 60 s）内确认停稳后仍然把 TimeoutError 抛出去，本轮回 EXECUTION_EXCEPTION。worker 这时可能早已发布了有效的 completion。K8s 的停稳要等 CP 轮询（0.5 s）、删除 Pod、kubelet 报告 sandbox 已关（`PodReadyToStartContainers=False`，`k8s_pod.py:19-41`）、去掉 finalizer、再看到 404。集群繁忙时这串步骤能否超过 10 s 只能在真实集群上确认。设计文档写的是"expiry fences further attempts and retains ownership/evidence"，代码在取消成功时并不 fence，只是让本轮失败，属于可用性问题，先记为线索。模型里 `settleTimeout` 只覆盖"取消也确认不了"的 fence 情况。
+
 ## 上游查重
 
 #5616（K8s CJ 与 task worker 恢复，OPEN）：跟踪"确认停止后再替换、保留分派、新物理 ID、checkpoint 连续"，验收点与 W1/W2 相同，没有提到时钟。#5500（Process task GPU 与失败清理，OPEN）：Process 后端已推迟，与 K8s 路径无交集。L5 与两者都不重叠。
