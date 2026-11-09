@@ -37,7 +37,7 @@ FAULT1 = re.compile(r'"(\w+)"\s*\\in\s*Faults')
 # action by the escape; seen for dynamic pricing only (not a static gate)
 TIMINGOK = re.compile(r'TimingOK\(\s*Faults\s*,\s*"(\w+)"')
 FAULTSET = re.compile(r'(?:Faults\s*\\cap\s*\{([^}]*)\}|\{([^}]*)\}\s*\\cap\s*Faults)\s*/=\s*\{\}')
-PORT_MODULES = ["Consts", "Timing", "PortsJob", "PortsFed", "PortsPay", "PortsTrn", "PortsReg", "Ports"]
+PORT_MODULES = ["Consts", "Timing", "PortsJob", "PortsFed", "PortsPay", "PortsTrn", "PortsReg", "PortsWrk", "PortsModel", "Ports"]
 
 
 def bodies(text):

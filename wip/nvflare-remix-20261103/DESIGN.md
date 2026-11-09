@@ -368,3 +368,178 @@ Profile `taskMode` means the client app uses `execution_lifetime: "task"` on the
   - `tv_worker_test.py` runs the real executor, supervisor, store and worker process through upstream's process harness, and logs port events.
   - The stand-in for the Kubernetes backend is the test `ProcessTaskLauncher`, with K8s retryable-exit semantics mirrored. CP and Pod steps are silent.
   - `gen_tv_worker.py` replays each trace against Worker_F with a trace-driven environment.
+
+## 16. v11: breadth plan (coarse groups for the rest of the control plane)
+
+Goal: bring the remaining high-level control-plane content into the model as **coarse** behavior, block by block (A–G), each with a smoke check and a happy-path group-level trace validation. Hunts, fine variants of the new content, large-scale TV and reproductions are out of scope for v11. The rollback point is commit `5b6f008d`.
+
+### 16.1 Rules for v11 content
+
+- **Profile-gated.** Every new behavior sits behind a profile switch (`Consts.ProfileSwitches`) or a priced fault (`rarity.json`). With all new switches off, every new branch is disabled and every new port is a constant, so earlier mixes keep their state spaces (checked in 16.10).
+- **Coarse-only.** New behavior inside an existing group is added to its coarse variant only. `mkmc.py` refuses a mix that selects a fine variant of a group whose new profile branch exists only in the coarse module (`COARSE_ONLY`). New groups have a single variant `C`. Trainer gains an alternative implementation variant `A` (Attach), selected by grain like `X`, with no refinement receipt yet.
+- **Failure outcomes are kept.** Coarse steps may merge internal steps, but every failure outcome in the block's event table has a step, or the table says why it is left out.
+- **No value modeling.** Model weights, accumulator contents, timestamps and deadlines stay tokens; only their outcome classes are modeled (clean, poisoned, corrupt, missing).
+- **Windows that need fine steps later** go into the list in `notes/v11-audit.md`; v11 does not split them.
+
+### 16.2 New profile switches and faults
+
+| Switch | Block | Meaning | Coarse-only groups |
+|---|---|---|---|
+| `sjModel` | A | the SJ aggregator / persistor is the separate group Model; WfSJ calls it for accept, aggregate and save | WfSJ |
+| `sag` | B | ScatterAndGather workflow | WfSJ |
+| `cyclic` | B | Cyclic relay workflow | WfSJ, CommSJ |
+| `cseServer` | B | server-controlled cross-site model evaluation (standing validation broadcasts) | WfSJ, CommSJ |
+| `swarm` | D | client-controlled Swarm (CCWF): server-side controller in WfSJ, client side in the new group Swarm | WfSJ, CommSJ, TaskCJ |
+| `k8sJob` / `dockerJob` | E | CJ launched as a Kubernetes Pod / Docker container (default: process launcher) | JobCP |
+| `multiJobCP` | F | a second job J2 with its own allocation and CJ lifecycle on every CP | JobCP |
+| `sampling` | G | FedAvg client sampling: each round targets a nonempty subset of the sites | WfSJ, CommSJ |
+
+The workflow switches `sag`, `cyclic`, `cseServer`, `swarm` and the existing `cseTasks` are mutually exclusive (`ASSUME`). `k8sJob` and `dockerJob` are mutually exclusive.
+
+New faults (all priced in `rarity.json`):
+
+| Fault | Block | Event |
+|---|---|---|
+| `acceptRaise` | A | `aggregator.accept` raises after mutating part of the accumulator (arithmetic or materialization error; also a lazy reference whose disk-offload backing is gone) |
+| `saveFail` | A | the persistor's `save` raises (before replace, after replace, or after a partial direct write) |
+| `tpAttachLate` | C | the attach trainer never opens a session before the attach timeout |
+| `tpCrash` | C | the attached trainer process dies |
+| `tpReplyLost` | C | a CJ→trainer control reply (TASK_ACCEPTED, RESULT_ACCEPTED/REJECTED) is lost; the trainer probes status |
+| `swarmMsgFail` | D | a peer-to-peer learn / submit / status aux message fails or times out |
+| `learnFail` | D | the local learn executor returns an error |
+| `busyReplace` | D | a new learn task arrives while the client is still busy (abort of the current task) |
+| `gatherTimeout` | D | the aggregator's gather window expires before all replies |
+| `podDeleteFail` | E | the Kubernetes API fails a Pod delete (H20) |
+| `slowPublish` | E | a CJ's `publish_results` handler on CP runs past its requester (H07) |
+| `sjSyncFail` | G | the new SJ cannot get the participant list from SP within 30 s (#15) |
+| `taskDataFail` | G | a CJ fails to download a task's input payload and asks for the task again |
+
+### 16.3 Ports
+
+- **New `pModel`** (`spec/PortsModel.tla`, group Model, process SJ). Constant 0 unless `sjModel`.
+  - `call` / `ret`: the WfSJ→Model call-return handshake, `[op, round, site]` with `op ∈ {accept, aggregate, save, reset}` and outcome in `ret`.
+  - `acc[r][c] ∈ {none, accepted, rejected, partial}`: accept outcome per round and site.
+  - `poisoned[r]`: some accept of round `r` raised after a partial mutation.
+  - `agg[r] ∈ {none, clean, poisoned, empty}`: the aggregate the workflow got for round `r`.
+  - `artifact ∈ {initial, [round, kind]}` with `kind ∈ {clean, poisoned, corrupt}`: what the persisted model file holds.
+- **New `pSwarm[c][l]`** (`spec/PortsSwarm.tla`, group Swarm, process CJ, per site). Constant 0 unless `swarm`.
+  - `cfg`, `started`, `round`, `role` (trainer / aggregator of the round), `learn` (idle / busy / done / failed / aborted), `stopped` (`asked_to_stop`), `gathered[r]` (sites whose submission entered accept), `replied[r]` (sites recorded as replied), `aggregated[r]`, `report` (last status report: `[round, allDone, error]`), `final` (final result distributed).
+- **Extensions of existing ports** (fields exist only under their switch, like `pTaskCJ.abort` under `taskMode`):
+  - `pWfSJ`: `mcall` (call to Model), `policy` state `wfDone` (Cyclic `_is_done`), `targets` (sampling), `cw` (CCWF: `configured`, `started`, `ended`).
+  - `pCommSJ`: `targets` (sampling / relay order), `relayPos` (Cyclic).
+  - `pTaskCJ[c][l]`: `ccwf` (the client-controller executor's reply for config / start tasks).
+  - `pJobCP[c]`: `backend` facts `podLive[l]` (K8s/Docker: the CJ container exists regardless of the CJ process view), `released[l]` (handle released transfer, secret, task owner), `wsRecord` (workspace transfer record: `[l, token]`), `j2` (J2 lifecycle on this CP: `none | starting | running | restarting | exited | freed`, its launch generation and its allocation).
+- **Liveness under `k8sJob`/`dockerJob`.** `Ports.CJAlive` drops the `~CPRestarted(c)` conjunct: the CJ Pod or container does not die with the CP (no `monitor_parent_process` across containers). The restarted CP keeps no record of it (adoption is unsupported upstream, `docs/design/client_job_recovery.md`), so the CJ becomes an orphan that keeps working with the SJ.
+
+### 16.4 New message kinds
+
+| Kind | Owner | From → to | Body |
+|---|---|---|---|
+| `SWARM_LEARN` | Swarm | CJ(aggregator) → CJ(trainer) | `[round, aggregator]` |
+| `SWARM_SUBMIT` | Swarm | CJ(trainer) → CJ(aggregator) | `[round, rc]` |
+| `SWARM_STATUS` | Swarm | CJ → SJ | `[round, allDone, error]` (status reports ride on the client's task requests; one message per change) |
+| `SWARM_END_WF` | WfSJ | SJ → CJ | `None` (end-workflow aux request) |
+| `SWARM_END_REPLY` | Swarm | CJ → SJ | `rc` |
+| `PUBLISH_RESULTS` | RunCJ | CJ → CP | `[l, token]` (K8s workspace transfer) |
+
+Attach trainer↔CJ control messages stay private to `Trainer_A` (like Trainer_X's session), because no other group reads them.
+
+### 16.5 Block A: SJ.Model (group Model)
+
+Anchors: `dxo_aggregator.py:75-208`, `weighted_aggregation_helper.py:192-285`, `fedavg.py:221-260,300-400`, `base_model_controller.py:452-462`, `pt/file_model_persistor.py:308-360`, `np/np_model_persistor.py:103-114`, `wf_comm_server.py:655-672`.
+
+| Event | Phase | Model step | Outcome |
+|---|---|---|---|
+| accept OK | result callback of round r | `Accept` | `acc[r][c] = accepted` |
+| safe reject (wrong round, duplicate, shape, kind) | callback | `Reject` | `rejected`; accumulator unchanged |
+| accept raises after a partial mutation (`acceptRaise`) | callback | `AcceptRaise` | `partial`, `poisoned[r]`; the callback raises: WFComm marks the task ERROR, no abort |
+| aggregate | after the round's task ends | `Aggregate` | `agg[r] ∈ {clean, poisoned, empty}` from the round's state |
+| save OK | after aggregate | `Save` | `artifact = [r, clean or poisoned]` |
+| save raises (`saveFail`) | save | `SaveFail` | before replace: artifact unchanged; after replace: new artifact; direct write: `corrupt`; the workflow sees an exception |
+| reset | round start | `Reset` | round state cleared |
+| SJ crash | any | (WfSJ `Crash`) | Model stops; artifact stays |
+
+Not modeled: numeric content, LazyAggregator's queue (H47, intentional policy), the PT in-memory update before save (H39 partly: covered by "after replace").
+
+### 16.6 Block B: workflows (WfSJ_C policies)
+
+Anchors: `scatter_and_gather.py:240-460`, `cyclic_ctl.py` (`control_flow`, `_process_result`), `cross_site_model_eval.py` (`control_flow`), `wf_comm_server.py:1048-1170` (relay).
+
+| Event | SAG | Cyclic | Server CSE |
+|---|---|---|---|
+| round start | broadcast to all, `min_responses`, wait after min | relay in site order, one client at a time | submit-model broadcast, then one validation broadcast per model, standing together |
+| OK result | Model accept | replaces the relayed model | recorded |
+| non-OK result | `ignore_result_error` policy: panic or ignore | `_stop_workflow`: the workflow ends normally (no panic) | logged |
+| callback raises (`cbFail`, `acceptRaise`) | task ERROR; SAG does not check the status and aggregates | stop workflow | task ERROR |
+| task timeout / assignment timeout | task ends with what it has | client skipped | task ends |
+| abort signal | checked before aggregate and before save | checked per round | checked in the wait loop |
+| aggregate / convert raises | panic | — | — |
+| save raises | panic | panic | — |
+| resend after a lost reply (cseTasks-style duplicate ClientTask) | — | — | monitor may die (H11, same coarse step as `cseTasks`) |
+
+### 16.7 Block C: Attach trainer (Trainer variant A)
+
+Anchors: `attach_backend.py:351-640,746-832`, `cell_backend.py:195-290`, `client/cell/attach_session.py:260-537`, `client/cell/api.py` (send, RESULT_SOURCE_SETTLED).
+
+| Event | Phase | Outcome at the Trainer port |
+|---|---|---|
+| trainer attaches | before or after the first task | session open |
+| no session before the attach timeout (`tpAttachLate`) | first task | executor error (`stopped`) |
+| task delivered; TASK_ACCEPTED lost (`tpReplyLost`) | delivery | status probe resolves; RESULT_READY also counts as delivery |
+| training, RESULT_READY (attempt 1, retry attempt 2) | result | `published` once the CJ accepts |
+| task closed before acceptance | result | RESULT_REJECTED; if both replies are lost the trainer infers success (H01, private outcome) |
+| abort / result wait timeout | waiting | TASK_ABORTED / error; abort sent to the trainer |
+| trainer crash (`tpCrash`) or silence (`tpSilent`) | any | session lost: error for the current task |
+| RESULT_SOURCE_SETTLED | after receivers finish | source released |
+| CJ finalize | run end | shutdown request, listener close, wait for source release (H24 window recorded, not split) |
+| CJ crash | any | session gone |
+
+### 16.8 Block D: Swarm (WfSJ_C `swarm` policy, group Swarm, TaskCJ_C routing)
+
+Anchors: `ccwf/server_ctl.py:231-540`, `ccwf/client_ctl.py:344-600`, `ccwf/swarm_client_ctl.py:116-290,555-1030`, `ccwf/client_controller_executor.py`.
+
+| Event | Phase | Outcome |
+|---|---|---|
+| config broadcast; fewer than `min_clients` replies within the configure timeout | config | SJ panic |
+| start task to the starting client fails | start | SJ panic |
+| learn task scatter to a trainer fails (`swarmMsgFail`) | round r | that trainer misses the round |
+| local learn error (`learnFail`) | round r | error result submitted, or error status report → SJ panic |
+| busy replacement (`busyReplace`) | round r | ABORT_TASK fired; the client's own controller treats it as a stop (H06) |
+| submit to the aggregator fails (`swarmMsgFail`) | round r | aggregator misses the contribution |
+| gather closes on all-replied before the last reply entered accept | gather | `replied` ⊋ `gathered` (H05 window, coarse nondeterminism) |
+| gather timeout (`gatherTimeout`) | gather | aggregate what was gathered, or fail below the minimum |
+| aggregator / any CJ crash | any | the swarm stalls; SJ progress / report timeout panics |
+| status report silent for `max_status_report_interval` | monitor | panic (min_clients = 0) or prune |
+| ALL_DONE / final result distribution | end | SJ ends the workflow: END_WF to all; too few replies → panic |
+
+### 16.9 Blocks E, F, G (JobCP_C, CommSJ_C, WfSJ_C, JobSP_C patches)
+
+E (anchors `job_launcher/k8s_launcher.py:308-745`, `docker_launcher.py:280-410`, `workspace_cell_transfer.py:333-475`):
+
+| Event | K8s | Docker |
+|---|---|---|
+| CP crash | CJ Pod survives; new CP has no record (orphan) | container survives; same |
+| terminate | Pod delete; API failure (`podDeleteFail`) still marks TERMINATED and releases transfer record, secret and task owner (H20) | stop+remove; API failure keeps the handle (no release) |
+| exit observation | Pod phase; restartable rc classes | container wait; NotFound → ABORTED |
+| `can_restart` | Pod UID unchanged, shutdown confirmed, task owner thread done, workspace download complete | exit confirmed and not terminating |
+| workspace publish (K8s) | `publish_results` handler; a slow handler of the old launch (`slowPublish`) removes the replacement's record (H07) | — |
+| GPU environment | from the allocation (no CP-global env) | from the allocation (`DeviceIDs`) |
+
+Slurm is deferred: its batch scheduler semantics (queueing, `scancel`, accounting states) need cluster behavior to be written accurately; recorded in `notes/v11-audit.md`.
+
+F (`multiJobCP`): J2's START (allocate + env consume, the existing `otherJob` write), spawn, exit, restart (snapshot of the CP-global env, H08 in both directions), outcome, free, abort; the CP restart kills both jobs' CJs (process launcher); the heartbeat lists both. J2 is CP-local: the SP side keeps the existing `multiJob` summary.
+
+G:
+- `sjSyncFail` (#15): the new SJ exits with an error before opening the workflow.
+- `taskDataFail`: SJ→CJ input download failure; the CJ asks again, and the server's resend path runs (H11's trigger).
+- `sampling`: per round, a nonempty target subset; only targets get assignments; the round completes when the targets finished.
+- CP restart adoption: covered by E (orphan CJ under `k8sJob`/`dockerJob`); under the process launcher the CJ dies with the CP (unchanged).
+- H31 (a new transaction per submission try) is deferred: the payload ports are keyed by attempt (`pPaySrc[c][l].tx[a]`), so a per-try transaction changes the port shape of PaySrc and PayRcv in both variants (PaySrc_F is 1,654 lines). The server deduplicates by receipt, and H31 is a contract baseline.
+
+### 16.10 Checks per block
+
+1. `gen_mix` static checks and SANY.
+2. Smoke (simulation): with the block's switch on, the job reaches a terminal status (reachability witness), and each fault in the block's table reaches its outcome (one witness each). For groups with an environment module, `AG_<G>` holds in a mix by simulation.
+3. Existing groups whose coarse module changed: their fine→coarse refinement with all new switches off, to a budget, plus the negative control (BadStep).
+4. Non-interference with all new switches off: two or three previously exhaustive BFS configurations give the same distinct-state counts; the real POC trace is still accepted on all-fine and all-coarse; the D-track known bugs are still found.
+5. Happy-path TV: at least one real trace accepted and one mutated trace rejected per block, replayed group-level against the coarse variant (acceptance on a coarse variant is weak evidence, stated as such).

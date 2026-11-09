@@ -11,6 +11,24 @@ import argparse, json, sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+# v11 (DESIGN 16.1): profile switches whose behavior exists only in the coarse
+# module of these groups; a mix that picks another variant for them is refused.
+COARSE_ONLY = {
+    "sjModel": ["WfSJ"], "sag": ["WfSJ"], "cyclic": ["WfSJ"], "cseServer": ["WfSJ", "CommSJ"],
+    "swarm": ["WfSJ", "CommSJ", "TaskCJ"], "k8sJob": ["JobCP"], "dockerJob": ["JobCP"],
+    "multiJobCP": ["JobCP"], "sampling": ["WfSJ", "CommSJ"],
+}
+
+
+def check_coarse_only(grain, profile):
+    for sw in profile or ():
+        for grp in COARSE_ONLY.get(sw, ()):
+            v = grain.get(grp)
+            vals = set(v.values()) if isinstance(v, dict) else {v}
+            bad = vals - {"C"}
+            assert not bad, f"profile {sw}: group {grp} must be coarse (C), got {sorted(bad)}"
+
+
 PORT_INVS = ("ClaimNeedsMaterialized","MaterializedIsRegistered","AggregateIsAccepted","AcceptedWasClaimed","ReceivedReceiptMeansFinished","ReceivedMeansAccepted","NoFreeWhileChildAlive","AtMostOneFree","FinishedJobSaved","FinishedJobAllOk","NoReleaseBeforeMaterialize")
 
 
@@ -46,6 +64,7 @@ def build(name, grain=None, default="C", faults=(), sites=2, launch=1, attempt=1
         else:
             assert val in vs, (grp, val, vs)
         g[grp] = val
+    check_coarse_only(g, profile)
     outdir = Path(outdir or ROOT / "checks" / "mixes")
     outdir.mkdir(parents=True, exist_ok=True)
     site_names = [f"s{i+1}" for i in range(sites)]

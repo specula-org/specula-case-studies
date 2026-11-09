@@ -38,6 +38,11 @@ Materialized(c, a, refs) == Rx(c, a).status = "materialized" /\ Rx(c, a).want \i
 RetireFaults == ({"cancel", "prepFail", "taskTimeout", "minClients", "deadClient"} \cap Faults /= {})
                 \/ pReg.notified /= {}     \* v8: dead-client reports come from Reg
 NonLiveFaults == {"cancel", "prepFail"} \cap Faults /= {} \/ P.cancelled = Cur
+\* v11: a result callback of the current round raised; WFComm set the task's
+\* completion status to ERROR, so the task exits (wf_comm_server.py:657-672).
+CbRaised == RaiseTracked /\ Cur \in pWfSJ.raised
+\* v11: standing groups of tasks whose resend may list a ClientTask twice
+DupTasks == {"cseTasks", "cseServer"} \cap Profile /= {}
 
 ScheduleTask ==
     /\ SJAlive /\ pWfSJ.scheduled > Cur /\ pWfSJ.scheduled \in 1..Rounds
@@ -149,9 +154,9 @@ Reject(c, k) ==
 \* monitor retires nothing and checks no dead-client policy.
 Retire ==
     /\ SJAlive /\ P.standing /\ P.call = None /\ ~P.monitorCrashed
-    /\ P.finished = Sites \/ RetireFaults \/ P.cancelled = Cur
+    /\ P.finished = Sites \/ RetireFaults \/ P.cancelled = Cur \/ CbRaised
     /\ \/ pCommSJ' = [pCommSJ EXCEPT !.standing = FALSE]
-       \/ /\ "cseTasks" \in Profile
+       \/ /\ DupTasks
           /\ pCommSJ' = [pCommSJ EXCEPT !.standing = FALSE, !.monitorCrashed = TRUE]
     /\ UNCHANGED <<commSJ_c, net>>
 

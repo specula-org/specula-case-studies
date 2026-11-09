@@ -16,3 +16,5 @@ rsync -a $DRY --include='*.sh' --include='*.py' --exclude='*' "$SRC/.build/" "$D
 rsync -a $DRY --include='*.py' --include='*.sh' --include='*.json' --include='*.out' --include='toy/' --include='toy/*.tla' --include='toy/*.cfg' --exclude='*' "$SRC/.build/x7/" "$DST/.build/x7/"
 mkdir -p "$DST/.build/x10"
 rsync -a $DRY --include='*.py' --include='*.sh' --exclude='*' "$SRC/.build/x10/" "$DST/.build/x10/"
+mkdir -p "$DST/.build/x11"
+rsync -a $DRY --include='*.py' --include='*.sh' --include='*.jsonl' --exclude='*' "$SRC/.build/x11/" "$DST/.build/x11/"

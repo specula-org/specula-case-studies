@@ -55,7 +55,7 @@ def strip_comments(s):
     return "\n".join(line.split("\\*")[0] for line in s.splitlines())
 
 
-ALLOWED_IMPORTS = {"Ports", "Consts", "PortsJob", "PortsFed", "PortsPay", "PortsTrn", "PortsWrk", "Naturals",
+ALLOWED_IMPORTS = {"Ports", "Consts", "PortsJob", "PortsFed", "PortsPay", "PortsTrn", "PortsWrk", "PortsModel", "PortsSwarm", "Naturals",
                    "Integers", "Sequences", "FiniteSets", "TLC", "SequencesExt", "Bags"}
 
 

@@ -75,7 +75,19 @@ WfSJPortBase == [open |-> FALSE, scheduled |-> 0, accepted |-> {},
                  aggregate |-> None, saved |-> FALSE, cancelAll |-> 0,
                  ret |-> None, panic |-> FALSE, returned |-> "none",
                  done |-> FALSE, dsShutdown |-> FALSE, sj |-> "none"]
-WfSJPortInit == IF TaskMode THEN [f \in DOMAIN WfSJPortBase \cup {"errored"} |->
-                                    IF f = "errored" THEN {} ELSE WfSJPortBase[f]]
-                ELSE WfSJPortBase
+\* v11 (DESIGN 16.3), each field only under its switch:
+\*   mcall / mseq (sjModel): the call to the Model group and its call counter;
+\*   raised (sjModel or sag/cyclic/cseServer): rounds whose result callback
+\*     raised (WFComm sets the task's completion status ERROR, no abort);
+\*   wfDone (cyclic): _stop_workflow latched (_is_done).
+RaiseTracked == SJModel \/ WfPolicy \in {"sag", "cyclic", "cseServer"}
+WfSJExtra == (IF TaskMode THEN {"errored"} ELSE {}) \cup (IF SJModel THEN {"mcall", "mseq"} ELSE {})
+             \cup (IF RaiseTracked THEN {"raised"} ELSE {}) \cup (IF WfPolicy = "cyclic" THEN {"wfDone"} ELSE {})
+WfSJExtraInit(f) == CASE f \in {"errored", "raised"} -> {}
+                      [] f = "mcall" -> None
+                      [] f = "mseq" -> 0
+                      [] f = "wfDone" -> FALSE
+WfSJPortInit == IF WfSJExtra = {} THEN WfSJPortBase
+                ELSE [f \in DOMAIN WfSJPortBase \cup WfSJExtra |->
+                        IF f \in WfSJExtra THEN WfSJExtraInit(f) ELSE WfSJPortBase[f]]
 =============================================================================
