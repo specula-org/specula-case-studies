@@ -52,7 +52,10 @@ JobKinds == JobSPKinds \cup JobCPKinds \cup RunCJKinds
 JobFaults == {"slowSJTeardown", "slowAdminStop", "statusLost", "abortCmdError", "cjCrash", "abort", "outcomeReportFail", "deployError", "launchError",
               "storeError", "rpcTimeout", "outcomeTimeout", "archiveError",
               "admissionError", "resExpiry", "deleteJob", "spCrash", "cpCrash",
-              "spShutdown", "slowShutdownAbort"}
+              "spShutdown", "slowShutdownAbort",
+              \* v11 E: K8s Pod delete fails (H20); publish_results handler outlives its requester (H07);
+              \* G: the new SJ cannot get the participants from SP (#15)
+              "podDeleteFail", "slowPublish", "sjSyncFail"}
 JobStatuses == {"SUBMITTED", "DISPATCHED", "RUNNING", "ABORTED", "COMPLETED",
                 "FAILED", "FAILED_TO_RUN", "CANT_SCHEDULE"}
 JobTerminalStatuses == {"ABORTED", "COMPLETED", "FAILED", "FAILED_TO_RUN", "CANT_SCHEDULE"}
@@ -82,9 +85,21 @@ JobSPPortInit == [sjLaunched |-> FALSE, sjKilled |-> FALSE, startSent |-> {},
 \* terminated; exitSeen[l]: exit status CP's waiter observed for launch l
 \* ("ok"|"crash"|"killed"); freed: resource releases; reported: outcome the CP
 \* tried to report ("none"|"ok"|"failed"|"aborted").
-JobCPPortInit == [c \in Sites |-> [launch |-> 0, killed |-> {},
+JobCPPortBase == [launch |-> 0, killed |-> {},
                   exitSeen |-> [l \in Launches |-> "none"], freed |-> 0,
-                  allocated |-> FALSE, reported |-> "none", cpRestarted |-> FALSE]]
+                  allocated |-> FALSE, reported |-> "none", cpRestarted |-> FALSE]
+\* v11 (k8sJob; DESIGN 16.9): ws = the launch whose workspace-transfer record is
+\* registered (WorkspaceTransferManager.jobs[job_id]; 0 = none); pub[l] = the
+\* publish_results handler of launch l: none | running | done; wsLost = launches
+\* whose results publication found no record (results not returned).
+K8sJob == "k8sJob" \in Profile
+JobCPPortInit == [c \in Sites |->
+    IF ~K8sJob THEN JobCPPortBase
+    ELSE [f \in DOMAIN JobCPPortBase \cup {"ws", "pub", "wsLost"} |->
+            CASE f = "ws" -> 0
+              [] f = "pub" -> [l \in Launches |-> "none"]
+              [] f = "wsLost" -> {}
+              [] OTHER -> JobCPPortBase[f]]]
 \* state: "none" -> "initialized" (init_run) -> "running" (main loop) ->
 \*        "stopping" (left the loop: run_abort_signal) -> "exited";
 \* ready: main loop started (after on_ready); abort: run_abort_signal

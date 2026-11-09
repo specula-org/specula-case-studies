@@ -88,7 +88,9 @@ Spawn(c) ==
     \* fine JobExecutorRegisterPendingHandle sends HB 2 atomically (X1/X2); a
     \* lazy listing let the SP resolve a running CJ's outcome as missing (bfs3)
     /\ P(c).hb = 2
-    /\ pJobCP' = [pJobCP EXCEPT ![c].launch = 1]
+    \* k8sJob: launch_job registers the job's workspace-transfer record (add_job)
+    /\ pJobCP' = IF K8sJob THEN [pJobCP EXCEPT ![c].launch = 1, ![c].ws = 1]
+                 ELSE [pJobCP EXCEPT ![c].launch = 1]
     /\ UNCHANGED <<jobCP_c, net>>
 
 \* Prepare/spawn/waiter exception -> StartJobProcessor rollback: free + StartNo.
@@ -146,7 +148,8 @@ RestartClaim(c) ==
 Relaunch(c) ==
     /\ P(c).relaunching \/ P(c).orphan
     /\ jobCP_c' = [jobCP_c EXCEPT ![c].relaunching = FALSE, ![c].orphan = FALSE]
-    /\ pJobCP' = [pJobCP EXCEPT ![c].launch = @ + 1]
+    /\ pJobCP' = IF K8sJob THEN [pJobCP EXCEPT ![c].launch = @ + 1, ![c].ws = CurLaunch(c) + 1]
+                 ELSE [pJobCP EXCEPT ![c].launch = @ + 1]
     /\ UNCHANGED net
 
 \* Restart submission exception: report failure instead.
@@ -200,7 +203,41 @@ CPCrashRestart(c) ==
     /\ pJobCP' = [pJobCP EXCEPT ![c].cpRestarted = TRUE, ![c].allocated = FALSE]
     /\ net' = Send(net, Msg("HEARTBEAT", CP(c), SP, <<JobId, c, 3>>, 3))
 
+\* ---------------------------------------------------------------- v11 E (k8sJob)
+\* The CJ publishes its results at shutdown (upload_results_on_shutdown); the CP's
+\* handler authorizes against the current record, downloads and extracts, then
+\* remove_job(job_id) pops whatever record is current (workspace_cell_transfer.py:
+\* 429-487). Normally the requester waits, so the handler ends while launch l is
+\* still alive; slowPublish lets it end after a replacement registered (H07).
+PubStart(c, l) ==
+    /\ K8sJob /\ l \in Launches /\ pJobCP[c].ws = l /\ pJobCP[c].pub[l] = "none" /\ CJAlive(c, l)
+    /\ pJobCP' = [pJobCP EXCEPT ![c].pub[l] = "running"]
+    /\ UNCHANGED <<jobCP_c, net>>
+PubDone(c, l) ==
+    /\ K8sJob /\ l \in Launches /\ pJobCP[c].pub[l] = "running"
+    /\ CJAlive(c, l) \/ "slowPublish" \in Faults
+    /\ pJobCP' = [pJobCP EXCEPT ![c].pub[l] = "done", ![c].ws = 0]
+    /\ UNCHANGED <<jobCP_c, net>>
+\* the CJ's publish finds no record (unknown job_id): its results are not returned
+PubMissing(c, l) ==
+    /\ K8sJob /\ l \in Launches /\ l = CurLaunch(c) /\ CJAlive(c, l)
+    /\ pJobCP[c].pub[l] = "none" /\ pJobCP[c].ws /= l /\ l \notin pJobCP[c].wsLost
+    /\ pJobCP' = [pJobCP EXCEPT ![c].wsLost = @ \cup {l}]
+    /\ UNCHANGED <<jobCP_c, net>>
+\* terminate(): delete_namespaced_pod fails (podDeleteFail), yet the handle sets
+\* terminal_state TERMINATED and releases the transfer record, the credential
+\* Secret and the task owner while the Pod may still run (k8s_launcher.py:409-437,
+\* H20); the waiter sees a terminal handle.
+K8sDeleteFail(c) ==
+    LET l == CurLaunch(c) IN
+    /\ K8sJob /\ "podDeleteFail" \in Faults /\ P(c).abortReq /\ l > 0 /\ CJAlive(c, l)
+    /\ pJobCP[c].exitSeen[l] = "none" /\ P(c).st \in {"starting", "running"}
+    /\ pJobCP' = [pJobCP EXCEPT ![c].exitSeen[l] = "killed", ![c].ws = 0]
+    /\ UNCHANGED <<jobCP_c, net>>
+
 Next ==
+    \/ \E c \in Sites, l \in Launches : PubStart(c, l) \/ PubDone(c, l) \/ PubMissing(c, l)
+    \/ \E c \in Sites : K8sDeleteFail(c)
     \/ \E c \in Sites, k \in DOMAIN net :
         RecvCheck(c, k) \/ RecvCancel(c, k) \/ RecvDeploy(c, k) \/ RecvStart(c, k)
         \/ RecvAbort(c, k)

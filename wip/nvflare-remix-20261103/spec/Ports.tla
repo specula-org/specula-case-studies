@@ -60,11 +60,13 @@ CJFatal(c, l) == Flag(pTaskCJ[c][l], "fatal") \/ Flag(pPaySrc[c][l], "fatal")
 \* A CJ dies with its parent: monitor_parent_process (worker_process.py:124,
 \* app/utils.py:45) ends the job process when the CP is gone (cpCrash restart).
 CPRestarted(c) == Flag(pJobCP[c], "cpRestarted")
+\* v11 (k8sJob / dockerJob): the CJ runs in its own Pod / container, which does not
+\* die with the CP (no monitor_parent_process across containers).
 CJAlive(c, l) == /\ l \in Launches /\ CurLaunch(c) >= l
-                 /\ pRunCJ[c][l].exit = "none" /\ ~CJFatal(c, l) /\ ~CPRestarted(c)
+                 /\ pRunCJ[c][l].exit = "none" /\ ~CJFatal(c, l) /\ (CJContainer \/ ~CPRestarted(c))
 \* Exit status the parent observes for launch l (meaningful once ~CJAlive).
 CJExitCode(c, l) == IF pRunCJ[c][l].exit /= "none" THEN pRunCJ[c][l].exit
-                    ELSE IF CJFatal(c, l) \/ (CPRestarted(c) /\ l \in Launches /\ CurLaunch(c) >= l)
+                    ELSE IF CJFatal(c, l) \/ (CPRestarted(c) /\ ~CJContainer /\ l \in Launches /\ CurLaunch(c) >= l)
                          THEN "crash" ELSE "none"
 \* A launched child that is no longer alive: peers may observe it as a
 \* transport failure (connection lost / no route), at any later time.

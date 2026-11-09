@@ -51,4 +51,14 @@ WSwEndLost == ~(SwarmOn /\ pWfSJ.cw = "ending" /\ \E k \in DOMAIN net : net[k].l
 WSwEndFail == ~(SwarmOn /\ pWfSJ.panic /\ pWfSJ.cw = "ending")
 WSwGatherTimeoutPartial == ~(SwarmOn /\ \E c \in Sites, r \in 1..SwarmRounds :
                                 Sw(c).aggregated[r] /= None /\ Sw(c).aggregated[r] /= Sites)
+\* --- E (k8sJob / dockerJob)
+WOrphanCJ == ~(CJContainer /\ \E c \in Sites, l \in Launches : CPRestarted(c) /\ CJAlive(c, l))
+WFreeWhileAlive == ~(\E c \in Sites : pJobCP[c].freed > 0 /\ \E l \in Launches : CJAlive(c, l))
+WPubDone == ~("k8sJob" \in Profile /\ \E c \in Sites, l \in Launches : pJobCP[c].pub[l] = "done")
+WWsLost == ~("k8sJob" \in Profile /\ \E c \in Sites : pJobCP[c].wsLost /= {})
+\* the orphan CJ finished the workflow (model saved, CJ exited ok), yet the job
+\* is recorded as failed (the restarted CP never reports its outcome)
+WOrphanFail == ~(CJContainer /\ pWfSJ.saved /\ pJobSP.terminal = "ABORTED_OR_FAILED"
+                 /\ \E c \in Sites : CPRestarted(c) /\ pRunCJ[c][1].exit = "ok")
+WRelaunch == ~(\E c \in Sites : CurLaunch(c) >= 2)
 =============================================================================
