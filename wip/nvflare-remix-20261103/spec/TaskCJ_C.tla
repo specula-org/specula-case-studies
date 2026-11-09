@@ -96,6 +96,7 @@ FirstCheck(c, l) ==
          /\ ~TaskMode =>
               /\ rc = "OK" => pTrainer[c][l].published /= None
               /\ rc /= "OK" => "resultWaitTimeout" \in Faults \/ pTrainer[c][l].stopped
+                               \/ pTrainer[c][l].err >= T(c, l).task   \* v11 Attach (Trainer_A)
          /\ TaskMode =>
               /\ WorkerOut(c, l) /= None
               /\ rc = "OK" => WorkerOut(c, l).kind = "result"

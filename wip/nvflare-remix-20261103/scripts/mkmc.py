@@ -20,7 +20,19 @@ COARSE_ONLY = {
 }
 
 
+# grain-level rules: a variant whose port effects only the coarse module of a
+# neighbor reads (Trainer_A sets pTrainer.err, read by TaskCJ_C only)
+GRAIN_COARSE_ONLY = {("Trainer", "A"): ["TaskCJ"]}
+
+
 def check_coarse_only(grain, profile):
+    for (grp0, var0), groups in GRAIN_COARSE_ONLY.items():
+        v0 = grain.get(grp0)
+        if var0 in (set(v0.values()) if isinstance(v0, dict) else {v0}):
+            for grp in groups:
+                v = grain.get(grp)
+                bad = (set(v.values()) if isinstance(v, dict) else {v}) - {"C"}
+                assert not bad, f"{grp0}={var0}: group {grp} must be coarse (C), got {sorted(bad)}"
     for sw in profile or ():
         for grp in COARSE_ONLY.get(sw, ()):
             v = grain.get(grp)

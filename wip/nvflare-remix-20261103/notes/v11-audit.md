@@ -22,6 +22,8 @@ Pin `c411a201`, source `/home/ubuntu/nvflare-integrated-model-20261103/sources/c
 
 | Window | Code | Event that lands in it | Why coarse cannot show it |
 |---|---|---|---|
+| H24: the trainer clears `_result_send_active` before RESULT_SOURCE_SETTLED is acknowledged, while CJ finalize closes the Attach listener | `client/cell/api.py` send tail; `attach_backend.py:375-412` | CJ finalize (END_RUN) | Trainer_A merges settlement and finalize (`Finalize` clears the source in one step); the gap between the trainer's flag clear and the CJ's listener close needs separate trainer and CJ steps |
+| Attach delivery: RESULT_READY arriving while `_deliver_task` still retries | `attach_backend.py:655-745` (`task.result_ready` checks) | trainer result during a lost TASK_ACCEPTED | Trainer_A delivers atomically (`Deliver`/`DeliverFail`); interleaving the retry loop with an early result needs the loop's steps |
 
 ## Deferred
 
