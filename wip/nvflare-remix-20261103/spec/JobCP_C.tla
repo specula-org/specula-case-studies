@@ -37,6 +37,13 @@ RecvCheck(c, k) ==
     /\ jobCP_c' = [jobCP_c EXCEPT ![c].handled = @ \cup {k}, ![c].reserved = TRUE]
     /\ net' = Send(net, Reply("RESOURCES_OK", c, "ok"))
     /\ UNCHANGED pJobCP
+\* v11 multiJobCP: J2 holds the site's resource unit, so the check finds it
+\* unavailable (no reservation); the SP cannot schedule our job on this site.
+RecvCheckBusy(c, k) ==
+    /\ MultiJobCP /\ Fresh1(c, k, "CHECK_RESOURCES") /\ pJobCP[c].j2.alloc
+    /\ jobCP_c' = [jobCP_c EXCEPT ![c].handled = @ \cup {k}]
+    /\ net' = Send(net, Reply("RESOURCES_OK", c, "no"))
+    /\ UNCHANGED pJobCP
 
 \* AutoCleanResourceManager TTL expiry of an unallocated reservation.
 Expire(c) ==
@@ -200,8 +207,33 @@ CPCrashRestart(c) ==
     /\ "cpCrash" \in Faults /\ ~pJobCP[c].cpRestarted
     /\ \E k \in P(c).handled : k[1] = "START_JOB"
     /\ jobCP_c' = [jobCP_c EXCEPT ![c] = [InitValue[c] EXCEPT !.handled = P(c).handled, !.hb = 3]]
-    /\ pJobCP' = [pJobCP EXCEPT ![c].cpRestarted = TRUE, ![c].allocated = FALSE]
+    \* multiJobCP: J2's process CJ dies with the CP and its allocation is gone too
+    /\ pJobCP' = IF MultiJobCP /\ ~CJContainer /\ pJobCP[c].j2.st = "running"
+                 THEN [pJobCP EXCEPT ![c].cpRestarted = TRUE, ![c].allocated = FALSE,
+                                     ![c].j2 = [@ EXCEPT !.st = "exited", !.alloc = FALSE]]
+                 ELSE [pJobCP EXCEPT ![c].cpRestarted = TRUE, ![c].allocated = FALSE]
     /\ net' = Send(net, Msg("HEARTBEAT", CP(c), SP, <<JobId, c, 3>>, 3))
+
+\* ---------------------------------------------------------------- v11 F (multiJobCP)
+\* J2's CP-side lifecycle (its START allocates the unit, its CJ may crash and be
+\* restarted under the same allocation, it exits, its allocation is freed).
+J2(c) == pJobCP[c].j2
+J2Start(c) ==
+    /\ MultiJobCP /\ J2(c).st = "none" /\ ~CPRestarted(c)
+    /\ pJobCP' = [pJobCP EXCEPT ![c].j2 = [st |-> "running", launch |-> 1, alloc |-> TRUE]]
+    /\ UNCHANGED <<jobCP_c, net>>
+J2Restart(c) ==
+    /\ MultiJobCP /\ "cjCrash" \in Faults /\ J2(c).st = "running" /\ J2(c).launch < MaxLaunch
+    /\ pJobCP' = [pJobCP EXCEPT ![c].j2.launch = @ + 1]
+    /\ UNCHANGED <<jobCP_c, net>>
+J2Exit(c) ==
+    /\ MultiJobCP /\ J2(c).st = "running"
+    /\ pJobCP' = [pJobCP EXCEPT ![c].j2.st = "exited"]
+    /\ UNCHANGED <<jobCP_c, net>>
+J2Free(c) ==
+    /\ MultiJobCP /\ J2(c).st = "exited" /\ J2(c).alloc
+    /\ pJobCP' = [pJobCP EXCEPT ![c].j2 = [@ EXCEPT !.st = "freed", !.alloc = FALSE]]
+    /\ UNCHANGED <<jobCP_c, net>>
 
 \* ---------------------------------------------------------------- v11 E (k8sJob)
 \* The CJ publishes its results at shutdown (upload_results_on_shutdown); the CP's
@@ -237,9 +269,9 @@ K8sDeleteFail(c) ==
 
 Next ==
     \/ \E c \in Sites, l \in Launches : PubStart(c, l) \/ PubDone(c, l) \/ PubMissing(c, l)
-    \/ \E c \in Sites : K8sDeleteFail(c)
+    \/ \E c \in Sites : K8sDeleteFail(c) \/ J2Start(c) \/ J2Restart(c) \/ J2Exit(c) \/ J2Free(c)
     \/ \E c \in Sites, k \in DOMAIN net :
-        RecvCheck(c, k) \/ RecvCancel(c, k) \/ RecvDeploy(c, k) \/ RecvStart(c, k)
+        RecvCheck(c, k) \/ RecvCheckBusy(c, k) \/ RecvCancel(c, k) \/ RecvDeploy(c, k) \/ RecvStart(c, k)
         \/ RecvAbort(c, k)
     \/ \E c \in Sites : Expire(c) \/ ReturnedError(c) \/ Spawn(c) \/ Rollback(c)
         \/ StartReplyOk(c) \/ Kill(c) \/ ObserveExit(c) \/ RestartClaim(c)

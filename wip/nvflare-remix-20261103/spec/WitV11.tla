@@ -61,4 +61,12 @@ WWsLost == ~("k8sJob" \in Profile /\ \E c \in Sites : pJobCP[c].wsLost /= {})
 WOrphanFail == ~(CJContainer /\ pWfSJ.saved /\ pJobSP.terminal = "ABORTED_OR_FAILED"
                  /\ \E c \in Sites : CPRestarted(c) /\ pRunCJ[c][1].exit = "ok")
 WRelaunch == ~(\E c \in Sites : CurLaunch(c) >= 2)
+\* --- F (multiJobCP)
+WJ2Running == ~(MultiJobCP /\ \E c \in Sites : pJobCP[c].j2.st = "running")
+WJ2Freed == ~(MultiJobCP /\ \E c \in Sites : pJobCP[c].j2.st = "freed")
+WJ2Restart == ~(MultiJobCP /\ \E c \in Sites : pJobCP[c].j2.launch = 2)
+WCheckBusy == ~(MultiJobCP /\ \E k \in DOMAIN net : net[k].msg.kind = "RESOURCES_OK" /\ net[k].msg.body = "no")
+WCantSchedule == ~(MultiJobCP /\ pJobSP.status = "CANT_SCHEDULE")
+WCPRestartBoth == ~(MultiJobCP /\ \E c \in Sites : CPRestarted(c) /\ pJobCP[c].j2.st = "exited" /\ ~pJobCP[c].j2.alloc
+                                                    /\ \E l \in Launches : CJGone(c, l))
 =============================================================================

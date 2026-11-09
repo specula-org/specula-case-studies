@@ -93,12 +93,19 @@ JobCPPortBase == [launch |-> 0, killed |-> {},
 \* publish_results handler of launch l: none | running | done; wsLost = launches
 \* whose results publication found no record (results not returned).
 K8sJob == "k8sJob" \in Profile
+\* v11 (multiJobCP; DESIGN 16.9 F): j2 = a second job J2 on this CP with its own
+\* allocation (the site's single resource unit) and CJ: st none | running |
+\* exited | freed, launch = its CJ launch generation, alloc = it holds the unit.
+MultiJobCP == "multiJobCP" \in Profile
+J2Init == [st |-> "none", launch |-> 0, alloc |-> FALSE]
+JobCPExtra == (IF K8sJob THEN {"ws", "pub", "wsLost"} ELSE {}) \cup (IF MultiJobCP THEN {"j2"} ELSE {})
 JobCPPortInit == [c \in Sites |->
-    IF ~K8sJob THEN JobCPPortBase
-    ELSE [f \in DOMAIN JobCPPortBase \cup {"ws", "pub", "wsLost"} |->
+    IF JobCPExtra = {} THEN JobCPPortBase
+    ELSE [f \in DOMAIN JobCPPortBase \cup JobCPExtra |->
             CASE f = "ws" -> 0
               [] f = "pub" -> [l \in Launches |-> "none"]
               [] f = "wsLost" -> {}
+              [] f = "j2" -> J2Init
               [] OTHER -> JobCPPortBase[f]]]
 \* state: "none" -> "initialized" (init_run) -> "running" (main loop) ->
 \*        "stopping" (left the loop: run_abort_signal) -> "exited";
