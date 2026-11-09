@@ -528,14 +528,29 @@ E (anchors `job_launcher/k8s_launcher.py:308-745`, `docker_launcher.py:280-410`,
 
 Slurm is deferred: its batch scheduler semantics (queueing, `scancel`, accounting states) need cluster behavior to be written accurately; recorded in `notes/v11-audit.md`.
 
-F (`multiJobCP`): J2's START (allocate + env consume, the existing `otherJob` write), spawn, exit, restart (snapshot of the CP-global env, H08 in both directions), outcome, free, abort; the CP restart kills both jobs' CJs (process launcher); the heartbeat lists both. J2 is CP-local: the SP side keeps the existing `multiJob` summary.
+F (`multiJobCP`; anchors `app_common/resource_managers/auto_clean_resource_manager.py:102-172`, `list_resource_manager.py`, `private/fed/client/scheduler_cmds.py:67-140`, `client_executor.py:722-842`):
 
-G:
-- `sjSyncFail` (#15): the new SJ exits with an error before opening the workflow.
-- `taskDataFail`: SJ→CJ input download failure. Eager path (the payload is downloaded while the GET_TASK reply is decoded): `pull_task` gets a non-OK return code, the CJ asks again, and the server's resend path runs (H11's trigger). Lazy path (`resolve_task_data` fails in `_process_task`): the CJ submits BAD_TASK_DATA as the task's result.
-- `sampling`: per round, a nonempty target subset; only targets get assignments; the round completes when the targets finished.
-- CP restart adoption: covered by E (orphan CJ under `k8sJob`/`dockerJob`); under the process launcher the CJ dies with the CP (unchanged).
-- H31 (a new transaction per submission try) is deferred: the payload ports are keyed by attempt (`pPaySrc[c][l].tx[a]`), so a per-try transaction changes the port shape of PaySrc and PayRcv in both variants (PaySrc_F is 1,654 lines). The server deduplicates by receipt, and H31 is a contract baseline.
+| Event | Phase | Model step | Outcome |
+|---|---|---|---|
+| J2's START: check + allocate the site's unit | before or during our job | `J2Start` | J2 running, holds the unit |
+| our CHECK_RESOURCES while J2 holds the unit | scheduling | `RecvCheckBusy` | reply "no"; the SP cannot schedule our job here (CANT_SCHEDULE path) |
+| J2's CJ crashes and is restarted (same allocation) | J2 running | `J2Restart` (cjCrash) | J2 launch 2 |
+| J2's CJ exits, then its allocation is freed | J2 running | `J2Exit`, `J2Free` | unit available again |
+| CP crash and restart | any | `CPCrashRestart` | both jobs' process CJs die; J2's allocation is gone |
+| J2 aborted by the SP | J2 running | — | not separate: J2's abort ends in `J2Exit` / `J2Free` (CP-local view) |
+| CP-global CUDA env written by J2's START, snapshotted by our restart (H08) | restart | — | fine-only (`JobCP_F`, profile `otherJob`); coarse has no env |
+
+G (anchors per row):
+
+| Event | Phase | Model step | Outcome |
+|---|---|---|---|
+| sampling: each round targets a sampled subset (`base_model_controller.py:464-490`) | round start | `WfSJ_C!Schedule` (`TargetSets`), CommSJ_C assigns only to `targets` | non-targets get TRY_AGAIN; the round completes when the targets finished |
+| a target dies / times out under sampling | round | existing CommSJ_C retire paths | FedAvg's existing failure handling |
+| new SJ cannot get the participants within 30 s (`server_engine.py:829-848`, `server_app_runner.py:84-91`) | SJ start | `WfSJ_C!SyncFail` (`sjSyncFail`) | SJ exits nonzero before the workflow opens; the job fails |
+| eager task-data download fails while the GET_TASK reply is decoded (`communicator.py:486-500`, `client_runner.py:613-636`) | task pull | `TaskCJ_C!RecvAssignmentFail` (`taskDataFail`) | no task; the CJ polls again and the server resends |
+| lazy task data fails to resolve in `_process_task` (`client_runner.py:345-367`) | task execution | `TaskCJ_C!FirstCheck` with rc ≠ OK (`taskDataFail`) | BAD_TASK_DATA submitted as the task's result |
+| CP restart adoption | CP restart | covered by E (`CJContainer`) | orphan CJ under k8sJob / dockerJob; process CJ dies with the CP |
+| a new transaction per submission try (H31) | submission retry | — | deferred: changes the PaySrc/PayRcv port shape in both variants |
 
 ### 16.10 Checks per block
 

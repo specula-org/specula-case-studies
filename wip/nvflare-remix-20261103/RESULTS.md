@@ -758,6 +758,28 @@ W3a 的第一版没有限定"服务器还在等"，不带故障的 BFS 第 72 �
 | F | 到 COMPLETED | J2 启动、重启、释放；资源被 J2 占用时 CHECK 回 "no"，job 记为 CANT_SCHEDULE；CP 重启后两个 job 的 CJ 都退出 | 2 个配置无违例 | — |
 | G | 采样（2 site 每轮选 1 个）到 COMPLETED | SJ 启动失败后 job 失败、任务数据下载失败触发重发、CSE 下重发后 monitor 死掉 | 2 个配置无违例 | — |
 
+**故障 → 见证**（每个新故障，以及在新开关下用到的已有故障，至少一个到达的见证；名字见 `spec/WitV11.tla`、`spec/WitLocalV11.tla`，结果在 `.build/x11/results.jsonl`）：
+
+| 故障 | 开关 / grain | 见证 |
+|---|---|---|
+| acceptRaise | sjModel（FedAvg、SAG） | `WPartial`、`WFedPoisonFailed`、`WAggPoisoned`、`WFinishedPoisoned`、`WAggRaisePanic` |
+| saveFail | sjModel（FedAvg、Cyclic） | `WArtCorrupt`、`WSaveFailPanic` |
+| cbFail | sag、cyclic、cseServer | `WRaised`（SAG、CSE）、`WCycStop`、`WCycStopFinished` |
+| trainerError（非 OK 结果） | sag、cyclic、Trainer=A | `WSagErrPanic`、`WCycStop`、`WAttTrainerError` |
+| taskTimeout | sag、cyclic、swarm | `WSagPartialFinished`、`WCycTimeoutFinished`、`WSwCfgPanic` |
+| tpAttachLate / tpCrash / tpSilent / tpReplyLost / resultWaitTimeout | Trainer=A | `WAttErr`（各一次）、`WAttH01`、`WAttReattach` |
+| swarmMsgFail / learnFail | swarm | `WSwErrPanic`、`WSwStartFail`、`WFailedJob` |
+| busyReplace（+ gatherTimeout） | swarm | `WSwH06`、`WSwH06Finished` |
+| gatherTimeout | swarm | `WSwGatherTimeoutPartial` |
+| cjCrash | swarm、k8sJob、multiJobCP | `WSwMonCrash`、`WSwProgress`、`WSwEndFail`（后三条用 action constraint 把崩溃限定在该阶段）、`WRelaunch`、`WJ2Restart` |
+| cpCrash | k8sJob、dockerJob、multiJobCP | `WOrphanCJ`、`WOrphanFail`、`WCPRestartBoth` |
+| podDeleteFail（+ abort） | k8sJob | `WFreeWhileAlive` |
+| slowPublish（+ cjCrash） | k8sJob | `WWsLost` |
+| abort | multiJobCP | `WFailedJob` |
+| sjSyncFail | — | `WSyncFail` |
+| taskDataFail | —、cseServer | `WTaskDataResend`、`WMonitorDead` |
+| 无故障的事件 | 各开关 | 拒收（`WRejected`）、无贡献时保存未更新模型（`WArtStale`）、H05（`WSwH05`）、状态上报（`WSwStatusSeen`）、CHECK 回 "no" 和 CANT_SCHEDULE（`WCheckBusy`、`WCantSchedule`）、采样（`WSampled`） |
+
 冒烟里注意到的两件事：
 
 - 只开 `netLoss` 时，PayRcv_C 可以让任何一次结果拉取失败，SJ 随之退出（H29 的策略），Swarm 两个 site 的 config 结果都要拉取，所以几乎走不到第二轮。这是已有的粗粒度行为，不是 v11 引入的；Swarm 结束阶段的失败见证改用"结束阶段 CJ 崩溃"到达。
@@ -775,16 +797,16 @@ W3a 的第一版没有限定"服务器还在等"，不带故障的 BFS 第 72 �
 | E | 真实 `K8sJobHandle`（假的 Kubernetes API，上游 K8s 单测的做法）和真实 `WorkspaceTransferManager`：发布结果后正常退出；abort 时删除 Pod 返回 500 | 2 | 3 |
 | F | 真实 `ListResourceManager`，一个 GPU 单元，两个 job | 1 | 2 |
 | G | 真实 `FedAvg`（内置聚合、真实 `sample_clients`，num_clients=1）；真实 `ServerEngine.sync_clients_from_main_process` 超时 | 2 | 2 |
-| 合计 | | 10 | 16 |
+| B（补） | 真实 `CrossSiteModelEval`（server 控制的 CSE）控制流和结果回调，真实 `WFCommServer` 任务表；ModelLocator 是桩，提供一个 server 模型 | 1 | 1 |
+| E（补） | 真实 `DockerJobHandle`（假的 Docker client，上游 Docker 单测的做法）：容器正常退出；abort 后 stop 返回 APIError，handle 保持非终态 | 2 | 1 |
+| G（补，手写） | `taskDataFail` 急切路径：按代码路径手写的 trace（`communicator.py:486-500`、`client_runner.py:613-636`），标为手写；客户端拉任务要整套 ClientRunner、Communicator、Cell，组级 harness 没做 | 1 | 1 |
+| 合计 | | 14 | 19 |
 
 E 块的删除失败 trace 同时说明 H20 在真实代码里成立：删除 Pod 返回 500 时 handle 记 TERMINATED，workspace 记录被移除。
 
-没有真实 trace 的部分及原因：
+Docker 的 stop 失败 trace 和改错 trace 一起说明两种后端的差别：Docker 在 stop 失败时保留 handle，不释放；把 K8s 的"失败也释放"套到 Docker 上的 trace 被穷尽拒绝。
 
-- server 控制的 CSE：`CrossSiteModelEval` 的提交模型、模型定位、验证任务要配齐一套组件才能跑通，这一轮没做，只有冒烟。
-- `dockerJob`：模型里只有"CJ 不随 CP 退出"这一个开关，没有单独的步骤可回放。
-- `taskDataFail`：客户端拉任务要整套 ClientRunner、Communicator、Cell，组级 harness 没做，只有冒烟。
-- Model 的保存失败分支：persistor 用的是记录桩，只回放了保存成功。
+仍没有真实 trace 的部分：`taskDataFail` 只有按代码路径手写的 trace（原因见表）；Model 的保存失败分支没有回放（persistor 用记录桩，只回放了保存成功）。
 
 ### 17.4 不干扰和精化
 
@@ -831,7 +853,7 @@ Swarm 的两条 Phase 1 候选在模型里也走得到：H05（gather 在所有�
 
 ### 17.6 小结
 
-- 这一轮把 Phase 1 列为范围外的大部分内容以粗变体建了进来：spec 增加约 925 行，2 个新组、1 个新 trainer 变体、9 个开关、13 个故障。7 块里 Slurm 和 H31 推迟（理由见 17.1），其余都有冒烟和真实 trace 的 TV。
+- 这一轮把 Phase 1 列为范围外的大部分内容以粗变体建了进来：spec 增加约 925 行，2 个新组、1 个新 trainer 变体、9 个开关、13 个故障。7 块里 Slurm 和 H31 推迟（理由见 17.1），其余都有冒烟；TV 共 14 条 trace 被接受（其中 1 条手写）、19 条改错 trace 被拒绝，每块至少一接受一拒绝。
 - 没有跑 hunt，所以没有新的模型检查结论，根因计数不变（RESULTS §16.5）。冒烟见证顺带说明几条 Phase 1 候选（H04、H05、H06、H07、H20、H39）在模型里走得到，另有一条新线索 V7；都只是静态加模型见证，没有复现，不计数。
 - 待拆细的窗口清单在 `notes/v11-audit.md`：H24（训练进程清标志和 CJ 关监听之间）、Attach 投递重试循环里早到的 RESULT_READY、K8s 下 CJ 在关闭时才发布结果。
 - 仍在范围外：edge、simulator、lighter/dashboard/tool、xgboost/psi/statistics/splitnn、filters、cellnet/drivers 内部、安全鉴权、时间数值、显式 ref 复用（H09），以及这一轮推迟的 Slurm 和 H31。

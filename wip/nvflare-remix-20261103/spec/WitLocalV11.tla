@@ -13,4 +13,6 @@ WAttH01 == ~(AttachOn /\ \E c \in Sites, l \in Launches :
 WAttStopped == ~(AttachOn /\ \E c \in Sites, l \in Launches : pTrainer[c][l].stopped)
 WAttReattach == ~(AttachOn /\ \E c \in Sites, l \in Launches : TA(c, l).tp = "open" /\ TA(c, l).auth > 0
                                                               /\ TA(c, l).tpGen = 0 /\ TA(c, l).gen > TA(c, l).auth)
+WAttTrainerError == ~(AttachOn /\ "trainerError" \in Faults /\ \E c \in Sites, l \in Launches :
+                        TA(c, l).tp = "gone" /\ pTrainer[c][l].err > 0)
 =============================================================================

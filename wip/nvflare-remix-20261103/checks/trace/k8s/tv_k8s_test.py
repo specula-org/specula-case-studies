@@ -142,3 +142,72 @@ def test_k8s_publish_and_exit(tmp_path, monkeypatch):
 def test_k8s_delete_failure_releases(tmp_path, monkeypatch):
     ev = _run("k8s_deletefail", True, tmp_path, monkeypatch)
     assert ev[-1]["ev"] == "deletefail"
+
+
+def _install_fake_docker():
+    docker, errors, types_ = ModuleType("docker"), ModuleType("docker.errors"), ModuleType("docker.types")
+
+    class _NotFound(Exception):
+        pass
+
+    class _APIError(Exception):
+        pass
+
+    errors.NotFound, errors.APIError, errors.ImageNotFound = _NotFound, _APIError, _NotFound
+    docker.errors, docker.types = errors, types_
+    types_.DeviceRequest = MagicMock
+    types_.Mount = MagicMock
+    models, mc = ModuleType("docker.models"), ModuleType("docker.models.containers")
+    mc.RUN_CREATE_KWARGS, mc.RUN_HOST_CONFIG_KWARGS = ["labels"], ["shm_size", "ipc_mode", "device_requests"]
+    models.containers = mc
+    docker.models = models
+    docker.from_env = MagicMock
+    for name, mod in {"docker": docker, "docker.errors": errors, "docker.types": types_,
+                      "docker.models": models, "docker.models.containers": mc}.items():
+        sys.modules[name] = mod
+    return errors
+
+
+def test_docker_exit_and_failed_stop(tmp_path):
+    """Real DockerJobHandle on a fake Docker client: (1) the container exits 0 and the
+    waiter observes it; (2) after an abort, stop() fails with APIError and the handle
+    stays non-terminal (no release, unlike K8s)."""
+    errors = _install_fake_docker()
+    from nvflare.app_opt.job_launcher.docker_launcher import DockerJobHandle
+
+    def container(status, code=0):
+        c = MagicMock()
+        c.status = status
+        c.attrs = {"State": {"ExitCode": code}}
+        return c
+
+    ev = []
+    tr = lambda name, **kw: ev.append(dict(ev=name, **kw))
+    dc = MagicMock()
+    dc.containers.get.return_value = container("running")
+    tr("sp")
+    h = DockerJobHandle(container_id="c1", container_name="cj-1", docker_client=dc, watch_exit=False)
+    tr("launch", l=1)
+    tr("cjexit")
+    dc.containers.get.return_value = container("exited", 0)
+    h.wait()
+    assert h._get_terminal_state() is not None
+    tr("exit", l=1)
+    os.makedirs(OUT, exist_ok=True)
+    with open(os.path.join(OUT, "docker_ok.json"), "w") as f:
+        json.dump(ev, f, indent=1)
+
+    ev2 = []
+    tr2 = lambda name, **kw: ev2.append(dict(ev=name, **kw))
+    dc2 = MagicMock()
+    running = container("running")
+    running.stop.side_effect = errors.APIError("daemon error")
+    dc2.containers.get.return_value = running
+    tr2("sp")
+    h2 = DockerJobHandle(container_id="c2", container_name="cj-2", docker_client=dc2, watch_exit=False)
+    tr2("launch", l=1)
+    tr2("abort")
+    h2.terminate()
+    assert h2._get_terminal_state() is None      # ownership kept: no terminal state, nothing released
+    with open(os.path.join(OUT, "docker_stopfail.json"), "w") as f:
+        json.dump(ev2, f, indent=1)

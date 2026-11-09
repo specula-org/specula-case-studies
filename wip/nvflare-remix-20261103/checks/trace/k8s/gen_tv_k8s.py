@@ -32,17 +32,17 @@ CONSTANTS s1
 VARIABLES jobCP_c, cur
 CP1 == INSTANCE JobCP_C
 MCFaults == {@FAULTS@}
-MCProfile == {"k8sJob"}
+MCProfile == {"@PROFILE@"}
 TR == << @TR@ >>
 EnvKinds == {"sp", "cjexit", "abort"}
 Fixed == <<pJobSP, pTaskCJ, pPaySrc, pPayRcv, pCommSJ, pWfSJ, pTrainer, pReg, pWorker, pModel, pSwarm>>
 J == pJobCP[s1]
 Jn == pJobCP'[s1]
-Obs == <<J.launch, J.ws, J.pub, J.exitSeen>>
+Obs == @OBS@
 ObsAny == Obs' /= Obs
 SPMsg(kind) == Msg(kind, SP, CP(s1), <<JobId, s1>>, None)
 Match(e) ==
-    CASE e.ev = "launch" -> Jn.launch = e.l /\ Jn.ws = e.l /\ J.launch /= e.l
+    CASE e.ev = "launch" -> Jn.launch = e.l /\ J.launch /= e.l /\ @WSLAUNCH@
       [] e.ev = "pubstart" -> Jn.pub[e.l] = "running" /\ J.pub[e.l] = "none"
       [] e.ev = "pubdone" -> Jn.pub[e.l] = "done" /\ Jn.ws = 0 /\ J.pub[e.l] = "running"
       [] e.ev = "exit" -> Jn.exitSeen[e.l] = "ok" /\ J.exitSeen[e.l] = "none"
@@ -83,10 +83,20 @@ CHECK_DEADLOCK FALSE
 
 def gen(scn):
     ev = json.loads((HERE / "traces" / f"{scn}.json").read_text())
-    faults = '"podDeleteFail", "abort"' if "deletefail" in scn else ""
+    docker = "docker" in scn
+    faults = '"podDeleteFail", "abort"' if ("deletefail" in scn or "stopfail" in scn) else ""
     name = f"TraceK8s_{scn}"
-    (MIXES / f"MC_{name}.tla").write_text(TEMPLATE.replace("@SCN@", scn).replace("@FAULTS@", faults).replace(
-        "@TR@", ",\n        ".join(tla_val(e) for e in ev)))
+    t = (TEMPLATE.replace("@SCN@", scn).replace("@FAULTS@", faults)
+         .replace("@PROFILE@", "dockerJob" if docker else "k8sJob")
+         .replace("@OBS@", "<<J.launch, J.exitSeen>>" if docker else "<<J.launch, J.ws, J.pub, J.exitSeen>>")
+         .replace("@WSLAUNCH@", "TRUE" if docker else "Jn.ws = e.l")
+         .replace("@TR@", ",\n        ".join(tla_val(e) for e in ev)))
+    if docker:   # the K8s-only fields do not exist under dockerJob
+        t = t.replace('      [] e.ev = "pubstart" -> Jn.pub[e.l] = "running" /\\ J.pub[e.l] = "none"\n', "")
+        t = t.replace('      [] e.ev = "pubdone" -> Jn.pub[e.l] = "done" /\\ Jn.ws = 0 /\\ J.pub[e.l] = "running"\n', "")
+        t = t.replace('      [] e.ev = "deletefail" -> Jn.exitSeen[e.l] = "killed" /\\ Jn.ws = 0 /\\ J.exitSeen[e.l] = "none"\n',
+                      '      [] e.ev = "deletefail" -> Jn.exitSeen[e.l] = "killed" /\\ J.exitSeen[e.l] = "none"\n')
+    (MIXES / f"MC_{name}.tla").write_text(t)
     (MIXES / f"MC_{name}.cfg").write_text(CFG)
     return name, len(ev)
 
@@ -103,6 +113,9 @@ def mutate():
     df = json.loads((HERE / "traces" / "k8s_deletefail.json").read_text())
     neg3 = [e for e in df if e["ev"] != "abort"]              # Pod delete without an abort request
     (HERE / "traces" / "neg_deletefail_noabort.json").write_text(json.dumps(neg3, indent=1))
+    sf = json.loads((HERE / "traces" / "docker_stopfail.json").read_text())
+    neg4 = sf + [dict(ev="deletefail", l=1)]                   # Docker releasing on a failed stop, as K8s does
+    (HERE / "traces" / "neg_docker_release_on_stopfail.json").write_text(json.dumps(neg4, indent=1))
 
 
 if __name__ == "__main__":

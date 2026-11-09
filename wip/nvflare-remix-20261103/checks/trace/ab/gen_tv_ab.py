@@ -20,8 +20,9 @@ sys.path.insert(0, str(ROOT / "scripts"))
 HERE = Path(__file__).resolve().parent
 MIXES = ROOT / "checks" / "mixes"
 ENV = {"launch", "task", "call", "complete", "retire"}
-PROFILE = {"sag": ["sjModel", "sag"], "cyc": ["sjModel", "cyclic"], "samp": ["sampling"], "sync": []}
-SITES = {"sag": 1, "cyc": 2, "samp": 2, "sync": 1}
+PROFILE = {"sag": ["sjModel", "sag"], "cyc": ["sjModel", "cyclic"], "samp": ["sampling"], "sync": [], "cse": ["cseServer"]}
+SITES = {"sag": 1, "cyc": 2, "samp": 2, "sync": 1, "cse": 1}
+ROUNDS = {"cse": 1}
 FAULTS = {"sync": ["sjSyncFail"]}
 
 
@@ -68,6 +69,7 @@ Match(e) ==
       [] e.ev = "agg" -> pModel'.agg[e.r] = e.kind /\ pModel.agg[e.r] = "none"
       [] e.ev = "aggregate" -> pWfSJ.aggregate = None /\ pWfSJ'.aggregate /= None
       [] e.ev = "art" -> pModel'.artifact = [round |-> e.r, kind |-> e.kind] /\ pModel.artifact /= pModel'.artifact
+      [] e.ev = "csedone" -> pWfSJ'.returned = "normal" /\ pWfSJ.returned = "none" /\ pWfSJ'.saved
       [] e.ev = "syncfail" -> pWfSJ'.sj = "crashed" /\ pWfSJ.sj = "none" /\ ~pWfSJ'.open
       [] e.ev = "saved" -> wfSJ_c'.saved = e.r /\ wfSJ_c.saved /= e.r /\ pWfSJ'.returned = e.returned
       [] OTHER -> FALSE
@@ -107,7 +109,7 @@ CFG = """CONSTANTS
   None = None
   JobId = JobId
   MaxLaunch = 1
-  MaxAttempt = 2
+  MaxAttempt = @ROUNDS@
 INIT TInit
 NEXT TNext
 INVARIANT TraceNotAccepted
@@ -117,7 +119,7 @@ CHECK_DEADLOCK FALSE
 
 def family(scn):
     base = scn[4:] if scn.startswith("neg_") else scn
-    for fam in ("cyc", "samp", "sync"):
+    for fam in ("cyc", "samp", "sync", "cse"):
         if base.startswith(fam):
             return fam
     return "sag"
@@ -135,7 +137,7 @@ def gen(scn):
          .replace("@FAULTS@", ", ".join(f'"{f}"' for f in FAULTS.get(fam, [])))
          .replace("@TR@", ",\n        ".join(tla_val(e) for e in ev)))
     cfg = (CFG.replace("@SITES@", ", ".join(names))
-           .replace("@SITEEQ@", "\n  ".join(f"{x} = {x}" for x in names)))
+           .replace("@SITEEQ@", "\n  ".join(f"{x} = {x}" for x in names)).replace("@ROUNDS@", str(ROUNDS.get(fam, 2))))
     (MIXES / f"MC_{name}.tla").write_text(t)
     (MIXES / f"MC_{name}.cfg").write_text(cfg)
     return name, len(ev)
@@ -163,6 +165,9 @@ def mutate():
     sync = json.loads((HERE / "traces" / "sync_fail.json").read_text())
     neg5 = [sync[0], dict(ev="open"), sync[1]]                   # the workflow opened, then the start failed
     (HERE / "traces" / "neg_sync_after_open.json").write_text(json.dumps(neg5, indent=1))
+    cse = json.loads((HERE / "traces" / "cse_ok.json").read_text())
+    neg6 = [e for e in cse if e["ev"] != "retire"]              # evaluation finished while its task still stands
+    (HERE / "traces" / "neg_cse_done_while_standing.json").write_text(json.dumps(neg6, indent=1))
 
 
 if __name__ == "__main__":

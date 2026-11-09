@@ -313,3 +313,77 @@ def test_sj_sync_fail(monkeypatch):
         se.ServerEngine.sync_clients_from_main_process(fake)
     tr("syncfail")
     tr.dump("sync_fail")
+
+
+def test_cse_server(tmp_path):
+    """Server-controlled cross-site evaluation: the real CrossSiteModelEval control flow
+    and result callback with the real WFCommServer task table; a stub ModelLocator
+    provides one server model; one site validates it (submit_model task disabled)."""
+    from nvflare.apis.workspace import Workspace
+    from nvflare.app_common.abstract.model_locator import ModelLocator
+    from nvflare.app_common.workflows.cross_site_model_eval import CrossSiteModelEval
+
+    from nvflare.app_common.decomposers import common_decomposers
+
+    common_decomposers.register()
+    tr = Tracer()
+    clients, engine, fl_ctx = make_env(1)
+    ws = Mock(spec=Workspace)
+    ws.get_run_dir.return_value = str(tmp_path / "run")
+    engine.get_workspace.return_value = ws
+
+    class Locator(ModelLocator):
+        def get_model_names(self, fl_ctx):
+            return ["best"]
+
+        def locate_model(self, model_name, fl_ctx):
+            return DXO(DataKind.WEIGHTS, {"w": np.ones(2)})
+
+    engine.get_component.side_effect = {"locator": Locator()}.get
+    controller = CrossSiteModelEval(submit_model_task_name="", model_locator_id="locator", formatter_id="",
+                                    participating_clients=["site-1"], task_check_period=0.01)
+    comm = WFCommServer()
+    comm._engine = engine
+    controller.set_communicator(comm)
+    controller._engine = engine
+    controller.fire_event = Mock()
+    panic = Mock()
+    controller.system_panic = panic
+    controller.start_controller(fl_ctx)
+    state = {"round": 0}
+    real_broadcast = controller.broadcast
+
+    def broadcast(task, fl_ctx, targets=None, min_responses=1, wait_time_after_min_received=0, **kw):
+        state["round"] += 1
+        r = state["round"]
+        tr("schedule", r=r)
+        real_broadcast(task=task, fl_ctx=fl_ctx, targets=targets, min_responses=min_responses,
+                       wait_time_after_min_received=wait_time_after_min_received, **kw)
+        tr("task", r=r)
+        cb = task.result_received_cb
+
+        def traced_cb(client_task, fl_ctx):
+            cb(client_task=client_task, fl_ctx=fl_ctx)
+            tr("ret", c=site_no(client_task.client.name), r=r, accepted=True)
+
+        task.result_received_cb = traced_cb
+        for client in clients:
+            task_name, task_id, task_data = comm.process_task_request(client, fl_ctx)
+            assert task_name, "validation task not assigned"
+            tr("call", c=site_no(client.name), r=r, rc="OK")
+            res = DXO(DataKind.METRICS, {"accuracy": 0.9}).to_shareable()
+            res.set_peer_props({ReservedKey.IDENTITY_NAME: client.name})
+            res.set_cookie_jar(dict(task_data.get_cookie_jar()))
+            comm.process_submission(client, task_name, task_id, res, fl_ctx)
+            tr("complete")
+        comm.check_tasks()
+        tr("retire")
+
+    controller.broadcast = broadcast
+    tr("launch")
+    tr("open")
+    controller.control_flow(Signal(), fl_ctx)
+    panic.assert_not_called()
+    assert controller.get_num_standing_tasks() == 0
+    tr("csedone")
+    tr.dump("cse_ok")

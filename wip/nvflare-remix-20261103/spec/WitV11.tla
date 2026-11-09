@@ -77,4 +77,10 @@ WTaskDataResend == ~("taskDataFail" \in Faults /\ \E c \in Sites :
                         Cardinality({k \in DOMAIN net : net[k].msg.kind = "TASK_ASSIGNMENT" /\ net[k].msg.to = CJ(c)
                                                           /\ net[k].msg.body.status = "ASSIGNED"}) >= 2
                         /\ pJobSP.terminal = "FINISHED")
+\* --- added for the fault -> witness table (RESULTS 17.2)
+WSagErrPanic == ~(WfPolicy = "sag" /\ pWfSJ.panic /\ pWfSJ.returned = "none")
+WSagPartialFinished == ~(WfPolicy = "sag" /\ pJobSP.terminal = "FINISHED" /\ pWfSJ.accepted /= Sites)
+WCycTimeoutFinished == ~(WfPolicy = "cyclic" /\ pJobSP.terminal = "FINISHED" /\ pWfSJ.accepted /= Sites)
+WSwStartFail == ~(SwarmOn /\ \E c \in Sites : Sw(c).reply /= None /\ Sw(c).reply.round = 2 /\ Sw(c).reply.rc /= "OK")
+WSwStatusSeen == ~(SwarmOn /\ \E k \in DOMAIN net : InInbox(k, SJ, "SWARM_STATUS"))
 =============================================================================
