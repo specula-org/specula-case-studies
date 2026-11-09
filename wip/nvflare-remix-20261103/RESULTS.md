@@ -725,3 +725,113 @@ W3a 的第一版没有限定"服务器还在等"，不带故障的 BFS 第 72 �
 | 只有模型反例 | 1 | N1 |
 
 这一轮模型检查没有找到新根因；L5 和 L6 都来自读代码。模型和性质的价值在于：给 task worker 子系统写出了 6 条端到端性质，有 TV 和精化检查作支撑，变异检查证明它们能抓到对应的 bug 类，在有界范围内没有发现反例。
+
+## 17. 第十一轮（11-09）：剩余控制面的粗粒度建模（v11）
+
+目标：把剩下的高层控制面内容以粗变体建进模型，每块做冒烟和一条真实 happy-path trace 的组级 TV。不跑 hunt，不写新内容的细变体，不复现线索。回退点 `5b6f008d`。设计和端口方案在 DESIGN §16，读代码的线索和待拆细窗口在 `notes/v11-audit.md`。
+
+### 17.1 建了什么
+
+| 块 | 新增或修改 | 开关 / 故障 | 没建的部分及理由 |
+|---|---|---|---|
+| A SJ.Model | 新组 `Model`（`Model_C` 64 行，`PortsModel`）；`WfSJ_C` 经 `pWfSJ.mcall` 调用 accept / aggregate / save | `sjModel`；`acceptRaise`、`saveFail` | 数值；LazyAggregator 的队列（H47，有意的策略） |
+| B 其他工作流 | `WfSJ_C` 加 SAG、Cyclic、server 控制的 CSE 三种策略；`CommSJ_C` 在回调抛异常时允许 task 退出，CSE 的重复 ClientTask 分支 | `sag`、`cyclic`、`cseServer` | Cyclic 的模型接力（数值） |
+| C Attach | `Trainer_A`（158 行，CJ 侧 AttachBackend + 训练进程）；`pTrainer.err`；`TaskCJ_C` 读 `err` | grain `Trainer=A`；`tpAttachLate`、`tpCrash`、`tpReplyLost` | CJ↔训练进程的控制消息留在私有状态（没有别的组读）；H24 的窗口只记清单 |
+| D Swarm | 新组 `Swarm`（`Swarm_C` 163 行，`PortsSwarm`，4 种消息）；`WfSJ_C` 加 CCWF server 策略；`CommSJ_C` 按 `targets` 派发；`TaskCJ_C` 取 config / start 的回复 | `swarm`；`swarmMsgFail`、`learnFail`、`busyReplace`、`gatherTimeout` | 学习执行器内部（只建结果）；最终结果分发的细节 |
+| E launcher | `Ports.CJAlive`：容器里的 CJ 不随 CP 退出；`JobCP_C` 加 workspace transfer 记录、publish handler、Pod 删除失败 | `k8sJob`、`dockerJob`；`podDeleteFail`、`slowPublish` | Slurm（批调度语义要集群行为才能写准）；`can_restart` 里"workspace 下载完成"一项 |
+| F 第二个 job | `JobCP_C` 加 J2 的分配和 CJ 生命周期、资源被占时 CHECK 回 "no" | `multiJobCP` | CP 全局环境变量（只在 `JobCP_F` 的 `otherJob` 里，H08） |
+| G 缺口 | 采样（`WfSJ_C` 选目标子集）；SJ 启动拿不到参与者（`SyncFail`）；任务数据下载失败（急切路径重新取任务、惰性路径回 BAD_TASK_DATA）；CP 重启后接管由 E 覆盖 | `sampling`；`sjSyncFail`、`taskDataFail` | H31 每次重试新建 tx：要改 PaySrc/PayRcv 两个变体的端口形状，推迟 |
+
+所有新内容都经开关或带价格的故障接入；`mkmc.py` 拒绝在这些开关或故障下选用相关组的细变体（`COARSE_ONLY`、`COARSE_ONLY_FAULTS`、`Trainer=A` 要求 `TaskCJ=C`）。spec（不含生成的 Mix）从 10,060 行增加到 10,985 行。
+
+### 17.2 冒烟
+
+每块的冒烟都用模拟（每个见证一个运行，多数在 2–30 秒内到达）。脚本和全部结果在 `.build/x11/`（`results.jsonl`），见证定义在 `spec/WitV11.tla`、`spec/WitLocalV11.tla`。
+
+| 块 | 正常流程走到终态 | 到达的故障见证 | 死锁 / 不变式（模拟 300 秒） | AG |
+|---|---|---|---|---|
+| A | FedAvg + Model 到 COMPLETED | accept 被拒、改了一半后抛异常、FedAvg 的轮次守卫让 job 失败、保存失败后 panic、截断文件；"FedAvg 从不聚合被污染的累加器"在 300 秒模拟里没有反例 | 3 个配置无违例 | `AG_WfSJ`、`AG_Pay`、`AG_RunCJ` 在 A/B 的 5 个组合里成立（1 轮，2 site） |
+| B | SAG、Cyclic（2 site）、server CSE 都到 COMPLETED | SAG：聚合并保存被污染的模型后 job 仍 COMPLETED（95 秒）、无贡献时保存未更新的模型、聚合抛异常后 panic、回调抛异常；Cyclic：停止后正常结束、保存失败后 panic；CSE：monitor 线程死掉、回调抛异常 | 3 个配置无违例 | 同上 |
+| C | Attach 下两个任务都发布结果，job 到 COMPLETED | attach 超时、训练进程崩溃、静默、控制回复丢失、结果等待超时都让当前任务报错；H01（训练进程以为成功、CJ 从未接受）；断开后重新 attach | 2 个配置无违例 | — |
+| D | Swarm 两轮聚合，END_WF 后 COMPLETED | H05、H06（`busyReplace` + `gatherTimeout`）、本地训练失败或 aux 失败导致错误报告和 panic、config 失败 panic、gather 超时只聚合部分贡献；监控阶段 CJ 崩溃导致进度 panic、结束阶段缺回复 panic 这两条用 action constraint 把崩溃限定在该阶段才到达 | 2 个配置无违例 | 同上，1 个组合成立 |
+| E | k8sJob、dockerJob 都到 COMPLETED | CP 重启后 CJ 成为孤儿（K8s、Docker）、H20（CJ 还活着时分配已被释放）、H07（替换 launch 的记录被旧 handler 删掉，结果回不来）、V7（孤儿 CJ 跑完、job 被记失败） | 3 个配置无违例 | — |
+| F | 到 COMPLETED | J2 启动、重启、释放；资源被 J2 占用时 CHECK 回 "no"，job 记为 CANT_SCHEDULE；CP 重启后两个 job 的 CJ 都退出 | 2 个配置无违例 | — |
+| G | 采样（2 site 每轮选 1 个）到 COMPLETED | SJ 启动失败后 job 失败、任务数据下载失败触发重发、CSE 下重发后 monitor 死掉 | 2 个配置无违例 | — |
+
+冒烟里注意到的两件事：
+
+- 只开 `netLoss` 时，PayRcv_C 可以让任何一次结果拉取失败，SJ 随之退出（H29 的策略），Swarm 两个 site 的 config 结果都要拉取，所以几乎走不到第二轮。这是已有的粗粒度行为，不是 v11 引入的；Swarm 结束阶段的失败见证改用"结束阶段 CJ 崩溃"到达。
+- `AG_Trainer` 在 v10 的基线（不开任何 v11 开关）里就会被违反（2 site，cbFail、taskTimeout）：TaskCJ_C 给已经 `stopped` 的 trainer 发布输入，超出 `Env_Trainer` 的假设。它早先的 discharge 没开这些故障。这是已有假设写窄了，记在 `notes/v11-audit.md`，没有改。
+
+### 17.3 happy-path TV（组级回放，真实代码）
+
+做法和第十轮 Worker 组一样：在真实代码上跑正常流程，挂钩记录端口事件，在新组或改过的粗变体上配 trace 驱动的环境做组级回放，BFS 穷尽。新内容只有粗变体，所以"接受"是粗粒度证据；拒绝是穷尽的。
+
+| 块 | 真实运行 | 接受 | 拒绝的改错 trace |
+|---|---|---:|---:|
+| A+B | 真实 `ScatterAndGather`、`CyclicController`、`WFCommServer` 任务表、`InTimeAccumulateWeightedAggregator`（上游 SAG 单测的路径），persistor 用记录桩：SAG 两轮、SAG 第一轮贡献被拒（模型不更新仍保存）、Cyclic 两 site 两轮 | 3 | 3 |
+| C | 真实 `AttachBackend` 和一个经 TCP attach 的真实训练进程（上游 attach e2e 测试的路径），两个任务后 finalize | 1 | 3 |
+| D | 真实两 site Swarm job（`CCWFJob`、`NPTrainer`）在 NVFlare simulator 里跑，各进程经 `sitecustomize` 钩子记事件 | 1 | 3 |
+| E | 真实 `K8sJobHandle`（假的 Kubernetes API，上游 K8s 单测的做法）和真实 `WorkspaceTransferManager`：发布结果后正常退出；abort 时删除 Pod 返回 500 | 2 | 3 |
+| F | 真实 `ListResourceManager`，一个 GPU 单元，两个 job | 1 | 2 |
+| G | 真实 `FedAvg`（内置聚合、真实 `sample_clients`，num_clients=1）；真实 `ServerEngine.sync_clients_from_main_process` 超时 | 2 | 2 |
+| 合计 | | 10 | 16 |
+
+E 块的删除失败 trace 同时说明 H20 在真实代码里成立：删除 Pod 返回 500 时 handle 记 TERMINATED，workspace 记录被移除。
+
+没有真实 trace 的部分及原因：
+
+- server 控制的 CSE：`CrossSiteModelEval` 的提交模型、模型定位、验证任务要配齐一套组件才能跑通，这一轮没做，只有冒烟。
+- `dockerJob`：模型里只有"CJ 不随 CP 退出"这一个开关，没有单独的步骤可回放。
+- `taskDataFail`：客户端拉任务要整套 ClientRunner、Communicator、Cell，组级 harness 没做，只有冒烟。
+- Model 的保存失败分支：persistor 用的是记录桩，只回放了保存成功。
+
+### 17.4 不干扰和精化
+
+**不干扰（v11 开关全关，改前用回退点 `5b6f008d` 的 spec 和脚本，改后用当前 spec，同样的配置）**。从 Init 出发的完整 BFS 在新旧两边 25 分钟内都跑不完（第七轮已知），所以组合层面用相同的深度上限：
+
+| 检查 | 改前 distinct | 改后 distinct |
+|---|---:|---:|
+| WfSJ 组 harness F→C（Env_WfSJ，5 个故障，穷尽） | 20,789 | 20,789 |
+| Trainer 组 harness F→C（1 site，2 launch，穷尽） | 248,517 | 248,517 |
+| RunCJ 组 harness F→C（cjCrash、netLoss、slowSJTeardown，穷尽） | 86,973 | 86,973 |
+| 组合 BFS，深度 ≤ 45，JobCP/RunCJ/TaskCJ/CommSJ/WfSJ 细 | 2,079 | 2,079 |
+| 组合 BFS，深度 ≤ 30，全粗 + `cseTasks` + cbFail，2 site | 66,838 | 66,838 |
+| 组合 BFS，深度 ≤ 40，taskMode（Worker/TaskCJ/JobCP 细）+ workerCrash | 4,247 | 4,247 |
+| 组合 BFS，深度 ≤ 32，全粗 + cjCrash + taskTimeout，2 launch | 2,829,428 | 2,829,428 |
+
+G 里的改动都经开关或故障接入，没有改变基准的改动。
+
+- **真实 POC trace**：在重新生成的全细、全粗组合上仍被接受（模拟，122 秒、21 秒）。
+- **D 组回归**（`plans/hunt11_reg.py`，`checks/sweeps/h11reg.jsonl`）：14 个 D 运行里 13 个报出原有违例（T1、R1、T3、R2、L13 两种、C1-B 跨 job、T2 的 BFS 版本）；T2 的模拟版本这次没命中，和第十轮一样由 BFS 版本找回。14 个 S 冒烟（每族一个）都没有违例。
+
+**精化（细 → 粗，v11 开关全关）**：
+
+| 组 | 配置 | 状态数 | 结果 | 负控 |
+|---|---|---:|---|---|
+| CommSJ | 1 site，2 轮，cbFail、taskTimeout、cjCrash | 141 万 | 无违例（时限停止） | BadStep（14 层） |
+| TaskCJ | 1 site，2 launch，cjCrash、submitTimeout、taskTimeout | 187 万 | 无违例（时限停止） | BadStep（15 层） |
+| JobCP | 1 site，2 launch，cjCrash、abort、cpCrash、rpcTimeout | 130 万 | 无违例（时限停止） | BadStep（5 层） |
+| WfSJ、Trainer、RunCJ | 见上表的 harness 行（穷尽） | | 通过 | WfSJ BadStep（3 层）、Trainer BadStep（7 层） |
+
+### 17.5 读代码看到的线索（只记录，不计数）
+
+读代码时看到的问题都记在 `notes/v11-audit.md`，这里只列和模型见证对得上的几条。它们都没有在真实代码上复现，按约定不计数。
+
+| 编号 | 问题 | 模型里的见证 | 状态 |
+|---|---|---|---|
+| V3（H04） | 结果回调抛异常时 WFComm 只把 task 标成 ERROR，SAG 不看状态，直接聚合可能已被改了一半的累加器，保存后 job 记为 COMPLETED | `WFinishedPoisoned`（sag + sjModel + acceptRaise）可达 | Phase 1 候选，静态 |
+| V4 | Cyclic 收到非 OK 结果时 `_stop_workflow`，`control_flow` 正常返回，job 记为 COMPLETED | `WCycStopFinished` 可达 | 是否有意待查 |
+| V5（H39） | NP persistor 直接 `np.save` 到最终路径，写一半失败留下截断文件；PT persistor 先写临时文件再替换 | `WArtCorrupt` 可达 | Phase 1 候选，静态 |
+| V6（H07） | `_handle_publish_results` 做完下载和解压后按 job_id `remove_job`，会删掉替换 launch 新登记的记录，替换 CJ 的结果回不来 | `WWsLost`（k8sJob + slowPublish + cjCrash）可达 | Phase 1 候选，静态 |
+| V1（H20） | K8s 删除 Pod 失败（非 404）时 handle 仍记 TERMINATED 并释放 transfer 记录、Secret、task owner；E 块的 TV 在真实 `K8sJobHandle` 上确认了这一行为，上游单测也断言它 | `WFreeWhileAlive`（k8sJob + podDeleteFail + abort）可达：CJ 还活着时分配已被释放 | 已知（known-open） |
+| V7（新） | K8s 下 CJ Pod 不随 CP 重启退出（没有 ownerReference），可以把训练跑完、模型已保存；重启后的 CP 没有 handle，不报 outcome，SJ 退出后 `_resolve_missing_client_outcome` 把 job 记为失败 | `WOrphanFail` 可达 | 只有模型见证；上游写明 CP 重启接管不在范围内，失败状态是否有意不清楚 |
+
+Swarm 的两条 Phase 1 候选在模型里也走得到：H05（gather 在所有回复到齐时关闭，最后一个 accept 还没完成，`WSwH05`）和 H06（忙时替换触发自己的 ABORT_TASK，客户端控制器永久停止，`WSwH06`，需要 `busyReplace` 加 `gatherTimeout`）。
+
+### 17.6 小结
+
+- 这一轮把 Phase 1 列为范围外的大部分内容以粗变体建了进来：spec 增加约 925 行，2 个新组、1 个新 trainer 变体、9 个开关、13 个故障。7 块里 Slurm 和 H31 推迟（理由见 17.1），其余都有冒烟和真实 trace 的 TV。
+- 没有跑 hunt，所以没有新的模型检查结论，根因计数不变（RESULTS §16.5）。冒烟见证顺带说明几条 Phase 1 候选（H04、H05、H06、H07、H20、H39）在模型里走得到，另有一条新线索 V7；都只是静态加模型见证，没有复现，不计数。
+- 待拆细的窗口清单在 `notes/v11-audit.md`：H24（训练进程清标志和 CJ 关监听之间）、Attach 投递重试循环里早到的 RESULT_READY、K8s 下 CJ 在关闭时才发布结果。
+- 仍在范围外：edge、simulator、lighter/dashboard/tool、xgboost/psi/statistics/splitnn、filters、cellnet/drivers 内部、安全鉴权、时间数值、显式 ref 复用（H09），以及这一轮推迟的 Slurm 和 H31。

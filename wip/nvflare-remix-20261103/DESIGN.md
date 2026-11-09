@@ -387,7 +387,7 @@ Goal: bring the remaining high-level control-plane content into the model as **c
 |---|---|---|---|
 | `sjModel` | A | the SJ aggregator / persistor is the separate group Model; WfSJ calls it for accept, aggregate and save | WfSJ |
 | `sag` | B | ScatterAndGather workflow | WfSJ |
-| `cyclic` | B | Cyclic relay workflow | WfSJ, CommSJ |
+| `cyclic` | B | Cyclic relay workflow (CommSJ_C's assignment already over-approximates the relay order) | WfSJ |
 | `cseServer` | B | server-controlled cross-site model evaluation (standing validation broadcasts) | WfSJ, CommSJ |
 | `swarm` | D | client-controlled Swarm (CCWF): server-side controller in WfSJ, client side in the new group Swarm | WfSJ, CommSJ, TaskCJ |
 | `k8sJob` / `dockerJob` | E | CJ launched as a Kubernetes Pod / Docker container (default: process launcher) | JobCP |
@@ -395,6 +395,8 @@ Goal: bring the remaining high-level control-plane content into the model as **c
 | `sampling` | G | FedAvg client sampling: each round targets a nonempty subset of the sites | WfSJ, CommSJ |
 
 The workflow switches `sag`, `cyclic`, `cseServer`, `swarm` and the existing `cseTasks` are mutually exclusive (`ASSUME`). `k8sJob` and `dockerJob` are mutually exclusive.
+
+`mkmc.py` also refuses fine variants for faults whose events are coarse-only (`COARSE_ONLY_FAULTS`: `sjSyncFail` → WfSJ, `taskDataFail` → TaskCJ, `podDeleteFail` / `slowPublish` → JobCP, `acceptRaise` / `saveFail` → WfSJ) and requires `TaskCJ=C` when `Trainer=A`.
 
 New faults (all priced in `rarity.json`):
 
@@ -424,11 +426,11 @@ New faults (all priced in `rarity.json`):
   - `artifact ∈ {initial, [round, kind]}` with `kind ∈ {clean, poisoned, corrupt}`: what the persisted model file holds.
 - **New `pSwarm[c][l]`** (`spec/PortsSwarm.tla`, group Swarm, process CJ, per site). Constant 0 unless `swarm`.
   - `cfg`, `started`, `round`, `role` (trainer / aggregator of the round), `learn` (idle / busy / done / failed / aborted), `stopped` (`asked_to_stop`), `gathered[r]` (sites whose submission entered accept), `replied[r]` (sites recorded as replied), `aggregated[r]`, `report` (last status report: `[round, allDone, error]`), `final` (final result distributed).
-- **Extensions of existing ports** (fields exist only under their switch, like `pTaskCJ.abort` under `taskMode`):
-  - `pWfSJ`: `mcall` (call to Model), `policy` state `wfDone` (Cyclic `_is_done`), `targets` (sampling), `cw` (CCWF: `configured`, `started`, `ended`).
-  - `pCommSJ`: `targets` (sampling / relay order), `relayPos` (Cyclic).
-  - `pTaskCJ[c][l]`: `ccwf` (the client-controller executor's reply for config / start tasks).
-  - `pJobCP[c]`: `backend` facts `podLive[l]` (K8s/Docker: the CJ container exists regardless of the CJ process view), `released[l]` (handle released transfer, secret, task owner), `wsRecord` (workspace transfer record: `[l, token]`), `j2` (J2 lifecycle on this CP: `none | starting | running | restarting | exited | freed`, its launch generation and its allocation).
+- **Extensions of existing ports** (fields exist only under their switch, like `pTaskCJ.abort` under `taskMode`; as implemented):
+  - `pWfSJ`: `mcall` / `mseq` (call to Model, `sjModel`), `raised` (rounds whose result callback raised; `sjModel`, `sag`, `cyclic`, `cseServer`), `wfDone` (Cyclic `_is_done`), `targets` (`swarm`, `sampling`; CommSJ_C assigns only to these), `cw` (CCWF server phase `init | monitor | ending`).
+  - `pTrainer[c][l].err` (all profiles, constant 0 unless `Trainer=A`): the last task generation whose execute() returned an error without a trainer result; TaskCJ_C reads it.
+  - `pJobCP[c]`: `ws` / `pub` / `wsLost` (`k8sJob`: workspace-transfer record, publish handler per launch, launches whose publication found no record) and `j2` (`multiJobCP`: J2's state, launch and allocation).
+  - TaskCJ_C reads `pSwarm[c][l].reply` for the config / start task results under `swarm` (no TaskCJ port change).
 - **Liveness under `k8sJob`/`dockerJob`.** `Ports.CJAlive` drops the `~CPRestarted(c)` conjunct: the CJ Pod or container does not die with the CP (no `monitor_parent_process` across containers). The restarted CP keeps no record of it (adoption is unsupported upstream, `docs/design/client_job_recovery.md`), so the CJ becomes an orphan that keeps working with the SJ.
 
 ### 16.4 New message kinds
@@ -440,9 +442,8 @@ New faults (all priced in `rarity.json`):
 | `SWARM_STATUS` | Swarm | CJ → SJ | `[round, allDone, error]` (status reports ride on the client's task requests; one message per change) |
 | `SWARM_END_WF` | WfSJ | SJ → CJ | `None` (end-workflow aux request) |
 | `SWARM_END_REPLY` | Swarm | CJ → SJ | `rc` |
-| `PUBLISH_RESULTS` | RunCJ | CJ → CP | `[l, token]` (K8s workspace transfer) |
 
-Attach trainer↔CJ control messages stay private to `Trainer_A` (like Trainer_X's session), because no other group reads them.
+Attach trainer↔CJ control messages stay private to `Trainer_A` (like Trainer_X's session), because no other group reads them. The K8s `publish_results` exchange is modeled inside JobCP_C (`PubStart` / `PubDone`, any time while the launch is alive), so RunCJ needs no new message.
 
 ### 16.5 Block A: SJ.Model (group Model)
 

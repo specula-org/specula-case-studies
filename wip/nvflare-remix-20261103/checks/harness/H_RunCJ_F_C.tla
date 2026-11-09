@@ -1,17 +1,17 @@
 ---- MODULE H_RunCJ_F_C ----
 EXTENDS Ports, TLC
-CONSTANTS s1, s2
+CONSTANTS s1
 VARIABLES runCJ_f
-hvars == <<net, pJobSP, pJobCP, pRunCJ, pTaskCJ, pPaySrc, pPayRcv, pCommSJ, pWfSJ, pTrainer, runCJ_f>>
+hvars == <<net, pJobSP, pJobCP, pRunCJ, pTaskCJ, pPaySrc, pPayRcv, pCommSJ, pWfSJ, pTrainer, pReg, pWorker, pModel, pSwarm, runCJ_f>>
 FV == INSTANCE RunCJ_F
 E == INSTANCE Env_RunCJ
 CRef == INSTANCE RunCJ_C WITH runCJ_c <- FV!AbsC
 SentKinds(kk) == {net[k].msg : k \in {k2 \in DOMAIN net : net[k2].msg.kind \in kk}}
 ProjG == <<pRunCJ, SentKinds({"STARTED", "READY", "STOPPED"})>>
 NetKeep == DOMAIN net \subseteq DOMAIN net' /\ \A k \in DOMAIN net : net'[k] = net[k]
-GStep == FV!Next /\ UNCHANGED <<pJobSP, pJobCP, pTaskCJ, pPaySrc, pPayRcv, pCommSJ, pWfSJ, pTrainer>>
+GStep == FV!Next /\ UNCHANGED <<pJobSP, pJobCP, pTaskCJ, pPaySrc, pPayRcv, pCommSJ, pWfSJ, pTrainer, pReg, pWorker, pModel, pSwarm>>
     /\ Assert(NetKeep /\ \A k \in DOMAIN net' \ DOMAIN net : net'[k].msg.kind \in {"STARTED", "READY", "STOPPED"}, "net discipline (group)")
-EStep == E!EnvNext /\ UNCHANGED <<pRunCJ, pTaskCJ, pPayRcv, pCommSJ, pTrainer, runCJ_f>>
+EStep == E!EnvNext /\ UNCHANGED <<pRunCJ, pTaskCJ, pPayRcv, pCommSJ, pTrainer, pReg, pWorker, pModel, pSwarm, runCJ_f>>
 HInit == PortsInit /\ FV!Init
 HNext == GStep \/ EStep
 RefInit == CRef!Init

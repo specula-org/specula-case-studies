@@ -3,16 +3,16 @@ EXTENDS Ports, TLC
 CONSTANTS MaxGen
 CONSTANTS s1
 VARIABLES trainer_f
-hvars == <<net, pJobSP, pJobCP, pRunCJ, pTaskCJ, pPaySrc, pPayRcv, pCommSJ, pWfSJ, pTrainer, trainer_f>>
+hvars == <<net, pJobSP, pJobCP, pRunCJ, pTaskCJ, pPaySrc, pPayRcv, pCommSJ, pWfSJ, pTrainer, pReg, pWorker, pModel, pSwarm, trainer_f>>
 FV == INSTANCE Trainer_F
 E == INSTANCE Env_Trainer
 CRef == INSTANCE Trainer_C WITH trainer_c <- FV!AbsC
 SentKinds(kk) == {net[k].msg : k \in {k2 \in DOMAIN net : net[k2].msg.kind \in kk}}
 ProjG == <<pTrainer, SentKinds({})>>
 NetKeep == DOMAIN net \subseteq DOMAIN net' /\ \A k \in DOMAIN net : net'[k] = net[k]
-GStep == FV!Next /\ UNCHANGED <<net, pJobSP, pJobCP, pRunCJ, pTaskCJ, pPaySrc, pPayRcv, pCommSJ, pWfSJ>>
+GStep == FV!Next /\ UNCHANGED <<net, pJobSP, pJobCP, pRunCJ, pTaskCJ, pPaySrc, pPayRcv, pCommSJ, pWfSJ, pReg, pWorker, pModel, pSwarm>>
     /\ Assert(NetKeep /\ \A k \in DOMAIN net' \ DOMAIN net : net'[k].msg.kind \in {}, "net discipline (group)")
-EStep == E!EnvNext /\ UNCHANGED <<net, pJobSP, pPaySrc, pPayRcv, pCommSJ, pWfSJ, pTrainer, trainer_f>>
+EStep == E!EnvNext /\ UNCHANGED <<net, pJobSP, pPaySrc, pPayRcv, pCommSJ, pWfSJ, pTrainer, pReg, pWorker, pModel, pSwarm, trainer_f>>
 HInit == PortsInit /\ FV!Init
 HNext == GStep \/ EStep
 RefInit == CRef!Init
