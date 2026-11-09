@@ -20,10 +20,10 @@ sys.path.insert(0, str(ROOT / "scripts"))
 HERE = Path(__file__).resolve().parent
 MIXES = ROOT / "checks" / "mixes"
 ENV = {"launch", "task", "call", "complete", "retire"}
-PROFILE = {"sag": ["sjModel", "sag"], "cyc": ["sjModel", "cyclic"], "samp": ["sampling"], "sync": [], "cse": ["cseServer"]}
-SITES = {"sag": 1, "cyc": 2, "samp": 2, "sync": 1, "cse": 1}
+PROFILE = {"sagnpf": ["sjModel", "sag"], "sag": ["sjModel", "sag"], "cyc": ["sjModel", "cyclic"], "samp": ["sampling"], "sync": [], "cse": ["cseServer"]}
+SITES = {"sagnpf": 1, "sag": 1, "cyc": 2, "samp": 2, "sync": 1, "cse": 1}
 ROUNDS = {"cse": 1}
-FAULTS = {"sync": ["sjSyncFail"]}
+FAULTS = {"sync": ["sjSyncFail"], "sagnpf": ["saveFail"]}
 
 
 def tla_val(e):
@@ -69,6 +69,10 @@ Match(e) ==
       [] e.ev = "agg" -> pModel'.agg[e.r] = e.kind /\ pModel.agg[e.r] = "none"
       [] e.ev = "aggregate" -> pWfSJ.aggregate = None /\ pWfSJ'.aggregate /= None
       [] e.ev = "art" -> pModel'.artifact = [round |-> e.r, kind |-> e.kind] /\ pModel.artifact /= pModel'.artifact
+      [] e.ev = "artfail" -> /\ pModel'.ret /= None /\ pModel'.ret.out = "fail"
+                             /\ (pModel.ret = None \/ pModel.ret /= pModel'.ret)
+                             /\ pModel'.artifact = pModel.artifact
+      [] e.ev = "panic" -> pWfSJ'.panic /\ ~pWfSJ.panic /\ pWfSJ'.returned = "error"
       [] e.ev = "csedone" -> pWfSJ'.returned = "normal" /\ pWfSJ.returned = "none" /\ pWfSJ'.saved
       [] e.ev = "syncfail" -> pWfSJ'.sj = "crashed" /\ pWfSJ.sj = "none" /\ ~pWfSJ'.open
       [] e.ev = "saved" -> wfSJ_c'.saved = e.r /\ wfSJ_c.saved /= e.r /\ pWfSJ'.returned = e.returned
@@ -119,6 +123,8 @@ CHECK_DEADLOCK FALSE
 
 def family(scn):
     base = scn[4:] if scn.startswith("neg_") else scn
+    if base.startswith("sag_np_savefail") or base.startswith("sag_np_panic"):
+        return "sagnpf"
     for fam in ("cyc", "samp", "sync", "cse"):
         if base.startswith(fam):
             return fam
@@ -165,6 +171,9 @@ def mutate():
     sync = json.loads((HERE / "traces" / "sync_fail.json").read_text())
     neg5 = [sync[0], dict(ev="open"), sync[1]]                   # the workflow opened, then the start failed
     (HERE / "traces" / "neg_sync_after_open.json").write_text(json.dumps(neg5, indent=1))
+    npf = json.loads((HERE / "traces" / "sag_np_savefail.json").read_text())
+    neg7 = npf[:-2] + [npf[-1], npf[-2]]                     # panic before the save attempt failed
+    (HERE / "traces" / "neg_sag_np_panic_before_savefail.json").write_text(json.dumps(neg7, indent=1))
     cse = json.loads((HERE / "traces" / "cse_ok.json").read_text())
     neg6 = [e for e in cse if e["ev"] != "retire"]              # evaluation finished while its task still stands
     (HERE / "traces" / "neg_cse_done_while_standing.json").write_text(json.dumps(neg6, indent=1))

@@ -387,3 +387,116 @@ def test_cse_server(tmp_path):
     assert controller.get_num_standing_tasks() == 0
     tr("csedone")
     tr.dump("cse_ok")
+
+
+def run_sag_real_persistor(scn, tmp_path, fail_round=None):
+    """SAG with the real NPModelPersistor (np.save under the job's result root). With
+    fail_round, the result root is made unwritable before that round's save: np.save
+    raises, control_flow panics (the artifact keeps the previous round's file)."""
+    import stat
+
+    from nvflare.apis.workspace import Workspace
+    from nvflare.app_common.np.constants import NPConstants
+    from nvflare.app_common.np.np_model_persistor import NPModelPersistor
+
+    tr = Tracer()
+    clients, engine, fl_ctx = make_env(1)
+    root = tmp_path / "ws"
+    (root / "startup").mkdir(parents=True)
+    (root / "local").mkdir()
+    engine.get_workspace.return_value = Workspace(root_dir=str(root))
+    state = {"round": 0}
+    aggregator = InTimeAccumulateWeightedAggregator()
+    aggregator.handle_event(EventType.START_RUN, fl_ctx)
+    real_accept, real_aggregate = aggregator.accept, aggregator.aggregate
+
+    def accept(shareable, fl_ctx):
+        ok = real_accept(shareable, fl_ctx)
+        state["last_acc"] = ok
+        tr("acc", r=state["round"], c=1, out="accepted" if ok else "rejected")
+        return ok
+
+    def aggregate(fl_ctx):
+        res = real_aggregate(fl_ctx)
+        tr("agg", r=state["round"], kind="clean")
+        tr("aggregate", r=state["round"])
+        return res
+
+    aggregator.accept, aggregator.aggregate = accept, aggregate
+    persistor = NPModelPersistor()
+    real_save = persistor.save_model
+    model_root = os.path.join(Workspace(root_dir=str(root)).get_result_root("job"), "models")
+
+    def save_model(model_learnable, fl_ctx):
+        r = state["round"]
+        target = os.path.join(model_root, "server.npy")
+        if r == fail_round:
+            os.makedirs(model_root, exist_ok=True)
+            if os.path.exists(target):
+                os.chmod(target, stat.S_IRUSR)
+            os.chmod(model_root, stat.S_IRUSR | stat.S_IXUSR)
+        try:
+            real_save(model_learnable, fl_ctx)
+        except Exception:
+            tr("artfail", r=r)
+            raise
+        finally:
+            if r == fail_round:
+                os.chmod(model_root, stat.S_IRWXU)
+                if os.path.exists(target):
+                    os.chmod(target, stat.S_IRUSR | stat.S_IWUSR)
+        tr("art", r=r, kind="clean")
+        tr("saved", r=r, returned="normal" if r == 2 else "none")
+
+    persistor.save_model = save_model
+    persistor.load = lambda fl_ctx: make_model_learnable({NPConstants.NUMPY_KEY: np.zeros(2)}, {})
+    components = {"aggregator": aggregator, "persistor": persistor,
+                  "shareable_generator": FullModelShareableGenerator()}
+    engine.get_component.side_effect = components.get
+    controller = ScatterAndGather(min_clients=1, num_rounds=2, persistor_id="persistor",
+                                  snapshot_every_n_rounds=0, memory_gc_rounds=0, wait_time_after_min_received=0)
+    comm = WFCommServer()
+    comm._engine = engine
+    controller.set_communicator(comm)
+    controller.initialize(fl_ctx)
+    panics = []
+    controller.system_panic = lambda reason, fl_ctx: (panics.append(reason), tr("panic"))
+
+    def broadcast(task, fl_ctx, min_responses, wait_time_after_min_received, **kwargs):
+        state["round"] += 1
+        r = state["round"]
+        tr("schedule", r=r)
+        comm.broadcast(task, fl_ctx, min_responses=min_responses, wait_time_after_min_received=0)
+        tr("task", r=r)
+        cb = task.result_received_cb
+
+        def traced_cb(client_task, fl_ctx):
+            cb(client_task=client_task, fl_ctx=fl_ctx)
+            tr("ret", c=1, r=r, accepted=bool(state.get("last_acc")))
+
+        task.result_received_cb = traced_cb
+        for client in clients:
+            task_name, task_id, task_data = comm.process_task_request(client, fl_ctx)
+            tr("call", c=1, r=r, rc="OK")
+            comm.process_submission(client, task_name, task_id,
+                                    result_for(task_data, client, {NPConstants.NUMPY_KEY: np.array([1.0, 2.0])}, contribution_round=r - 1), fl_ctx)
+            tr("complete")
+        comm.check_tasks()
+        tr("retire")
+
+    controller.broadcast_and_wait = broadcast
+    tr("launch")
+    tr("open")
+    controller.control_flow(Signal(), fl_ctx)
+    tr.dump(scn)
+    return tr.ev, panics
+
+
+def test_sag_real_persistor(tmp_path):
+    ev, panics = run_sag_real_persistor("sag_np", tmp_path)
+    assert not panics and [e["ev"] for e in ev].count("saved") == 2
+
+
+def test_sag_real_persistor_save_fails(tmp_path):
+    ev, panics = run_sag_real_persistor("sag_np_savefail", tmp_path, fail_round=2)
+    assert panics and ev[-2]["ev"] == "artfail" and ev[-1]["ev"] == "panic"

@@ -800,17 +800,22 @@ W3a 的第一版没有限定"服务器还在等"，不带故障的 BFS 第 72 �
 | B（补） | 真实 `CrossSiteModelEval`（server 控制的 CSE）控制流和结果回调，真实 `WFCommServer` 任务表；ModelLocator 是桩，提供一个 server 模型 | 1 | 1 |
 | E（补） | 真实 `DockerJobHandle`（假的 Docker client，上游 Docker 单测的做法）：容器正常退出；abort 后 stop 返回 APIError，handle 保持非终态 | 2 | 1 |
 | G（补，手写） | `taskDataFail` 急切路径：按代码路径手写的 trace（`communicator.py:486-500`、`client_runner.py:613-636`），标为手写；客户端拉任务要整套 ClientRunner、Communicator、Cell，组级 harness 没做 | 1 | 1 |
-| 合计 | | 14 | 19 |
+| A（补） | 同一 SAG 路径改用真实 `NPModelPersistor`（`np.save` 到 job 的 result 目录）：两轮正常保存；第二轮前把模型文件和目录设成只读，`np.save` 抛 PermissionError，`control_flow` panic，旧文件保留 | 2 | 1 |
+| 合计 | | 16 | 20 |
 
 E 块的删除失败 trace 同时说明 H20 在真实代码里成立：删除 Pod 返回 500 时 handle 记 TERMINATED，workspace 记录被移除。
 
 Docker 的 stop 失败 trace 和改错 trace 一起说明两种后端的差别：Docker 在 stop 失败时保留 handle，不释放；把 K8s 的"失败也释放"套到 Docker 上的 trace 被穷尽拒绝。
 
-仍没有真实 trace 的部分：`taskDataFail` 只有按代码路径手写的 trace（原因见表）；Model 的保存失败分支没有回放（persistor 用记录桩，只回放了保存成功）。
+A 块（Model）的证据：SAG 的 5 条 trace 都实例化了 `Model_C` 并观察 `pModel`（accept 结果、aggregate 结果、文件状态），其中保存失败一条在真实 `NPModelPersistor` 上发生。改错 trace 里"保存失败却写成截断文件"的一条被接受了：粗粒度的 Model 允许 NP 直接写到一半留下截断文件，比这次真实失败（打开文件就失败、旧文件不变）多出的行为属于粗变体的过近似，不算回放失败，所以换成"panic 早于保存失败"这条做负控（被拒绝）。
+
+仍没有真实 trace 的只有 `taskDataFail`，用的是按代码路径手写的 trace（原因见表）。
+
+**SANY**：v11 新增或改动的 16 个 spec 模块、生成的 `Mix.tla`，以及 37 个 TV 模块，逐个用 `scripts/tlc.sh sany` 解析，全部通过。
 
 ### 17.4 不干扰和精化
 
-**不干扰（v11 开关全关，改前用回退点 `5b6f008d` 的 spec 和脚本，改后用当前 spec，同样的配置）**。从 Init 出发的完整 BFS 在新旧两边 25 分钟内都跑不完（第七轮已知），所以组合层面用相同的深度上限：
+**不干扰（v11 开关全关，改前用回退点 `5b6f008d` 的 spec 和脚本，改后用当前 spec，同样的配置）**。目标要求的"此前跑满的 BFS 配置"是前三行：WfSJ、Trainer、RunCJ 的 harness receipt 在 v11 之前就已穷尽跑满，这次在新旧两边原样重跑，状态数相同；后四行是额外加的组合层面对比。从 Init 出发的完整 BFS 在新旧两边 25 分钟内都跑不完（第七轮已知），所以组合层面用相同的深度上限：
 
 | 检查 | 改前 distinct | 改后 distinct |
 |---|---:|---:|
@@ -855,7 +860,7 @@ Swarm 的两条 Phase 1 候选在模型里也走得到：H05（gather 在所有�
 
 ### 17.6 小结
 
-- 这一轮把 Phase 1 列为范围外的大部分内容以粗变体建了进来：spec 增加约 925 行，2 个新组、1 个新 trainer 变体、9 个开关、13 个故障。7 块里 Slurm 和 H31 推迟（理由见 17.1），其余都有冒烟；TV 共 14 条 trace 被接受（其中 1 条手写）、19 条改错 trace 被拒绝，每块至少一接受一拒绝。
+- 这一轮把 Phase 1 列为范围外的大部分内容以粗变体建了进来：spec 增加约 925 行，2 个新组、1 个新 trainer 变体、9 个开关、13 个故障。7 块里 Slurm 和 H31 推迟（理由见 17.1），其余都有冒烟；TV 共 16 条 trace 被接受（其中 1 条手写）、20 条改错 trace 被拒绝，每块至少一接受一拒绝。
 - 没有跑 hunt，所以没有新的模型检查结论，根因计数不变（RESULTS §16.5）。冒烟见证顺带说明几条 Phase 1 候选（H04、H05、H06、H07、H20、H39）在模型里走得到，另有一条新线索 V7；都只是静态加模型见证，没有复现，不计数。
 - 待拆细的窗口清单在 `notes/v11-audit.md`：H24（训练进程清标志和 CJ 关监听之间）、Attach 投递重试循环里早到的 RESULT_READY、K8s 下 CJ 在关闭时才发布结果。
 - 仍在范围外：edge、simulator、lighter/dashboard/tool、xgboost/psi/statistics/splitnn、filters、cellnet/drivers 内部、安全鉴权、时间数值、显式 ref 复用（H09），以及这一轮推迟的 Slurm 和 H31。
