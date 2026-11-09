@@ -32,4 +32,23 @@ WCycStop == ~(WfPolicy = "cyclic" /\ pWfSJ.wfDone)
 WCycStopFinished == ~(WfPolicy = "cyclic" /\ pWfSJ.wfDone /\ pJobSP.terminal = "FINISHED")
 WCseDone == ~(WfPolicy = "cseServer" /\ pWfSJ.returned = "normal")
 WMonitorDead == ~pCommSJ.monitorCrashed
+\* --- D (swarm)
+Sw(c) == pSwarm[c][1]
+WSwAgg2 == ~(SwarmOn /\ \E c \in Sites : Sw(c).aggregated[SwarmRounds] /= None)
+WSwH05 == ~(SwarmOn /\ \E c \in Sites : Sw(c).gather /= None /\ Sw(c).gather.done
+                                       /\ Sw(c).gather.gathered /= Sw(c).gather.replied)
+WSwH06 == ~(SwarmOn /\ \E c \in Sites : Sw(c).stopped /\ Sw(c).learn.st = "aborted" /\ ~Sw(c).ended)
+WSwH06Finished == ~(SwarmOn /\ pJobSP.terminal = "FINISHED" /\ \E c \in Sites : Sw(c).learn.st = "aborted")
+WSwErrPanic == ~(SwarmOn /\ pWfSJ.panic /\ \E c \in Sites : Sw(c).report.error)
+WSwPanicNoErr == ~(SwarmOn /\ pWfSJ.panic /\ pWfSJ.cw = "monitor" /\ \A c \in Sites : ~Sw(c).report.error)
+WSwCfgPanic == ~(SwarmOn /\ pWfSJ.panic /\ pWfSJ.cw = "init" /\ \A c \in Sites : ~Sw(c).report.error)
+WSwProgress == ~(SwarmOn /\ pWfSJ.panic /\ pWfSJ.cw = "monitor" /\ \E c \in Sites : CJGone(c, 1))
+WSwMonCrash == ~(SwarmOn /\ pWfSJ.cw = "monitor" /\ \E c \in Sites : CJGone(c, 1))
+WSwMonitor == ~(SwarmOn /\ pWfSJ.cw = "monitor")
+WSwAllDoneSeen == ~(SwarmOn /\ pWfSJ.cw = "monitor" /\ \E k \in DOMAIN net : InInbox(k, SJ, "SWARM_STATUS") /\ M(k).body.allDone)
+WSwEnding == ~(SwarmOn /\ pWfSJ.cw = "ending")
+WSwEndLost == ~(SwarmOn /\ pWfSJ.cw = "ending" /\ \E k \in DOMAIN net : net[k].lost)
+WSwEndFail == ~(SwarmOn /\ pWfSJ.panic /\ pWfSJ.cw = "ending")
+WSwGatherTimeoutPartial == ~(SwarmOn /\ \E c \in Sites, r \in 1..SwarmRounds :
+                                Sw(c).aggregated[r] /= None /\ Sw(c).aggregated[r] /= Sites)
 =============================================================================

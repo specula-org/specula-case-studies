@@ -43,6 +43,8 @@ NonLiveFaults == {"cancel", "prepFail"} \cap Faults /= {} \/ P.cancelled = Cur
 CbRaised == RaiseTracked /\ Cur \in pWfSJ.raised
 \* v11: standing groups of tasks whose resend may list a ClientTask twice
 DupTasks == {"cseTasks", "cseServer"} \cap Profile /= {}
+\* v11 (swarm, sampling): the round's task targets only pWfSJ.targets
+Tgt == IF Has(pWfSJ, "targets") THEN pWfSJ.targets ELSE Sites
 
 ScheduleTask ==
     /\ SJAlive /\ pWfSJ.scheduled > Cur /\ pWfSJ.scheduled \in 1..Rounds
@@ -53,7 +55,7 @@ ScheduleTask ==
 
 SendAssignment(c, k) ==
     /\ SJAlive /\ IsFrom(k, "GET_TASK", c) /\ ~Replied("TASK_ASSIGNMENT", k)
-    /\ Cur >= 1 /\ pWfSJ.open
+    /\ Cur >= 1 /\ pWfSJ.open /\ c \in Tgt
     /\ \E r \in 1..Cur :
          net' = Send(net, Msg("TASK_ASSIGNMENT", SJ, CJ(c), M(k).id,
                    [status |-> "ASSIGNED", assignment |-> Assignment(c, r),
@@ -62,7 +64,7 @@ SendAssignment(c, k) ==
 
 TryAgain(c, k) ==
     /\ SJAlive /\ IsFrom(k, "GET_TASK", c) /\ ~Replied("TASK_ASSIGNMENT", k) /\ Cur >= 1
-    /\ \/ NonLiveFaults \/ MaybeClosed \/ ~P.standing \/ c \in P.finished
+    /\ \/ NonLiveFaults \/ MaybeClosed \/ ~P.standing \/ c \in P.finished \/ c \notin Tgt
        \/ \E k2 \in DOMAIN net : /\ net[k2].msg.kind = "TASK_ASSIGNMENT" /\ net[k2].msg.to = CJ(c)
                                  /\ net[k2].msg.body.status = "ASSIGNED"
        \/ \E k2 \in DOMAIN net : IsFrom(k2, "GET_TASK", c) /\ k2 /= k
@@ -154,7 +156,7 @@ Reject(c, k) ==
 \* monitor retires nothing and checks no dead-client policy.
 Retire ==
     /\ SJAlive /\ P.standing /\ P.call = None /\ ~P.monitorCrashed
-    /\ P.finished = Sites \/ RetireFaults \/ P.cancelled = Cur \/ CbRaised
+    /\ Tgt \subseteq P.finished \/ RetireFaults \/ P.cancelled = Cur \/ CbRaised
     /\ \/ pCommSJ' = [pCommSJ EXCEPT !.standing = FALSE]
        \/ /\ DupTasks
           /\ pCommSJ' = [pCommSJ EXCEPT !.standing = FALSE, !.monitorCrashed = TRUE]

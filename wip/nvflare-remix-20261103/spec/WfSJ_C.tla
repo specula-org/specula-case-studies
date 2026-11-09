@@ -35,7 +35,7 @@ Pol == WfPolicy
 ModelAccepts == SJModel /\ Pol \in {"fedavg", "sag"}
 Raised(r) == RaiseTracked /\ r \in pWfSJ.raised
 \* a round is finished once it saved its model (cseServer: once it closed)
-RoundDone == IF Pol = "cseServer" THEN W.closed /= "none" ELSE W.saved = W.round
+RoundDone == IF Pol \in {"cseServer", "swarm"} THEN W.closed /= "none" ELSE W.saved = W.round
 Max2(a, b) == IF a > b THEN a ELSE b
 Ret(c) == [site |-> c, round |-> Call.round]
 ModelRet == IF pWfSJ.mcall = None \/ pModel.ret = None THEN FALSE
@@ -53,13 +53,21 @@ CycActive == {c \in Sites : \A g \in 1..MaxTok : <<c, g>> \notin pReg.notified}
 StartRound ==
     /\ Running /\ pWfSJ.open /\ W.round < Rounds /\ (W.round = 0 \/ RoundDone)
     /\ Pol = "cyclic" => ~pWfSJ.wfDone /\ Cardinality(CycActive) >= 2
+    \* swarm: config (round 1) must reach every site before the start task (round 2)
+    /\ Pol = "swarm" /\ W.round = 1 => CountedSites = Sites
     /\ wfSJ_c' = [wfSJ_c EXCEPT !.round = @ + 1, !.counted = {}, !.closed = "none"]
     /\ UNCHANGED <<pWfSJ, net>>
 
+\* v11 targets: swarm sends config to every site and start to the starting
+\* client; sampling draws a nonempty subset (sample_clients)
+TargetSets == IF Pol = "swarm" THEN {IF W.round = 1 THEN Sites ELSE {Starter}}
+              ELSE IF "sampling" \in Profile THEN SUBSET Sites \ {{}} ELSE {Sites}
 Schedule ==
     /\ Running /\ W.round >= 1 /\ pWfSJ.scheduled < W.round
     \* per-round port fields are reset with `scheduled`
-    /\ pWfSJ' = [pWfSJ EXCEPT !.scheduled = W.round, !.accepted = {}, !.aggregate = None]
+    /\ \E ts \in TargetSets :
+         LET w == [pWfSJ EXCEPT !.scheduled = W.round, !.accepted = {}, !.aggregate = None]
+         IN pWfSJ' = IF Targeted THEN [w EXCEPT !.targets = ts] ELSE w
     /\ UNCHANGED <<wfSJ_c, net>>
 
 Count(c) ==
@@ -235,6 +243,57 @@ RelayPanic ==
     /\ pWfSJ' = [pWfSJ EXCEPT !.returned = "error", !.panic = TRUE]
     /\ UNCHANGED <<wfSJ_c, net>>
 
+\* ---------------------------------------------------------------- v11 swarm
+\* CCWF ServerSideController (ccwf/server_ctl.py:231-540): config broadcast, start
+\* task, status monitor, end-workflow aux request.
+SwarmStatus(k) == InInbox(k, SJ, "SWARM_STATUS")
+SwarmCfgPanic ==
+    /\ Pol = "swarm" /\ Running /\ W.round = 1 /\ W.closed = "ok" /\ CountedSites /= Sites
+    /\ pWfSJ' = [pWfSJ EXCEPT !.returned = "error", !.panic = TRUE]
+    /\ UNCHANGED <<wfSJ_c, net>>
+SwarmStartOk ==
+    /\ Pol = "swarm" /\ Running /\ W.round = 2 /\ W.closed = "ok" /\ Starter \in CountedSites
+    /\ pWfSJ.cw = "init"
+    /\ pWfSJ' = [pWfSJ EXCEPT !.cw = "monitor"]
+    /\ UNCHANGED <<wfSJ_c, net>>
+SwarmStartPanic ==
+    /\ Pol = "swarm" /\ Running /\ W.round = 2 /\ W.closed = "ok" /\ Starter \notin CountedSites
+    /\ pWfSJ' = [pWfSJ EXCEPT !.returned = "error", !.panic = TRUE]
+    /\ UNCHANGED <<wfSJ_c, net>>
+\* a failure report from any client: asked_to_stop + system_panic
+SwarmErrPanic ==
+    /\ Pol = "swarm" /\ Running /\ pWfSJ.cw \in {"monitor", "init"}
+    /\ \E k \in DOMAIN net : SwarmStatus(k) /\ M(k).body.error
+    /\ pWfSJ' = [pWfSJ EXCEPT !.returned = "error", !.panic = TRUE]
+    /\ UNCHANGED <<wfSJ_c, net>>
+\* no progress / a silent client (progress_timeout, max_status_report_interval):
+\* only with a stall cause (a dead or unreachable client, lost aux messages, a
+\* client that stopped itself)
+SwarmProgressPanic ==
+    /\ Pol = "swarm" /\ Running /\ pWfSJ.cw = "monitor"
+    /\ \/ \E c \in Sites : PeerFailureCJ(c, CurLaunch(c))
+       \/ {"swarmMsgFail", "busyReplace", "netLoss"} \cap Faults /= {}
+    /\ pWfSJ' = [pWfSJ EXCEPT !.returned = "error", !.panic = TRUE]
+    /\ UNCHANGED <<wfSJ_c, net>>
+\* ALL_DONE from a client: ask every client to end the workflow
+SwarmAllDone ==
+    /\ Pol = "swarm" /\ Running /\ pWfSJ.cw = "monitor"
+    /\ \E k \in DOMAIN net : SwarmStatus(k) /\ M(k).body.allDone
+    /\ pWfSJ' = [pWfSJ EXCEPT !.cw = "ending"]
+    /\ net' = SendAll(net, {Msg("SWARM_END_WF", SJ, CJ(c), <<JobId, c>>, None) : c \in Sites})
+    /\ UNCHANGED wfSJ_c
+EndReplied(c) == \E k \in DOMAIN net : InInbox(k, SJ, "SWARM_END_REPLY") /\ M(k).from = CJ(c)
+SwarmEndDone ==
+    /\ Pol = "swarm" /\ Running /\ pWfSJ.cw = "ending" /\ \A c \in Sites : EndReplied(c)
+    /\ pWfSJ' = [pWfSJ EXCEPT !.returned = "normal", !.saved = TRUE]
+    /\ UNCHANGED <<wfSJ_c, net>>
+\* fewer replies than required (min_clients = 0: all) within end_workflow_timeout
+SwarmEndFail ==
+    /\ Pol = "swarm" /\ Running /\ pWfSJ.cw = "ending"
+    /\ \E c \in Sites : ~EndReplied(c) /\ (PeerFailureCJ(c, CurLaunch(c)) \/ {"netLoss", "swarmMsgFail"} \cap Faults /= {})
+    /\ pWfSJ' = [pWfSJ EXCEPT !.returned = "error", !.panic = TRUE]
+    /\ UNCHANGED <<wfSJ_c, net>>
+
 CseDone ==
     /\ Pol = "cseServer" /\ Running /\ W.round = Rounds /\ W.closed = "ok"
     /\ pWfSJ' = [pWfSJ EXCEPT !.saved = TRUE, !.returned = "normal"]
@@ -266,6 +325,8 @@ Crash ==
 Next == \/ Open \/ StartRound \/ Schedule \/ Panic \/ RecordError \/ CancelAll \/ CloseRound
         \/ RaiseReturn \/ Aggregate \/ Save \/ EndRun \/ DSShutdown \/ Exit \/ Crash
         \/ CallAggregate \/ AggregateRet \/ CallSave \/ SaveRet \/ CseDone \/ RelayPanic
+        \/ SwarmCfgPanic \/ SwarmStartOk \/ SwarmStartPanic \/ SwarmErrPanic \/ SwarmProgressPanic
+        \/ SwarmAllDone \/ SwarmEndDone \/ SwarmEndFail
         \/ \E c \in Sites : Count(c) \/ Accept(c) \/ Return(c)
                            \/ CallAccept(c) \/ AcceptRet(c) \/ RaiseCb(c) \/ StopWorkflow(c)
 =============================================================================

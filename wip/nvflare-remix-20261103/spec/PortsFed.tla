@@ -80,13 +80,19 @@ WfSJPortBase == [open |-> FALSE, scheduled |-> 0, accepted |-> {},
 \*   raised (sjModel or sag/cyclic/cseServer): rounds whose result callback
 \*     raised (WFComm sets the task's completion status ERROR, no abort);
 \*   wfDone (cyclic): _stop_workflow latched (_is_done).
+\*   targets (swarm, sampling): the sites the current round's task targets;
+\*   cw (swarm): the CCWF server controller's phase init | monitor | ending.
 RaiseTracked == SJModel \/ WfPolicy \in {"sag", "cyclic", "cseServer"}
+Targeted == WfPolicy = "swarm" \/ "sampling" \in Profile
 WfSJExtra == (IF TaskMode THEN {"errored"} ELSE {}) \cup (IF SJModel THEN {"mcall", "mseq"} ELSE {})
              \cup (IF RaiseTracked THEN {"raised"} ELSE {}) \cup (IF WfPolicy = "cyclic" THEN {"wfDone"} ELSE {})
+             \cup (IF Targeted THEN {"targets"} ELSE {}) \cup (IF WfPolicy = "swarm" THEN {"cw"} ELSE {})
 WfSJExtraInit(f) == CASE f \in {"errored", "raised"} -> {}
                       [] f = "mcall" -> None
                       [] f = "mseq" -> 0
                       [] f = "wfDone" -> FALSE
+                      [] f = "targets" -> Sites
+                      [] f = "cw" -> "init"
 WfSJPortInit == IF WfSJExtra = {} THEN WfSJPortBase
                 ELSE [f \in DOMAIN WfSJPortBase \cup WfSJExtra |->
                         IF f \in WfSJExtra THEN WfSJExtraInit(f) ELSE WfSJPortBase[f]]

@@ -10,10 +10,10 @@ OUT = ROOT / ".build" / "x11" / "results.jsonl"
 
 
 def go(name, profile, faults, inv, sites=1, launch=1, attempt=2, mode="sim", depth=(400, 4000),
-       timeout=240, grain=None, deadlock=False, workers=4, constraint=None, prop=(), tag=""):
+       timeout=240, grain=None, deadlock=False, workers=4, constraint=None, prop=(), tag="", action_constraint=None):
     mkmc.build(name, grain=grain or {}, faults=faults, sites=sites, launch=launch, attempt=attempt,
                inv=list(inv), prop=list(prop), symmetry=False, deadlock=deadlock, profile=list(profile),
-               constraint=constraint, extends=EXT)
+               constraint=constraint, extends=EXT, action_constraint=action_constraint)
     r = run_mc.run(name, timeout, workers, mode, depth, "8g")
     r.pop("cfg", None)
     keep = {k: v for k, v in r.items() if k in ("result", "violated", "distinct", "depth", "traces", "error", "secs", "wall_seconds")}

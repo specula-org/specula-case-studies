@@ -93,17 +93,21 @@ SignalTrainer(c, l) ==
 FirstCheck(c, l) ==
     /\ CJAlive(c, l) /\ T(c, l).asg /= None /\ Tries(c, l) = 0
     /\ \E rc \in {"OK", "EXECUTION_EXCEPTION"} :
-         /\ ~TaskMode =>
+         /\ ~TaskMode /\ ~SwarmOn =>
               /\ rc = "OK" => pTrainer[c][l].published /= None
               /\ rc /= "OK" => "resultWaitTimeout" \in Faults \/ pTrainer[c][l].stopped
                                \/ pTrainer[c][l].err >= T(c, l).task   \* v11 Attach (Trainer_A)
+         \* swarm (v11): the client controller executor's reply to config / start
+         /\ SwarmOn =>
+              /\ pSwarm[c][l].reply /= None /\ pSwarm[c][l].reply.round = T(c, l).asg.attempt
+              /\ (rc = "OK") = (pSwarm[c][l].reply.rc = "OK")
          /\ TaskMode =>
               /\ WorkerOut(c, l) /= None
               /\ rc = "OK" => WorkerOut(c, l).kind = "result"
               /\ rc /= "OK" => WorkerOut(c, l).kind \in {"error", "aborted"}
          /\ taskCJ_c' = [taskCJ_c EXCEPT ![c][l].result =
                [rc |-> rc, value |-> IF rc /= "OK" THEN None
-                                     ELSE IF TaskMode THEN <<"result", c, T(c, l).task>>
+                                     ELSE IF TaskMode \/ SwarmOn THEN <<"result", c, T(c, l).task>>
                                      ELSE pTrainer[c][l].published.value]]
     /\ net' = Send(net, Msg("TASK_CHECK", CJ(c), SJ, SubmitId(c, l, 1),
                  [assignment |-> T(c, l).asg, try |-> 1]))

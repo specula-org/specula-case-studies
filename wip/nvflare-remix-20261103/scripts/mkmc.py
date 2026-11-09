@@ -170,7 +170,7 @@ def build(name, grain=None, default="C", faults=(), sites=2, launch=1, attempt=1
         init = "CInit"
     cfg = consts + ["INIT " + init, "NEXT " + nxt]
     # profile cseTasks fixes a site order (CommSJ_F LastSite): not symmetric
-    if symmetry and sites > 1 and not persite and not init_states and "cseTasks" not in (profile or ()):
+    if symmetry and sites > 1 and not persite and not init_states and not ({"cseTasks", "swarm"} & set(profile or ())):
         cfg.append("SYMMETRY MCSym")
     if constraint:
         cfg.append(f"CONSTRAINT {constraint}")

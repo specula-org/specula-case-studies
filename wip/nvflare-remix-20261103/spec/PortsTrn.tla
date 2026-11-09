@@ -19,7 +19,8 @@ EXTENDS Consts
 \* (the attached trainer dies), tpReplyLost (a CJ->trainer control reply is lost).
 TrnFaults == {"trainerError", "tpSilent", "monitorStale", "tpAttachLate", "tpCrash", "tpReplyLost"}
 \* taskMode (v10): no in-process trainer; Trainer variants quantify over this.
-TrnLaunches == IF TaskMode THEN {} ELSE Launches
+\* swarm (v11): the learn executor runs inside the Swarm group's coarse step
+TrnLaunches == IF TaskMode \/ WfPolicy = "swarm" THEN {} ELSE Launches
 TrainerPortInit == [c \in Sites |-> [l \in Launches |->
                      [slot |-> 0, received |-> 0, published |-> None, stopped |-> FALSE, err |-> 0]]]
 =============================================================================
