@@ -531,7 +531,7 @@ F (`multiJobCP`): J2's START (allocate + env consume, the existing `otherJob` wr
 
 G:
 - `sjSyncFail` (#15): the new SJ exits with an error before opening the workflow.
-- `taskDataFail`: SJ→CJ input download failure; the CJ asks again, and the server's resend path runs (H11's trigger).
+- `taskDataFail`: SJ→CJ input download failure. Eager path (the payload is downloaded while the GET_TASK reply is decoded): `pull_task` gets a non-OK return code, the CJ asks again, and the server's resend path runs (H11's trigger). Lazy path (`resolve_task_data` fails in `_process_task`): the CJ submits BAD_TASK_DATA as the task's result.
 - `sampling`: per round, a nonempty target subset; only targets get assignments; the round completes when the targets finished.
 - CP restart adoption: covered by E (orphan CJ under `k8sJob`/`dockerJob`); under the process launcher the CJ dies with the CP (unchanged).
 - H31 (a new transaction per submission try) is deferred: the payload ports are keyed by attempt (`pPaySrc[c][l].tx[a]`), so a per-try transaction changes the port shape of PaySrc and PayRcv in both variants (PaySrc_F is 1,654 lines). The server deduplicates by receipt, and H31 is a contract baseline.

@@ -69,4 +69,12 @@ WCheckBusy == ~(MultiJobCP /\ \E k \in DOMAIN net : net[k].msg.kind = "RESOURCES
 WCantSchedule == ~(MultiJobCP /\ pJobSP.status = "CANT_SCHEDULE")
 WCPRestartBoth == ~(MultiJobCP /\ \E c \in Sites : CPRestarted(c) /\ pJobCP[c].j2.st = "exited" /\ ~pJobCP[c].j2.alloc
                                                     /\ \E l \in Launches : CJGone(c, l))
+\* --- G
+WSampled == ~("sampling" \in Profile /\ pWfSJ.targets /= Sites /\ pWfSJ.scheduled >= 1)
+WSampledFinished == ~("sampling" \in Profile /\ pJobSP.terminal = "FINISHED" /\ pWfSJ.targets /= Sites)
+WSyncFail == ~(pWfSJ.sj = "crashed" /\ ~pWfSJ.open /\ pJobSP.terminal = "ABORTED_OR_FAILED")
+WTaskDataResend == ~("taskDataFail" \in Faults /\ \E c \in Sites :
+                        Cardinality({k \in DOMAIN net : net[k].msg.kind = "TASK_ASSIGNMENT" /\ net[k].msg.to = CJ(c)
+                                                          /\ net[k].msg.body.status = "ASSIGNED"}) >= 2
+                        /\ pJobSP.terminal = "FINISHED")
 =============================================================================

@@ -71,6 +71,19 @@ RecvAssignment(c, l, k) ==
     /\ pTaskCJ' = [pTaskCJ EXCEPT ![c][l].submission = None]
     /\ UNCHANGED net
 
+\* v11 G (taskDataFail), eager path: the task payload fails to download while the
+\* GET_TASK reply is decoded; pull_task gets a non-OK return code, the client asks
+\* again and the server sees a resend (communicator.py:486-500, client_runner.py:
+\* 613-636). The lazy path (resolve_task_data fails) replies BAD_TASK_DATA instead
+\* (FirstCheck).
+RecvAssignmentFail(c, l, k) ==
+    /\ "taskDataFail" \in Faults
+    /\ CJAlive(c, l) /\ InInbox(k, CJ(c), "TASK_ASSIGNMENT") /\ M(k).body.status = "ASSIGNED"
+    /\ M(k).id[3] = l /\ M(k).id[4] = Polls(c, l) /\ Polls(c, l) > T(c, l).got
+    /\ T(c, l).asg = None \/ FinalReply(c, l)
+    /\ taskCJ_c' = [taskCJ_c EXCEPT ![c][l].got = Polls(c, l)]
+    /\ UNCHANGED <<pTaskCJ, net>>
+
 \* Executor publishes the task data to the in-process trainer (GLOBAL_RESULT).
 PublishInput(c, l) ==
     /\ CJAlive(c, l) /\ T(c, l).asg /= None
@@ -97,6 +110,9 @@ FirstCheck(c, l) ==
               /\ rc = "OK" => pTrainer[c][l].published /= None
               /\ rc /= "OK" => "resultWaitTimeout" \in Faults \/ pTrainer[c][l].stopped
                                \/ pTrainer[c][l].err >= T(c, l).task   \* v11 Attach (Trainer_A)
+                               \* v11 G: lazy task data fails to resolve: BAD_TASK_DATA
+                               \* (client_runner.py:345-367)
+                               \/ "taskDataFail" \in Faults
          \* swarm (v11): the client controller executor's reply to config / start
          /\ SwarmOn =>
               /\ pSwarm[c][l].reply /= None /\ pSwarm[c][l].reply.round = T(c, l).asg.attempt
@@ -171,5 +187,5 @@ Next == \E c \in Sites, l \in Launches :
     \/ RequestTask(c, l) \/ PublishInput(c, l) \/ SignalTrainer(c, l) \/ FirstCheck(c, l)
     \/ RetryCheck(c, l) \/ Serialize(c, l) \/ SendEnvelope(c, l)
     \/ WorkerInterrupted(c, l) \/ LatchAbort(c, l) \/ RecordReceipt(c, l)
-    \/ \E k \in DOMAIN net : RecvAssignment(c, l, k)
+    \/ \E k \in DOMAIN net : RecvAssignment(c, l, k) \/ RecvAssignmentFail(c, l, k)
 =============================================================================

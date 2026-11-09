@@ -20,8 +20,9 @@ sys.path.insert(0, str(ROOT / "scripts"))
 HERE = Path(__file__).resolve().parent
 MIXES = ROOT / "checks" / "mixes"
 ENV = {"launch", "task", "call", "complete", "retire"}
-PROFILE = {"sag": ["sjModel", "sag"], "cyc": ["sjModel", "cyclic"]}
-SITES = {"sag": 1, "cyc": 2}
+PROFILE = {"sag": ["sjModel", "sag"], "cyc": ["sjModel", "cyclic"], "samp": ["sampling"], "sync": []}
+SITES = {"sag": 1, "cyc": 2, "samp": 2, "sync": 1}
+FAULTS = {"sync": ["sjSyncFail"]}
 
 
 def tla_val(e):
@@ -35,6 +36,8 @@ def tla_val(e):
             f[key] = f'"{e[key]}"'
     if "accepted" in e:
         f["accepted"] = "TRUE" if e["accepted"] else "FALSE"
+    if "tg" in e:
+        f["tg"] = "{" + ", ".join(str(i) for i in e["tg"]) + "}"
     return "[" + ", ".join(f"{k} |-> {v}" for k, v in f.items()) + "]"
 
 
@@ -45,24 +48,27 @@ CONSTANTS @SITECONSTS@
 VARIABLES wfSJ_c, model_c, cur
 WF == INSTANCE WfSJ_C
 MD == INSTANCE Model_C
-MCFaults == {}
+MCFaults == {@FAULTS@}
 MCProfile == {@PROFILE@}
 S(i) == @SITEMAP@
 TR == << @TR@ >>
 EnvKinds == {"launch", "task", "call", "complete", "retire"}
-Fixed == <<pJobCP, pRunCJ, pTaskCJ, pPaySrc, pPayRcv, pTrainer, pReg, pWorker>>
-Obs == <<pWfSJ.open, pWfSJ.scheduled, pWfSJ.ret, pWfSJ.accepted, pWfSJ.aggregate, pWfSJ.returned,
+Fixed == <<pJobCP, pRunCJ, pTaskCJ, pPaySrc, pPayRcv, pTrainer, pReg, pWorker, pSwarm>>
+Obs == <<pWfSJ.sj, pWfSJ.open, pWfSJ.scheduled, pWfSJ.ret, pWfSJ.accepted, pWfSJ.aggregate, pWfSJ.returned,
          pWfSJ.panic, wfSJ_c.saved, pModel>>
 ObsAny == Obs' /= Obs
 Match(e) ==
     CASE e.ev = "open" -> ~pWfSJ.open /\ pWfSJ'.open
       [] e.ev = "schedule" -> pWfSJ'.scheduled = e.r /\ pWfSJ.scheduled /= e.r
+      [] e.ev = "scheduleT" -> /\ pWfSJ'.scheduled = e.r /\ pWfSJ.scheduled /= e.r
+                               /\ pWfSJ'.targets = {S(i) : i \in e.tg}
       [] e.ev = "acc" -> pModel'.acc[e.r][S(e.c)] = e.out /\ pModel.acc[e.r][S(e.c)] /= e.out
       [] e.ev = "ret" -> /\ pWfSJ'.ret = [site |-> S(e.c), round |-> e.r] /\ pWfSJ.ret /= pWfSJ'.ret
                          /\ (S(e.c) \in pWfSJ'.accepted) = e.accepted
       [] e.ev = "agg" -> pModel'.agg[e.r] = e.kind /\ pModel.agg[e.r] = "none"
       [] e.ev = "aggregate" -> pWfSJ.aggregate = None /\ pWfSJ'.aggregate /= None
       [] e.ev = "art" -> pModel'.artifact = [round |-> e.r, kind |-> e.kind] /\ pModel.artifact /= pModel'.artifact
+      [] e.ev = "syncfail" -> pWfSJ'.sj = "crashed" /\ pWfSJ.sj = "none" /\ ~pWfSJ'.open
       [] e.ev = "saved" -> wfSJ_c'.saved = e.r /\ wfSJ_c.saved /= e.r /\ pWfSJ'.returned = e.returned
       [] OTHER -> FALSE
 Env(e) ==
@@ -111,7 +117,10 @@ CHECK_DEADLOCK FALSE
 
 def family(scn):
     base = scn[4:] if scn.startswith("neg_") else scn
-    return "cyc" if base.startswith("cyc") else "sag"
+    for fam in ("cyc", "samp", "sync"):
+        if base.startswith(fam):
+            return fam
+    return "sag"
 
 
 def gen(scn):
@@ -123,6 +132,7 @@ def gen(scn):
     name = f"TraceAB_{scn}"
     t = (TEMPLATE.replace("@SCN@", scn).replace("@SITECONSTS@", ", ".join(names))
          .replace("@PROFILE@", ", ".join(f'"{p}"' for p in PROFILE[fam])).replace("@SITEMAP@", sitemap)
+         .replace("@FAULTS@", ", ".join(f'"{f}"' for f in FAULTS.get(fam, [])))
          .replace("@TR@", ",\n        ".join(tla_val(e) for e in ev)))
     cfg = (CFG.replace("@SITES@", ", ".join(names))
            .replace("@SITEEQ@", "\n  ".join(f"{x} = {x}" for x in names)))
@@ -145,6 +155,14 @@ def mutate():
     rej = json.loads((HERE / "traces" / "sag_reject.json").read_text())
     neg3 = [dict(e, kind="clean") if (e["ev"] == "art" and e["r"] == 1) else e for e in rej]  # clean model from a rejected round
     (HERE / "traces" / "neg_sag_reject_clean.json").write_text(json.dumps(neg3, indent=1))
+    samp = json.loads((HERE / "traces" / "samp_ok.json").read_text())
+    a = next(i for i, e in enumerate(samp) if e["ev"] == "aggregate")
+    b = next(i for i, e in enumerate(samp) if e["ev"] == "saved")
+    neg4 = list(samp); neg4[a], neg4[b] = neg4[b], neg4[a]      # model saved before the round aggregated
+    (HERE / "traces" / "neg_samp_save_before_aggregate.json").write_text(json.dumps(neg4, indent=1))
+    sync = json.loads((HERE / "traces" / "sync_fail.json").read_text())
+    neg5 = [sync[0], dict(ev="open"), sync[1]]                   # the workflow opened, then the start failed
+    (HERE / "traces" / "neg_sync_after_open.json").write_text(json.dumps(neg5, indent=1))
 
 
 if __name__ == "__main__":

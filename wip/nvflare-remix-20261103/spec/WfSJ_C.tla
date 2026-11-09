@@ -317,6 +317,15 @@ Exit ==
     /\ pWfSJ' = [pWfSJ EXCEPT !.sj = "exited"]
     /\ UNCHANGED <<wfSJ_c, net>>
 
+\* v11 G (#15, sjSyncFail): the new SJ cannot get the participants from the SP
+\* within 30 s (sync_clients_from_main_process, server_engine.py:829-848); the
+\* RuntimeError ends start_server_app (FATAL_SYSTEM_ERROR, server_app_runner.py:
+\* 84-91) and the SJ process exits nonzero before the workflow opens.
+SyncFail ==
+    /\ "sjSyncFail" \in Faults /\ pJobSP.sjLaunched /\ pWfSJ.sj = "none" /\ SJAlive
+    /\ pWfSJ' = [pWfSJ EXCEPT !.sj = "crashed", !.panic = TRUE]
+    /\ UNCHANGED <<wfSJ_c, net>>
+
 Crash ==
     /\ "sjCrash" \in Faults /\ SJAlive /\ pWfSJ.sj = "running"
     /\ pWfSJ' = [pWfSJ EXCEPT !.sj = "crashed"]
@@ -326,7 +335,7 @@ Next == \/ Open \/ StartRound \/ Schedule \/ Panic \/ RecordError \/ CancelAll \
         \/ RaiseReturn \/ Aggregate \/ Save \/ EndRun \/ DSShutdown \/ Exit \/ Crash
         \/ CallAggregate \/ AggregateRet \/ CallSave \/ SaveRet \/ CseDone \/ RelayPanic
         \/ SwarmCfgPanic \/ SwarmStartOk \/ SwarmStartPanic \/ SwarmErrPanic \/ SwarmProgressPanic
-        \/ SwarmAllDone \/ SwarmEndDone \/ SwarmEndFail
+        \/ SwarmAllDone \/ SwarmEndDone \/ SwarmEndFail \/ SyncFail
         \/ \E c \in Sites : Count(c) \/ Accept(c) \/ Return(c)
                            \/ CallAccept(c) \/ AcceptRet(c) \/ RaiseCb(c) \/ StopWorkflow(c)
 =============================================================================

@@ -25,7 +25,17 @@ COARSE_ONLY = {
 GRAIN_COARSE_ONLY = {("Trainer", "A"): ["TaskCJ"]}
 
 
-def check_coarse_only(grain, profile):
+# v11: faults whose events exist only in the coarse module of these groups
+COARSE_ONLY_FAULTS = {"sjSyncFail": ["WfSJ"], "taskDataFail": ["TaskCJ"], "podDeleteFail": ["JobCP"],
+                      "slowPublish": ["JobCP"], "acceptRaise": ["WfSJ"], "saveFail": ["WfSJ"]}
+
+
+def check_coarse_only(grain, profile, faults=()):
+    for f in faults or ():
+        for grp in COARSE_ONLY_FAULTS.get(f, ()):
+            v = grain.get(grp)
+            bad = (set(v.values()) if isinstance(v, dict) else {v}) - {"C"}
+            assert not bad, f"fault {f}: group {grp} must be coarse (C), got {sorted(bad)}"
     for (grp0, var0), groups in GRAIN_COARSE_ONLY.items():
         v0 = grain.get(grp0)
         if var0 in (set(v0.values()) if isinstance(v0, dict) else {v0}):
@@ -76,7 +86,7 @@ def build(name, grain=None, default="C", faults=(), sites=2, launch=1, attempt=1
         else:
             assert val in vs, (grp, val, vs)
         g[grp] = val
-    check_coarse_only(g, profile)
+    check_coarse_only(g, profile, faults)
     outdir = Path(outdir or ROOT / "checks" / "mixes")
     outdir.mkdir(parents=True, exist_ok=True)
     site_names = [f"s{i+1}" for i in range(sites)]

@@ -229,3 +229,87 @@ def test_sag_rejected_then_ok():
 def test_cyclic_two_rounds():
     ev = run_cyclic("cyc_ok", rounds=2)
     assert [e["ev"] for e in ev].count("saved") == 2
+
+
+def run_fedavg_sampling(scn, rounds=2):
+    """FedAvg (built-in aggregation) with num_clients=1 of two sites: real sample_clients,
+    real per-result aggregation and model update; send_model delivers each target's
+    result through the real callback."""
+    from nvflare.apis.fl_context import FLContext
+    from nvflare.app_common.abstract.fl_model import FLModel, ParamsType
+    from nvflare.app_common.workflows.fedavg import FedAvg
+
+    tr = Tracer()
+    clients, engine, _ = make_env(2)
+    controller = FedAvg(num_clients=1, num_rounds=rounds, model={"w": np.zeros(2)}, sampling_seed=7)
+    controller.engine = engine
+    controller.fl_ctx = FLContext()
+    controller.abort_signal = Signal()
+    state = {"round": 0}
+    controller.save_model = lambda model: (tr("saved", r=state["round"], returned="normal" if state["round"] == rounds else "none"))
+
+    def send_model(task_name=None, targets=None, data=None, callback=None, **kw):
+        state["round"] += 1
+        r = state["round"]
+        tr("scheduleT", r=r, tg=[site_no(t) for t in targets])
+        tr("task", r=r)
+        for t in targets:
+            tr("call", c=site_no(t), r=r, rc="OK")
+            res = FLModel(params={"w": np.ones(2)}, params_type=ParamsType.FULL, meta={"NUM_STEPS_CURRENT_ROUND": 1},
+                          current_round=r - 1)
+            res.meta["client_name"] = t
+            ok = callback(res)
+            tr("ret", c=site_no(t), r=r, accepted=bool(ok) if ok is not None else True)
+            tr("complete")
+        tr("retire")
+        state["standing"] = 0
+
+    controller.send_model = send_model
+    controller.get_num_standing_tasks = lambda: 0
+    real_aggr = controller._get_aggregated_result
+
+    def aggr():
+        out = real_aggr()
+        tr("aggregate", r=state["round"])
+        return out
+
+    controller._get_aggregated_result = aggr
+    tr("launch")
+    tr("open")
+    controller.run()
+    tr.dump(scn)
+    return tr.ev
+
+
+def test_fedavg_sampling():
+    ev = run_fedavg_sampling("samp_ok", rounds=2)
+    tgs = [e["tg"] for e in ev if e["ev"] == "scheduleT"]
+    assert all(len(t) == 1 for t in tgs)
+    assert [e["ev"] for e in ev].count("saved") == 2
+
+
+def test_sj_sync_fail(monkeypatch):
+    """The real ServerEngine.sync_clients_from_main_process on an SJ whose GET_CLIENTS
+    requests to the SP keep failing: it raises after its 30 s window (clock advanced)."""
+    import types
+
+    import pytest
+
+    from nvflare.private.fed.server import server_engine as se
+
+    tr = Tracer()
+    now = {"t": 1000.0}
+
+    def fake_time():
+        now["t"] += 5.0
+        return now["t"]
+
+    monkeypatch.setattr(se.time, "time", fake_time)
+    monkeypatch.setattr(se.time, "sleep", lambda s: None)
+    fake = types.SimpleNamespace(args=types.SimpleNamespace(job_id="job"), logger=__import__("logging").getLogger("tv"),
+                                 client_manager=Mock(), _retrieve_clients_data=lambda job_id: None)
+    tr("launch")
+    with pytest.raises(RuntimeError):
+        se.ServerEngine.sync_clients_from_main_process(fake)
+    tr("syncfail")
+    tr.dump("sync_fail")

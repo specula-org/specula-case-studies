@@ -36,7 +36,7 @@ MCFaults == {}
 MCProfile == {}
 TR == << @TR@ >>
 EnvKinds == {"launch", "input", "stop"}
-Fixed == <<net, pJobSP, pRunCJ, pPaySrc, pPayRcv, pCommSJ, pWfSJ, pReg, pWorker, pModel>>
+Fixed == <<net, pJobSP, pRunCJ, pPaySrc, pPayRcv, pCommSJ, pWfSJ, pReg, pWorker, pModel, pSwarm>>
 P == pTrainer[s1][1]
 Pn == pTrainer'[s1][1]
 Obs == <<P.received, P.published, P.stopped, P.err, trainer_a[s1][1].tp>>

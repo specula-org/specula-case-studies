@@ -23,8 +23,9 @@ FedKinds == {"GET_TASK", "TASK_ASSIGNMENT", "TASK_CHECK", "TASK_CHECK_REPLY",
 \* cancel: direct mark-only cancel_task.  deadClient: dead-job reports + heartbeat.
 \* minClients: bcast min_responses < targets (task may exit OK with stragglers).
 \* resultWaitTimeout: in-process executor result_wait_timeout.
+\* taskDataFail (v11 G): the CJ fails to download a task's input payload and asks again.
 FedFaults == {"sjCrash", "taskTimeout", "submitTimeout", "prepFail", "cbFail", "cancel",
-              "deadClient", "minClients", "resultWaitTimeout", "slowFinalize"}
+              "deadClient", "minClients", "resultWaitTimeout", "slowFinalize", "taskDataFail"}
 \* FedAvg rounds = the attempt bound (mkmc.py --attempt N). Round r uses server
 \* attempt r, result transaction Tx(c, l, r) and ref Ref(c, l, r).
 Rounds == MaxAttempt
@@ -40,6 +41,7 @@ FedLossyIn(fs) == {"netLoss", "submitTimeout"} \cap fs /= {}
 \* bound. With only Rounds polls, a single TRY_AGAIN exhausted the budget and the
 \* generic deadlock check reported a model-bound hang (blind2, 03:10).
 FedMaxPollIn(fs) == 2 * Rounds + (IF FedLossyIn(fs) \/ "prepFail" \in fs THEN 1 ELSE 0)
+                              + (IF "taskDataFail" \in fs THEN 1 ELSE 0)
 FedMaxTryIn(fs) == 1 + (IF FedLossyIn(fs) \/ {"pullTimeout", "txTimeout", "taskTimeout"} \cap fs /= {}
                         THEN 1 ELSE 0)
 \* Global model generation broadcast with round r's task.
