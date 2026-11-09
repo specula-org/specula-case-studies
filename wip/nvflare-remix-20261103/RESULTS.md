@@ -873,6 +873,9 @@ Swarm 的两条 Phase 1 候选在模型里也走得到：H05（gather 在所有�
   - 跑法是融合模拟（throttle 20、rarity 4、深度 2500、每条 40 分钟）。
   - 性质用 hunt8 的通用集合，已知发现过滤掉。v11 的后果性质（`spec/PropsV11.tla`）单独跑（`plans/hunt11_leads.py`）。
 - **规模**：主 hunt 13:46–15:07 UTC，墙钟 81 分钟；之后补跑 12 分钟（15:09–15:21，`plans/hunt11c.py`，6 个没有交叉过的跨块组合各跑两遍：cyclic + k8sJob、sag + multiJobCP、Attach + sampling、swarm + dockerJob、cseServer + k8sJob、sampling + dockerJob + sjModel）。合计墙钟 93 分钟、48 个运行、4,893 条 trace、21.1 run·小时。
+- **单个连续 90 分钟运行**（`plans/hunt11d.py`）：Swarm 族（两个 site、两次 launch，learnFail、swarmMsgFail、busyReplace、gatherTimeout、cjCrash），一个 TLC 进程，24 个 worker，15:43–17:13 UTC（5,402 秒），1,497 条 trace、914 万个状态，没有违例（跑到时限停止）。
+  - 第一次启动（15:22）在第 14 分钟报出 `net discipline: Step_Swarm_C_SendStatus` 断言失败。这是模型自己的错误：Swarm 消息编号没带 CJ 的 launch 代数，CJ 重启后新 launch 用同一个编号发了内容不同的消息，违反了"已有消息不可变"。
+  - 已修复，编号加上发送方 launch（`c938e550`）。修复后重跑 Swarm 冒烟（含重启）和 TV，都通过，再从头跑这一个 90 分钟运行。
 - **结果**：盲搜没有新违例。报出的 4 次都能解释：
 
 | 运行 | 违反 | 解释 |
