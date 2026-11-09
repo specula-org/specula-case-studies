@@ -872,13 +872,13 @@ Swarm 的两条 Phase 1 候选在模型里也走得到：H05（gather 在所有�
 - **计划**：`plans/hunt11.py`。12 个族各跑两遍，覆盖 v11 的全部开关：sjModel、sag、cyclic、cseServer、Attach、swarm、k8sJob、dockerJob、multiJobCP、sampling、两个 G 缺口故障，外加一个跨块组合（k8sJob + sjModel + sampling）。
   - 跑法是融合模拟（throttle 20、rarity 4、深度 2500、每条 40 分钟）。
   - 性质用 hunt8 的通用集合，已知发现过滤掉。v11 的后果性质（`spec/PropsV11.tla`）单独跑（`plans/hunt11_leads.py`）。
-- **规模**：主 hunt 13:46–15:07 UTC，墙钟 81 分钟。连同 saveFail 补跑和后果性质，共 36 个运行、4,466 条 trace、18.8 run·小时。
+- **规模**：主 hunt 13:46–15:07 UTC，墙钟 81 分钟；之后补跑 12 分钟（15:09–15:21，`plans/hunt11c.py`，6 个没有交叉过的跨块组合各跑两遍：cyclic + k8sJob、sag + multiJobCP、Attach + sampling、swarm + dockerJob、cseServer + k8sJob、sampling + dockerJob + sjModel）。合计墙钟 93 分钟、48 个运行、4,893 条 trace、21.1 run·小时。
 - **结果**：盲搜没有新违例。报出的 4 次都能解释：
 
 | 运行 | 违反 | 解释 |
 |---|---|---|
 | `h11_sag_*`（2 次） | `SavedAfterOkClose` | 这条性质（有聚合结果就说明 workflow 没失败）假设失败只发生在聚合之前；新故障 `saveFail` 在聚合之后失败，真实代码这时也会 panic。去掉这条性质后，fm、sag、cyclic 三族各跑两遍（`plans/hunt11b.py`，35 分钟），都没有违例 |
-| `h11_k8s_*_b`、`h11_combo_*_b` | `GNoFreeWhileAliveK` | H20（已知，known-open）：Pod 删除失败，分配仍被释放 |
+| `h11_k8s_*_b`、`h11_combo_*_b`、`h11c_cse_k8s` | `GNoFreeWhileAliveK` | H20（已知，known-open）：Pod 删除失败，分配仍被释放 |
 
 - **试跑发现的 V8（新线索）**：k8sJob、dockerJob 下，`GNoChildWithoutAlloc` 几步就被违反。CP 重启后旧 CJ 容器还在跑，新 CP 却忘了它的分配。
   - 静态核实：两种 launcher 都不扫描、也不接管已有容器；资源管理器只在内存里，不持久化；Docker 的 GPU `DeviceIDs` 直接取自分配结果（`docker_launcher.py:738-743`）。
