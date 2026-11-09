@@ -864,3 +864,53 @@ Swarm 的两条 Phase 1 候选在模型里也走得到：H05（gather 在所有�
 - 没有跑 hunt，所以没有新的模型检查结论，根因计数不变（RESULTS §16.5）。冒烟见证顺带说明几条 Phase 1 候选（H04、H05、H06、H07、H20、H39）在模型里走得到，另有一条新线索 V7；都只是静态加模型见证，没有复现，不计数。
 - 待拆细的窗口清单在 `notes/v11-audit.md`：H24（训练进程清标志和 CJ 关监听之间）、Attach 投递重试循环里早到的 RESULT_READY、K8s 下 CJ 在关闭时才发布结果。
 - 仍在范围外：edge、simulator、lighter/dashboard/tool、xgboost/psi/statistics/splitnn、filters、cellnet/drivers 内部、安全鉴权、时间数值、显式 ref 复用（H09），以及这一轮推迟的 Slurm 和 H31。
+
+## 18. 第十二轮（11-09）：v11 模型上 90 分钟 model checking 和复现
+
+### 18.1 搜索
+
+- **计划**：`plans/hunt11.py`。12 个族各跑两遍，覆盖 v11 的全部开关：sjModel、sag、cyclic、cseServer、Attach、swarm、k8sJob、dockerJob、multiJobCP、sampling、两个 G 缺口故障，外加一个跨块组合（k8sJob + sjModel + sampling）。
+  - 跑法是融合模拟（throttle 20、rarity 4、深度 2500、每条 40 分钟）。
+  - 性质用 hunt8 的通用集合，已知发现过滤掉。v11 的后果性质（`spec/PropsV11.tla`）单独跑（`plans/hunt11_leads.py`）。
+- **规模**：主 hunt 13:46–15:07 UTC，墙钟 81 分钟。连同 saveFail 补跑和后果性质，共 36 个运行、4,466 条 trace、18.8 run·小时。
+- **结果**：盲搜没有新违例。报出的 4 次都能解释：
+
+| 运行 | 违反 | 解释 |
+|---|---|---|
+| `h11_sag_*`（2 次） | `SavedAfterOkClose` | 这条性质（有聚合结果就说明 workflow 没失败）假设失败只发生在聚合之前；新故障 `saveFail` 在聚合之后失败，真实代码这时也会 panic。去掉这条性质后，fm、sag、cyclic 三族各跑两遍（`plans/hunt11b.py`，35 分钟），都没有违例 |
+| `h11_k8s_*_b`、`h11_combo_*_b` | `GNoFreeWhileAliveK` | H20（已知，known-open）：Pod 删除失败，分配仍被释放 |
+
+- **试跑发现的 V8（新线索）**：k8sJob、dockerJob 下，`GNoChildWithoutAlloc` 几步就被违反。CP 重启后旧 CJ 容器还在跑，新 CP 却忘了它的分配。
+  - 静态核实：两种 launcher 都不扫描、也不接管已有容器；资源管理器只在内存里，不持久化；Docker 的 GPU `DeviceIDs` 直接取自分配结果（`docker_launcher.py:738-743`）。
+  - 所以重启后的 CP 会把旧容器还在用的 GPU 再分给下一个 job。没有复现，不计数。主 hunt 里对容器族过滤了这条不变式。
+- **后果性质的盲搜**（每条 900 秒）：V7（`V11CompletedNotFailed`，499 秒）和 H01（`V11AttachNoFalseSuccess`，29 秒）被盲搜找到；H04、H05、H06、H07 在 15 分钟内没有找到，只靠第 17 节的定向见证到达。
+
+### 18.2 在真实代码上复现
+
+五个都在 pin `c411a201` 上执行。涉及的代码在上游 main 上没变：`swarm_client_ctl.is_done`、`fed_server._resolve_missing_client_outcome` 已对照最新版本，其余文件 pin 之后没有提交。只读 GitHub 搜索没有找到直接相关的 issue；最接近的是 FedAvg 修过的"失败回调不发布部分聚合"（#5295），它不覆盖 SAG。
+
+| 编号 | 问题 | 复现（脚本在 `checks/confirm/`） | 证据档位 |
+|---|---|---|---|
+| V7（新） | K8s 下 CP 重启后，CJ Pod 继续跑完、模型已保存，job 却被记为 FINISHED_ABNORMAL | `v7_repro.py`：真实的 `ClientManager.authenticate`（重新登录拿到新 token）、`_sync_client_jobs`、`_resolve_missing_client_outcome`、`JobRunner.fail_run` 和状态分类。对照组 CP 不重启、上报 outcome，记为 COMPLETED | REPRODUCED，无强制；"Pod 不随 CP 退出"这一前提是静态的（没有 ownerReference） |
+| H06 | 允许忙时替换（`allow_busy_task`）时，新学习任务到达，控制器为中止当前任务触发 ABORT_TASK；事件分发把它送回控制器自己，被当作"要求停止"并结束 workflow；新任务被接受却永远不执行，学习循环退出 | `h06_repro.py`：真实的 `ClientSideController` 和真实事件分发 `nvflare.private.event.fire_event`（控制器作为 job 组件之一）。对照组新任务在空闲时到达，正常执行 | REPRODUCED，无强制；前提是开了 `allow_busy_task`，且有任务在忙时到达 |
+| H07 | 旧 launch 的 `publish_results` handler 下载、解压完后按 job_id `remove_job`，删掉替换 launch 新登记的记录，替换 CJ 的结果被拒（`invalid_target`） | `h07_repro.py`：真实的 `WorkspaceTransferManager`（add_job、handler、remove_job），下载用桩，旧下载一直挂到替换 launch 登记之后。对照组不重叠，两次发布都成功 | REPRODUCED，强制时序（handler 比请求方活得久） |
+| H04 | SAG 的回调抛异常后，task 只被标成 ERROR、不 panic；SAG 照样聚合，并保存一个混了"失败贡献的一半"的模型（键 `a` 含 site-2 的值，键 `b` 不含），job 照常往下走 | `h04_repro.py`：真实的 SAG、WFCommServer、`InTimeAccumulateWeightedAggregator`。注入：site-2 第二个键是一个 materialize 会失败的惰性值（offload 文件已不在） | REPRODUCED，注入故障 |
+| H05 | Swarm 聚合方在"所有 trainer 都回复了"时关闭 gather，最后一个回复还在 `aggregator.accept` 里；这一轮的聚合漏掉它，它随后被加进聚合器，混进下一轮（下一轮结果是 (100+5)/2 = 52.5，应为 5.0） | `h05_repro.py`：真实的 `Gatherer` 和聚合器。强制调度：site-2 的 accept 在打上 `reply_time` 之后被挂起，直到 monitor 完成聚合 | REPRODUCED，强制调度 |
+
+### 18.3 按根因汇总（截至 11-09 第十二轮）
+
+| 口径 | 个数 | 是哪些 |
+|---|---:|---|
+| 在真实代码上复现 | 22 | 第十轮的 17 个，加上 V7、H06、H07、H04、H05 |
+| 其中不需要强制调度或注入 | 8 | H08、H11、T1、R1、R2、L5，加上 V7、H06（各自有一条配置或部署前提） |
+| 其中靠强制调度、桩、注入故障或时序巧合 | 14 | 第十轮的 11 个，加上 H07、H04、H05 |
+| 有模型反例 | 21 | 第十轮的 15 个，加上 H01（这一轮的盲搜找到）和新复现的五个；L5 是时间值，模型不含 |
+| 其中盲搜能找到 | 17 | 第十轮的 15 个，加上 H01、V7；H04、H05、H06、H07 只靠定向见证到达 |
+| 新于上游 | 21（或 22） | 加上新复现的五个，都没有找到相关 issue；都没有提交 |
+| 新于 Phase 1 | 14 | 加上 V7 |
+| Phase 1 候选，第一次确认 | 8 | H08、H11、H03、H01，加上 H04、H05、H06、H07 |
+| 只有静态代码确认 | 3 | S2、S3、L6 |
+| 静态加模型反例、未复现 | 1 | V8 |
+| 只有模型反例 | 1 | N1 |
+
+和第十一轮复盘的经验一致：这一轮新增的五个，都来自"为了建模而读代码"时记下的线索，再加上模型里的定向见证；90 分钟盲搜本身没有找到新的。
