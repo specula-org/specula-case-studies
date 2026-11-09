@@ -10,10 +10,11 @@
 \*     _scatter, _monitor_gather), :662-720 (_end_gather -> next round or final),
 \*     :1030-1192 (do_learn_task: gatherer, learn, submit to the aggregator).
 \* Messages (CJ<->CJ aux; status reports ride on the client's task pulls):
-\*   SWARM_LEARN     CJ(a)->CJ(d)  id <<JobId, a, d, r>>   body [round, aggr]
-\*   SWARM_SUBMIT    CJ(d)->CJ(g)  id <<JobId, d, g, r>>   body [round, rc]
-\*   SWARM_STATUS    CJ(c)->SJ     id <<JobId, c, n>>      body [round, allDone, error]
-\*   SWARM_END_REPLY CJ(c)->SJ     id <<JobId, c>>         body "OK"
+\*   SWARM_LEARN     CJ(a)->CJ(d)  id <<JobId, a, l, d, r>>  body [round, aggr]
+\*   SWARM_SUBMIT    CJ(d)->CJ(g)  id <<JobId, d, l, g, r>>  body [round, rc]
+\*   SWARM_STATUS    CJ(c)->SJ     id <<JobId, c, l, n>>     body [round, allDone, error]
+\*   SWARM_END_REPLY CJ(c)->SJ     id <<JobId, c, l>>        body "OK"
+\*   (l = the sender's CJ launch)
 \*   (SWARM_END_WF   SJ->CJ(c)     id <<JobId, c>>, owned by WfSJ)
 \* pSwarm[c][l]:
 \*   cfg      : configured by the server's config task

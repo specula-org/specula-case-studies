@@ -437,7 +437,7 @@ New faults (all priced in `rarity.json`):
 
 | Kind | Owner | From → to | Body |
 |---|---|---|---|
-| `SWARM_LEARN` | Swarm | CJ(aggregator) → CJ(trainer) | `[round, aggregator]` |
+| `SWARM_LEARN` | Swarm | CJ(aggregator) → CJ(trainer) | `[round, aggregator]`; ids carry the sender launch |
 | `SWARM_SUBMIT` | Swarm | CJ(trainer) → CJ(aggregator) | `[round, rc]` |
 | `SWARM_STATUS` | Swarm | CJ → SJ | `[round, allDone, error]` (status reports ride on the client's task requests; one message per change) |
 | `SWARM_END_WF` | WfSJ | SJ → CJ | `None` (end-workflow aux request) |

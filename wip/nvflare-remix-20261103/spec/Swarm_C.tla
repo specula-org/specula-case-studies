@@ -19,7 +19,9 @@ InRound(c, l) == IF In(c, l) = None THEN 0 ELSE In(c, l).assignment.attempt
 Handled(c, l, k) == k \in swarm_c[c][l]
 Mark(c, l, k) == swarm_c' = [swarm_c EXCEPT ![c][l] = @ \cup {k}]
 Err(r) == [r EXCEPT !.report.error = TRUE]
-LearnMsg(a, d, r, g) == Msg("SWARM_LEARN", CJ(a), CJ(d), <<JobId, a, d, r>>, [round |-> r, aggr |-> g])
+\* message ids carry the sender's CJ launch: a relaunched CJ sends new messages (v11 fix
+\* after the 90-minute run: the same id with a different body broke net immutability)
+LearnMsg(a, l, d, r, g) == Msg("SWARM_LEARN", CJ(a), CJ(d), <<JobId, a, l, d, r>>, [round |-> r, aggr |-> g])
 \* sending a learn task fails on a lost / timed-out aux request or a dead peer
 SendFailPossible(d) == "swarmMsgFail" \in Faults \/ PeerFailureCJ(d, CurLaunch(d))
 
@@ -32,7 +34,7 @@ Configure(c, l) ==
 \* _scatter for round r with aggregator g: queue the learn task locally (every
 \* site is a trainer and an aggregator candidate) and broadcast it to the others
 Scatter(c, l, r, g, rec) ==
-    /\ net' = SendAll(net, {LearnMsg(c, d, r, g) : d \in Sites \ {c}})
+    /\ net' = SendAll(net, {LearnMsg(c, l, d, r, g) : d \in Sites \ {c}})
     /\ pSwarm' = Upd(c, l, [rec EXCEPT !.learn = [r |-> r, st |-> "busy", aggr |-> g],
                                        !.gather = IF g = c THEN [r |-> r, replied |-> {}, gathered |-> {}, done |-> FALSE]
                                                   ELSE @,
@@ -89,7 +91,7 @@ Submit(c, l) ==
        THEN /\ S(c, l).gather /= None /\ S(c, l).gather.r = L.r /\ ~S(c, l).gather.done
             /\ pSwarm' = Upd(c, l, [S(c, l) EXCEPT !.learn.st = "done", !.gather.replied = @ \cup {c}])
             /\ UNCHANGED net
-       ELSE \/ /\ net' = Send(net, Msg("SWARM_SUBMIT", CJ(c), CJ(L.aggr), <<JobId, c, L.aggr, L.r>>,
+       ELSE \/ /\ net' = Send(net, Msg("SWARM_SUBMIT", CJ(c), CJ(L.aggr), <<JobId, c, l, L.aggr, L.r>>,
                                        [round |-> L.r, rc |-> "OK"]))
                /\ pSwarm' = Upd(c, l, [S(c, l) EXCEPT !.learn.st = "done"])
             \/ /\ SendFailPossible(L.aggr)
@@ -136,7 +138,7 @@ GatherDone(c, l) ==
 \* status report on the next task pull (one message per change)
 SendStatus(c, l) ==
     /\ SwarmOn /\ CJAlive(c, l) /\ ~S(c, l).ended /\ S(c, l).report /= S(c, l).sentRep
-    /\ net' = Send(net, Msg("SWARM_STATUS", CJ(c), SJ, <<JobId, c, S(c, l).sent + 1>>, S(c, l).report))
+    /\ net' = Send(net, Msg("SWARM_STATUS", CJ(c), SJ, <<JobId, c, l, S(c, l).sent + 1>>, S(c, l).report))
     /\ pSwarm' = Upd(c, l, [S(c, l) EXCEPT !.sent = @ + 1, !.sentRep = S(c, l).report])
     /\ UNCHANGED swarm_c
 
@@ -152,7 +154,7 @@ RecvEndWf(c, l, k) ==
     /\ SwarmOn /\ CJAlive(c, l) /\ InInbox(k, CJ(c), "SWARM_END_WF") /\ ~Handled(c, l, k)
     /\ Mark(c, l, k)
     /\ pSwarm' = Upd(c, l, [S(c, l) EXCEPT !.ended = TRUE, !.stopped = TRUE])
-    /\ net' = Send(net, Msg("SWARM_END_REPLY", CJ(c), SJ, <<JobId, c>>, "OK"))
+    /\ net' = Send(net, Msg("SWARM_END_REPLY", CJ(c), SJ, <<JobId, c, l>>, "OK"))
 
 Next ==
     \/ \E c \in Sites, l \in Launches :
